@@ -290,7 +290,7 @@ fn detail_table_rows<'a>(app: &'a App, svc: &'a crate::app::ServiceEntry) -> (Ve
 
     rows.push(
         Row::new(vec![
-            Cell::from("SRVC"),
+            Cell::from("srvc"),
             Cell::from(""),
             Cell::from(""),
             Cell::from(""),
@@ -306,7 +306,7 @@ fn detail_table_rows<'a>(app: &'a App, svc: &'a crate::app::ServiceEntry) -> (Ve
         }
         rows.push(
             Row::new(vec![
-                Cell::from("SUBT"),
+                Cell::from("subt"),
                 Cell::from(""),
                 Cell::from(""),
                 Cell::from(""),
@@ -324,7 +324,7 @@ fn detail_table_rows<'a>(app: &'a App, svc: &'a crate::app::ServiceEntry) -> (Ve
         };
         rows.push(
             Row::new(vec![
-                Cell::from("HOST"),
+                Cell::from("host"),
                 Cell::from(""),
                 Cell::from(""),
                 Cell::from(""),
@@ -400,7 +400,7 @@ fn detail_table_rows<'a>(app: &'a App, svc: &'a crate::app::ServiceEntry) -> (Ve
     for (name, rtype, source, _, _) in svc.questions.iter().rev() {
         rows.push(
             Row::new(vec![
-                Cell::from("QRY"),
+                Cell::from("qry"),
                 Cell::from(""),
                 Cell::from(""),
                 Cell::from(source.to_string()),
