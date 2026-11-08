@@ -440,9 +440,9 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
     for (name, rtype, source, received, _) in svc.questions.iter().rev() {
         let age = received.elapsed().as_secs();
         let age_str = if age >= 60 {
-            format!("{}m{:02}s ago", age / 60, age % 60)
+            format!("{}m{:02}s", age / 60, age % 60)
         } else {
-            format!("{age}s ago")
+            format!("{age}s")
         };
         // Questions asked from this host's own addresses (including our
         // own looped-back queries) get the same highlight as local records.
