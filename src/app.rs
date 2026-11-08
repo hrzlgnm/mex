@@ -1047,11 +1047,22 @@ impl App {
         } else {
             s.records.push(rec.clone());
         }
-        // Fresh answer resets the RFC 6762 §5.2 requery schedule so the
-        // next refresh starts again at 80% TTL, not hourly.
+        // Fresh answer resets the RFC 6762 §5.2 requery schedule, but only
+        // if no row for this key is still inside the 80%-TTL window:
+        // sibling rows with other rdata/sources may still need their
+        // backoff, and clearing on every unrelated answer re-arms the
+        // trigger each loop iteration (reset-driven storm).
         if rec.ttl > 0 {
             let key = (rec.name.trim_end_matches('.').to_string(), rec.rtype);
-            self.requeries.remove(&key);
+            let still_expiring = self.services[svc_idx].records.iter().any(|r| {
+                r.ttl > 0
+                    && r.name.trim_end_matches('.') == key.0.as_str()
+                    && r.rtype == key.1
+                    && r.received_at.elapsed().as_secs() as u32 * 5 >= r.ttl * 4
+            });
+            if !still_expiring {
+                self.requeries.remove(&key);
+            }
         }
     }
 
