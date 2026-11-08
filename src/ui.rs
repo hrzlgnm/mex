@@ -315,7 +315,7 @@ fn detail_table_rows<'a>(app: &'a App, svc: &'a crate::app::ServiceEntry) -> (Ve
                 Cell::from(""),
                 Cell::from(sub.clone()),
             ])
-            .style(dim),
+            .style(info_style),
         );
     }
 
@@ -398,7 +398,7 @@ fn detail_table_rows<'a>(app: &'a App, svc: &'a crate::app::ServiceEntry) -> (Ve
                             Cell::from(""),
                             Cell::from(format!("  {branch} {pair}")),
                         ])
-                        .style(dim),
+                        .style(info_style),
                     );
                 }
             }
