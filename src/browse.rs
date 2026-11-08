@@ -69,6 +69,7 @@ pub struct Event {
     pub source: SocketAddr,
 }
 
+#[derive(Debug, Clone)]
 pub struct QueryRequest {
     pub name: String,
     pub record_type: RecordType,
@@ -76,11 +77,28 @@ pub struct QueryRequest {
     pub known_answers: Vec<(String, u32)>,
 }
 
-pub fn spawn(query_rx: mpsc::Receiver<QueryRequest>) -> Result<mpsc::Receiver<Event>> {
+/// Query sender fanning out to both transports, so solicited queries
+/// reach v6-only responders too. A dead listener thread just drops its copy.
+pub struct QueryTx {
+    v4: mpsc::Sender<QueryRequest>,
+    v6: mpsc::Sender<QueryRequest>,
+}
+
+impl QueryTx {
+    pub fn send(&self, req: QueryRequest) {
+        let _ = self.v4.send(req.clone());
+        let _ = self.v6.send(req);
+    }
+}
+
+pub fn spawn() -> Result<(QueryTx, mpsc::Receiver<Event>)> {
     let (tx, rx) = mpsc::channel();
+    let (tx_v4, rx_v4) = mpsc::channel();
+    let (tx_v6, rx_v6) = mpsc::channel();
 
     let v4_interfaces = v4_interfaces();
     let tx4 = tx.clone();
+    let dest_v4 = SocketAddr::from(SocketAddrV4::new(MDNS_V4, MDNS_PORT));
     thread::spawn(move || {
         let socket = match create_v4_socket() {
             Ok(s) => s,
@@ -94,10 +112,11 @@ pub fn spawn(query_rx: mpsc::Receiver<QueryRequest>) -> Result<mpsc::Receiver<Ev
                 eprintln!("mex: v4 mcast {name}: {e}");
             }
         }
-        listen(&socket, tx4, query_rx);
+        listen(&socket, tx4, rx_v4, dest_v4);
     });
 
     let v6_interfaces = v6_interfaces();
+    let dest_v6 = SocketAddr::from(SocketAddrV6::new(MDNS_V6, MDNS_PORT, 0, 0));
     thread::spawn(move || {
         let socket = match create_v6_socket() {
             Ok(s) => s,
@@ -111,11 +130,16 @@ pub fn spawn(query_rx: mpsc::Receiver<QueryRequest>) -> Result<mpsc::Receiver<Ev
                 eprintln!("mex: v6 mcast {name}: {e}");
             }
         }
-        let (_dummy_tx, dummy_rx) = mpsc::channel();
-        listen(&socket, tx, dummy_rx);
+        listen(&socket, tx, rx_v6, dest_v6);
     });
 
-    Ok(rx)
+    Ok((
+        QueryTx {
+            v4: tx_v4,
+            v6: tx_v6,
+        },
+        rx,
+    ))
 }
 
 pub fn local_ips() -> HashSet<IpAddr> {
@@ -177,9 +201,13 @@ fn create_v6_socket() -> Result<Socket> {
     Ok(socket)
 }
 
-fn listen(socket: &Socket, tx: mpsc::Sender<Event>, query_rx: mpsc::Receiver<QueryRequest>) {
+fn listen(
+    socket: &Socket,
+    tx: mpsc::Sender<Event>,
+    query_rx: mpsc::Receiver<QueryRequest>,
+    dest: SocketAddr,
+) {
     let mut buf = vec![MaybeUninit::uninit(); 65535];
-    let dest = SocketAddrV4::new(MDNS_V4, MDNS_PORT).into();
 
     loop {
         // drain any pending outgoing queries

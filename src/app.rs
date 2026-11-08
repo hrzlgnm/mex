@@ -63,7 +63,7 @@ pub struct App {
     pub running: bool,
 
     rx: mpsc::Receiver<browse::Event>,
-    query_tx: mpsc::Sender<browse::QueryRequest>,
+    query_tx: browse::QueryTx,
     last_query: Instant,
     burst_count: u8,
     queried_types: HashSet<String>,
@@ -129,8 +129,7 @@ impl ServiceEntry {
 
 impl App {
     pub fn new() -> Result<Self> {
-        let (query_tx, query_rx) = mpsc::channel();
-        let rx = browse::spawn(query_rx)?;
+        let (query_tx, rx) = browse::spawn()?;
         Ok(Self {
             services: Vec::new(),
             selected_display: 0,
