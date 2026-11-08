@@ -42,3 +42,17 @@ cargo build
 Requires no external commands — interface enumeration goes through the
 `if-addrs` crate. No root needed. Without a TTY it runs headless and logs
 to stderr.
+
+## Known limitations
+
+**Quiet publishers' subtypes are undiscoverable.** A service subtype (e.g.
+`_magic._sub._test._tcp`) can only be learned two ways: from a
+`_services._dns-sd._udp` enumeration that lists it, or by overhearing
+subtype traffic (startup announcements, someone else's subtype
+queries/responses). Some responders (e.g. avahi) do not list subtypes in
+their enumeration answers, and there is no DNS query that enumerates
+_unknown_ subtype labels. So if mex starts after such a publisher has gone
+quiet, it shows the service but not its subtype; starting mex first (or
+any subtype traffic while it runs) picks it up normally via the
+announcement burst. Once learned, subtype enumerations are re-queried to
+stay fresh.
