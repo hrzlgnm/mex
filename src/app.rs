@@ -690,9 +690,13 @@ impl App {
     }
 
     /// File a goodbye (TTL 0) record with the matching service so it renders
-    /// as an expired row instead of vanishing silently.
+    /// as an expired row instead of vanishing silently. PTR goodbyes name
+    /// the type, so the withdrawn instance is matched via the rdata.
     fn ingest_goodbye(&mut self, rec: &browse::RawRecord, ev: &browse::Event) {
-        let name = rec.name.trim_end_matches('.').to_lowercase();
+        let mut names = vec![rec.name.trim_end_matches('.').to_lowercase()];
+        if rec.rtype == 12 {
+            names.push(rec.rdata.trim_end_matches('.').to_lowercase());
+        }
         for i in 0..self.services.len() {
             let full = format!(
                 "{}.{}",
@@ -703,7 +707,8 @@ impl App {
                 .hostname
                 .trim_end_matches('.')
                 .to_lowercase();
-            if full == name || host == name || self.services[i].instance.to_lowercase() == name {
+            let inst = self.services[i].instance.to_lowercase();
+            if names.iter().any(|n| *n == full || *n == host || *n == inst) {
                 self.services[i].last_event = Some(ev.clone());
                 self.push_record(i, rec);
                 return;
