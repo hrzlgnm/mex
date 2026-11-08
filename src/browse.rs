@@ -156,12 +156,16 @@ fn skipped_interface(name: &str) -> bool {
 
 fn v4_interfaces() -> Vec<(String, Ipv4Addr)> {
     let mut out = Vec::new();
+    let mut seen = HashSet::new();
     for iface in if_addrs::get_if_addrs().unwrap_or_default() {
         if skipped_interface(&iface.name) {
             continue;
         }
         if let if_addrs::IfAddr::V4(v4) = iface.addr {
-            out.push((iface.name, v4.ip));
+            // Join once per interface: extra addresses share the group.
+            if seen.insert(iface.name.clone()) {
+                out.push((iface.name, v4.ip));
+            }
         }
     }
     out
@@ -169,12 +173,14 @@ fn v4_interfaces() -> Vec<(String, Ipv4Addr)> {
 
 fn v6_interfaces() -> Vec<(String, u32)> {
     let mut out = Vec::new();
+    let mut seen = HashSet::new();
     for iface in if_addrs::get_if_addrs().unwrap_or_default() {
         if skipped_interface(&iface.name) {
             continue;
         }
         if let if_addrs::IfAddr::V6(v6) = iface.addr {
-            if v6.ip.to_string().starts_with('f') {
+            // Join once per interface: extra addresses share the group.
+            if v6.ip.to_string().starts_with('f') && seen.insert(iface.name.clone()) {
                 out.push((iface.name, iface.index.unwrap_or(0)));
             }
         }
@@ -232,8 +238,9 @@ fn listen(
                     }
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut =>
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
             {
                 continue;
             }
@@ -277,7 +284,12 @@ fn parse_packet(raw: &[u8], source: SocketAddr) -> Option<Event> {
 
     let mut records = Vec::new();
 
-    for rec in msg.answers().iter().chain(msg.name_servers()).chain(msg.additionals()) {
+    for rec in msg
+        .answers()
+        .iter()
+        .chain(msg.name_servers())
+        .chain(msg.additionals())
+    {
         let class: u16 = rec.dns_class().into();
         records.push(RawRecord {
             name: unescape(&rec.name().to_string()),
@@ -336,7 +348,13 @@ fn rdata_label(data: Option<&RData>) -> String {
         Some(RData::A(ip)) => ip.to_string(),
         Some(RData::AAAA(ip)) => ip.to_string(),
         Some(RData::SRV(srv)) => {
-            format!("{} {} {} {}", srv.priority(), srv.weight(), srv.port(), unescape(&srv.target().to_string()))
+            format!(
+                "{} {} {} {}",
+                srv.priority(),
+                srv.weight(),
+                srv.port(),
+                unescape(&srv.target().to_string())
+            )
         }
         Some(RData::TXT(txt)) => txt
             .iter()
@@ -346,7 +364,11 @@ fn rdata_label(data: Option<&RData>) -> String {
         Some(RData::PTR(n)) => unescape(&n.to_string()),
         Some(RData::CNAME(n)) => unescape(&n.to_string()),
         Some(RData::NS(n)) => unescape(&n.to_string()),
-        Some(RData::MX(mx)) => format!("{} {}", mx.preference(), unescape(&mx.exchange().to_string())),
+        Some(RData::MX(mx)) => format!(
+            "{} {}",
+            mx.preference(),
+            unescape(&mx.exchange().to_string())
+        ),
         Some(RData::SOA(soa)) => format!(
             "{} {} {} {} {} {} {}",
             unescape(&soa.mname().to_string()),
@@ -443,5 +465,3 @@ fn decode_nsec(rdata: &[u8]) -> String {
         format!("{name} {}", types.join(" "))
     }
 }
-
-
