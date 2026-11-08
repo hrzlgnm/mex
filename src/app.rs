@@ -1032,6 +1032,18 @@ impl App {
         if self.list_offset.get() > max {
             self.list_offset.set(max.saturating_sub(1));
         }
+        // The first header is not a selectable stop, so plain
+        // follow-the-cursor scrolling would strand the viewport at
+        // offset 1 with row 0 hidden forever. When the cursor sits on
+        // the first selectable row, pull the view back to the top.
+        if let Some(first) = items.iter().position(|it| self.is_selectable(it)) {
+            if self.selected_display == first {
+                let top = first.saturating_sub(1);
+                if self.list_offset.get() > top {
+                    self.list_offset.set(top);
+                }
+            }
+        }
         // Sticky detail: headers select nothing, so remember the last
         // selected service to keep the right panes alive while navigating.
         let key = self
