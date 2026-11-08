@@ -11,26 +11,32 @@ standard browse queries (service enumeration, PTR/SRV/TXT/A/AAAA).
 
 ## Layout
 
-- **Left — Services.** Collapsible tree grouped by service type
-  (`http.tcp` is short for `_http._tcp.local`), instances below it.
-- **Right top — Records.** For the selected service: derived rows
-  (`SRVC`, `SUBT`, `HOST`, `QRY`), then one row per observed raw record
+- **Left — Services.** Collapsible tree grouped by shortened service type
+  (`http.tcp` is short for `_http._tcp.local`); each row shows
+  `instance @ host:port` with the state dot up front. `Up`/`Down` skips
+  open headers (collapsed ones stay selectable), the selection is inverted,
+  and the pane title always names the selected row's service type.
+- **Right top — Answers.** For the selected service: derived rows
+  (`srvc`, `subt`, `host`), then one row per observed raw record
   (deduplicated across responders, sorted by type then source) with
   remaining TTL, flush bit, source, and rdata. Multi-pair TXT records
-  expand inline into child rows. Locally published records are highlighted.
-  Goodbyes (TTL 0) and observed questions show up here too.
-- **Right bottom — Hex.** Wire bytes of the selected record or query
+  expand into unlabeled child rows. Records announced by this host are
+  highlighted; goodbye (TTL 0) records show as expired.
+- **Right middle — Questions.** Recently observed queries asking for this
+  service, newest first (capped), with per-query age instead of TTL.
+  Questions from this host are highlighted like local records.
+- **Right bottom — Hex.** Wire bytes of the selected record or question
   packet, falling back to the service's latest packet.
 
 ## Keys
 
-| Key                    | Action                              |
-| ---------------------- | ----------------------------------- |
-| `Up` / `Down`          | select service (skips open headers) |
-| `j` / `k`              | select record row                   |
-| `Space` / `Enter`      | fold / unfold                       |
-| `←` / `→`              | collapse / expand                   |
-| `q` / `Esc` / `Ctrl+C` | quit                                |
+| Key                    | Action                               |
+| ---------------------- | ------------------------------------ |
+| `Up` / `Down`          | select service (skips open headers)  |
+| `j` / `k`              | select record / question row         |
+| `Space` / `Enter`      | fold / unfold                        |
+| `←` / `→`              | collapse / expand                    |
+| `q` / `Esc` / `Ctrl+C` | quit                                 |
 
 ## Build & run
 
