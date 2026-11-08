@@ -335,6 +335,7 @@ fn rtype_label(rtype: RecordType) -> String {
         RecordType::TXT => "TXT".into(),
         RecordType::PTR => "PTR".into(),
         RecordType::CNAME => "CNAME".into(),
+        RecordType::NS => "NS".into(),
         RecordType::NSEC => "NSEC".into(),
         RecordType::ANY => "ANY".into(),
         RecordType::SOA => "SOA".into(),
