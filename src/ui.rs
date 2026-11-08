@@ -148,43 +148,15 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
                     let last = is_last_instance(i);
                     let branch = if last { "└─" } else { "├─" };
                     let active = if svc.is_active { "●" } else { "○" };
-                    let port_str = if svc.port > 0 {
-                        format!(" :{}", svc.port)
-                    } else {
-                        String::new()
-                    };
-                    let host = svc.hostname.trim_end_matches('.');
-                    let base_style = if !svc.is_active {
-                        Style::default().fg(Color::Gray)
-                    } else if is_selected {
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                    };
-                    // The short service type rides along dimmed: group headers
-                    // scroll out of view in tall groups, and then the row
-                    // alone no longer says which type it belongs to.
-                    let type_suffix = format!(" ·{}", short_service_type(&svc.service_type));
-                    if host.is_empty() {
-                        ListItem::new(Line::from(vec![
-                            Span::styled(
-                                format!("  {branch} {}{port_str}  {active}", svc.instance),
-                                base_style,
-                            ),
-                            Span::styled(type_suffix, Style::default().fg(Color::DarkGray)),
-                        ]))
-                    } else {
-                        ListItem::new(Line::from(vec![
-                            Span::styled(
-                                format!("  {branch} {}{port_str}  {active}  ", svc.instance),
-                                base_style,
-                            ),
-                            Span::styled(host.to_string(), Style::default().fg(Color::Gray)),
-                            Span::styled(type_suffix, Style::default().fg(Color::DarkGray)),
-                        ]))
-                    }
+                    // One uniform style for all rows: the leading ●/○
+                    // carries the state and the list's bold highlight
+                    // marks the cursor. Same instance@host:port notation
+                    // as the right-pane titles.
+                    let style = Style::default();
+                    ListItem::new(Line::from(Span::styled(
+                        format!("{branch} {active} {}", pane_ident(svc)),
+                        style,
+                    )))
                 }
             }
         })
