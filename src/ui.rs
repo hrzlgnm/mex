@@ -200,17 +200,21 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
 }
 
 fn draw_detail_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    // Right side: Records table on top, hex dump of the selected packet
-    // below. The old Query/Records tabs are gone; questions and goodbyes
-    // now live in the Records table itself.
+    // Right side: Records table on top, its questions in the middle with
+    // their own captions (age, not TTL), hex dump of the selected entry
+    // at the bottom.
     let panes = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .constraints([
+            Constraint::Percentage(50),
+            Constraint::Percentage(20),
+            Constraint::Percentage(30),
+        ])
         .split(area);
 
     draw_records_tab(frame, panes[0], app);
-
-    draw_hex_tab(frame, panes[1], app);
+    draw_questions_tab(frame, panes[1], app);
+    draw_hex_tab(frame, panes[2], app);
 }
 
 fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
@@ -221,7 +225,7 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         return;
     };
 
-    let (rows, raw_positions, qry_start) = detail_table_rows(app, svc);
+    let (rows, raw_positions) = detail_table_rows(app, svc);
 
     // Size SOURCE to the longest socket addr so IPv6 fits, clamped to
     // keep RDATA usable on narrow terminals.
@@ -260,15 +264,12 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
-    // Highlight the j/k-selected row, if the cursor is valid. TXT child
-    // rows are display-only; the cursor stops on raw and question rows.
-    let selected_table_row = if app.selected_detail_entry().is_some() {
-        let raw_count = raw_positions.len();
-        Some(if app.detail_selected < raw_count {
-            raw_positions[app.detail_selected]
-        } else {
-            qry_start + (app.detail_selected - raw_count)
-        })
+    // Highlight the j/k-selected row, if the cursor is on a record.
+    // TXT child rows are display-only; questions live in their own pane.
+    let selected_table_row = if app.selected_detail_entry().is_some()
+        && app.detail_selected < raw_positions.len()
+    {
+        Some(raw_positions[app.detail_selected])
     } else {
         None
     };
@@ -279,7 +280,7 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     app.detail_offset.set(tstate.offset());
 }
 
-fn detail_table_rows<'a>(app: &'a App, svc: &'a crate::app::ServiceEntry) -> (Vec<Row<'a>>, Vec<usize>, usize) {
+fn detail_table_rows<'a>(app: &'a App, svc: &'a crate::app::ServiceEntry) -> (Vec<Row<'a>>, Vec<usize>) {
     let mut rows = Vec::new();
 
     let info_style = Style::default().fg(Color::Green);
@@ -402,9 +403,23 @@ fn detail_table_rows<'a>(app: &'a App, svc: &'a crate::app::ServiceEntry) -> (Ve
         }
     }
 
-    let qry_start = rows.len();
-    // Recently seen questions asking for this service, newest first.
-    // Capped per service at ingest; deduped by name/type/querier there.
+    (rows, raw_positions)
+}
+
+fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let Some(svc) = app.display_service() else {
+        let empty = Paragraph::new("No service selected").style(Style::default().fg(Color::Gray));
+        frame.render_widget(empty, area);
+        return;
+    };
+
+    let mut rows = Vec::new();
+    let dim = Style::default().fg(Color::Gray);
+    let local_style = Style::default()
+        .fg(Color::Green)
+        .add_modifier(Modifier::BOLD);
+
+    // Newest first, matching the j/k cursor order.
     for (name, rtype, source, received, _) in svc.questions.iter().rev() {
         let age = received.elapsed().as_secs();
         let age_str = if age >= 60 {
@@ -421,17 +436,59 @@ fn detail_table_rows<'a>(app: &'a App, svc: &'a crate::app::ServiceEntry) -> (Ve
         };
         rows.push(
             Row::new(vec![
-                Cell::from("qry"),
+                Cell::from(rtype.clone()),
                 Cell::from(age_str),
-                Cell::from(""),
                 Cell::from(source.to_string()),
-                Cell::from(format!("{rtype} {name}")),
+                Cell::from(name.clone()),
             ])
             .style(style),
         );
     }
 
-    (rows, raw_positions, qry_start)
+    let widths = [
+        Constraint::Length(6),
+        Constraint::Length(12),
+        Constraint::Length(
+            svc.questions
+                .iter()
+                .map(|(_, _, source, _, _)| source.to_string().len())
+                .max()
+                .unwrap_or(14)
+                .clamp(14, 45) as u16,
+        ),
+        Constraint::Min(20),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(
+            Row::new(vec!["TYPE", "AGE", "SOURCE", "QUESTION"]).style(
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .fg(Color::Cyan),
+            ),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Questions ")
+                .border_style(Style::default().fg(Color::Gray)),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+
+    // Highlight the j/k-selected question row, if the cursor is on one.
+    let raw_count = svc.ordered_records().len();
+    let selected_table_row = if app.selected_detail_entry().is_some()
+        && app.detail_selected >= raw_count
+    {
+        Some(app.detail_selected - raw_count)
+    } else {
+        None
+    };
+    let mut tstate = TableState::default();
+    tstate.select(selected_table_row);
+    *tstate.offset_mut() = app.questions_offset.get();
+    frame.render_stateful_widget(table, area, &mut tstate);
+    app.questions_offset.set(tstate.offset());
 }
 
 fn draw_hex_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {

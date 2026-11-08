@@ -58,6 +58,7 @@ pub struct App {
     pub list_offset: Cell<usize>,
     pub detail_selected: usize,
     pub detail_offset: Cell<usize>,
+    pub questions_offset: Cell<usize>,
     pub packet_count: u64,
     pub start_time: Instant,
     pub running: bool,
@@ -148,6 +149,7 @@ impl App {
             local_ips: browse::local_ips(),
             detail_selected: 0,
             detail_offset: Cell::new(0),
+            questions_offset: Cell::new(0),
             detail_svc_key: None,
             detail_anchor: None,
             sticky_key: None,
@@ -495,6 +497,7 @@ impl App {
                 self.detail_anchor = None;
                 self.detail_selected = 0;
                 self.detail_offset.set(0);
+                self.questions_offset.set(0);
             }
             KeyCode::Char('R') => self.raw_events.clear(),
             // Record cursor, only meaningful while the Records table is shown.
@@ -634,6 +637,7 @@ impl App {
             self.detail_svc_key = key;
             self.detail_selected = 0;
             self.detail_offset.set(0);
+            self.questions_offset.set(0);
             self.detail_anchor = self
                 .selected_service()
                 .and_then(|svc| Self::identity_at(svc, self.detail_selected));
