@@ -220,16 +220,29 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
     app.list_offset.set(state.offset());
 }
 
+/// "instance @ host:port" identity used in the right-pane titles.
+fn pane_ident(svc: &crate::app::ServiceEntry) -> String {
+    let host = svc.hostname.trim_end_matches('.');
+    if host.is_empty() {
+        svc.instance.clone()
+    } else if svc.port > 0 {
+        format!("{} @ {}:{}", svc.instance, host, svc.port)
+    } else {
+        format!("{} @ {host}", svc.instance)
+    }
+}
+
 fn draw_detail_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    // Right side: Records table on top, its questions in the middle with
+    // Right side: Answers table on top, its questions in the middle with
     // their own captions (age, not TTL), hex dump of the selected entry
-    // at the bottom.
+    // at the bottom. Answers and Questions share the same height; the hex
+    // view keeps only what is left over.
     let panes = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(50),
+            Constraint::Percentage(40),
+            Constraint::Percentage(40),
             Constraint::Percentage(20),
-            Constraint::Percentage(30),
         ])
         .split(area);
 
@@ -266,11 +279,7 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         Constraint::Min(20),
     ];
 
-    let block_title = if svc.hostname.is_empty() {
-        svc.instance.clone()
-    } else {
-        format!("{} @ {}", svc.instance, svc.hostname.trim_end_matches('.'))
-    };
+    let block_title = format!("Answers: {}", pane_ident(svc));
 
     let table = Table::new(rows, widths)
         .header(
@@ -280,7 +289,7 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" {} ", block_title))
+                .title(format!(" {block_title} "))
                 .border_style(Style::default().fg(Color::Gray)),
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
@@ -491,7 +500,7 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Questions ")
+                .title(format!(" Questions: {} ", pane_ident(svc)))
                 .border_style(Style::default().fg(Color::Gray)),
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
