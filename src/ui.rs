@@ -235,7 +235,7 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
 
     let widths = [
         Constraint::Length(6),
-        Constraint::Length(8),
+        Constraint::Length(12),
         Constraint::Length(6),
         Constraint::Length(src_w),
         Constraint::Min(20),
@@ -405,11 +405,17 @@ fn detail_table_rows<'a>(app: &'a App, svc: &'a crate::app::ServiceEntry) -> (Ve
     let qry_start = rows.len();
     // Recently seen questions asking for this service, newest first.
     // Capped per service at ingest; deduped by name/type/querier there.
-    for (name, rtype, source, _, _) in svc.questions.iter().rev() {
+    for (name, rtype, source, received, _) in svc.questions.iter().rev() {
+        let age = received.elapsed().as_secs();
+        let age_str = if age >= 60 {
+            format!("{}m{:02}s ago", age / 60, age % 60)
+        } else {
+            format!("{age}s ago")
+        };
         rows.push(
             Row::new(vec![
                 Cell::from("qry"),
-                Cell::from(""),
+                Cell::from(age_str),
                 Cell::from(""),
                 Cell::from(source.to_string()),
                 Cell::from(format!("{rtype} {name}")),
