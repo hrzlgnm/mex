@@ -163,11 +163,18 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
                     } else {
                         Style::default()
                     };
+                    // The short service type rides along dimmed: group headers
+                    // scroll out of view in tall groups, and then the row
+                    // alone no longer says which type it belongs to.
+                    let type_suffix = format!(" ·{}", short_service_type(&svc.service_type));
                     if host.is_empty() {
-                        ListItem::new(Line::from(Span::styled(
-                            format!("  {branch} {}{port_str}  {active}", svc.instance),
-                            base_style,
-                        )))
+                        ListItem::new(Line::from(vec![
+                            Span::styled(
+                                format!("  {branch} {}{port_str}  {active}", svc.instance),
+                                base_style,
+                            ),
+                            Span::styled(type_suffix, Style::default().fg(Color::DarkGray)),
+                        ]))
                     } else {
                         ListItem::new(Line::from(vec![
                             Span::styled(
@@ -175,6 +182,7 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
                                 base_style,
                             ),
                             Span::styled(host.to_string(), Style::default().fg(Color::Gray)),
+                            Span::styled(type_suffix, Style::default().fg(Color::DarkGray)),
                         ]))
                     }
                 }
@@ -182,11 +190,24 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
         })
         .collect();
 
+    // Always show the selected row's service type in the border title:
+    // instance rows carry no type themselves, so the type would otherwise
+    // be invisible once its group header scrolls out of view.
+    let title = match app.display_items().get(app.selected_display) {
+        Some(DisplayItem::Instance { index }) => format!(
+            " Services: {} ",
+            short_service_type(&app.services[*index].service_type)
+        ),
+        Some(DisplayItem::ServiceType { label }) => {
+            format!(" Services: {} ", short_service_type(label))
+        }
+        None => " Services ".to_string(),
+    };
     let list = List::new(list_items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Services ")
+                .title(title)
                 .border_style(Style::default().fg(Color::Gray)),
         )
         .highlight_style(Style::default().add_modifier(Modifier::BOLD))
