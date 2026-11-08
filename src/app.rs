@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -70,6 +70,12 @@ pub struct App {
     queried_types: HashSet<String>,
     queried_instances: HashSet<String>,
     queried_hosts: HashSet<String>,
+    /// Requery schedule per (name, type): (next query due, unanswered
+    /// count). RFC 6762 §5.2: a querier SHOULD re-ask at 80% of the TTL,
+    /// then 85/90/95% if no answer arrives, then at most hourly; known
+    /// answers suppress the responses in between. Answers reset the
+    /// schedule via push_record.
+    requeries: HashMap<(String, u16), (Instant, u8)>,
     collapsed_types: HashSet<String>,
     local_ips: HashSet<std::net::IpAddr>,
     detail_svc_key: Option<(String, String)>,
@@ -139,6 +145,7 @@ impl App {
             queried_types: HashSet::new(),
             queried_instances: HashSet::new(),
             queried_hosts: HashSet::new(),
+            requeries: HashMap::new(),
             collapsed_types: HashSet::new(),
             local_ips: browse::local_ips(),
             detail_selected: 0,
@@ -271,40 +278,73 @@ impl App {
         out
     }
 
-    fn requery_expiring(&self) {
-        let mut seen = std::collections::HashSet::new();
+    fn requery_expiring(&mut self) {
+        let now = Instant::now();
+        // Per-key minimum TTL plus whether any row reached the 80% window.
+        let mut ttl_by_key: HashMap<(String, u16), u32> = HashMap::new();
+        let mut triggered: HashSet<(String, u16)> = HashSet::new();
         for svc in &self.services {
             for rec in &svc.records {
                 if rec.ttl == 0 {
                     continue;
                 }
+                match rec.rtype {
+                    12 | 33 | 16 | 1 | 28 => {}
+                    _ => continue,
+                }
+                let key = (rec.name.trim_end_matches('.').to_string(), rec.rtype);
+                ttl_by_key
+                    .entry(key.clone())
+                    .and_modify(|t| *t = (*t).min(rec.ttl))
+                    .or_insert(rec.ttl);
                 let elapsed = rec.received_at.elapsed().as_secs() as u32;
                 if elapsed * 5 >= rec.ttl * 4 {
-                    let name = rec.name.trim_end_matches('.').to_string();
-                    let query = match rec.rtype {
-                        12 => Some((name, RecordType::PTR)),
-                        33 => Some((name, RecordType::SRV)),
-                        16 => Some((name, RecordType::TXT)),
-                        1 => Some((name, RecordType::A)),
-                        28 => Some((name, RecordType::AAAA)),
-                        _ => None,
-                    };
-                    if let Some((n, rt)) = query {
-                        if seen.insert((n.clone(), rt)) {
-                            let ka = if rt == RecordType::PTR {
-                                self.known_ptrs(&n)
-                            } else {
-                                Vec::new()
-                            };
-                            self.query_tx.send(browse::QueryRequest {
-                                name: n,
-                                record_type: rt,
-                                known_answers: ka,
-                            });
-                        }
-                    }
+                    triggered.insert(key);
                 }
             }
+        }
+        if triggered.is_empty() {
+            return;
+        }
+        // 0-2% jitter, varied per pass and per key so requeries for
+        // different names do not stay in lockstep.
+        let base_pct = self.start_time.elapsed().subsec_nanos();
+        for key in triggered {
+            let ttl = ttl_by_key.get(&key).copied().unwrap_or(120);
+            let pct = (base_pct + key.0.len() as u32 * 37 + key.1 as u32 * 101) % 200;
+            // 5% of TTL plus jitter, floored at 1s (RFC 6762 §5.2 wants
+            // >=1s between the first two queries).
+            let step_millis = (ttl as u64) * 50 + (ttl as u64) * (pct as u64) / 10;
+            let step = Duration::from_millis(step_millis.max(1000));
+            let (due, count) = self.requeries.get(&key).copied().unwrap_or((now, 0));
+            if count > 0 && now < due {
+                continue;
+            }
+            let rt = match key.1 {
+                12 => RecordType::PTR,
+                33 => RecordType::SRV,
+                16 => RecordType::TXT,
+                1 => RecordType::A,
+                28 => RecordType::AAAA,
+                _ => continue,
+            };
+            let ka = if rt == RecordType::PTR {
+                self.known_ptrs(&key.0)
+            } else {
+                Vec::new()
+            };
+            self.query_tx.send(browse::QueryRequest {
+                name: key.0.clone(),
+                record_type: rt,
+                known_answers: ka,
+            });
+            let unanswered = (count + 1).min(4);
+            let next_due = if unanswered >= 4 {
+                now + Duration::from_secs(3600)
+            } else {
+                now + step
+            };
+            self.requeries.insert(key, (next_due, unanswered));
         }
     }
 
@@ -1007,6 +1047,12 @@ impl App {
         } else {
             s.records.push(rec.clone());
         }
+        // Fresh answer resets the RFC 6762 §5.2 requery schedule so the
+        // next refresh starts again at 80% TTL, not hourly.
+        if rec.ttl > 0 {
+            let key = (rec.name.trim_end_matches('.').to_string(), rec.rtype);
+            self.requeries.remove(&key);
+        }
     }
 
     /// Flip a service inactive when a goodbye names it. For a PTR goodbye
@@ -1063,6 +1109,15 @@ impl App {
             .retain(|s| s.is_active || now.duration_since(s.last_seen) < grace);
         self.pending_instances
             .retain(|p| now.duration_since(p.last_seen) < grace);
+        // Drop schedules for names that no longer exist, so dead services
+        // stop costing even an hourly query.
+        let mut live: HashSet<(String, u16)> = HashSet::new();
+        for svc in &self.services {
+            for rec in &svc.records {
+                live.insert((rec.name.trim_end_matches('.').to_string(), rec.rtype));
+            }
+        }
+        self.requeries.retain(|k, _| live.contains(k));
         self.clamp_selection();
     }
 
