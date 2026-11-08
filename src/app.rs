@@ -807,13 +807,60 @@ impl App {
         self.pending_instances[pi].records.push(rec.clone());
     }
 
+    /// Split a full instance name ("inst._svc._tcp.local") into (instance,
+    /// service type). Instance names may legally contain dots (e.g. Fire TV
+    /// style "amzn.dmgr:...:..."), so splitting on the first dot misparses
+    /// them. Match against known service types instead (longest suffix
+    /// wins); the caller falls back to the naive split when nothing is
+    /// known yet. Case is preserved as-is since all candidates come from
+    /// the same wire data.
+    fn split_instance_type(&self, full_name: &str) -> Option<(String, String)> {
+        let mut best: Option<(String, String)> = None;
+        let mut consider = |known: &str| {
+            if known.is_empty() {
+                return;
+            }
+            if let Some(instance) = full_name
+                .strip_suffix(known)
+                .and_then(|prefix| prefix.strip_suffix('.'))
+            {
+                if instance.is_empty() {
+                    return;
+                }
+                let replace = match &best {
+                    Some((_, current)) => known.len() > current.len(),
+                    None => true,
+                };
+                if replace {
+                    best = Some((instance.to_string(), known.to_string()));
+                }
+            }
+        };
+        for s in &self.services {
+            consider(&s.service_type);
+        }
+        for p in &self.pending_instances {
+            consider(&p.service_type);
+        }
+        for t in &self.queried_types {
+            consider(t);
+        }
+        best
+    }
+
     fn handle_srv(&mut self, rec: &browse::RawRecord, ev: &browse::Event) {
         let name = rec.name.trim_end_matches('.');
-        let parts: Vec<&str> = name.splitn(2, '.').collect();
-        if parts.len() < 2 {
-            return;
-        }
-        let idx = self.ensure_svc(parts[0], parts[1]);
+        let (instance, service_type) = match self.split_instance_type(name) {
+            Some(split) => split,
+            None => {
+                let parts: Vec<&str> = name.splitn(2, '.').collect();
+                if parts.len() < 2 {
+                    return;
+                }
+                (parts[0].to_string(), parts[1].to_string())
+            }
+        };
+        let idx = self.ensure_svc(&instance, &service_type);
 
         let sv: Vec<&str> = rec.rdata.split_whitespace().collect();
         if sv.len() >= 4 {
@@ -827,8 +874,8 @@ impl App {
         let svc_idx = idx;
         let mut i = 0;
         while i < self.pending_instances.len() {
-            if self.pending_instances[i].instance == parts[0]
-                && self.pending_instances[i].service_type == parts[1]
+            if self.pending_instances[i].instance == instance
+                && self.pending_instances[i].service_type == service_type
             {
                 let p = self.pending_instances.swap_remove(i);
                 let s = &mut self.services[svc_idx];
@@ -843,11 +890,17 @@ impl App {
 
     fn handle_txt(&mut self, rec: &browse::RawRecord) {
         let name = rec.name.trim_end_matches('.');
-        let parts: Vec<&str> = name.splitn(2, '.').collect();
-        if parts.len() < 2 {
-            return;
-        }
-        let pi = self.ensure_pending(parts[0], parts[1]);
+        let (instance, service_type) = match self.split_instance_type(name) {
+            Some(split) => split,
+            None => {
+                let parts: Vec<&str> = name.splitn(2, '.').collect();
+                if parts.len() < 2 {
+                    return;
+                }
+                (parts[0].to_string(), parts[1].to_string())
+            }
+        };
+        let pi = self.ensure_pending(&instance, &service_type);
 
         self.pending_instances[pi].records.push(rec.clone());
     }
