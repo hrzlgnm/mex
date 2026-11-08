@@ -30,7 +30,6 @@ standard browse queries (service enumeration, PTR/SRV/TXT/A/AAAA).
 | `j` / `k`              | select record row                   |
 | `Space` / `Enter`      | fold / unfold                       |
 | `←` / `→`              | collapse / expand                   |
-| `c` / `R`              | clear services / clear packet log   |
 | `q` / `Esc` / `Ctrl+C` | quit                                |
 
 ## Build & run

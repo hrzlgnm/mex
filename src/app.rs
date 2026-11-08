@@ -477,8 +477,7 @@ impl App {
     }
 
     fn handle_key(&mut self, key: &KeyEvent) {
-        // Ctrl+C quits: raw mode turns it into a key event (no SIGINT),
-        // and without this it would fall through to clear-services `c`.
+        // Ctrl+C quits: raw mode turns it into a key event (no SIGINT).
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.running = false;
             return;
@@ -489,17 +488,6 @@ impl App {
             KeyCode::Down => self.move_selection(1),
             KeyCode::Left => self.set_collapsed(true),
             KeyCode::Right => self.set_collapsed(false),
-            KeyCode::Char('c') => {
-                self.services.clear();
-                self.selected_display = 0;
-                self.sticky_key = None;
-                self.detail_svc_key = None;
-                self.detail_anchor = None;
-                self.detail_selected = 0;
-                self.detail_offset.set(0);
-                self.questions_offset.set(0);
-            }
-            KeyCode::Char('R') => self.raw_events.clear(),
             // Record cursor, only meaningful while the Records table is shown.
             KeyCode::Char('j') => self.move_detail_cursor(1),
             KeyCode::Char('k') => self.move_detail_cursor(-1),

@@ -61,7 +61,7 @@ fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     let line = Line::from(vec![
         Span::styled(" mex ", Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)),
         Span::raw(format!(
-            "│ {} pkts │ {} svcs │ uptime {}  [q] quit [c] clear [space←→] fold [j/k] row",
+            "│ {} pkts │ {} svcs │ uptime {}  [q] quit [space←→] fold [j/k] row",
             app.packet_count,
             app.services.len(),
             uptime_str
