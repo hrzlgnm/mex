@@ -412,6 +412,13 @@ fn detail_table_rows<'a>(app: &'a App, svc: &'a crate::app::ServiceEntry) -> (Ve
         } else {
             format!("{age}s ago")
         };
+        // Questions asked from this host's own addresses (including our
+        // own looped-back queries) get the same highlight as local records.
+        let style = if app.is_local_source(source) {
+            local_style
+        } else {
+            dim
+        };
         rows.push(
             Row::new(vec![
                 Cell::from("qry"),
@@ -420,7 +427,7 @@ fn detail_table_rows<'a>(app: &'a App, svc: &'a crate::app::ServiceEntry) -> (Ve
                 Cell::from(source.to_string()),
                 Cell::from(format!("{rtype} {name}")),
             ])
-            .style(dim),
+            .style(style),
         );
     }
 

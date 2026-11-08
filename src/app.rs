@@ -991,7 +991,11 @@ impl App {
     }
 
     pub fn is_local_record(&self, rec: &browse::RawRecord) -> bool {
-        self.local_ips.contains(&rec.source.ip())
+        self.is_local_source(&rec.source)
+    }
+
+    pub fn is_local_source(&self, source: &std::net::SocketAddr) -> bool {
+        self.local_ips.contains(&source.ip())
     }
 
     pub fn service_type_count(&self, label: &str) -> usize {
