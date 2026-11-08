@@ -182,7 +182,7 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
                 .title(title)
                 .border_style(Style::default().fg(Color::Gray)),
         )
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_spacing(HighlightSpacing::Always);
 
     let mut state = ListState::default()
