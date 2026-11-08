@@ -870,7 +870,7 @@ impl App {
         let sv: Vec<&str> = rec.rdata.split_whitespace().collect();
         if sv.len() >= 4 {
             self.services[idx].port = sv[2].parse().unwrap_or(0);
-            self.services[idx].hostname = sv[3..].join(" ").to_lowercase();
+            self.services[idx].hostname = sv[3..].join(" ");
         }
         self.push_record(idx, rec);
         self.services[idx].last_event = Some(ev.clone());
