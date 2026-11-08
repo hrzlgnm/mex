@@ -111,18 +111,12 @@ impl ServiceEntry {
             }
         }
         out.sort_by(|a, b| {
-            (
-                &a.rtype_str,
-                a.source.to_string(),
-                &a.name,
-                &a.rdata,
-            )
-                .cmp(&(
-                    &b.rtype_str,
-                    b.source.to_string(),
-                    &b.name,
-                    &b.rdata,
-                ))
+            (&a.rtype_str, a.source.to_string(), &a.name, &a.rdata).cmp(&(
+                &b.rtype_str,
+                b.source.to_string(),
+                &b.name,
+                &b.rdata,
+            ))
         });
         out
     }
@@ -212,7 +206,12 @@ impl App {
             let rec = self.pending_addrs[i].1.clone();
             let mut matched = false;
             for j in 0..self.services.len() {
-                if self.services[j].hostname.trim_end_matches('.').to_lowercase() == host {
+                if self.services[j]
+                    .hostname
+                    .trim_end_matches('.')
+                    .to_lowercase()
+                    == host
+                {
                     self.push_record(j, &rec);
                     matched = true;
                     break;
@@ -237,7 +236,8 @@ impl App {
             self.raw_events.push(ev.clone());
         }
         if self.raw_events.len() > 2000 {
-            self.raw_events.drain(0..self.raw_events.len().saturating_sub(2000));
+            self.raw_events
+                .drain(0..self.raw_events.len().saturating_sub(2000));
         }
 
         for ev in &batch {
@@ -275,7 +275,9 @@ impl App {
         let mut seen = std::collections::HashSet::new();
         for svc in &self.services {
             for rec in &svc.records {
-                if rec.ttl == 0 { continue; }
+                if rec.ttl == 0 {
+                    continue;
+                }
                 let elapsed = rec.received_at.elapsed().as_secs() as u32;
                 if elapsed * 5 >= rec.ttl * 4 {
                     let name = rec.name.trim_end_matches('.').to_string();
@@ -409,7 +411,10 @@ impl App {
         for (i, s) in self.services.iter().enumerate() {
             match groups.iter_mut().find(|g| g.label == s.service_type) {
                 Some(g) => g.indices.push(i),
-                None => groups.push(G { label: s.service_type.clone(), indices: vec![i] }),
+                None => groups.push(G {
+                    label: s.service_type.clone(),
+                    indices: vec![i],
+                }),
             }
         }
 
@@ -417,9 +422,7 @@ impl App {
         groups.sort_by(|a, b| a.label.cmp(&b.label));
         for g in &groups {
             let mut sorted = g.indices.clone();
-            sorted.sort_by(|&a, &b| {
-                self.services[a].instance.cmp(&self.services[b].instance)
-            });
+            sorted.sort_by(|&a, &b| self.services[a].instance.cmp(&self.services[b].instance));
             items.push(DisplayItem::ServiceType {
                 label: g.label.clone(),
             });
@@ -722,14 +725,12 @@ impl App {
                 .hostname
                 .trim_end_matches('.')
                 .to_lowercase();
-            if full == name
-                || host == name
-                || self.services[i].service_type.to_lowercase() == name
+            if full == name || host == name || self.services[i].service_type.to_lowercase() == name
             {
                 let s = &mut self.services[i];
-                match s.questions.iter().position(
-                    |(n, t, src, _, _)| n == &q.name && t == &q.rtype_str && src == &ev.source,
-                ) {
+                match s.questions.iter().position(|(n, t, src, _, _)| {
+                    n == &q.name && t == &q.rtype_str && src == &ev.source
+                }) {
                     Some(pos) => {
                         s.questions[pos] = (
                             q.name.clone(),
@@ -787,8 +788,13 @@ impl App {
             let suffix = format!(".{svc_type}");
             let instance = target.strip_suffix(&suffix).unwrap_or(target);
             let pi = self.ensure_pending(instance, svc_type);
-            if !self.pending_instances[pi].subtypes.contains(&subtype.to_string()) {
-                self.pending_instances[pi].subtypes.push(subtype.to_string());
+            if !self.pending_instances[pi]
+                .subtypes
+                .contains(&subtype.to_string())
+            {
+                self.pending_instances[pi]
+                    .subtypes
+                    .push(subtype.to_string());
             }
             self.pending_instances[pi].records.push(rec.clone());
             return;
@@ -901,7 +907,12 @@ impl App {
     fn handle_addr(&mut self, rec: &browse::RawRecord, ev: &browse::Event) {
         let host = rec.name.trim_end_matches('.').to_lowercase();
         for i in 0..self.services.len() {
-            if self.services[i].hostname.trim_end_matches('.').to_lowercase() == host {
+            if self.services[i]
+                .hostname
+                .trim_end_matches('.')
+                .to_lowercase()
+                == host
+            {
                 self.services[i].last_event = Some(ev.clone());
                 self.push_record(i, rec);
                 return;
@@ -913,8 +924,18 @@ impl App {
     fn handle_other(&mut self, rec: &browse::RawRecord, ev: &browse::Event) {
         let name = rec.name.trim_end_matches('.').to_lowercase();
         for i in 0..self.services.len() {
-            let full = format!("{}.{}", self.services[i].instance, self.services[i].service_type).to_lowercase();
-            if full == name || self.services[i].hostname.trim_end_matches('.').to_lowercase() == name {
+            let full = format!(
+                "{}.{}",
+                self.services[i].instance, self.services[i].service_type
+            )
+            .to_lowercase();
+            if full == name
+                || self.services[i]
+                    .hostname
+                    .trim_end_matches('.')
+                    .to_lowercase()
+                    == name
+            {
                 self.services[i].last_event = Some(ev.clone());
                 self.push_record(i, rec);
                 return;
@@ -1038,8 +1059,10 @@ impl App {
         let grace = Duration::from_secs(120);
         let now = Instant::now();
         Self::expire_stale_services(&mut self.services);
-        self.services.retain(|s| s.is_active || now.duration_since(s.last_seen) < grace);
-        self.pending_instances.retain(|p| now.duration_since(p.last_seen) < grace);
+        self.services
+            .retain(|s| s.is_active || now.duration_since(s.last_seen) < grace);
+        self.pending_instances
+            .retain(|p| now.duration_since(p.last_seen) < grace);
         self.clamp_selection();
     }
 

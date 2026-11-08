@@ -2,8 +2,10 @@ use std::collections::HashSet;
 use std::io;
 use std::io::IsTerminal;
 
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -49,8 +51,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    let uptime = chrono::Duration::from_std(app.start_time.elapsed())
-        .unwrap_or_default();
+    let uptime = chrono::Duration::from_std(app.start_time.elapsed()).unwrap_or_default();
     let uptime_str = format!(
         "{:02}:{:02}:{:02}",
         uptime.num_hours(),
@@ -59,7 +60,12 @@ fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     );
 
     let line = Line::from(vec![
-        Span::styled(" mex ", Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)),
+        Span::styled(
+            " mex ",
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Cyan),
+        ),
         Span::raw(format!(
             "│ {} pkts │ {} svcs │ uptime {}  [q] quit [space←→] fold [j/k] row",
             app.packet_count,
@@ -68,8 +74,11 @@ fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         )),
     ]);
 
-    let header = Paragraph::new(line)
-        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Gray)));
+    let header = Paragraph::new(line).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Gray)),
+    );
     frame.render_widget(header, area);
 }
 
@@ -221,8 +230,7 @@ fn draw_detail_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
 
 fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     let Some(svc) = app.display_service() else {
-        let empty = Paragraph::new("No service selected")
-            .style(Style::default().fg(Color::Gray));
+        let empty = Paragraph::new("No service selected").style(Style::default().fg(Color::Gray));
         frame.render_widget(empty, area);
         return;
     };
@@ -251,8 +259,11 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
 
     let table = Table::new(rows, widths)
         .header(
-            Row::new(vec!["TYPE", "TTL", "FLUSH", "SOURCE", "RDATA"])
-                .style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)),
+            Row::new(vec!["TYPE", "TTL", "FLUSH", "SOURCE", "RDATA"]).style(
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .fg(Color::Cyan),
+            ),
         )
         .block(
             Block::default()
@@ -264,13 +275,12 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
 
     // Highlight the j/k-selected row, if the cursor is on a record.
     // TXT child rows are display-only; questions live in their own pane.
-    let selected_table_row = if app.selected_detail_entry().is_some()
-        && app.detail_selected < raw_positions.len()
-    {
-        Some(raw_positions[app.detail_selected])
-    } else {
-        None
-    };
+    let selected_table_row =
+        if app.selected_detail_entry().is_some() && app.detail_selected < raw_positions.len() {
+            Some(raw_positions[app.detail_selected])
+        } else {
+            None
+        };
     let mut tstate = TableState::default();
     tstate.select(selected_table_row);
     *tstate.offset_mut() = app.detail_offset.get();
@@ -278,7 +288,10 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     app.detail_offset.set(tstate.offset());
 }
 
-fn detail_table_rows<'a>(app: &'a App, svc: &'a crate::app::ServiceEntry) -> (Vec<Row<'a>>, Vec<usize>) {
+fn detail_table_rows<'a>(
+    app: &'a App,
+    svc: &'a crate::app::ServiceEntry,
+) -> (Vec<Row<'a>>, Vec<usize>) {
     let mut rows = Vec::new();
 
     let info_style = Style::default().fg(Color::Green);
@@ -344,7 +357,13 @@ fn detail_table_rows<'a>(app: &'a App, svc: &'a crate::app::ServiceEntry) -> (Ve
         let rem = rec
             .ttl
             .saturating_sub(rec.received_at.elapsed().as_secs() as u32);
-        let ttl_str = if rem == 0 { "exp".into() } else if rem >= 60 { format!("{}m{:02}s", rem / 60, rem % 60) } else { format!("{rem}s") };
+        let ttl_str = if rem == 0 {
+            "exp".into()
+        } else if rem >= 60 {
+            format!("{}m{:02}s", rem / 60, rem % 60)
+        } else {
+            format!("{rem}s")
+        };
         // Records announced by this host (source is a local interface
         // address) get a brighter style so own publications stand out.
         let style = if app.is_local_record(rec) {
@@ -475,13 +494,12 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
 
     // Highlight the j/k-selected question row, if the cursor is on one.
     let raw_count = svc.ordered_records().len();
-    let selected_table_row = if app.selected_detail_entry().is_some()
-        && app.detail_selected >= raw_count
-    {
-        Some(app.detail_selected - raw_count)
-    } else {
-        None
-    };
+    let selected_table_row =
+        if app.selected_detail_entry().is_some() && app.detail_selected >= raw_count {
+            Some(app.detail_selected - raw_count)
+        } else {
+            None
+        };
     let mut tstate = TableState::default();
     tstate.select(selected_table_row);
     *tstate.offset_mut() = app.questions_offset.get();
@@ -508,8 +526,8 @@ fn draw_hex_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     }
 
     let Some(ev) = app.latest_event_for_selected() else {
-        let empty = Paragraph::new("No raw packet data available")
-            .style(Style::default().fg(Color::Gray));
+        let empty =
+            Paragraph::new("No raw packet data available").style(Style::default().fg(Color::Gray));
         frame.render_widget(empty, area);
         return;
     };
@@ -532,7 +550,9 @@ fn hex_dump(data: &[u8], width: usize) -> Vec<Line<'_>> {
 
     lines.push(Line::from(Span::styled(
         format!("Hex dump ({} bytes):", data.len()),
-        Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+        Style::default()
+            .add_modifier(Modifier::BOLD)
+            .fg(Color::Cyan),
     )));
     lines.push(Line::from(""));
 
@@ -547,7 +567,13 @@ fn hex_dump(data: &[u8], width: usize) -> Vec<Line<'_>> {
             .join(" ");
         let ascii: String = chunk
             .iter()
-            .map(|b| if b.is_ascii_graphic() || *b == b' ' { *b as char } else { '.' })
+            .map(|b| {
+                if b.is_ascii_graphic() || *b == b' ' {
+                    *b as char
+                } else {
+                    '.'
+                }
+            })
             .collect();
 
         let offset_str = format!("{:04x}  ", chunk_idx * width);
@@ -561,4 +587,3 @@ fn hex_dump(data: &[u8], width: usize) -> Vec<Line<'_>> {
 
     lines
 }
-
