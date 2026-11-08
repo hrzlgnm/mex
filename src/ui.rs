@@ -111,12 +111,8 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
 
     // An Instance is last in its group if the next row is not another
     // Instance (i.e. next is a ServiceType header or end of list).
-    let is_last_instance = |pos: usize| -> bool {
-        match items.get(pos + 1) {
-            Some(DisplayItem::Instance { .. }) => false,
-            _ => true,
-        }
-    };
+    let is_last_instance =
+        |pos: usize| !matches!(items.get(pos + 1), Some(DisplayItem::Instance { .. }));
 
     let list_items: Vec<ListItem<'_>> = items
         .iter()

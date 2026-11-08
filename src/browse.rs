@@ -379,11 +379,7 @@ fn decode_nsec(rdata: &[u8]) -> String {
     let mut compressed = false;
     // Next domain name in wire format.
     let mut truncated = false;
-    loop {
-        let len = match rdata.get(pos) {
-            Some(&b) => b,
-            None => break,
-        };
+    while let Some(&len) = rdata.get(pos) {
         if len == 0 {
             pos += 1;
             break;

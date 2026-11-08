@@ -192,7 +192,7 @@ impl App {
         while self.running {
             self.drain_events();
             self.send_queries();
-            if self.packet_count > 0 && self.packet_count % 10 == 0 {
+            if self.packet_count > 0 && self.packet_count.is_multiple_of(10) {
                 eprintln!(
                     "mex: {} packets, {} services seen",
                     self.packet_count,
@@ -294,7 +294,7 @@ impl App {
                             } else {
                                 Vec::new()
                             };
-                            let _ = self.query_tx.send(browse::QueryRequest {
+                            self.query_tx.send(browse::QueryRequest {
                                 name: n,
                                 record_type: rt,
                                 known_answers: ka,
@@ -313,7 +313,7 @@ impl App {
         // pending instances (PTR seen, SRV pending)
         for p in &self.pending_instances {
             if self.queried_types.insert(p.service_type.clone()) {
-                let _ = self.query_tx.send(browse::QueryRequest {
+                self.query_tx.send(browse::QueryRequest {
                     name: p.service_type.clone(),
                     record_type: RecordType::PTR,
                     known_answers: self.known_ptrs(&p.service_type),
@@ -321,12 +321,12 @@ impl App {
             }
             let full = format!("{}.{}", p.instance, p.service_type);
             if self.queried_instances.insert(full.clone()) {
-                let _ = self.query_tx.send(browse::QueryRequest {
+                self.query_tx.send(browse::QueryRequest {
                     name: full.clone(),
                     record_type: RecordType::SRV,
                     known_answers: Vec::new(),
                 });
-                let _ = self.query_tx.send(browse::QueryRequest {
+                self.query_tx.send(browse::QueryRequest {
                     name: full,
                     record_type: RecordType::TXT,
                     known_answers: Vec::new(),
@@ -337,7 +337,7 @@ impl App {
         for svc in &self.services {
             // new service type → PTR for its instances
             if self.queried_types.insert(svc.service_type.clone()) {
-                let _ = self.query_tx.send(browse::QueryRequest {
+                self.query_tx.send(browse::QueryRequest {
                     name: svc.service_type.clone(),
                     record_type: RecordType::PTR,
                     known_answers: self.known_ptrs(&svc.service_type),
@@ -346,12 +346,12 @@ impl App {
             // re-query SRV + TXT for confirmed services
             let full = format!("{}.{}", svc.instance, svc.service_type);
             if self.queried_instances.insert(full.clone()) {
-                let _ = self.query_tx.send(browse::QueryRequest {
+                self.query_tx.send(browse::QueryRequest {
                     name: full.clone(),
                     record_type: RecordType::SRV,
                     known_answers: Vec::new(),
                 });
-                let _ = self.query_tx.send(browse::QueryRequest {
+                self.query_tx.send(browse::QueryRequest {
                     name: full,
                     record_type: RecordType::TXT,
                     known_answers: Vec::new(),
@@ -361,12 +361,12 @@ impl App {
             if !svc.hostname.is_empty() {
                 let host = svc.hostname.trim_end_matches('.').to_lowercase();
                 if self.queried_hosts.insert(host.clone()) {
-                    let _ = self.query_tx.send(browse::QueryRequest {
+                    self.query_tx.send(browse::QueryRequest {
                         name: host.clone(),
                         record_type: RecordType::A,
                         known_answers: Vec::new(),
                     });
-                    let _ = self.query_tx.send(browse::QueryRequest {
+                    self.query_tx.send(browse::QueryRequest {
                         name: host,
                         record_type: RecordType::AAAA,
                         known_answers: Vec::new(),
@@ -392,7 +392,7 @@ impl App {
         // Refresh in case interfaces/addresses changed (cheap: ~1 fork/min).
         self.local_ips = browse::local_ips();
 
-        let _ = self.query_tx.send(browse::QueryRequest {
+        self.query_tx.send(browse::QueryRequest {
             name: "_services._dns-sd._udp.local".into(),
             record_type: RecordType::PTR,
             known_answers: Vec::new(),
@@ -525,7 +525,7 @@ impl App {
                 }
                 cur += 1;
             } else if delta < 0 {
-                if cur <= 0 {
+                if cur == 0 {
                     break;
                 }
                 cur -= 1;
@@ -772,7 +772,7 @@ impl App {
 
         if st == "_services._dns-sd._udp.local" {
             if self.queried_types.insert(target.to_string()) {
-                let _ = self.query_tx.send(browse::QueryRequest {
+                self.query_tx.send(browse::QueryRequest {
                     name: target.to_string(),
                     record_type: RecordType::PTR,
                     known_answers: self.known_ptrs(target),
@@ -1147,7 +1147,7 @@ impl App {
         let key = self.sticky_key.as_ref()?;
         self.services
             .iter()
-            .find(|s| &s.service_type == &key.0 && &s.instance == &key.1)
+            .find(|s| s.service_type == key.0 && s.instance == key.1)
     }
 
     /// Entry under the j/k cursor in the Records table: a raw record row or
