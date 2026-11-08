@@ -978,6 +978,15 @@ impl App {
     fn push_record(&mut self, svc_idx: usize, rec: &browse::RawRecord) {
         let s = &mut self.services[svc_idx];
         s.last_seen = Instant::now();
+        if rec.ttl > 0 && rec.rtype == 12 {
+            // Only a live PTR (re)announcement puts the service back on
+            // the browse list. Answers to our own SRV re-queries must not
+            // resurrect a withdrawn service: the phone is still on the
+            // network and answers, but it no longer browses the service.
+            // TTL 0 goodbyes pass through without reactivating; mark_goodbye
+            // runs first anyway.
+            s.is_active = true;
+        }
         // replace stale record with same name+rtype+rdata+source to keep list clean
         if let Some(pos) = s.records.iter().position(|r| {
             r.name == rec.name
@@ -991,13 +1000,48 @@ impl App {
         }
     }
 
+    /// Flip a service inactive when a goodbye names it. For a PTR goodbye
+    /// the withdrawn instance is the rdata (base-type withdrawal, e.g. a
+    /// phone stopping its share), so match that too. DNS names are
+    /// case-insensitive.
     fn mark_goodbye(&mut self, rec: &browse::RawRecord) {
-        let name = rec.name.trim_end_matches('.');
+        let mut candidates = vec![rec.name.trim_end_matches('.').to_lowercase()];
+        if rec.rtype == 12 {
+            candidates.push(rec.rdata.trim_end_matches('.').to_lowercase());
+        }
         for svc in &mut self.services {
-            let full = format!("{}.{}", svc.instance, svc.service_type);
-            if full == name || svc.instance == name {
+            let full = format!("{}.{}", svc.instance, svc.service_type).to_lowercase();
+            if candidates
+                .iter()
+                .any(|n| n == &full || n == &svc.instance.to_lowercase())
+            {
                 svc.is_active = false;
                 return;
+            }
+        }
+    }
+
+    /// Flip services with no live browse (PTR) record left to inactive
+    /// (with a fresh last_seen, granting the usual grace period), so a
+    /// withdrawn service reads as gone even while its SRV keeps getting
+    /// answered. Services never enumerated (no PTR rows yet) fall back to
+    /// any-record liveness. Re-announced PTRs reactivate via push_record.
+    fn expire_stale_services(services: &mut [ServiceEntry]) {
+        let now = Instant::now();
+        let is_live = |r: &browse::RawRecord| r.ttl > r.received_at.elapsed().as_secs() as u32;
+        for svc in services.iter_mut() {
+            if !svc.is_active || svc.records.is_empty() {
+                continue;
+            }
+            let has_ptr = svc.records.iter().any(|r| r.rtype == 12);
+            let gone = if has_ptr {
+                !svc.records.iter().any(|r| r.rtype == 12 && is_live(r))
+            } else {
+                !svc.records.iter().any(is_live)
+            };
+            if gone {
+                svc.is_active = false;
+                svc.last_seen = now;
             }
         }
     }
@@ -1005,6 +1049,7 @@ impl App {
     fn evict_expired(&mut self) {
         let grace = Duration::from_secs(120);
         let now = Instant::now();
+        Self::expire_stale_services(&mut self.services);
         self.services.retain(|s| s.is_active || now.duration_since(s.last_seen) < grace);
         self.pending_instances.retain(|p| now.duration_since(p.last_seen) < grace);
         self.clamp_selection();
