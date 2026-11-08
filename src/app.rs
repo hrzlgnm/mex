@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use hickory_proto::rr::RecordType;
 
 use crate::browse;
@@ -178,7 +178,7 @@ impl App {
             if event::poll(Duration::from_millis(80))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
-                        self.handle_key(key.code);
+                        self.handle_key(&key);
                     }
                 }
             }
@@ -475,8 +475,14 @@ impl App {
         self.clamp_selection();
     }
 
-    fn handle_key(&mut self, code: KeyCode) {
-        match code {
+    fn handle_key(&mut self, key: &KeyEvent) {
+        // Ctrl+C quits: raw mode turns it into a key event (no SIGINT),
+        // and without this it would fall through to clear-services `c`.
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.running = false;
+            return;
+        }
+        match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.running = false,
             KeyCode::Up => self.move_selection(-1),
             KeyCode::Down => self.move_selection(1),
