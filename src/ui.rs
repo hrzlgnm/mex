@@ -366,11 +366,19 @@ fn detail_table_rows<'a>(app: &'a App, svc: &'a crate::app::ServiceEntry) -> (Ve
         );
         if rec.rtype == 16 {
             let mut seen_pair = HashSet::new();
-            let pairs: Vec<&str> = rec
+            let mut pairs: Vec<&str> = rec
                 .rdata
                 .split("; ")
                 .filter(|pair| !pair.is_empty() && seen_pair.insert(*pair))
                 .collect();
+            pairs.sort_by(|a, b| {
+                let ka = a.split('=').next().unwrap_or(a);
+                let kb = b.split('=').next().unwrap_or(b);
+                ka.to_lowercase()
+                    .cmp(&kb.to_lowercase())
+                    .then_with(|| ka.cmp(kb))
+                    .then_with(|| a.cmp(b))
+            });
             // A lone pair is already fully shown in the parent row.
             if pairs.len() > 1 {
                 for (n, pair) in pairs.iter().enumerate() {
