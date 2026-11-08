@@ -40,5 +40,6 @@ cargo build
 ./target/debug/mex
 ```
 
-Requires the `ip` command (interface enumeration) on Linux. No root needed.
-Without a TTY it runs headless and logs to stderr.
+Requires no external commands — interface enumeration goes through the
+`if-addrs` crate. No root needed. Without a TTY it runs headless and logs
+to stderr.

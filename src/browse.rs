@@ -120,49 +120,24 @@ pub fn spawn(query_rx: mpsc::Receiver<QueryRequest>) -> Result<mpsc::Receiver<Ev
 
 pub fn local_ips() -> HashSet<IpAddr> {
     let mut out = HashSet::new();
-    let output = match std::process::Command::new("ip")
-        .args(["-o", "addr", "show"])
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return out,
-    };
-    let s = String::from_utf8_lossy(&output.stdout);
-    for line in s.lines() {
-        // e.g. "2: eth0    inet 192.168.1.10/24 brd ... scope global ..."
-        //      "2: eth0    inet6 fe80::1/64 scope link ..."
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 4 {
-            continue;
-        }
-        if parts[2] != "inet" && parts[2] != "inet6" {
-            continue;
-        }
-        if let Some(ip) = parts[3].split('/').next().and_then(|a| a.parse().ok()) {
-            out.insert(ip);
-        }
+    for iface in if_addrs::get_if_addrs().unwrap_or_default() {
+        out.insert(iface.addr.ip());
     }
     out
 }
 
+fn skipped_interface(name: &str) -> bool {
+    name == "lo" || name.starts_with("docker") || name.starts_with("veth")
+}
+
 fn v4_interfaces() -> Vec<(String, Ipv4Addr)> {
     let mut out = Vec::new();
-    let output = match std::process::Command::new("ip")
-        .args(["-4", "-o", "addr", "show"])
-        .output() {
-        Ok(o) => o,
-        Err(_) => return out,
-    };
-    let s = String::from_utf8_lossy(&output.stdout);
-    for line in s.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 4 { continue; }
-        let ifname = parts[1].trim_end_matches(':');
-        if ifname == "lo" || ifname.starts_with("docker") || ifname.starts_with("veth") {
+    for iface in if_addrs::get_if_addrs().unwrap_or_default() {
+        if skipped_interface(&iface.name) {
             continue;
         }
-        if let Ok(ip) = parts[3].split('/').next().unwrap_or("").parse::<Ipv4Addr>() {
-            out.push((ifname.to_string(), ip));
+        if let if_addrs::IfAddr::V4(v4) = iface.addr {
+            out.push((iface.name, v4.ip));
         }
     }
     out
@@ -170,24 +145,14 @@ fn v4_interfaces() -> Vec<(String, Ipv4Addr)> {
 
 fn v6_interfaces() -> Vec<(String, u32)> {
     let mut out = Vec::new();
-    let output = match std::process::Command::new("ip")
-        .args(["-6", "-o", "addr", "show"])
-        .output() {
-        Ok(o) => o,
-        Err(_) => return out,
-    };
-    let s = String::from_utf8_lossy(&output.stdout);
-    for line in s.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 4 { continue; }
-        let ifname = parts[1].trim_end_matches(':');
-        if ifname == "lo" || ifname.starts_with("docker") || ifname.starts_with("veth") {
+    for iface in if_addrs::get_if_addrs().unwrap_or_default() {
+        if skipped_interface(&iface.name) {
             continue;
         }
-        let ip_str = parts[3].split('/').next().unwrap_or("");
-        if ip_str.starts_with('f') {
-            let idx: u32 = parts[0].trim_end_matches(':').parse().unwrap_or(0);
-            out.push((ifname.to_string(), idx));
+        if let if_addrs::IfAddr::V6(v6) = iface.addr {
+            if v6.ip.to_string().starts_with('f') {
+                out.push((iface.name, iface.index.unwrap_or(0)));
+            }
         }
     }
     out
@@ -454,4 +419,5 @@ fn decode_nsec(rdata: &[u8]) -> String {
         format!("{name} {}", types.join(" "))
     }
 }
+
 
