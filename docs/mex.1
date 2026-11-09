@@ -1,0 +1,107 @@
+.TH mex 1 "2026-11-09" "mex" "User Commands"
+
+.SH NAME
+mex \- terminal UI for browsing mDNS traffic
+
+.SH SYNOPSIS
+.B mex
+[\fIOPTIONS\fR]
+
+.SH DESCRIPTION
+A terminal UI for browsing mDNS (Multicast DNS / DNS-SD) traffic on the local
+network: services, their records, who is asking, and the raw packets behind
+it all. Listens passively on UDP port 5353 (IPv4 + IPv6 multicast) and also
+sends the standard browse queries (service enumeration, PTR/SRV/TXT/A/AAAA).
+
+.SH OPTIONS
+.TP
+.B \-\-passive
+Listen only: never transmit queries, just observe announcements.
+With this flag mex transmits nothing: no startup QU batch, no continuous
+queries, no TTL refreshes \(em the view shows recently heard traffic
+decaying by TTL instead of actively maintained state.
+.TP
+.B \-h, \-\-help
+Display help message and exit.
+.TP
+.B \-V, \-\-version
+Display version information and exit.
+
+.SH LAYOUT
+.TP
+.B Hosts (left)
+Collapsible tree grouped by hostname. Each header shows the service count
+and primary address; each row shows the instance name with a short
+service type and port. The selection is inverted, and the pane title always
+names the selected row's host.
+.TP
+.B Answers (right top)
+For the selected service: derived rows, then one row per observed raw
+record with remaining TTL, flush bit, source, and rdata. Multi-pair TXT
+records expand into unlabeled child rows. Records announced by this host
+are highlighted; goodbye (TTL 0) records show as expired.
+.TP
+.B Questions (right middle)
+Recently observed queries asking for the selected service, newest first,
+with per-query age instead of TTL. Questions from this host are highlighted
+like local records.
+.TP
+.B Hex (right bottom)
+Wire bytes of the selected record or question packet, falling back to the
+service's latest packet.
+
+.SH CONTROLS
+.TP
+.B Pane switching
+.br
+Tab / Shift+Tab      - Switch pane (Hosts \(-> Answers \(-> Questions)
+.TP
+.B Navigation
+.br
+Up/Down or j/k       - Move within the focused pane
+.br
+h/l or \(<-/\(->         - Jump between host groups
+.br
+H/L                  - First / last host group
+.br
+Home/End             - First / last row of the focused pane
+.br
+PageUp/PageDown or b/f or Space - Page
+.br
+Enter                - Fold / unfold host (Hosts) or TXT record (Answers)
+.br
++/\-                  - Fold / unfold host (Hosts)
+.br
+*                    - Collapse all host groups / unfold all
+.br
+Ctrl+Up/Down, Ctrl+j/k, Shift+Up/Down, J/K - Scroll Answers viewport freely
+.TP
+.B Other
+.br
+m                      - Metrics overlay (traffic, discovery, queries, links)
+.br
+q or Esc or Ctrl+C     - Quit (m / Esc closes the overlay first)
+
+.SH ENVIRONMENT
+Setting the NO_COLOR environment variable to any non-empty value (see https://no-color.org/) disables colors. The interface remains usable through text attributes such as reverse video for the selection.
+
+.SH EXAMPLES
+.RS
+.IP \(bu
+Browse mDNS traffic:
+.br
+.B mex
+.IP \(bu
+Listen only, never transmit:
+.br
+.B mex \-\-passive
+.RE
+
+.SH AUTHOR
+Written by hrzlgnm.
+
+.SH REPORTING BUGS
+Report bugs at: https://github.com/hrzlgnm/mex/issues
+
+.SH LICENSE
+MIT License.

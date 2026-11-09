@@ -21,7 +21,13 @@ Options:
 ```
 
 Prebuilt Linux binaries (x86_64 glibc + musl static) are attached to
-[GitHub releases](https://github.com/hrzlgnm/mex/releases). With
+[GitHub releases](https://github.com/hrzlgnm/mex/releases). On Arch Linux,
+install from the [AUR](https://aur.archlinux.org/packages/mex) instead:
+
+```sh
+yay -S mex
+```
+With
 `--passive`, mex transmits nothing: no startup QU batch, no continuous
 queries, no TTL refreshes — the view shows recently heard traffic
 decaying by TTL instead of actively maintained state.
@@ -61,7 +67,8 @@ decaying by TTL instead of actively maintained state.
 | `H` / `L` | first / last host group |
 | `Home` / `End` | first / last row of the focused pane |
 | `PageUp` / `PageDown`, `b` / `f`, `Space` | page |
-| `Enter`, `+` / `-` | fold / unfold host (Services) or TXT record (Answers) |
+| `Enter` | fold / unfold host (Hosts) or TXT record (Answers) |
+| `+` / `-` | fold / unfold host (Hosts) |
 | `*` | collapse all host groups / unfold all |
 | `Ctrl+↑/↓`, `Ctrl+j/k`, `Shift+↑/↓`, `J` / `K` | scroll Answers viewport freely |
 | `m` | metrics overlay (traffic, discovery, queries, links) |

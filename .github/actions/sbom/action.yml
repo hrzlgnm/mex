@@ -1,0 +1,57 @@
+# Copyright 2026 hrzlgnm
+# SPDX-License-Identifier: MIT
+
+name: Create and scan SBOM action
+description: Creates and scans the sbom for security vulnerabilities
+
+inputs:
+  artifact-name:
+    description: "The name of the sbom upload artifact"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: 🏷️ Get version
+      id: get-version
+      shell: bash
+      run: |
+        VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+    - name: 📜 Create SBOM
+      uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+      env:
+        SYFT_SOURCE_NAME: ${{ github.event.repository.name }}
+        SYFT_SOURCE_VERSION: ${{ steps.get-version.outputs.version }}
+      with:
+        format: "spdx-json"
+        output-file: "sbom.spdx.json"
+        upload-artifact: false
+        upload-release-assets: false
+
+    - name: 📤 Upload SBOM artifact
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: sbom.spdx.json
+
+    - name: 🔍 Scan SBOM
+      id: scan
+      uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+      with:
+        sbom: "sbom.spdx.json"
+        severity-cutoff: medium
+        cache-db: false
+
+    - name: 🔍 Inspect SARIF report
+      if: ${{ !cancelled() && steps.scan.outputs.sarif != '' && runner.os != 'Windows' }}
+      shell: bash
+      run: |
+        jq . ${{ steps.scan.outputs.sarif }}
+
+    - name: 🔍 Inspect SARIF report
+      if: ${{ !cancelled() && steps.scan.outputs.sarif != '' && runner.os == 'Windows' }}
+      shell: pwsh
+      run: |
+        jq . ${{ steps.scan.outputs.sarif }}

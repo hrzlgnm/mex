@@ -6,30 +6,114 @@ name: "Reusable build workflow"
 on:
   workflow_call:
     inputs:
-      tagName:
+      branch:
         required: false
         type: string
         default: ""
+      tagName:
+        required: false
+        type: string
       profile:
         description: "Cargo build profile (debug for fast CI, release for publishing)"
         required: false
         type: string
         default: "release"
+      upload_artifacts:
+        description: "Upload CI artifacts (disabled for PRs)"
+        required: false
+        type: boolean
+        default: true
 
 jobs:
-  build:
+  sbom:
     strategy:
       fail-fast: false
       matrix:
         include:
+          - family: unix
+            os: ubuntu-latest
+          - family: windows
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: 🔄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: 📜 Create and 🔍 scan SBOM for vulnerabilities
+        uses: ./.github/actions/sbom
+        with:
+          artifact-name: "sbom-${{ matrix.family }}"
+
+      - name: 🚀 Upload SBOM to release
+        if: ${{ inputs.tagName }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ inputs.tagName }}
+        run: |
+          cp sbom.spdx.json "sbom-${{ matrix.family }}.spdx.json"
+          gzip -f "sbom-${{ matrix.family }}.spdx.json"
+          gh release upload "$TAG_NAME" "sbom-${{ matrix.family }}.spdx.json.gz" --clobber
+
+  build:
+    needs: [sbom]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: "ubuntu-22.04"
+            symbol: 🐧 x86_64 glibc-2.35
+            target: x86_64-unknown-linux-gnu
+            platform: Linux-x86_64-glibc-2.35
           - os: "ubuntu-latest"
-            symbol: 🐧 x86_64 glibc
+            symbol: 🐧 x86_64 latest
             target: x86_64-unknown-linux-gnu
             platform: Linux-x86_64
+          - os: "ubuntu-latest"
+            symbol: 🐧 aarch64 glibc
+            target: aarch64-unknown-linux-gnu
+            platform: Linux-aarch64
+            use_cross: true
+          - os: "ubuntu-latest"
+            symbol: 🐧 arm glibc
+            target: arm-unknown-linux-gnueabihf
+            platform: Linux-arm
+            use_cross: true
           - os: "ubuntu-latest"
             symbol: 🐧 x86_64 musl
             target: x86_64-unknown-linux-musl
             platform: Linux-x86_64-musl
+            use_cross: true
+          - os: "ubuntu-latest"
+            symbol: 🐧 aarch64 musl
+            target: aarch64-unknown-linux-musl
+            platform: Linux-aarch64-musl
+            use_cross: true
+          - os: "ubuntu-latest"
+            symbol: 🐧 arm musl
+            target: arm-unknown-linux-musleabihf
+            platform: Linux-arm-musl
+            use_cross: true
+          - os: "ubuntu-latest"
+            symbol: 🐧 riscv64 glibc
+            target: riscv64gc-unknown-linux-gnu
+            platform: Linux-riscv64
+            use_cross: true
+          - os: "macos-latest"
+            symbol: 🍏 aarch64 latest
+            target: aarch64-apple-darwin
+            platform: macOS-aarch64
+          - os: "macos-latest"
+            symbol: 🍏 x86_64 latest
+            target: x86_64-apple-darwin
+            platform: macOS-x86_64
+          - os: "windows-latest"
+            symbol: 🪟 x86_64 latest
+            platform: Windows-x86_64
+            target: x86_64-pc-windows-msvc
 
     name: ${{matrix.symbol}}🔨
     runs-on: ${{matrix.os}}
@@ -41,41 +125,121 @@ jobs:
           ref: ${{ inputs.tagName || '' }}
           persist-credentials: false
 
-      - name: 🦀 Setup Rust cache
+      - name: 📥 Download SBOM
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: sbom-${{ contains(matrix.os, 'windows') && 'windows' || 'unix' }}
+          path: .
+
+      - name: 🦀🚀
         uses: ./.github/actions/setup-rust-cache
         with:
           targets: ${{ matrix.target }}
+          save-cache: ${{ inputs.branch == 'main' }}
 
-      - name: ⚡ Setup sccache
-        # Release builds stay cold for determinism.
-        if: ${{ !inputs.tagName }}
+      - name: 🛠️🔐 cargo-auditable
+        if: inputs.tagName
+        uses: baptiste0928/cargo-install@8195d4f734a149db85385bb4102b42efcd373759 # v3
+        with:
+          crate: cargo-auditable
+          version: 0.7.7
+          locked: true
+          cache-key: ${{ github.job }}-${{ strategy.job-index }}
+
+      - name: 🛠️📦 cargo-deb
+        if: contains(matrix.os, 'ubuntu') && inputs.profile == 'release'
+        uses: baptiste0928/cargo-install@8195d4f734a149db85385bb4102b42efcd373759 # v3
+        with:
+          crate: cargo-deb
+          version: 3.8.0
+          locked: true
+          cache-key: ${{ github.job }}-${{ strategy.job-index }}
+
+      - name: 🛠️ cross
+        if: matrix.use_cross
+        uses: baptiste0928/cargo-install@8195d4f734a149db85385bb4102b42efcd373759 # v3
+        with:
+          crate: cross
+          version: 0.2.5
+          locked: true
+          cache-key: ${{ github.job }}-${{ strategy.job-index }}
+
+      - name: 🛠️🚀
+        # sccache never sees compilations inside cross containers
+        # (RUSTC_WRAPPER/SCCACHE_* are not passed through; metrics show
+        # 0 hits / 0 misses on all use_cross jobs vs ~100% on native).
+        if: (!inputs.tagName) && (!matrix.use_cross)
         uses: ./.github/actions/setup-sccache
-
-      - name: 🛠️ musl tools
-        if: contains(matrix.target, '-musl')
-        shell: bash
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
 
       - name: 🔨 Build binary
         shell: bash
         env:
           RUSTFLAGS: "-D warnings"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ inputs.tagName }}
           TARGET: ${{ matrix.target }}
+          USE_CROSS: ${{ matrix.use_cross }}
           PROFILE: ${{ inputs.profile }}
         run: |
+          if [ "$USE_CROSS" = "true" ]; then
+            BUILD_CMD="cross"
+          else
+            BUILD_CMD="cargo"
+          fi
           if [ "$PROFILE" = "release" ]; then
             PROFILE_FLAG="--release"
           else
             PROFILE_FLAG=""
           fi
-          cargo build --locked $PROFILE_FLAG --target "$TARGET"
+          if [ -n "$TAG_NAME" ] && [ "$USE_CROSS" != "true" ]; then
+            $BUILD_CMD auditable build $PROFILE_FLAG --target "$TARGET"
+          else
+            $BUILD_CMD build $PROFILE_FLAG --target "$TARGET"
+          fi
 
-      - name: 📦 Build archive
+      - name: 📝 Gzip changelog for deb
+        if: contains(matrix.os, 'ubuntu') && inputs.profile == 'release'
+        shell: bash
+        run: |
+          mkdir -p target/debian
+          gzip -9 -c CHANGELOG.md > target/debian/changelog.gz
+
+      - name: 📦 Build deb package
+        if: contains(matrix.os, 'ubuntu') && inputs.profile == 'release'
         shell: bash
         env:
           TAG_NAME: ${{ inputs.tagName }}
           TARGET: ${{ matrix.target }}
+          OS: ${{ matrix.os }}
+        run: |
+          if [ -n "$TAG_NAME" ]; then
+            cargo --locked auditable deb --no-build -p mex --target "$TARGET"
+          else
+            cargo --locked deb --no-build -p mex --target "$TARGET"
+          fi
+          # Rename deb to avoid conflicts between ubuntu-latest and ubuntu-22.04, and glibc vs musl
+          SUFFIX=""
+          if [ "$OS" = "ubuntu-22.04" ]; then
+            SUFFIX="-glibc2.35"
+          elif [[ "$TARGET" == *"-musl"* ]]; then
+            SUFFIX="-musl"
+          fi
+          if [ -n "$SUFFIX" ]; then
+            cd "target/$TARGET/debian" || exit 1
+            for deb_file in *.deb; do
+              [ -f "$deb_file" ] || continue
+              new_name="${deb_file%.deb}${SUFFIX}.deb"
+              mv "$deb_file" "$new_name"
+            done
+          fi
+
+      - name: 📦 Build archive
+        if: inputs.tagName || inputs.upload_artifacts
+        shell: bash
+        env:
+          TAG_NAME: ${{ inputs.tagName }}
+          TARGET: ${{ matrix.target }}
+          OS: ${{ matrix.os }}
           PLATFORM: ${{ matrix.platform }}
           PROFILE: ${{ inputs.profile }}
         run: |
@@ -90,27 +254,248 @@ jobs:
           else
             PROFILE_DIR="debug"
           fi
+          echo "VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+          # Use platform for tarball, but preserve original .deb name on Linux
           staging="mex-${VERSION_NAME}-${PLATFORM}"
           mkdir -p "$staging"
-          cp "target/$TARGET/$PROFILE_DIR/mex" "$staging/"
           cp LICENSE "$staging/"
-          cp CHANGELOG.md "$staging/" || true
-          tar czf "$staging.tar.gz" "$staging"
-          echo "ASSET=$staging.tar.gz" >> "$GITHUB_ENV"
+          cp CHANGELOG.md "$staging/"
+          if [ "$OS" = "windows-latest" ]; then
+            cp "target/$TARGET/$PROFILE_DIR/mex.exe" "$staging/"
+            cp "target/$TARGET/$PROFILE_DIR/mex.pdb" "$staging/" || true
+            7z a -tzip "$staging.zip" "$staging"
+            echo "ASSET=$staging.zip" >> "$GITHUB_ENV"
+          elif [ "$OS" = "macos-latest" ]; then
+            cp "target/$TARGET/$PROFILE_DIR/mex" "$staging/"
+            cp "target/$TARGET/$PROFILE_DIR/mex.dwp" "$staging/" || true
+            cp -LR "target/$TARGET/$PROFILE_DIR/mex.dSYM" "$staging/" || true
+            mkdir -p "$staging/man/man1"
+            cp "docs/mex.1" "$staging/man/man1/"
+            tar czf "$staging.tar.gz" "$staging"
+            echo "ASSET=$staging.tar.gz" >> "$GITHUB_ENV"
+          else
+            cp "target/$TARGET/$PROFILE_DIR/mex" "$staging/"
+            cp "target/$TARGET/$PROFILE_DIR/mex.dwp" "$staging/" || true
+            cp -LR "target/$TARGET/$PROFILE_DIR/mex.dSYM" "$staging/" || true
+            # Include manpage for Linux builds only
+            if [[ "$OS" =~ ^ubuntu ]]; then
+              mkdir -p "$staging/man/man1"
+              cp "docs/mex.1" "$staging/man/man1/"
+              mkdir -p "$staging/applications"
+              cp "packaging/linux/mex.desktop" "$staging/applications/"
+              mkdir -p "$staging/icons/hicolor/scalable/apps"
+              cp "packaging/linux/mex.svg" "$staging/icons/hicolor/scalable/apps/"
+            fi
+            tar czf "$staging.tar.gz" "$staging"
+            echo "ASSET=$staging.tar.gz" >> "$GITHUB_ENV"
+            # Copy .deb file if it exists (Linux builds only)
+            if find "target/$TARGET/debian" -name '*.deb' -print -quit 2>/dev/null | grep -q .; then
+              DEB_FILE=$(find "target/$TARGET/debian" -name '*.deb' -print -quit)
+              cp "$DEB_FILE" .
+              DEB_NAME=$(basename "$DEB_FILE")
+              echo "DEB_ASSET=$DEB_NAME" >> "$GITHUB_ENV"
+              # Convert .deb to .ipk for aarch64 and armhf (OpenWrt)
+              if [[ "$TARGET" == "aarch64-unknown-linux-gnu" || "$TARGET" == "arm-unknown-linux-gnueabihf" ]]; then
+                TEMP_DIR=$(mktemp -d)
+                DEB_ABS_PATH="$GITHUB_WORKSPACE/$DEB_FILE"
+                cp "$DEB_ABS_PATH" "$TEMP_DIR/"
+                cd "$TEMP_DIR" || exit 1
+                ar x "$(basename "$DEB_FILE")"
+                # Discover archive filenames
+                DATA_TAR=$(find . -name 'data.tar.*' -print -quit)
+                CONTROL_TAR=$(find . -name 'control.tar.*' -print -quit)
+                # Update control file for OpenWrt
+                ARCH_MAP_ARM64="aarch64"
+                ARCH_MAP_ARMHF="armv7ahf-vfp"
+                if [[ "$TARGET" == "aarch64-unknown-linux-gnu" ]]; then
+                  TARGET_ARCH="$ARCH_MAP_ARM64"
+                else
+                  TARGET_ARCH="$ARCH_MAP_ARMHF"
+                fi
+                mkdir -p tmp_control
+                tar -xf "$CONTROL_TAR" -C tmp_control
+                sed -i "s/^Architecture: .*/Architecture: $TARGET_ARCH/" tmp_control/control
+                sed -i 's/libgcc-s1/libgcc1/g' tmp_control/control
+                tar -C tmp_control -czf control.tar.gz .
+                ar cr "$TEMP_DIR/mex_${VERSION_NAME}_${TARGET_ARCH}.ipk" debian-binary control.tar.gz "$DATA_TAR"
+                cp "$TEMP_DIR/mex_${VERSION_NAME}_${TARGET_ARCH}.ipk" "$GITHUB_WORKSPACE/"
+                echo "IPK_ASSET=mex_${VERSION_NAME}_${TARGET_ARCH}.ipk" >> "$GITHUB_ENV"
+                cd "$GITHUB_WORKSPACE" || exit 1
+                rm -rf "$TEMP_DIR"
+              fi
+            fi
+          fi
 
-      - name: 🚀 Upload asset to release
+      - name: 🛠️ Install create-dmg
+        if: contains(matrix.os, 'macos') && inputs.profile == 'release'
+        run: |
+          CREATE_DMG_VERSION="v1.1.0"
+          git clone --depth 1 --branch "$CREATE_DMG_VERSION" https://github.com/create-dmg/create-dmg.git /tmp/create-dmg
+          cd /tmp/create-dmg
+          make
+          sudo cp create-dmg /usr/local/bin/
+          cd -
+          rm -rf /tmp/create-dmg
+
+      - name: 📦 Build DMG
+        if: contains(matrix.os, 'macos') && inputs.profile == 'release'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          if [ "$PROFILE" = "release" ]; then
+            PROFILE_DIR="release"
+          else
+            PROFILE_DIR="debug"
+          fi
+          DMG_STAGING="mex-dmg-${VERSION_NAME}-${PLATFORM}"
+          APP_NAME="mex.app"
+          DMG_NAME="mex-${VERSION_NAME}-${PLATFORM}.dmg"
+          mkdir -p "$DMG_STAGING/$APP_NAME/Contents/MacOS"
+          mkdir -p "$DMG_STAGING/$APP_NAME/Contents/Resources"
+          cp "target/$TARGET/$PROFILE_DIR/mex" "$DMG_STAGING/$APP_NAME/Contents/MacOS/"
+          cp LICENSE "$DMG_STAGING/$APP_NAME/Contents/Resources/"
+          cp CHANGELOG.md "$DMG_STAGING/$APP_NAME/Contents/Resources/"
+          cp "packaging/macos/mex.icns" "$DMG_STAGING/$APP_NAME/Contents/Resources/"
+          # Create a shell script wrapper that launches Terminal with the TUI app
+          cat > "$DMG_STAGING/$APP_NAME/Contents/MacOS/run" << 'WRAPPER'
+          #!/bin/bash
+          EXE_PATH="$(cd "$(dirname "$0")" && pwd)/mex"
+          osascript -e 'tell app "Terminal"' -e "do script (quoted form of \"$EXE_PATH\" & \"; exit\")" -e 'end tell'
+          WRAPPER
+          chmod +x "$DMG_STAGING/$APP_NAME/Contents/MacOS/run"
+          # Set the wrapper as the executable in Info.plist
+          cat > "$DMG_STAGING/$APP_NAME/Contents/Info.plist" << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key>
+            <string>run</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.mex.app</string>
+            <key>CFBundleName</key>
+            <string>mex</string>
+            <key>CFBundleIconFile</key>
+            <string>mex</string>
+            <key>CFBundleIconName</key>
+            <string>mex</string>
+            <key>CFBundleVersion</key>
+            <string>${VERSION_NAME}</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${VERSION_NAME}</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>10.13</string>
+            <key>LSApplicationCategoryType</key>
+            <string>public.app-category.utilities</string>
+            <key>LSBackgroundOnly</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+          # Self-sign the app bundle before packaging into DMG
+          codesign --force --deep --sign - "$DMG_STAGING/$APP_NAME"
+          create-dmg --volname "mex" \
+                    --window-pos 200 120 \
+                    --window-size 600 400 \
+                    --icon-size 100 \
+                    --icon "$APP_NAME" 150 150 \
+                    --app-drop-link 425 150 \
+                    "$DMG_NAME" \
+                    "$DMG_STAGING/"
+          # Self-sign the DMG (the app inside was already signed during build)
+          codesign --force --sign - "$DMG_NAME"
+          # Clean up DMG staging
+          rm -rf "$DMG_STAGING"
+          echo "DMG_ASSET=$DMG_NAME" >> "$GITHUB_ENV"
+
+      - name: 🧮 Compute attestation subjects
+        if: inputs.tagName && (contains(matrix.os, 'ubuntu') || contains(matrix.os, 'macos'))
+        shell: bash
+        env:
+          ASSET: ${{ env.ASSET }}
+          DEB_ASSET: ${{ env.DEB_ASSET }}
+          IPK_ASSET: ${{ env.IPK_ASSET }}
+          DMG_ASSET: ${{ env.DMG_ASSET }}
+        run: |
+          if [ -n "$IPK_ASSET" ]; then
+            echo "ATTESTATION_SUBJECTS=${ASSET},${DEB_ASSET},${IPK_ASSET}" >> "$GITHUB_ENV"
+          elif [ -n "$DMG_ASSET" ]; then
+            echo "ATTESTATION_SUBJECTS=${ASSET},${DMG_ASSET}" >> "$GITHUB_ENV"
+          elif [ -n "$DEB_ASSET" ]; then
+            echo "ATTESTATION_SUBJECTS=${ASSET},${DEB_ASSET}" >> "$GITHUB_ENV"
+          else
+            echo "ATTESTATION_SUBJECTS=${ASSET}" >> "$GITHUB_ENV"
+          fi
+
+      - name: 🛡️ Attest SBOM
+        if: inputs.tagName
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ contains(matrix.os, 'windows') && format('target/{0}/release/mex.exe', matrix.target) || format('target/{0}/release/mex', matrix.target) }}
+          sbom-path: "sbom.spdx.json"
+
+      - name: 🔐 Generate provenance attestation
+        if: inputs.tagName
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ (contains(matrix.os, 'ubuntu') || contains(matrix.os, 'macos')) && env.ATTESTATION_SUBJECTS || env.ASSET }}
+
+      - name: 🚀 Publish release assets
         if: inputs.tagName
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ inputs.tagName }}
           ASSET: ${{ env.ASSET }}
-        run: gh release upload "$TAG_NAME" "$ASSET" --clobber
+          DEB_ASSET: ${{ env.DEB_ASSET }}
+          IPK_ASSET: ${{ env.IPK_ASSET }}
+          DMG_ASSET: ${{ env.DMG_ASSET }}
+        run: |
+          ASSETS=()
+          for file in "$ASSET" "$DEB_ASSET" "$IPK_ASSET" "$DMG_ASSET"; do
+            if [ -n "$file" ] && [ -f "$file" ]; then
+              ASSETS+=("$file")
+            fi
+          done
+          if [ "${#ASSETS[@]}" -eq 0 ]; then
+            echo "No release assets to upload for this platform"
+            exit 1
+          fi
+          gh release upload "$TAG_NAME" "${ASSETS[@]}" --clobber
 
-      - name: 📤 Upload CI artifact
-        if: ${{ !inputs.tagName }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      - name: 📦 Upload artifacts
+        if: (!inputs.tagName) && inputs.upload_artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: ${{ env.ASSET }}
+          name: mex-${{ matrix.platform }}${{ matrix.target && '-' || '' }}${{ matrix.target || '' }}
           path: ${{ env.ASSET }}
-          if-no-files-found: error
+          retention-days: 30
+
+      - name: 📦 Upload deb artifacts
+        if: (!inputs.tagName) && inputs.upload_artifacts && contains(matrix.os, 'ubuntu') && env.DEB_ASSET != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mex-${{ matrix.target }}-deb${{ matrix.os == 'ubuntu-22.04' && '-glibc2.35' || '' }}
+          path: ${{ env.DEB_ASSET }}
+          retention-days: 30
+
+      - name: 📦 Upload ipk artifacts
+        if: (!inputs.tagName) && inputs.upload_artifacts && matrix.os == 'ubuntu-latest' && (matrix.target == 'aarch64-unknown-linux-gnu' || matrix.target == 'arm-unknown-linux-gnueabihf') && env.IPK_ASSET != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mex-${{ matrix.target }}-ipk
+          path: ${{ env.IPK_ASSET }}
+          retention-days: 30
+
+      - name: 📦 Upload DMG artifacts
+        if: (!inputs.tagName) && inputs.upload_artifacts && contains(matrix.os, 'macos') && env.DMG_ASSET != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mex-${{ matrix.target }}-dmg
+          path: ${{ env.DMG_ASSET }}
+          retention-days: 30

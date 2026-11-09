@@ -34,6 +34,8 @@ jobs:
     needs: [release-please]
     if: needs.release-please.outputs.release_created == 'true'
     permissions:
+      id-token: write # needed for OIDC token for attestation
+      attestations: write # needed to create build attestations
       contents: write # needed to upload build artifacts
     name: 🔨 Build and Publish
     uses: ./.github/workflows/build-reusable.yml
@@ -74,6 +76,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write # to publish the draft release
+      actions: write # to dispatch the downstream packaging workflow
     steps:
       - name: 🔄 Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -86,3 +89,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
         run: gh release edit "$TAG_NAME" --draft=false --prerelease=false
+
+      - name: 🚀 Dispatch AUR packaging workflow
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! gh workflow run aur-reusable.yml --ref "$REF_NAME" -f tag_name="$TAG_NAME"; then
+            echo "::error::Failed to dispatch aur-reusable.yml"
+            exit 1
+          fi
