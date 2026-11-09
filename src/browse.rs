@@ -133,7 +133,7 @@ pub fn spawn() -> Result<(QueryTx, mpsc::Receiver<Event>)> {
         let socket = match create_v4_socket() {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("mex: v4 socket: {e}");
+                log::error!("mex: v4 socket: {e}");
                 return;
             }
         };
@@ -144,7 +144,7 @@ pub fn spawn() -> Result<(QueryTx, mpsc::Receiver<Event>)> {
         let socket = match create_v6_socket() {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("mex: v6 socket: {e}");
+                log::error!("mex: v6 socket: {e}");
                 return;
             }
         };
@@ -269,15 +269,19 @@ fn listen(
         {
             last_refresh = Some(Instant::now());
             ifnames = iface_names();
+            // Joins run unconditionally every pass: they are idempotent,
+            // and a rejoin is required after an interface went away and
+            // came back (same name, new incarnation).
             match family {
                 Family::V4 => {
                     ifaces_v4 = v4_interfaces();
-                    // Join unconditionally: joins are idempotent, and a
-                    // rejoin is required after the interface went away
-                    // and came back (same name, new incarnation).
                     for (name, ip) in &ifaces_v4 {
                         if let Err(e) = socket.join_multicast_v4(&MDNS_V4, ip) {
-                            eprintln!("mex: v4 mcast {name}: {e}");
+                            // Duplicate joins report AddrInUse; the membership
+                            // is already in place, so only log real failures.
+                            if e.kind() != std::io::ErrorKind::AddrInUse {
+                                log::warn!("mex: v4 mcast {name}: {e}");
+                            }
                         }
                     }
                 }
@@ -285,7 +289,9 @@ fn listen(
                     ifaces_v6 = v6_interfaces();
                     for (name, idx) in &ifaces_v6 {
                         if let Err(e) = socket.join_multicast_v6(&MDNS_V6, *idx) {
-                            eprintln!("mex: v6 mcast {name}: {e}");
+                            if e.kind() != std::io::ErrorKind::AddrInUse {
+                                log::warn!("mex: v6 mcast {name}: {e}");
+                            }
                         }
                     }
                 }
@@ -321,7 +327,7 @@ fn listen(
                 thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
-                eprintln!("mex: recv error: {e}");
+                log::error!("mex: recv error: {e}");
                 thread::sleep(Duration::from_secs(1));
             }
         }

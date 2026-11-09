@@ -594,6 +594,7 @@ dependencies = [
  "crossterm",
  "hickory-proto",
  "if-addrs",
+ "log",
  "ratatui",
  "socket-pktinfo",
  "socket2 0.6.5",

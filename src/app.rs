@@ -245,12 +245,12 @@ impl App {
     }
 
     fn run_headless(&mut self) -> Result<()> {
-        eprintln!("mex: started (no TUI available, listening on port 5353)");
+        log::info!("mex: started (no TUI available, listening on port 5353)");
         while self.running {
             self.drain_events();
             self.send_queries();
             if self.packet_count > 0 && self.packet_count.is_multiple_of(10) {
-                eprintln!(
+                log::info!(
                     "mex: {} packets, {} services seen",
                     self.packet_count,
                     self.services.len()
