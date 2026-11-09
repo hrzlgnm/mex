@@ -138,7 +138,9 @@ jobs:
           save-cache: ${{ inputs.branch == 'main' }}
 
       - name: 🛠️🔐 cargo-auditable
-        if: inputs.tagName
+        # Tagged builds need it everywhere (cross .deb packaging calls
+        # `cargo auditable deb`); untagged builds only where it can run.
+        if: ${{ inputs.tagName || !matrix.use_cross }}
         uses: baptiste0928/cargo-install@8195d4f734a149db85385bb4102b42efcd373759 # v3
         with:
           crate: cargo-auditable
@@ -176,25 +178,21 @@ jobs:
         env:
           RUSTFLAGS: "-D warnings"
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ inputs.tagName }}
           TARGET: ${{ matrix.target }}
           USE_CROSS: ${{ matrix.use_cross }}
           PROFILE: ${{ inputs.profile }}
         run: |
-          if [ "$USE_CROSS" = "true" ]; then
-            BUILD_CMD="cross"
-          else
-            BUILD_CMD="cargo"
-          fi
           if [ "$PROFILE" = "release" ]; then
             PROFILE_FLAG="--release"
           else
             PROFILE_FLAG=""
           fi
-          if [ -n "$TAG_NAME" ] && [ "$USE_CROSS" != "true" ]; then
-            $BUILD_CMD auditable build $PROFILE_FLAG --target "$TARGET"
+          # cargo-auditable cannot run inside cross containers, so cross
+          # builds stay plain cargo; everything else embeds audit data.
+          if [ "$USE_CROSS" = "true" ]; then
+            cross build $PROFILE_FLAG --target "$TARGET"
           else
-            $BUILD_CMD build $PROFILE_FLAG --target "$TARGET"
+            cargo auditable build $PROFILE_FLAG --target "$TARGET"
           fi
 
       - name: 📝 Gzip changelog for deb
@@ -440,7 +438,9 @@ jobs:
           sbom-path: "sbom.spdx.json"
 
       - name: 🔐 Generate provenance attestation
-        if: inputs.tagName
+        # Releases attest everything; CI attests the uploaded artifacts
+        # (skipped on PRs, where upload_artifacts is false).
+        if: inputs.tagName || inputs.upload_artifacts
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-path: ${{ (contains(matrix.os, 'ubuntu') || contains(matrix.os, 'macos')) && env.ATTESTATION_SUBJECTS || env.ASSET }}

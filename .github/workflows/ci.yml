@@ -69,6 +69,8 @@ jobs:
     name: "🔨 Build"
     permissions:
       contents: read # Needed to run build and pass permissions to reusable workflow
+      id-token: write # Needed for OIDC token for attestation
+      attestations: write # Needed to create build attestations
     uses: ./.github/workflows/build-reusable.yml
     secrets: inherit
     with:
