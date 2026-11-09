@@ -936,7 +936,7 @@ impl App {
 
     fn ingest_record(&mut self, rec: &browse::RawRecord, ev: &browse::Event) {
         match rec.rtype {
-            12 => self.handle_ptr(rec),
+            12 => self.handle_ptr(rec, ev),
             33 => self.handle_srv(rec, ev),
             16 => self.handle_txt(rec),
             1 | 28 => self.handle_addr(rec, ev),
@@ -944,7 +944,7 @@ impl App {
         }
     }
 
-    fn handle_ptr(&mut self, rec: &browse::RawRecord) {
+    fn handle_ptr(&mut self, rec: &browse::RawRecord, ev: &browse::Event) {
         let st = rec.name.trim_end_matches('.');
         let target = rec.rdata.trim_end_matches('.');
 
@@ -984,6 +984,20 @@ impl App {
         let instance = target.strip_suffix(&suffix).unwrap_or(target);
         let pi = self.ensure_pending(instance, st);
         self.pending_instances[pi].records.push(rec.clone());
+        // A live PTR for an already-confirmed service must reactivate it
+        // here: after a goodbye the service is inactive, and without this
+        // forward the PTR would sit in pending until (and unless) a fresh
+        // SRV arrives, leaving a returned service stuck offline.
+        // push_record only reactivates on live PTR, so SRV/TXT answers
+        // still cannot resurrect a withdrawn service.
+        if let Some(idx) = self
+            .services
+            .iter()
+            .position(|s| s.instance == instance && s.service_type == st)
+        {
+            self.services[idx].last_event = Some(ev.clone());
+            self.push_record(idx, rec);
+        }
     }
 
     /// Split a full instance name ("inst._svc._tcp.local") into (instance,
@@ -1052,7 +1066,10 @@ impl App {
         self.push_record(idx, rec);
         self.services[idx].last_event = Some(ev.clone());
 
-        // merge any cached data from pending_instances
+        // merge any cached data from pending_instances, routing each
+        // record through push_record so live PTRs reactivate a returned
+        // service (and replace their goodbye rows) instead of duplicating
+        // them via a blind extend.
         let svc_idx = idx;
         let mut i = 0;
         while i < self.pending_instances.len() {
@@ -1060,10 +1077,17 @@ impl App {
                 && self.pending_instances[i].service_type == service_type
             {
                 let p = self.pending_instances.swap_remove(i);
-                let s = &mut self.services[svc_idx];
-                s.records.extend(p.records);
-                s.subtypes.extend(p.subtypes);
-                s.last_seen = s.last_seen.max(p.last_seen);
+                for sub in p.subtypes {
+                    if !self.services[svc_idx].subtypes.contains(&sub) {
+                        self.services[svc_idx].subtypes.push(sub);
+                    }
+                }
+                self.services[svc_idx].last_seen =
+                    self.services[svc_idx].last_seen.max(p.last_seen);
+                let records = p.records;
+                for rec in &records {
+                    self.push_record(svc_idx, rec);
+                }
             } else {
                 i += 1;
             }
@@ -1466,5 +1490,133 @@ impl App {
                 raw,
             } => Some((raw.to_vec(), format!(" QRY {rtype_str} {name} "))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    fn test_source() -> SocketAddr {
+        "192.168.1.2:5353".parse().unwrap()
+    }
+
+    fn raw_record(
+        name: &str,
+        rtype: u16,
+        rtype_str: &str,
+        rdata: &str,
+        ttl: u32,
+    ) -> browse::RawRecord {
+        browse::RawRecord {
+            name: name.to_string(),
+            rtype,
+            rtype_str: rtype_str.to_string(),
+            flush_bit: false,
+            ttl,
+            rdata: rdata.to_string(),
+            wire: Vec::new(),
+            source: test_source(),
+            received_at: Instant::now(),
+        }
+    }
+
+    fn ptr_record(ttl: u32) -> browse::RawRecord {
+        raw_record(
+            "_http._tcp.local.",
+            12,
+            "PTR",
+            "Test._http._tcp.local.",
+            ttl,
+        )
+    }
+
+    fn srv_record(ttl: u32) -> browse::RawRecord {
+        raw_record(
+            "Test._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 80 test.local.",
+            ttl,
+        )
+    }
+
+    fn event_for(rec: &browse::RawRecord) -> browse::Event {
+        browse::Event {
+            records: vec![rec.clone()],
+            questions: Vec::new(),
+            raw_bytes: Vec::new(),
+            source: test_source(),
+        }
+    }
+
+    fn ingest(app: &mut App, rec: &browse::RawRecord) {
+        let ev = event_for(rec);
+        app.ingest_event(&ev);
+    }
+
+    fn live_ptr_rows(app: &App) -> Vec<browse::RawRecord> {
+        app.services
+            .iter()
+            .flat_map(|s| s.ordered_records())
+            .filter(|r| r.rtype == 12)
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn hostname_case_preserved_in_queries() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(
+            &mut app,
+            &raw_record(
+                "Test._http._tcp.local.",
+                33,
+                "SRV",
+                "0 0 80 MyHost.local.",
+                120,
+            ),
+        );
+        // Dedup keys stay lowercase, but the query name keeps wire case.
+        let desired = app.desired_continuous();
+        let qname = desired
+            .get(&("myhost.local".to_string(), 1))
+            .expect("A query interest for the host");
+        assert_eq!(qname.trim_end_matches('.'), "MyHost.local");
+        let qname_aaaa = desired
+            .get(&("myhost.local".to_string(), 28))
+            .expect("AAAA query interest for the host");
+        assert_eq!(qname_aaaa.trim_end_matches('.'), "MyHost.local");
+    }
+
+    #[test]
+    fn goodbye_then_comeback_reactivates() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        assert_eq!(app.services.len(), 1);
+        assert!(app.services[0].is_active);
+
+        // Goodbye takes the service offline but keeps it during grace.
+        ingest(&mut app, &ptr_record(0));
+        assert_eq!(app.services.len(), 1);
+        assert!(!app.services[0].is_active);
+
+        // Comeback with valid TTL must show the service as online again.
+        ingest(&mut app, &ptr_record(120));
+        assert!(app.services[0].is_active);
+        let ptrs = live_ptr_rows(&app);
+        assert_eq!(ptrs.len(), 1);
+        assert_eq!(ptrs[0].ttl, 120);
+
+        // A fresh SRV burst merges pending state without duplicating the
+        // PTR row or dropping back offline.
+        ingest(&mut app, &srv_record(120));
+        assert!(app.services[0].is_active);
+        let ptrs = live_ptr_rows(&app);
+        assert_eq!(ptrs.len(), 1);
+        assert_eq!(ptrs[0].ttl, 120);
     }
 }
