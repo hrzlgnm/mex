@@ -1,0 +1,64 @@
+# Copyright 2026 hrzlgnm
+# SPDX-License-Identifier: MIT
+
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write # to open Release PRs, tag, and create draft releases
+  issues: write # to manage autorelease labels on Release PRs
+  pull-requests: write # to open and update Release PRs
+
+jobs:
+  release-please:
+    name: "🤖 Release Please"
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+      sha: ${{ steps.release.outputs.sha }}
+    steps:
+      - uses: googleapis/release-please-action@v5
+        id: release
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  build_and_publish:
+    needs: [release-please]
+    if: needs.release-please.outputs.release_created == 'true'
+    permissions:
+      contents: write # needed to upload build artifacts
+    name: 🔨 Build and Publish
+    uses: ./.github/workflows/build-reusable.yml
+    secrets: inherit
+    with:
+      tagName: ${{ needs.release-please.outputs.tag_name }}
+      profile: release
+
+  publish:
+    # Flips the draft live only when every build job succeeded. A cancelled
+    # or failed build skips this job, so a partial release never goes live.
+    needs: [release-please, build_and_publish]
+    if: needs.release-please.outputs.release_created == 'true'
+    name: "📢 Publish Release"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to publish the draft release
+    steps:
+      - name: 🔄 Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: 📢 Publish draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
+        run: gh release edit "$TAG_NAME" --draft=false --prerelease=false

@@ -1,0 +1,116 @@
+# Copyright 2026 hrzlgnm
+# SPDX-License-Identifier: MIT
+
+name: "Reusable build workflow"
+
+on:
+  workflow_call:
+    inputs:
+      tagName:
+        required: false
+        type: string
+        default: ""
+      profile:
+        description: "Cargo build profile (debug for fast CI, release for publishing)"
+        required: false
+        type: string
+        default: "release"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: "ubuntu-latest"
+            symbol: 🐧 x86_64 glibc
+            target: x86_64-unknown-linux-gnu
+            platform: Linux-x86_64
+          - os: "ubuntu-latest"
+            symbol: 🐧 x86_64 musl
+            target: x86_64-unknown-linux-musl
+            platform: Linux-x86_64-musl
+
+    name: ${{matrix.symbol}}🔨
+    runs-on: ${{matrix.os}}
+    steps:
+      - name: 🔄 Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: ${{ inputs.tagName && '0' || '1' }}
+          ref: ${{ inputs.tagName || '' }}
+          persist-credentials: false
+
+      - name: 🦀 Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 📦 Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: 🛠️ musl tools
+        if: contains(matrix.target, '-musl')
+        shell: bash
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: 🔨 Build binary
+        shell: bash
+        env:
+          RUSTFLAGS: "-D warnings"
+          TAG_NAME: ${{ inputs.tagName }}
+          TARGET: ${{ matrix.target }}
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          if [ "$PROFILE" = "release" ]; then
+            PROFILE_FLAG="--release"
+          else
+            PROFILE_FLAG=""
+          fi
+          cargo build --locked $PROFILE_FLAG --target "$TARGET"
+
+      - name: 📦 Build archive
+        shell: bash
+        env:
+          TAG_NAME: ${{ inputs.tagName }}
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ -n "$TAG_NAME" ]; then
+            VERSION_NAME="$TAG_NAME"
+          else
+            VERSION_NAME="$VERSION"
+          fi
+          if [ "$PROFILE" = "release" ]; then
+            PROFILE_DIR="release"
+          else
+            PROFILE_DIR="debug"
+          fi
+          staging="mex-${VERSION_NAME}-${PLATFORM}"
+          mkdir -p "$staging"
+          cp "target/$TARGET/$PROFILE_DIR/mex" "$staging/"
+          cp LICENSE "$staging/"
+          cp CHANGELOG.md "$staging/" || true
+          tar czf "$staging.tar.gz" "$staging"
+          echo "ASSET=$staging.tar.gz" >> "$GITHUB_ENV"
+
+      - name: 🚀 Upload asset to release
+        if: inputs.tagName
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ inputs.tagName }}
+          ASSET: ${{ env.ASSET }}
+        run: gh release upload "$TAG_NAME" "$ASSET" --clobber
+
+      - name: 📤 Upload CI artifact
+        if: ${{ !inputs.tagName }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
