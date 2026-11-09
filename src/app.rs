@@ -92,7 +92,7 @@ const ENUM_SERVICE: &str = "_services._dns-sd._udp.local";
 /// Maximum interval between continuous queries (RFC 6762 §5.2 steady state).
 const MAX_CONTINUOUS_INTERVAL: Duration = Duration::from_secs(3600);
 /// Local address refresh is unrelated to querying; keep it on its own timer.
-const LOCAL_IPS_REFRESH: Duration = Duration::from_secs(60);
+const LOCAL_IPS_REFRESH: Duration = Duration::from_secs(10);
 
 pub struct App {
     pub services: Vec<ServiceEntry>,

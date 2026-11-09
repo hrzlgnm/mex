@@ -46,9 +46,11 @@ const MDNS_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 const MDNS_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
 const MDNS_PORT: u16 = 5353;
 /// How often the listener threads re-enumerate interfaces: picks up
-/// bridges and other links that appear at runtime (and drops dead ones
-/// from the transmit set on the next pass).
-const IFACE_REFRESH: Duration = Duration::from_secs(60);
+/// bridges and other links that appear at runtime, drops dead ones from
+/// the transmit set, and re-joins flapped ones (replug or down/up with
+/// the same name would otherwise stay deaf: the kernel join does not
+/// survive the interface going away).
+const IFACE_REFRESH: Duration = Duration::from_secs(10);
 
 /// Address family of a listener thread: selects the interface list,
 /// the join call, and the per-packet transmit interface.
@@ -257,8 +259,6 @@ fn listen(
     let mut buf = vec![0u8; 65535];
     let mut ifaces_v4: Vec<(String, Ipv4Addr)> = Vec::new();
     let mut ifaces_v6: Vec<(String, u32)> = Vec::new();
-    let mut joined_v4: HashSet<String> = HashSet::new();
-    let mut joined_v6: HashSet<String> = HashSet::new();
     let mut ifnames: HashMap<u32, String> = HashMap::new();
     let mut last_refresh: Option<Instant> = None;
 
@@ -272,10 +272,10 @@ fn listen(
             match family {
                 Family::V4 => {
                     ifaces_v4 = v4_interfaces();
+                    // Join unconditionally: joins are idempotent, and a
+                    // rejoin is required after the interface went away
+                    // and came back (same name, new incarnation).
                     for (name, ip) in &ifaces_v4 {
-                        if !joined_v4.insert(name.clone()) {
-                            continue;
-                        }
                         if let Err(e) = socket.join_multicast_v4(&MDNS_V4, ip) {
                             eprintln!("mex: v4 mcast {name}: {e}");
                         }
@@ -284,9 +284,6 @@ fn listen(
                 Family::V6 => {
                     ifaces_v6 = v6_interfaces();
                     for (name, idx) in &ifaces_v6 {
-                        if !joined_v6.insert(name.clone()) {
-                            continue;
-                        }
                         if let Err(e) = socket.join_multicast_v6(&MDNS_V6, *idx) {
                             eprintln!("mex: v6 mcast {name}: {e}");
                         }
