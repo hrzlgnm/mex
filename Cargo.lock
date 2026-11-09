@@ -337,6 +337,7 @@ dependencies = [
  "ipnet",
  "once_cell",
  "rand",
+ "socket2 0.5.10",
  "thiserror",
  "tinyvec",
  "tokio",

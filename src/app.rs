@@ -1,7 +1,8 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -52,6 +53,47 @@ struct PendingService {
     last_seen: Instant,
 }
 
+/// Continuous-browse state per (name, type), RFC 6762 §5.2: first query
+/// after 20-120ms, then >=1s, doubling each time, capped at 1/hour.
+struct ContinuousQuery {
+    next_due: Instant,
+    interval: Duration,
+    /// Name as sent on the wire (original case). The map key is
+    /// normalized to lowercase for host names so lookups dedup
+    /// case-insensitively, but the query itself keeps wire case.
+    qname: String,
+}
+
+/// Small xorshift-style helper so query jitter does not need a new
+/// dependency. Seeded from wall-clock time plus an atomic counter.
+fn rand_u32() -> u32 {
+    static CTR: AtomicU64 = AtomicU64::new(0);
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() ^ (d.subsec_nanos() as u64))
+        .unwrap_or(0x9e3779b9);
+    let c = CTR.fetch_add(0x9e3779b97f4a7c15, Ordering::Relaxed);
+    let mut x = t.wrapping_add(c).wrapping_add(0x9e3779b97f4a7c15);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58476d1ce4e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d049bb133111eb);
+    x ^= x >> 31;
+    (x >> 32) as u32
+}
+
+/// Inclusive random range for scheduling jitter.
+fn rand_range(lo_ms: u64, hi_ms: u64) -> Duration {
+    let span = hi_ms.saturating_sub(lo_ms).saturating_add(1).max(1);
+    Duration::from_millis(lo_ms + (rand_u32() as u64 % span))
+}
+
+const ENUM_SERVICE: &str = "_services._dns-sd._udp.local";
+/// Maximum interval between continuous queries (RFC 6762 §5.2 steady state).
+const MAX_CONTINUOUS_INTERVAL: Duration = Duration::from_secs(3600);
+/// Local address refresh is unrelated to querying; keep it on its own timer.
+const LOCAL_IPS_REFRESH: Duration = Duration::from_secs(60);
+
 pub struct App {
     pub services: Vec<ServiceEntry>,
     pub selected_display: usize,
@@ -65,17 +107,30 @@ pub struct App {
 
     rx: mpsc::Receiver<browse::Event>,
     query_tx: browse::QueryTx,
-    last_query: Instant,
-    burst_count: u8,
-    queried_types: HashSet<String>,
-    queried_instances: HashSet<String>,
-    queried_hosts: HashSet<String>,
+    /// Continuous browse schedule per (name, rtype): RFC 6762 §5.2
+    /// exponential backoff (1s, 2s, 4s, … capped at 1h). Replaces the old
+    /// fixed 60s re-poll. TTL-driven cache refresh lives in `requeries`.
+    continuous: HashMap<(String, u16), ContinuousQuery>,
+    /// Every service type ever learned (enumeration answers, PTR owners,
+    /// confirmed services). Persistent: used for instance/type splitting
+    /// and as the desired continuous-query set. Never cleared on a timer.
+    known_types: HashSet<String>,
     /// Requery schedule per (name, type): (next query due, unanswered
     /// count). RFC 6762 §5.2: a querier SHOULD re-ask at 80% of the TTL,
-    /// then 85/90/95% if no answer arrives, then at most hourly; known
-    /// answers suppress the responses in between. Answers reset the
+    /// then 85/90/95% if no answer arrives, with ~2% random variation;
+    /// after four misses the record expires at 100% (no hourly refresh —
+    /// hourly is only the cap for *unanswered* continuous browsing).
+    /// Known answers suppress the responses in between. Answers reset the
     /// schedule via push_record.
     requeries: HashMap<(String, u16), (Instant, u8)>,
+    /// Enumeration answers learned from `_services._dns-sd._udp.local`
+    /// PTR records: service type -> (original TTL, received_at). Used as
+    /// known answers on enumeration requeries (RFC 6762 §7.1, shared).
+    enum_known: HashMap<String, (u32, Instant)>,
+    /// Whether the startup QU batch was already sent (RFC 6762 §5.4:
+    /// QU only on wake/interface-activation batch, QM afterwards).
+    startup_qu_sent: bool,
+    last_ip_refresh: Instant,
     collapsed_types: HashSet<String>,
     local_ips: HashSet<std::net::IpAddr>,
     detail_svc_key: Option<(String, String)>,
@@ -140,12 +195,12 @@ impl App {
             running: true,
             rx,
             query_tx,
-            last_query: Instant::now() - Duration::from_secs(10),
-            burst_count: 0,
-            queried_types: HashSet::new(),
-            queried_instances: HashSet::new(),
-            queried_hosts: HashSet::new(),
+            continuous: HashMap::new(),
+            known_types: HashSet::new(),
             requeries: HashMap::new(),
+            enum_known: HashMap::new(),
+            startup_qu_sent: false,
+            last_ip_refresh: Instant::now(),
             collapsed_types: HashSet::new(),
             local_ips: browse::local_ips(),
             detail_selected: 0,
@@ -253,29 +308,74 @@ impl App {
         self.flush_pending_addrs();
     }
 
-    fn known_ptrs(&self, svc_type: &str) -> Vec<(String, u32)> {
+    fn remaining_ttl(rec: &browse::RawRecord) -> u32 {
+        rec.ttl
+            .saturating_sub(rec.received_at.elapsed().as_secs() as u32)
+    }
+
+    /// Known PTR answers for a service type (or enumeration), RFC 6762 §7.1:
+    /// only records with at least half of the original TTL remaining, sent
+    /// with their remaining TTL so responders can suppress duplicates.
+    /// Unique types (SRV/TXT/A/AAAA) are intentionally omitted: §7.1 notes
+    /// known-answer suppression is for shared records.
+    fn known_ptrs(&self, owner: &str) -> Vec<(String, u32)> {
+        let mut seen = HashSet::new();
         let mut out = Vec::new();
+        let mut push_rec = |rec: &browse::RawRecord, out: &mut Vec<(String, u32)>| {
+            if rec.rtype != 12 || rec.ttl == 0 {
+                return;
+            }
+            let remaining = Self::remaining_ttl(rec);
+            if remaining * 2 < rec.ttl {
+                return;
+            }
+            let target = rec.rdata.trim_end_matches('.').to_string();
+            if seen.insert(target.clone()) {
+                out.push((target, remaining));
+            }
+        };
         for s in &self.services {
-            if s.service_type != svc_type {
+            if s.service_type != owner {
                 continue;
             }
             for rec in &s.records {
-                if rec.rtype == 12 {
-                    out.push((rec.rdata.clone(), rec.ttl));
-                }
+                push_rec(rec, &mut out);
             }
         }
         for p in &self.pending_instances {
-            if p.service_type != svc_type {
+            if p.service_type != owner {
                 continue;
             }
             for rec in &p.records {
-                if rec.rtype == 12 {
-                    out.push((rec.rdata.clone(), rec.ttl));
-                }
+                push_rec(rec, &mut out);
             }
         }
         out
+    }
+
+    fn known_enum_answers(&self) -> Vec<(String, u32)> {
+        let now = Instant::now();
+        let mut out = Vec::new();
+        for (svc_type, (ttl, received)) in &self.enum_known {
+            let elapsed = now.duration_since(*received).as_secs() as u32;
+            let remaining = ttl.saturating_sub(elapsed);
+            if *ttl == 0 || remaining * 2 < *ttl {
+                continue;
+            }
+            out.push((svc_type.clone(), remaining));
+        }
+        out
+    }
+
+    fn record_type_from_u16(rtype: u16) -> Option<RecordType> {
+        match rtype {
+            12 => Some(RecordType::PTR),
+            33 => Some(RecordType::SRV),
+            16 => Some(RecordType::TXT),
+            1 => Some(RecordType::A),
+            28 => Some(RecordType::AAAA),
+            _ => None,
+        }
     }
 
     fn requery_expiring(&mut self) {
@@ -306,30 +406,28 @@ impl App {
         if triggered.is_empty() {
             return;
         }
-        // 0-2% jitter, varied per pass and per key so requeries for
-        // different names do not stay in lockstep.
-        let base_pct = self.start_time.elapsed().subsec_nanos();
         for key in triggered {
             let ttl = ttl_by_key.get(&key).copied().unwrap_or(120);
-            let pct = (base_pct + key.0.len() as u32 * 37 + key.1 as u32 * 101) % 200;
+            // 0-2% random variation so queriers do not stay in lockstep
+            // (RFC 6762 §5.2: 80-82%, 85-87%, 90-92%, 95-97%).
+            let jitter_pct = rand_u32() % 201;
             // 5% of TTL plus jitter, floored at 1s (RFC 6762 §5.2 wants
             // >=1s between the first two queries).
-            let step_millis = (ttl as u64) * 50 + (ttl as u64) * (pct as u64) / 10;
+            let step_millis = (ttl as u64) * 50 + (ttl as u64) * (jitter_pct as u64) / 10;
             let step = Duration::from_millis(step_millis.max(1000));
             let (due, count) = self.requeries.get(&key).copied().unwrap_or((now, 0));
             if count > 0 && now < due {
                 continue;
             }
-            let rt = match key.1 {
-                12 => RecordType::PTR,
-                33 => RecordType::SRV,
-                16 => RecordType::TXT,
-                1 => RecordType::A,
-                28 => RecordType::AAAA,
-                _ => continue,
+            let Some(rt) = Self::record_type_from_u16(key.1) else {
+                continue;
             };
             let ka = if rt == RecordType::PTR {
-                self.known_ptrs(&key.0)
+                if key.0 == ENUM_SERVICE {
+                    self.known_enum_answers()
+                } else {
+                    self.known_ptrs(&key.0)
+                }
             } else {
                 Vec::new()
             };
@@ -337,108 +435,147 @@ impl App {
                 name: key.0.clone(),
                 record_type: rt,
                 known_answers: ka,
+                qu: false,
             });
             let unanswered = (count + 1).min(4);
-            let next_due = if unanswered >= 4 {
-                now + Duration::from_secs(3600)
+            if unanswered >= 4 {
+                // RFC 6762 §5.2: after queries at ~80/85/90/95% with no
+                // answer, the record expires at 100% — no hourly refresh.
+                // Hourly is only the cap for unanswered *continuous*
+                // browsing (see `continuous`), which keeps running.
+                self.requeries.remove(&key);
             } else {
-                now + step
+                self.requeries.insert(key, (now + step, unanswered));
+            }
+        }
+    }
+
+    /// Map key for `continuous`: host names (A/AAAA) are matched
+    /// case-insensitively, everything else keeps wire case. The query
+    /// itself always uses the original case (see `qname`).
+    fn continuous_key(name: &str, rtype: u16) -> (String, u16) {
+        if rtype == 1 || rtype == 28 {
+            (name.to_lowercase(), rtype)
+        } else {
+            (name.to_string(), rtype)
+        }
+    }
+
+    /// Desired continuous-browse queries: enumeration plus every live PTR /
+    /// SRV / TXT / A / AAAA interest, as key -> wire-case name. Derived
+    /// from live state each tick so dead services stop costing queries
+    /// (RFC 6762 §5.2: no maintenance without active interest).
+    fn desired_continuous(&self) -> HashMap<(String, u16), String> {
+        let mut desired = HashMap::new();
+        let mut want = |name: String, rtype: u16| {
+            let key = Self::continuous_key(&name, rtype);
+            desired.entry(key).or_insert(name);
+        };
+        want(ENUM_SERVICE.to_string(), 12);
+        for t in &self.known_types {
+            want(t.clone(), 12);
+        }
+        for p in &self.pending_instances {
+            want(p.service_type.clone(), 12);
+            let full = format!("{}.{}", p.instance, p.service_type);
+            want(full.clone(), 33);
+            want(full, 16);
+        }
+        for svc in &self.services {
+            want(svc.service_type.clone(), 12);
+            let full = format!("{}.{}", svc.instance, svc.service_type);
+            want(full.clone(), 33);
+            want(full, 16);
+            if !svc.hostname.is_empty() {
+                let host = svc.hostname.trim_end_matches('.').to_string();
+                want(host.clone(), 1);
+                want(host, 28);
+            }
+        }
+        desired
+    }
+
+    fn poll_continuous(&mut self) {
+        let now = Instant::now();
+        let desired = self.desired_continuous();
+        // Drop interests that went away (no queries without active interest).
+        self.continuous.retain(|k, _| desired.contains_key(k));
+        for (key, qname) in desired {
+            let (due, send_name) = match self.continuous.get(&key) {
+                Some(entry) => (now >= entry.next_due, entry.qname.clone()),
+                None => {
+                    // RFC 6762 §5.2: first query delayed 20-120ms random.
+                    self.continuous.insert(
+                        key.clone(),
+                        ContinuousQuery {
+                            next_due: now + rand_range(20, 120),
+                            interval: Duration::from_secs(1),
+                            qname: qname.clone(),
+                        },
+                    );
+                    (false, qname)
+                }
             };
-            self.requeries.insert(key, (next_due, unanswered));
+            if !due {
+                continue;
+            }
+            let Some(rt) = Self::record_type_from_u16(key.1) else {
+                continue;
+            };
+            let ka = if rt == RecordType::PTR {
+                if key.0 == ENUM_SERVICE {
+                    self.known_enum_answers()
+                } else {
+                    self.known_ptrs(&send_name)
+                }
+            } else {
+                Vec::new()
+            };
+            // QU only on the very first startup enumeration batch
+            // (RFC 6762 §5.4); everything afterwards is QM.
+            let qu = !self.startup_qu_sent && key.0 == ENUM_SERVICE && key.1 == 12;
+            if qu {
+                self.startup_qu_sent = true;
+            }
+            self.query_tx.send(browse::QueryRequest {
+                name: send_name,
+                record_type: rt,
+                known_answers: ka,
+                qu,
+            });
+            // RFC 6762 §5.2: at least 1s between the first two, then at
+            // least doubling, capped at one query per hour.
+            if let Some(entry) = self.continuous.get_mut(&key) {
+                let next_interval = (entry.interval * 2).min(MAX_CONTINUOUS_INTERVAL);
+                entry.interval = next_interval.max(Duration::from_secs(1));
+                entry.next_due = now + entry.interval;
+            }
         }
     }
 
     fn send_queries(&mut self) {
         self.flush_pending_addrs();
-        let now = Instant::now();
-
-        // pending instances (PTR seen, SRV pending)
-        for p in &self.pending_instances {
-            if self.queried_types.insert(p.service_type.clone()) {
-                self.query_tx.send(browse::QueryRequest {
-                    name: p.service_type.clone(),
-                    record_type: RecordType::PTR,
-                    known_answers: self.known_ptrs(&p.service_type),
-                });
-            }
-            let full = format!("{}.{}", p.instance, p.service_type);
-            if self.queried_instances.insert(full.clone()) {
-                self.query_tx.send(browse::QueryRequest {
-                    name: full.clone(),
-                    record_type: RecordType::SRV,
-                    known_answers: Vec::new(),
-                });
-                self.query_tx.send(browse::QueryRequest {
-                    name: full,
-                    record_type: RecordType::TXT,
-                    known_answers: Vec::new(),
-                });
-            }
-        }
-
+        // Learn service types before scheduling so new PTR owners are
+        // browsed without waiting for a record-bearing service entry.
         for svc in &self.services {
-            // new service type → PTR for its instances
-            if self.queried_types.insert(svc.service_type.clone()) {
-                self.query_tx.send(browse::QueryRequest {
-                    name: svc.service_type.clone(),
-                    record_type: RecordType::PTR,
-                    known_answers: self.known_ptrs(&svc.service_type),
-                });
-            }
-            // re-query SRV + TXT for confirmed services
-            let full = format!("{}.{}", svc.instance, svc.service_type);
-            if self.queried_instances.insert(full.clone()) {
-                self.query_tx.send(browse::QueryRequest {
-                    name: full.clone(),
-                    record_type: RecordType::SRV,
-                    known_answers: Vec::new(),
-                });
-                self.query_tx.send(browse::QueryRequest {
-                    name: full,
-                    record_type: RecordType::TXT,
-                    known_answers: Vec::new(),
-                });
-            }
-            // new host → A + AAAA
-            if !svc.hostname.is_empty() {
-                let host = svc.hostname.trim_end_matches('.').to_lowercase();
-                if self.queried_hosts.insert(host.clone()) {
-                    self.query_tx.send(browse::QueryRequest {
-                        name: host.clone(),
-                        record_type: RecordType::A,
-                        known_answers: Vec::new(),
-                    });
-                    self.query_tx.send(browse::QueryRequest {
-                        name: host,
-                        record_type: RecordType::AAAA,
-                        known_answers: Vec::new(),
-                    });
-                }
-            }
+            self.known_types.insert(svc.service_type.clone());
+        }
+        for p in &self.pending_instances {
+            self.known_types.insert(p.service_type.clone());
+        }
+        for t in self.enum_known.keys() {
+            self.known_types.insert(t.clone());
         }
 
+        self.poll_continuous();
         self.requery_expiring();
 
-        // RFC 6762: initial burst (3 queries ~1s apart), then every 60 s
-        let interval = if self.burst_count < 3 { 1u64 } else { 60 };
-        let elapsed = now.duration_since(self.last_query).as_secs();
-        if elapsed < interval {
-            return;
-        }
-        self.last_query = now;
-        self.burst_count = self.burst_count.saturating_add(1);
-
-        self.queried_types.clear();
-        self.queried_instances.clear();
-        self.queried_hosts.clear();
         // Refresh in case interfaces/addresses changed (cheap: ~1 fork/min).
-        self.local_ips = browse::local_ips();
-
-        self.query_tx.send(browse::QueryRequest {
-            name: "_services._dns-sd._udp.local".into(),
-            record_type: RecordType::PTR,
-            known_answers: Vec::new(),
-        });
+        // Independent of query backoff.
+        if self.last_ip_refresh.elapsed() >= LOCAL_IPS_REFRESH {
+            self.last_ip_refresh = Instant::now();
+            self.local_ips = browse::local_ips();
+        }
     }
 
     pub fn display_items(&self) -> Vec<DisplayItem> {
@@ -811,13 +948,16 @@ impl App {
         let st = rec.name.trim_end_matches('.');
         let target = rec.rdata.trim_end_matches('.');
 
-        if st == "_services._dns-sd._udp.local" {
-            if self.queried_types.insert(target.to_string()) {
-                self.query_tx.send(browse::QueryRequest {
-                    name: target.to_string(),
-                    record_type: RecordType::PTR,
-                    known_answers: self.known_ptrs(target),
-                });
+        if st == ENUM_SERVICE {
+            // Track enumeration answers for known-answer suppression and
+            // for the continuous browse set; polling itself runs through
+            // the §5.2 backoff in poll_continuous.
+            self.known_types.insert(target.to_string());
+            if rec.ttl > 0 {
+                self.enum_known
+                    .insert(target.to_string(), (rec.ttl, rec.received_at));
+            } else {
+                self.enum_known.remove(target);
             }
             return;
         }
@@ -881,7 +1021,10 @@ impl App {
         for p in &self.pending_instances {
             consider(&p.service_type);
         }
-        for t in &self.queried_types {
+        for t in &self.known_types {
+            consider(t);
+        }
+        for t in self.enum_known.keys() {
             consider(t);
         }
         best
@@ -1063,6 +1206,16 @@ impl App {
             if !still_expiring {
                 self.requeries.remove(&key);
             }
+            // RFC 6762 §5.2: a unique answer (cache-flush bit) means no
+            // other answers are forthcoming, so dampen the exponential
+            // discovery stream and let the 80%-TTL refresh take over.
+            if rec.flush_bit {
+                let ckey = Self::continuous_key(rec.name.trim_end_matches('.'), rec.rtype);
+                if let Some(entry) = self.continuous.get_mut(&ckey) {
+                    entry.interval = MAX_CONTINUOUS_INTERVAL;
+                    entry.next_due = Instant::now() + MAX_CONTINUOUS_INTERVAL;
+                }
+            }
         }
     }
 
@@ -1121,14 +1274,45 @@ impl App {
         self.pending_instances
             .retain(|p| now.duration_since(p.last_seen) < grace);
         // Drop schedules for names that no longer exist, so dead services
-        // stop costing even an hourly query.
+        // stop costing even an hourly query (RFC 6762 §5.2: no maintenance
+        // without active interest).
         let mut live: HashSet<(String, u16)> = HashSet::new();
+        live.insert((ENUM_SERVICE.to_string(), 12));
         for svc in &self.services {
+            live.insert((svc.service_type.clone(), 12));
+            let full = format!("{}.{}", svc.instance, svc.service_type);
+            live.insert((full.clone(), 33));
+            live.insert((full, 16));
+            if !svc.hostname.is_empty() {
+                let host = svc.hostname.trim_end_matches('.').to_lowercase();
+                live.insert((host.clone(), 1));
+                live.insert((host, 28));
+            }
             for rec in &svc.records {
                 live.insert((rec.name.trim_end_matches('.').to_string(), rec.rtype));
             }
         }
+        for p in &self.pending_instances {
+            live.insert((p.service_type.clone(), 12));
+            let full = format!("{}.{}", p.instance, p.service_type);
+            live.insert((full.clone(), 33));
+            live.insert((full, 16));
+        }
+        for t in self.enum_known.keys() {
+            live.insert((t.clone(), 12));
+        }
         self.requeries.retain(|k, _| live.contains(k));
+        self.continuous.retain(|k, _| live.contains(k));
+        // Expire enumeration known answers at 100% TTL; prune the type
+        // cache to live interests so it cannot grow without bound.
+        self.enum_known
+            .retain(|_, (ttl, received)| received.elapsed().as_secs() as u32 <= *ttl);
+        let live_types: HashSet<String> = live
+            .iter()
+            .filter(|(_, t)| *t == 12)
+            .map(|(n, _)| n.clone())
+            .collect();
+        self.known_types.retain(|t| live_types.contains(t));
         self.clamp_selection();
     }
 

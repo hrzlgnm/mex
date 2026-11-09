@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 ratatui = "0.28"
 crossterm = "0.28"
-hickory-proto = "0.24"
+hickory-proto = { version = "0.24", features = ["mdns"] }
 socket2 = "0.5"
 chrono = "0.4"
 anyhow = "1"

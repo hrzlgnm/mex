@@ -73,8 +73,14 @@ pub struct Event {
 pub struct QueryRequest {
     pub name: String,
     pub record_type: RecordType,
-    /// PTR target names to include as known-answer records (owner name = self.name)
+    /// PTR target names to include as known-answer records (owner name = self.name).
+    /// Each TTL must be the *remaining* TTL, and callers must omit records
+    /// with less than half of the original TTL left (RFC 6762 §7.1).
     pub known_answers: Vec<(String, u32)>,
+    /// mDNS unicast-response (QU) bit. Only set on the first query of the
+    /// startup batch (RFC 6762 §5.4); retransmissions and later questions
+    /// are QM.
+    pub qu: bool,
 }
 
 /// Query sender fanning out to both transports, so solicited queries
@@ -258,13 +264,16 @@ fn send_query(socket: &Socket, req: &QueryRequest, dest: SocketAddr) {
         Err(_) => return,
     };
     let mut msg = Message::new();
-    msg.add_query(Query::query(qname.clone(), req.record_type));
+    let mut query = Query::query(qname.clone(), req.record_type);
+    query.set_mdns_unicast_response(req.qu);
+    msg.add_query(query);
     msg.set_message_type(MessageType::Query);
     msg.set_recursion_desired(false);
     msg.set_id(0);
 
     for (ka_rdata, ka_ttl) in &req.known_answers {
-        if let Ok(rdata) = Name::from_ascii(format!("{ka_rdata}.")) {
+        let target = ka_rdata.trim_end_matches('.');
+        if let Ok(rdata) = Name::from_ascii(format!("{target}.")) {
             let mut rec = Record::with(qname.clone(), req.record_type, *ka_ttl);
             rec.set_data(Some(RData::PTR(hickory_proto::rr::rdata::PTR(rdata))));
             rec.set_dns_class(DNSClass::IN);
