@@ -169,17 +169,11 @@ fn iface_names() -> HashMap<u32, String> {
     out
 }
 
-/// Whether an interface is usable for mDNS: skip links that are
-/// operationally down (Down, LowerLayerDown) and point-to-point links,
-/// which have no multicast group to browse. Anything else counts as
-/// usable (fail-open), so tunnels and VPNs reporting `unknown` keep
-/// working. Sourced from if-addrs so this stays cross-platform.
+/// Whether an interface is usable for mDNS: it must be operationally
+/// up, and point-to-point links are skipped (they have no multicast
+/// group to browse). Sourced from if-addrs so this stays cross-platform.
 fn usable_interface(iface: &if_addrs::Interface) -> bool {
-    !iface.is_p2p()
-        && !matches!(
-            iface.oper_status,
-            if_addrs::IfOperStatus::Down | if_addrs::IfOperStatus::LowerLayerDown
-        )
+    !iface.is_p2p() && iface.is_oper_up()
 }
 
 fn skipped_interface(name: &str) -> bool {
@@ -624,10 +618,10 @@ mod tests {
         assert!(usable_interface(&iface(St::Up, false)));
         assert!(!usable_interface(&iface(St::Down, false)));
         assert!(!usable_interface(&iface(St::LowerLayerDown, false)));
-        assert!(usable_interface(&iface(St::Unknown, false)));
-        assert!(usable_interface(&iface(St::Dormant, false)));
-        assert!(usable_interface(&iface(St::Testing, false)));
-        assert!(usable_interface(&iface(St::NotPresent, false)));
+        assert!(!usable_interface(&iface(St::Unknown, false)));
+        assert!(!usable_interface(&iface(St::Dormant, false)));
+        assert!(!usable_interface(&iface(St::Testing, false)));
+        assert!(!usable_interface(&iface(St::NotPresent, false)));
         assert!(!usable_interface(&iface(St::Up, true)));
         assert!(!usable_interface(&iface(St::Unknown, true)));
     }
