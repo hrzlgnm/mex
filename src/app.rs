@@ -760,16 +760,17 @@ impl App {
             self.running = false;
             return;
         }
-        // Pane switching works from anywhere.
+        // Tab cycles pane focus in both directions.
         match key.code {
-            KeyCode::Tab => {
-                self.focus = Focus::Records;
-                // Anchor the record cursor without moving it.
-                self.move_detail_cursor(0);
-                return;
-            }
-            KeyCode::BackTab => {
-                self.focus = Focus::Services;
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.focus = match self.focus {
+                    Focus::Services => Focus::Records,
+                    Focus::Records => Focus::Services,
+                };
+                if self.focus == Focus::Records {
+                    // Anchor the record cursor without moving it.
+                    self.move_detail_cursor(0);
+                }
                 return;
             }
             _ => {}
@@ -2243,8 +2244,8 @@ mod tests {
         app.handle_key(&plain(KeyCode::Char('k')));
         assert!(!app.detail_free_scroll);
         assert_eq!(app.detail_selected, before - 1);
-        // Shift+Tab returns to the service list.
-        app.handle_key(&plain(KeyCode::BackTab));
+        // Tab cycles back to the service list.
+        app.handle_key(&plain(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Services);
     }
 
@@ -2269,8 +2270,8 @@ mod tests {
         app.handle_key(&plain(KeyCode::Char('j')));
         assert_eq!(app.selected_display, 3);
         assert_eq!(app.detail_selected, detail_before + 1);
-        // BackTab returns to the service list.
-        app.handle_key(&plain(KeyCode::BackTab));
+        // Tab cycles back to the service list.
+        app.handle_key(&plain(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Services);
     }
 
