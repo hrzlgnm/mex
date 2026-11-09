@@ -124,9 +124,10 @@ pub struct App {
     /// schedule via push_record.
     requeries: HashMap<(String, u16), (Instant, u8)>,
     /// Enumeration answers learned from `_services._dns-sd._udp.local`
-    /// PTR records: service type -> (original TTL, received_at). Used as
-    /// known answers on enumeration requeries (RFC 6762 §7.1, shared).
-    enum_known: HashMap<String, (u32, Instant)>,
+    /// PTR records: service type -> (original TTL, received_at, ingress
+    /// interface). Used as known answers on enumeration requeries
+    /// (RFC 6762 §7.1, shared), scoped to the link they came from.
+    enum_known: HashMap<String, (u32, Instant, String)>,
     /// Whether the startup QU batch was already sent (RFC 6762 §5.4:
     /// QU only on wake/interface-activation batch, QM afterwards).
     startup_qu_sent: bool,
@@ -317,11 +318,13 @@ impl App {
     /// only records with at least half of the original TTL remaining, sent
     /// with their remaining TTL so responders can suppress duplicates.
     /// Unique types (SRV/TXT/A/AAAA) are intentionally omitted: §7.1 notes
-    /// known-answer suppression is for shared records.
-    fn known_ptrs(&self, owner: &str) -> Vec<(String, u32)> {
+    /// known-answer suppression is for shared records. Each answer carries
+    /// the interface it was observed on; the transport only sends it back
+    /// out that same link, where it can actually suppress something.
+    fn known_ptrs(&self, owner: &str) -> Vec<browse::KnownAnswer> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
-        let mut push_rec = |rec: &browse::RawRecord, out: &mut Vec<(String, u32)>| {
+        let mut push_rec = |rec: &browse::RawRecord, out: &mut Vec<browse::KnownAnswer>| {
             if rec.rtype != 12 || rec.ttl == 0 {
                 return;
             }
@@ -330,8 +333,12 @@ impl App {
                 return;
             }
             let target = rec.rdata.trim_end_matches('.').to_string();
-            if seen.insert(target.clone()) {
-                out.push((target, remaining));
+            if seen.insert((target.clone(), rec.iface.clone())) {
+                out.push(browse::KnownAnswer {
+                    target,
+                    ttl: remaining,
+                    iface: rec.iface.clone(),
+                });
             }
         };
         for s in &self.services {
@@ -353,16 +360,20 @@ impl App {
         out
     }
 
-    fn known_enum_answers(&self) -> Vec<(String, u32)> {
+    fn known_enum_answers(&self) -> Vec<browse::KnownAnswer> {
         let now = Instant::now();
         let mut out = Vec::new();
-        for (svc_type, (ttl, received)) in &self.enum_known {
+        for (svc_type, (ttl, received, iface)) in &self.enum_known {
             let elapsed = now.duration_since(*received).as_secs() as u32;
             let remaining = ttl.saturating_sub(elapsed);
             if *ttl == 0 || remaining * 2 < *ttl {
                 continue;
             }
-            out.push((svc_type.clone(), remaining));
+            out.push(browse::KnownAnswer {
+                target: svc_type.clone(),
+                ttl: remaining,
+                iface: iface.clone(),
+            });
         }
         out
     }
@@ -954,8 +965,10 @@ impl App {
             // the §5.2 backoff in poll_continuous.
             self.known_types.insert(target.to_string());
             if rec.ttl > 0 {
-                self.enum_known
-                    .insert(target.to_string(), (rec.ttl, rec.received_at));
+                self.enum_known.insert(
+                    target.to_string(),
+                    (rec.ttl, rec.received_at, rec.iface.clone()),
+                );
             } else {
                 self.enum_known.remove(target);
             }
@@ -1330,7 +1343,7 @@ impl App {
         // Expire enumeration known answers at 100% TTL; prune the type
         // cache to live interests so it cannot grow without bound.
         self.enum_known
-            .retain(|_, (ttl, received)| received.elapsed().as_secs() as u32 <= *ttl);
+            .retain(|_, (ttl, received, _)| received.elapsed().as_secs() as u32 <= *ttl);
         let live_types: HashSet<String> = live
             .iter()
             .filter(|(_, t)| *t == 12)
@@ -1576,6 +1589,27 @@ mod tests {
         let ptrs = live_ptr_rows(&app);
         assert_eq!(ptrs.len(), 1);
         assert_eq!(ptrs[0].iface, "br0");
+    }
+
+    #[test]
+    fn known_answers_carry_their_ingress_interface() {
+        let mut app = App::new().unwrap();
+        let mut a = ptr_record(120);
+        a.iface = "br0".to_string();
+        ingest(&mut app, &a);
+        // Same instance seen on another link: distinct source, distinct row.
+        let mut b = ptr_record(120);
+        b.iface = "enx".to_string();
+        b.source = "192.168.178.61:5353".parse().unwrap();
+        ingest(&mut app, &b);
+        ingest(&mut app, &srv_record(120));
+        let mut ifaces: Vec<String> = app
+            .known_ptrs("_http._tcp.local")
+            .into_iter()
+            .map(|ka| ka.iface)
+            .collect();
+        ifaces.sort();
+        assert_eq!(ifaces, vec!["br0".to_string(), "enx".to_string()]);
     }
 
     #[test]

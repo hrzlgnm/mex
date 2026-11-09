@@ -85,13 +85,22 @@ pub struct Event {
 }
 
 #[derive(Debug, Clone)]
+pub struct KnownAnswer {
+    pub target: String,
+    pub ttl: u32,
+    /// Interface the answer was observed on; empty when unknown, in which
+    /// case it is sent everywhere.
+    pub iface: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct QueryRequest {
     pub name: String,
     pub record_type: RecordType,
     /// PTR target names to include as known-answer records (owner name = self.name).
     /// Each TTL must be the *remaining* TTL, and callers must omit records
     /// with less than half of the original TTL left (RFC 6762 §7.1).
-    pub known_answers: Vec<(String, u32)>,
+    pub known_answers: Vec<KnownAnswer>,
     /// mDNS unicast-response (QU) bit. Only set on the first query of the
     /// startup batch (RFC 6762 §5.4); retransmissions and later questions
     /// are QM.
@@ -337,23 +346,23 @@ fn send_on_all_interfaces(
         Family::V4 => {
             if ifaces_v4.is_empty() {
                 let dest = SocketAddr::from(SocketAddrV4::new(MDNS_V4, MDNS_PORT));
-                send_query(socket, req, dest);
+                send_query(socket, req, dest, "");
                 return;
             }
-            for (_name, ip) in ifaces_v4 {
+            for (name, ip) in ifaces_v4 {
                 let _ = socket.set_multicast_if_v4(ip);
                 let dest = SocketAddr::from(SocketAddrV4::new(MDNS_V4, MDNS_PORT));
-                send_query(socket, req, dest);
+                send_query(socket, req, dest, name);
             }
         }
         Family::V6 => {
             if ifaces_v6.is_empty() {
-                send_query(socket, req, mdns_dest_v6(0));
+                send_query(socket, req, mdns_dest_v6(0), "");
                 return;
             }
-            for (_name, idx) in ifaces_v6 {
+            for (name, idx) in ifaces_v6 {
                 let _ = socket.set_multicast_if_v6(*idx);
-                send_query(socket, req, mdns_dest_v6(*idx));
+                send_query(socket, req, mdns_dest_v6(*idx), name);
             }
         }
     }
@@ -366,7 +375,18 @@ fn is_v4_mapped(addr: &SocketAddr) -> bool {
     }
 }
 
-fn send_query(socket: &PktInfoUdpSocket, req: &QueryRequest, dest: SocketAddr) {
+/// Known answers relevant to one egress interface: suppression only
+/// helps if a responder on *that* link holds the record, so answers
+/// learned elsewhere are left out (empty origin means unknown, sent
+/// everywhere; an empty egress means an unknown link, keep everything).
+fn known_answers_for_iface<'a>(kas: &'a [KnownAnswer], iface: &str) -> Vec<(&'a str, u32)> {
+    kas.iter()
+        .filter(|ka| ka.iface.is_empty() || iface.is_empty() || ka.iface == iface)
+        .map(|ka| (ka.target.as_str(), ka.ttl))
+        .collect()
+}
+
+fn send_query(socket: &PktInfoUdpSocket, req: &QueryRequest, dest: SocketAddr, egress_iface: &str) {
     let qname = match Name::from_ascii(format!("{}.", req.name)) {
         Ok(n) => n,
         Err(_) => return,
@@ -379,10 +399,10 @@ fn send_query(socket: &PktInfoUdpSocket, req: &QueryRequest, dest: SocketAddr) {
     msg.set_recursion_desired(false);
     msg.set_id(0);
 
-    for (ka_rdata, ka_ttl) in &req.known_answers {
-        let target = ka_rdata.trim_end_matches('.');
+    for (ka_target, ka_ttl) in known_answers_for_iface(&req.known_answers, egress_iface) {
+        let target = ka_target.trim_end_matches('.');
         if let Ok(rdata) = Name::from_ascii(format!("{target}.")) {
-            let mut rec = Record::with(qname.clone(), req.record_type, *ka_ttl);
+            let mut rec = Record::with(qname.clone(), req.record_type, ka_ttl);
             rec.set_data(Some(RData::PTR(hickory_proto::rr::rdata::PTR(rdata))));
             rec.set_dns_class(DNSClass::IN);
             msg.add_answer(rec);
@@ -615,6 +635,30 @@ mod tests {
 
     fn test_source() -> std::net::SocketAddr {
         "192.168.178.60:5353".parse().unwrap()
+    }
+
+    #[test]
+    fn known_answers_are_scoped_to_egress_interface() {
+        use super::KnownAnswer;
+        let kas = vec![
+            KnownAnswer {
+                target: "a.".into(),
+                ttl: 100,
+                iface: "br0".into(),
+            },
+            KnownAnswer {
+                target: "b.".into(),
+                ttl: 100,
+                iface: "".into(),
+            },
+        ];
+        let got = known_answers_for_iface(&kas, "br0");
+        assert_eq!(got, vec![("a.", 100), ("b.", 100)]);
+        let got = known_answers_for_iface(&kas, "enx");
+        assert_eq!(got, vec![("b.", 100)]);
+        // Unknown egress link: keep everything rather than go silent.
+        let got = known_answers_for_iface(&kas, "");
+        assert_eq!(got, vec![("a.", 100), ("b.", 100)]);
     }
 
     #[test]

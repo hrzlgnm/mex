@@ -30,7 +30,8 @@ Headless run (no TTY) logs to stderr.
   random variation; after four misses the record expires at 100% TTL.
   Hourly is only the cap for unanswered continuous browsing.
 * Known-answer suppression is PTR-only (shared records, §7.1): only answers
-  with ≥half the original TTL remaining, sent with remaining TTL.
+  with ≥half the original TTL remaining, sent with remaining TTL, scoped to
+  the egress interface.
 * QU bit only on the startup enumeration batch; everything else is QM.
 * A/AAAA query names keep wire case; dedup keys are lowercase.
 * No queries for dead interests: `evict_expired` prunes `continuous`,
