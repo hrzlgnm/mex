@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -117,6 +117,56 @@ fn refresh_step(ttl_secs: u32, jitter_pct: u32) -> Duration {
 /// §7.3). Checked only when our query is due, so this is the window for
 /// near-simultaneous queries from multiple queriers.
 const OVERHEARD_WINDOW: Duration = Duration::from_secs(2);
+/// Packet arrival times older than this are dropped from the rate window.
+const METRICS_WINDOW: Duration = Duration::from_secs(300);
+
+/// Cumulative v2 traffic/query counters for the metrics overlay. Derived
+/// snapshot rows come from here plus live state; per-packet maps stay
+/// bounded by network size (tens of responders/interfaces).
+#[derive(Debug, Default)]
+pub struct MetricsCounters {
+    pub bytes_total: u64,
+    pub packet_times: VecDeque<Instant>,
+    pub last_packet_at: Option<Instant>,
+    pub records_total: u64,
+    pub records_by_type: HashMap<u16, u64>,
+    pub questions_total: u64,
+    pub qu_questions_seen: u64,
+    pub qm_questions_seen: u64,
+    pub kas_seen: u64,
+    pub goodbyes_seen: u64,
+    pub flush_seen: u64,
+    pub iface_rx: HashMap<String, u64>,
+    pub source_rx: HashMap<std::net::SocketAddr, u64>,
+    pub q_sent_continuous: u64,
+    pub q_sent_refresh: u64,
+    pub qu_sent: u64,
+    pub ka_sent: u64,
+    pub suppressed_continuous: u64,
+    pub suppressed_refresh: u64,
+    pub services_seen_total: u64,
+    pub services_expired_total: u64,
+}
+
+fn fmt_age(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{}h{:02}m", secs / 3600, secs % 3600 / 60)
+    } else if secs >= 60 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+fn fmt_bytes(bytes: u64) -> String {
+    if bytes >= 1_048_576 {
+        format!("{:.1} MiB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
 
 pub struct App {
     pub services: Vec<ServiceEntry>,
@@ -142,6 +192,15 @@ pub struct App {
     pub packet_count: u64,
     pub start_time: Instant,
     pub running: bool,
+    /// Metrics overlay popup (`m` toggles, `m`/`Esc` closes).
+    pub show_metrics: bool,
+    /// Scroll offset inside the metrics popup (viewport recorded at draw).
+    pub metrics_scroll: Cell<usize>,
+    pub metrics_viewport: Cell<usize>,
+    /// Cumulative v2 counters (traffic, queries, suppressions).
+    pub metrics: MetricsCounters,
+    /// Cached usable/skipped link snapshot, refreshed on the 10s tick.
+    pub link_stats: browse::LinkStats,
 
     rx: mpsc::Receiver<browse::Event>,
     query_tx: browse::QueryTx,
@@ -286,6 +345,11 @@ impl App {
             pending_instances: Vec::new(),
             pending_addrs: Vec::new(),
             raw_events: Vec::new(),
+            show_metrics: false,
+            metrics_scroll: Cell::new(0),
+            metrics_viewport: Cell::new(0),
+            metrics: MetricsCounters::default(),
+            link_stats: browse::link_stats(),
         })
     }
 
@@ -371,17 +435,65 @@ impl App {
         }
 
         for ev in &batch {
+            self.note_packet_metrics(ev);
             self.raw_events.push(ev.clone());
         }
         if self.raw_events.len() > 2000 {
             self.raw_events
                 .drain(0..self.raw_events.len().saturating_sub(2000));
         }
+        // Prune the sliding rate window even on idle ticks.
+        while self
+            .metrics
+            .packet_times
+            .front()
+            .is_some_and(|t| t.elapsed() > METRICS_WINDOW)
+        {
+            self.metrics.packet_times.pop_front();
+        }
 
         for ev in &batch {
             self.ingest_event(ev);
         }
         self.flush_pending_addrs();
+    }
+
+    /// Cumulative per-packet accounting for the metrics overlay.
+    fn note_packet_metrics(&mut self, ev: &browse::Event) {
+        let now = Instant::now();
+        let m = &mut self.metrics;
+        m.bytes_total += ev.raw_bytes.len() as u64;
+        m.packet_times.push_back(now);
+        m.last_packet_at = Some(now);
+        m.records_total += ev.records.len() as u64;
+        for rec in &ev.records {
+            *m.records_by_type.entry(rec.rtype).or_insert(0) += 1;
+            if rec.flush_bit {
+                m.flush_seen += 1;
+            }
+            if rec.ttl == 0 {
+                m.goodbyes_seen += 1;
+            }
+        }
+        m.questions_total += ev.questions.len() as u64;
+        for q in &ev.questions {
+            if q.qu {
+                m.qu_questions_seen += 1;
+            } else {
+                m.qm_questions_seen += 1;
+            }
+        }
+        m.kas_seen += ev.query_kas.len() as u64;
+        // Ingress link of the packet: first record/question/KA iface.
+        let iface = ev
+            .records
+            .first()
+            .map(|r| r.iface.as_str())
+            .or_else(|| ev.questions.first().map(|q| q.iface.as_str()))
+            .or_else(|| ev.query_kas.first().map(|k| k.iface.as_str()))
+            .unwrap_or("");
+        *m.iface_rx.entry(iface.to_string()).or_insert(0) += 1;
+        *m.source_rx.entry(ev.source).or_insert(0) += 1;
     }
 
     fn remaining_ttl(rec: &browse::RawRecord) -> u32 {
@@ -530,6 +642,7 @@ impl App {
             // RFC 6762 §7.3: another querier just asked the same QM
             // question with no KA we wouldn't send — count ours as sent.
             if self.suppressed_by_overheard(&key, &ka) {
+                self.metrics.suppressed_refresh += 1;
                 self.postpone_continuous_for_refresh(&key, now);
                 let unanswered = (count + 1).min(4);
                 if unanswered >= 4 {
@@ -539,6 +652,8 @@ impl App {
                 }
                 continue;
             }
+            self.metrics.q_sent_refresh += 1;
+            self.metrics.ka_sent += ka.len() as u64;
             self.query_tx.send(browse::QueryRequest {
                 name: key.0.clone(),
                 record_type: rt,
@@ -652,12 +767,18 @@ impl App {
             // QU elicits unicast and is never suppressed.
             if !qu && self.suppressed_by_overheard(&key, &ka) {
                 let now = Instant::now();
+                self.metrics.suppressed_continuous += 1;
                 self.advance_continuous(&key, now);
                 continue;
             }
             if qu {
                 self.startup_qu_sent = true;
             }
+            self.metrics.q_sent_continuous += 1;
+            if qu {
+                self.metrics.qu_sent += 1;
+            }
+            self.metrics.ka_sent += ka.len() as u64;
             self.query_tx.send(browse::QueryRequest {
                 name: send_name,
                 record_type: rt,
@@ -695,6 +816,7 @@ impl App {
         if self.last_ip_refresh.elapsed() >= LOCAL_IPS_REFRESH {
             self.last_ip_refresh = Instant::now();
             self.local_ips = browse::local_ips();
+            self.link_stats = browse::link_stats();
         }
     }
 
@@ -811,6 +933,395 @@ impl App {
             .count()
     }
 
+    /// Rows for the metrics overlay: `(key, value)` with an empty value
+    /// marking a section header. Pure snapshot of cumulative counters plus
+    /// live state; cheap enough to rebuild every frame.
+    pub fn metrics_rows(&self) -> Vec<(String, String)> {
+        let mut rows: Vec<(String, String)> = Vec::new();
+        let section = |rows: &mut Vec<(String, String)>, name: &str| {
+            rows.push((name.to_string(), String::new()));
+        };
+        let kv = |rows: &mut Vec<(String, String)>, k: &str, v: String| {
+            rows.push((k.to_string(), v));
+        };
+
+        // Session / traffic.
+        section(&mut rows, "Session");
+        let uptime_secs = self.start_time.elapsed().as_secs();
+        kv(&mut rows, "uptime", fmt_age(uptime_secs));
+        kv(&mut rows, "packets", self.packet_count.to_string());
+        let per_min = if uptime_secs > 0 {
+            self.packet_count as f64 * 60.0 / uptime_secs as f64
+        } else {
+            0.0
+        };
+        kv(&mut rows, "pkt/min overall", format!("{per_min:.1}"));
+        let last_60 = self
+            .metrics
+            .packet_times
+            .iter()
+            .filter(|t| t.elapsed() <= Duration::from_secs(60))
+            .count();
+        kv(&mut rows, "pkt/min last 60s", last_60.to_string());
+        let avg = self
+            .metrics
+            .bytes_total
+            .checked_div(self.packet_count)
+            .unwrap_or(0);
+        kv(
+            &mut rows,
+            "bytes",
+            format!("{} (avg {avg} B/pkt)", fmt_bytes(self.metrics.bytes_total)),
+        );
+        kv(
+            &mut rows,
+            "last packet",
+            self.metrics
+                .last_packet_at
+                .map(|t| format!("{} ago", fmt_age(t.elapsed().as_secs())))
+                .unwrap_or_else(|| "—".to_string()),
+        );
+
+        // Discovery.
+        section(&mut rows, "Discovery");
+        let active = self.services.iter().filter(|s| s.is_active).count();
+        kv(
+            &mut rows,
+            "services",
+            format!(
+                "{} ({} active, {} inactive)",
+                self.services.len(),
+                active,
+                self.services.len().saturating_sub(active)
+            ),
+        );
+        kv(
+            &mut rows,
+            "services ever / expired",
+            format!(
+                "{} / {}",
+                self.metrics.services_seen_total, self.metrics.services_expired_total
+            ),
+        );
+        kv(&mut rows, "hosts", self.group_labels().len().to_string());
+        kv(
+            &mut rows,
+            "types / enum",
+            format!("{} / {}", self.known_types.len(), self.enum_known.len()),
+        );
+        kv(
+            &mut rows,
+            "pending inst / addrs",
+            format!(
+                "{} / {}",
+                self.pending_instances.len(),
+                self.pending_addrs.len()
+            ),
+        );
+        let (live, expired, goodbye) = self.current_record_liveness();
+        kv(
+            &mut rows,
+            "records current",
+            format!("{live} live, {expired} expired, {goodbye} goodbye"),
+        );
+        kv(
+            &mut rows,
+            "records ever",
+            format!(
+                "{} (PTR {} · SRV {} · TXT {} · A {} · AAAA {} · other {})",
+                self.metrics.records_total,
+                self.metrics.records_by_type.get(&12).copied().unwrap_or(0),
+                self.metrics.records_by_type.get(&33).copied().unwrap_or(0),
+                self.metrics.records_by_type.get(&16).copied().unwrap_or(0),
+                self.metrics.records_by_type.get(&1).copied().unwrap_or(0),
+                self.metrics.records_by_type.get(&28).copied().unwrap_or(0),
+                self.other_records_total(),
+            ),
+        );
+        let flush_pct = if self.metrics.records_total > 0 {
+            self.metrics.flush_seen as f64 * 100.0 / self.metrics.records_total as f64
+        } else {
+            0.0
+        };
+        kv(
+            &mut rows,
+            "flush-bit / goodbyes",
+            format!(
+                "{:.0}% flush · {} goodbyes",
+                flush_pct, self.metrics.goodbyes_seen
+            ),
+        );
+        let current_q: usize = self.services.iter().map(|s| s.questions.len()).sum();
+        let mut queriers = HashSet::new();
+        for s in &self.services {
+            for q in &s.questions {
+                queriers.insert(q.2);
+            }
+        }
+        kv(
+            &mut rows,
+            "questions",
+            format!(
+                "{current_q} current ({} queriers) · {} ever ({} QU / {} QM) · {} KAs seen",
+                queriers.len(),
+                self.metrics.questions_total,
+                self.metrics.qu_questions_seen,
+                self.metrics.qm_questions_seen,
+                self.metrics.kas_seen,
+            ),
+        );
+
+        // Query engine.
+        section(&mut rows, "Queries");
+        let sent = self.metrics.q_sent_continuous + self.metrics.q_sent_refresh;
+        let supp = self.metrics.suppressed_continuous + self.metrics.suppressed_refresh;
+        let supp_pct = if sent + supp > 0 {
+            supp as f64 * 100.0 / (sent + supp) as f64
+        } else {
+            0.0
+        };
+        kv(
+            &mut rows,
+            "sent",
+            format!(
+                "{sent} ({} continuous · {} refresh · {} QU)",
+                self.metrics.q_sent_continuous, self.metrics.q_sent_refresh, self.metrics.qu_sent
+            ),
+        );
+        kv(
+            &mut rows,
+            "suppressed §7.3",
+            format!(
+                "{supp} ({supp_pct:.0}% of due · {} continuous · {} refresh)",
+                self.metrics.suppressed_continuous, self.metrics.suppressed_refresh
+            ),
+        );
+        kv(
+            &mut rows,
+            "KAs attached",
+            format!(
+                "{} ({:.1}/query)",
+                self.metrics.ka_sent,
+                if sent > 0 {
+                    self.metrics.ka_sent as f64 / sent as f64
+                } else {
+                    0.0
+                }
+            ),
+        );
+        kv(
+            &mut rows,
+            "continuous interests",
+            format!(
+                "{} · next in {} · {}",
+                self.continuous.len(),
+                self.next_continuous_in(),
+                self.interval_histogram()
+            ),
+        );
+        kv(
+            &mut rows,
+            "requeries",
+            format!(
+                "{} pending · {} overdue · {}",
+                self.requeries.len(),
+                self.requery_overdue(),
+                self.unanswered_histogram()
+            ),
+        );
+        kv(
+            &mut rows,
+            "overheard pending",
+            self.overheard.len().to_string(),
+        );
+
+        // Links.
+        section(&mut rows, "Links");
+        kv(&mut rows, "local addrs", self.local_ips.len().to_string());
+        kv(
+            &mut rows,
+            "usable v4",
+            if self.link_stats.v4.is_empty() {
+                "—".to_string()
+            } else {
+                self.link_stats
+                    .v4
+                    .iter()
+                    .map(|(n, _)| n.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+        );
+        kv(
+            &mut rows,
+            "usable v6",
+            if self.link_stats.v6.is_empty() {
+                "—".to_string()
+            } else {
+                self.link_stats
+                    .v6
+                    .iter()
+                    .map(|(n, _)| n.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+        );
+        kv(
+            &mut rows,
+            "skipped / inactive",
+            format!(
+                "{}/{}",
+                if self.link_stats.skipped.is_empty() {
+                    "—".to_string()
+                } else {
+                    self.link_stats.skipped.join(", ")
+                },
+                if self.link_stats.inactive.is_empty() {
+                    "—".to_string()
+                } else {
+                    self.link_stats.inactive.join(", ")
+                }
+            ),
+        );
+        kv(
+            &mut rows,
+            "fan-out per query",
+            format!(
+                "{} v4 + {} v6 copies",
+                self.link_stats.v4.len().max(1),
+                self.link_stats.v6.len().max(1)
+            ),
+        );
+        let mut iface_rows: Vec<(&String, &u64)> = self.metrics.iface_rx.iter().collect();
+        iface_rows.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        for (iface, count) in iface_rows.iter().take(8) {
+            let label = if iface.is_empty() { "(unknown)" } else { iface };
+            kv(&mut rows, &format!("rx {label}"), count.to_string());
+        }
+        if iface_rows.len() > 8 {
+            kv(
+                &mut rows,
+                "rx more links",
+                format!("+{} more", iface_rows.len() - 8),
+            );
+        }
+        let mut talkers: Vec<(&std::net::SocketAddr, &u64)> =
+            self.metrics.source_rx.iter().collect();
+        talkers.sort_by(|a, b| b.1.cmp(a.1));
+        for (src, count) in talkers.iter().take(5) {
+            kv(&mut rows, &format!("talker {src}"), format!("{count} pkts"));
+        }
+
+        rows
+    }
+
+    fn current_record_liveness(&self) -> (usize, usize, usize) {
+        let mut live = 0;
+        let mut expired = 0;
+        let mut goodbye = 0;
+        for svc in &self.services {
+            for rec in &svc.records {
+                if rec.ttl == 0 {
+                    goodbye += 1;
+                } else if rec.received_at.elapsed().as_secs() as u32 <= rec.ttl {
+                    live += 1;
+                } else {
+                    expired += 1;
+                }
+            }
+        }
+        (live, expired, goodbye)
+    }
+
+    fn other_records_total(&self) -> u64 {
+        self.metrics
+            .records_by_type
+            .iter()
+            .filter(|(t, _)| !matches!(**t, 12 | 33 | 16 | 1 | 28))
+            .map(|(_, c)| *c)
+            .sum()
+    }
+
+    fn next_continuous_in(&self) -> String {
+        let now = Instant::now();
+        self.continuous
+            .values()
+            .map(|e| e.next_due.saturating_duration_since(now))
+            .min()
+            .map(|d| {
+                if d.as_millis() < 1000 {
+                    format!("{}ms", d.as_millis())
+                } else {
+                    fmt_age(d.as_secs())
+                }
+            })
+            .unwrap_or_else(|| "—".to_string())
+    }
+
+    fn interval_histogram(&self) -> String {
+        if self.continuous.is_empty() {
+            return "no interests".to_string();
+        }
+        let mut buckets: HashMap<String, usize> = HashMap::new();
+        for e in self.continuous.values() {
+            let secs = e.interval.as_secs();
+            let label = if secs >= 3600 {
+                "1h".to_string()
+            } else if secs >= 60 {
+                format!("{}m", secs / 60)
+            } else {
+                format!("{secs}s")
+            };
+            *buckets.entry(label).or_insert(0) += 1;
+        }
+        let mut items: Vec<(u64, String, usize)> = buckets
+            .into_iter()
+            .map(|(label, count)| {
+                let secs = if label == "1h" {
+                    3600
+                } else if let Some(m) = label.strip_suffix('m') {
+                    m.parse::<u64>().unwrap_or(0) * 60
+                } else {
+                    label
+                        .strip_suffix('s')
+                        .unwrap_or(&label)
+                        .parse::<u64>()
+                        .unwrap_or(0)
+                };
+                (secs, label, count)
+            })
+            .collect();
+        items.sort_by_key(|(secs, _, _)| *secs);
+        items
+            .into_iter()
+            .map(|(_, label, count)| format!("{label}×{count}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn requery_overdue(&self) -> usize {
+        let now = Instant::now();
+        self.requeries
+            .values()
+            .filter(|(due, _)| now >= *due)
+            .count()
+    }
+
+    fn unanswered_histogram(&self) -> String {
+        if self.requeries.is_empty() {
+            return "none unanswered".to_string();
+        }
+        let mut counts = [0usize; 4];
+        for (_, c) in self.requeries.values() {
+            let idx = usize::from((*c).min(4).saturating_sub(1).min(3));
+            counts[idx] += 1;
+        }
+        format!(
+            "miss×1:{} ×2:{} ×3:{} ×4:{}",
+            counts[0], counts[1], counts[2], counts[3]
+        )
+    }
+
     fn toggle_collapse(&mut self) {
         let items = self.display_items();
         match items.get(self.selected_display) {
@@ -837,6 +1348,33 @@ impl App {
         // Ctrl+C quits: raw mode turns it into a key event (no SIGINT).
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.running = false;
+            return;
+        }
+        let no_ctrl_alt = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        // `m` toggles the metrics overlay from anywhere.
+        if no_ctrl_alt && matches!(key.code, KeyCode::Char('m') | KeyCode::Char('M')) {
+            self.show_metrics = !self.show_metrics;
+            if self.show_metrics {
+                self.metrics_scroll.set(0);
+            }
+            return;
+        }
+        // While the overlay is open it owns every key except Ctrl+C:
+        // `m`/`Esc` closes, `q` quits, the rest scrolls.
+        if self.show_metrics {
+            match key.code {
+                KeyCode::Esc => self.show_metrics = false,
+                KeyCode::Char('q') => self.running = false,
+                KeyCode::Up | KeyCode::Char('k') => self.scroll_metrics(-1),
+                KeyCode::Down | KeyCode::Char('j') => self.scroll_metrics(1),
+                KeyCode::Home => self.scroll_metrics_edge(true),
+                KeyCode::End => self.scroll_metrics_edge(false),
+                KeyCode::PageUp | KeyCode::Char('b') => self.page_metrics(-1),
+                KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => self.page_metrics(1),
+                _ => {}
+            }
             return;
         }
         // Tab cycles pane focus in both directions.
@@ -1193,6 +1731,31 @@ impl App {
         };
         self.detail_offset.set(next);
         self.detail_free_scroll = true;
+    }
+
+    /// Scroll the metrics overlay; upper clamping happens at render time.
+    fn scroll_metrics(&mut self, delta: isize) {
+        let cur = self.metrics_scroll.get();
+        let next = if delta < 0 {
+            cur.saturating_sub(delta.unsigned_abs())
+        } else {
+            cur.saturating_add(delta.unsigned_abs())
+        };
+        self.metrics_scroll.set(next);
+    }
+
+    fn scroll_metrics_edge(&mut self, first: bool) {
+        if first {
+            self.metrics_scroll.set(0);
+        } else {
+            self.metrics_scroll.set(usize::MAX / 2);
+        }
+    }
+
+    fn page_metrics(&mut self, pages: isize) {
+        let per_page = self.metrics_viewport.get().max(1) as isize;
+        let steps = pages * per_page;
+        self.scroll_metrics(steps);
     }
 
     /// Identity of the table row at an index (raw records first, then
@@ -1733,6 +2296,7 @@ impl App {
             is_active: true,
             last_event: None,
         });
+        self.metrics.services_seen_total += 1;
         self.services.len() - 1
     }
 
@@ -1840,8 +2404,10 @@ impl App {
         let grace = Duration::from_secs(120);
         let now = Instant::now();
         Self::expire_stale_services(&mut self.services);
+        let before = self.services.len();
         self.services
             .retain(|s| s.is_active || now.duration_since(s.last_seen) < grace);
+        self.metrics.services_expired_total += (before - self.services.len()) as u64;
         self.pending_instances
             .retain(|p| now.duration_since(p.last_seen) < grace);
         // Drop schedules for names that no longer exist, so dead services
@@ -2955,5 +3521,147 @@ mod tests {
         let ev = query_event("_http._tcp.local.", 12, "PTR", false, Vec::new(), local);
         app.ingest_event(&ev);
         assert!(app.overheard.is_empty());
+    }
+
+    #[test]
+    fn packet_metrics_count_by_type_and_iface() {
+        let mut app = App::new().unwrap();
+        let mut rec = ptr_record(120);
+        rec.iface = "br0".to_string();
+        rec.flush_bit = true;
+        let ev = browse::Event {
+            records: vec![rec],
+            questions: Vec::new(),
+            query_kas: Vec::new(),
+            raw_bytes: vec![0u8; 100],
+            source: test_source(),
+        };
+        app.note_packet_metrics(&ev);
+        assert_eq!(app.metrics.records_total, 1);
+        assert_eq!(app.metrics.records_by_type.get(&12), Some(&1));
+        assert_eq!(app.metrics.flush_seen, 1);
+        assert_eq!(app.metrics.bytes_total, 100);
+        assert_eq!(app.metrics.iface_rx.get("br0"), Some(&1));
+        assert_eq!(app.metrics.source_rx.get(&test_source()), Some(&1));
+        assert!(app.metrics.last_packet_at.is_some());
+    }
+
+    #[test]
+    fn packet_metrics_counts_goodbyes_and_qu() {
+        let mut app = App::new().unwrap();
+        let ev = browse::Event {
+            records: vec![ptr_record(0)],
+            questions: vec![browse::RawRecord {
+                name: "_http._tcp.local.".to_string(),
+                rtype: 12,
+                rtype_str: "PTR".to_string(),
+                flush_bit: false,
+                qu: true,
+                ttl: 0,
+                rdata: String::new(),
+                wire: Vec::new(),
+                source: remote_source(),
+                iface: String::new(),
+                received_at: Instant::now(),
+            }],
+            query_kas: vec![ptr_record(120)],
+            raw_bytes: Vec::new(),
+            source: remote_source(),
+        };
+        app.note_packet_metrics(&ev);
+        assert_eq!(app.metrics.goodbyes_seen, 1);
+        assert_eq!(app.metrics.questions_total, 1);
+        assert_eq!(app.metrics.qu_questions_seen, 1);
+        assert_eq!(app.metrics.qm_questions_seen, 0);
+        assert_eq!(app.metrics.kas_seen, 1);
+    }
+
+    #[test]
+    fn metrics_toggle_and_scroll_keys() {
+        use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = App::new().unwrap();
+        let key = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        assert!(!app.show_metrics);
+        app.handle_key(&key(KeyCode::Char('m')));
+        assert!(app.show_metrics);
+        assert_eq!(app.metrics_scroll.get(), 0);
+        app.handle_key(&key(KeyCode::Char('j')));
+        assert_eq!(app.metrics_scroll.get(), 1);
+        app.handle_key(&key(KeyCode::Char('k')));
+        assert_eq!(app.metrics_scroll.get(), 0);
+        // Tab must not escape the overlay.
+        app.handle_key(&key(KeyCode::Tab));
+        assert!(app.show_metrics);
+        assert_eq!(app.focus, Focus::Services);
+        app.handle_key(&key(KeyCode::Esc));
+        assert!(!app.show_metrics);
+    }
+
+    #[test]
+    fn metrics_rows_has_all_sections() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        let rows = app.metrics_rows();
+        let headers: Vec<&str> = rows
+            .iter()
+            .filter(|(_, v)| v.is_empty())
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert_eq!(headers, vec!["Session", "Discovery", "Queries", "Links"]);
+        assert!(rows.iter().any(|(k, _)| k == "packets"));
+        assert!(rows.iter().any(|(k, _)| k == "sent"));
+        assert!(rows.iter().any(|(k, _)| k == "usable v4"));
+    }
+
+    #[test]
+    fn metrics_service_counters() {
+        let mut app = App::new().unwrap();
+        assert_eq!(app.metrics.services_seen_total, 0);
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        assert_eq!(app.metrics.services_seen_total, 1);
+        assert_eq!(app.metrics.services_expired_total, 0);
+        // Goodbye + grace expiry removes the service.
+        ingest(&mut app, &ptr_record(0));
+        for svc in &mut app.services {
+            svc.last_seen = Instant::now() - Duration::from_secs(300);
+        }
+        app.evict_expired();
+        assert!(app.services.is_empty());
+        assert_eq!(app.metrics.services_expired_total, 1);
+    }
+
+    #[test]
+    fn metrics_suppression_counter() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        let ckey = ("_http._tcp.local".to_string(), 12);
+        app.continuous.insert(
+            ckey.clone(),
+            ContinuousQuery {
+                next_due: Instant::now() - Duration::from_millis(1),
+                interval: Duration::from_secs(2),
+                qname: "_http._tcp.local".to_string(),
+            },
+        );
+        let ev = query_event(
+            "_http._tcp.local.",
+            12,
+            "PTR",
+            false,
+            Vec::new(),
+            remote_source(),
+        );
+        app.ingest_event(&ev);
+        app.poll_continuous();
+        assert_eq!(app.metrics.suppressed_continuous, 1);
+        assert_eq!(app.metrics.q_sent_continuous, 0);
     }
 }

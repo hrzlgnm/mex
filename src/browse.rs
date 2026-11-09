@@ -173,6 +173,62 @@ pub fn local_ips() -> HashSet<IpAddr> {
     out
 }
 
+/// Snapshot of usable vs skipped links for the metrics view. Refreshed on
+/// demand from `if_addrs` (same source as the listener joins), so the App
+/// thread sees link changes without new thread communication.
+#[derive(Debug, Clone, Default)]
+pub struct LinkStats {
+    /// Usable v4 links: (interface name, address).
+    pub v4: Vec<(String, Ipv4Addr)>,
+    /// Usable v6 links: (interface name, index).
+    pub v6: Vec<(String, u32)>,
+    /// Distinct names skipped by policy (`lo`/`docker`/`veth`).
+    pub skipped: Vec<String>,
+    /// Distinct names that are down or point-to-point (no multicast).
+    pub inactive: Vec<String>,
+}
+
+pub fn link_stats() -> LinkStats {
+    let mut stats = LinkStats::default();
+    let mut seen_v4 = HashSet::new();
+    let mut seen_v6 = HashSet::new();
+    let mut seen_skipped = HashSet::new();
+    let mut seen_inactive = HashSet::new();
+    for iface in if_addrs::get_if_addrs().unwrap_or_default() {
+        if skipped_interface(&iface.name) {
+            if seen_skipped.insert(iface.name.clone()) {
+                stats.skipped.push(iface.name.clone());
+            }
+            continue;
+        }
+        if !usable_interface(&iface) {
+            if seen_inactive.insert(iface.name.clone()) {
+                stats.inactive.push(iface.name.clone());
+            }
+            continue;
+        }
+        match iface.addr {
+            if_addrs::IfAddr::V4(v4) => {
+                if seen_v4.insert(iface.name.clone()) {
+                    stats.v4.push((iface.name.clone(), v4.ip));
+                }
+            }
+            if_addrs::IfAddr::V6(v6) => {
+                if v6.ip.to_string().starts_with('f') && seen_v6.insert(iface.name.clone()) {
+                    stats
+                        .v6
+                        .push((iface.name.clone(), iface.index.unwrap_or(0)));
+                }
+            }
+        }
+    }
+    stats.v4.sort_by(|a, b| a.0.cmp(&b.0));
+    stats.v6.sort_by(|a, b| a.0.cmp(&b.0));
+    stats.skipped.sort();
+    stats.inactive.sort();
+    stats
+}
+
 fn iface_names() -> HashMap<u32, String> {
     // Unfiltered on purpose: this only labels observed packets for
     // display (including looped-back ones), it does not select links.
@@ -920,5 +976,23 @@ mod tests {
         assert_eq!(ev.records[0].rdata, "host.local. A");
         assert_eq!(ev.records[0].iface, "br0");
         assert!(ev.questions.is_empty());
+    }
+
+    #[test]
+    fn link_stats_lists_are_sorted_and_disjoint() {
+        let stats = link_stats();
+        let mut v4 = stats.v4.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
+        let mut sorted = v4.clone();
+        sorted.sort();
+        assert_eq!(v4, sorted);
+        // Usable links are never reported as skipped/inactive.
+        for name in &v4 {
+            assert!(!stats.skipped.contains(name));
+            assert!(!stats.inactive.contains(name));
+        }
+        v4 = stats.v6.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
+        sorted = v4.clone();
+        sorted.sort();
+        assert_eq!(v4, sorted);
     }
 }

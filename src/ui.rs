@@ -8,12 +8,12 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, HighlightSpacing, List, ListItem, ListState, Paragraph, Row, Table,
-    TableState,
+    Block, Borders, Cell, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Row,
+    Table, TableState,
 };
 use ratatui::Frame;
 
@@ -49,6 +49,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     draw_header(frame, chunks[0], app);
     draw_body(frame, chunks[1], app);
+    if app.show_metrics {
+        draw_metrics_overlay(frame, app);
+    }
 }
 
 fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
@@ -68,7 +71,7 @@ fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 .fg(Color::Cyan),
         ),
         Span::raw(format!(
-            "│ {} pkts │ {} svcs │ uptime {}  [q] quit [tab] pane [j/k] move [enter] fold",
+            "│ {} pkts │ {} svcs │ uptime {}  [q] quit [tab] pane [j/k] move [enter] fold [m] metrics",
             app.packet_count,
             app.services.len(),
             uptime_str
@@ -91,6 +94,91 @@ fn draw_body(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
 
     draw_service_list(frame, chunks[0], app);
     draw_detail_panel(frame, chunks[1], app);
+}
+
+/// Centered popup rect covering `pct_x`/`pct_y` percent of `area`.
+fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
+    let popup_w = area.width.saturating_mul(pct_x) / 100;
+    let popup_h = area.height.saturating_mul(pct_y) / 100;
+    let w = if area.width <= 20 {
+        area.width.max(1)
+    } else {
+        popup_w.clamp(20, area.width).max(1)
+    };
+    let h = if area.height <= 10 {
+        area.height.max(1)
+    } else {
+        popup_h.clamp(10, area.height).max(1)
+    };
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    }
+}
+
+/// Clamp a scroll offset to the valid range. Pure helper, unit-tested.
+fn clamp_scroll(offset: usize, total: usize, viewport: usize) -> usize {
+    if viewport == 0 || total <= viewport {
+        return 0;
+    }
+    offset.min(total - viewport)
+}
+
+fn draw_metrics_overlay(frame: &mut Frame, app: &App) {
+    let area = centered_rect(80, 85, frame.area());
+    frame.render_widget(Clear, area);
+
+    let rows = app.metrics_rows();
+    let total = rows.len();
+    let viewport = (area.height as usize).saturating_sub(4);
+    app.metrics_viewport.set(viewport);
+    let offset = clamp_scroll(app.metrics_scroll.get(), total, viewport);
+    app.metrics_scroll.set(offset);
+
+    let section_style = Style::default()
+        .add_modifier(Modifier::BOLD)
+        .fg(Color::Cyan);
+    let key_style = Style::default().fg(Color::Gray);
+    let val_style = Style::default().fg(Color::White);
+
+    let body: Vec<Row<'_>> = rows
+        .into_iter()
+        .map(|(k, v)| {
+            if v.is_empty() {
+                Row::new(vec![Cell::from(k).style(section_style), Cell::from("")])
+            } else {
+                Row::new(vec![
+                    Cell::from(format!("  {k}")).style(key_style),
+                    Cell::from(v).style(val_style),
+                ])
+            }
+        })
+        .collect();
+
+    let widths = [Constraint::Percentage(38), Constraint::Percentage(62)];
+    let table = Table::new(body, widths)
+        .header(
+            Row::new(vec!["METRIC", "VALUE"]).style(
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .fg(Color::Cyan),
+            ),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Metrics (m/Esc close · j/k scroll) ")
+                .border_style(Style::default().fg(Color::White)),
+        );
+
+    let mut state = TableState::default();
+    *state.offset_mut() = offset;
+    frame.render_stateful_widget(table, area, &mut state);
+    app.metrics_scroll.set(state.offset());
 }
 
 /// Short display form for a service type: `_http._tcp.local.` → `http.tcp`.
@@ -792,5 +880,31 @@ mod tests {
         // 10 children in a viewport of 5: cannot fit, so pin the parent
         // (row 8) to the top; the rest pages via Ctrl-j/k.
         assert_eq!(fit_row_extent(0, 8, 19, 5, 30), 8);
+    }
+
+    #[test]
+    fn centered_rect_covers_most_of_area() {
+        let area = Rect::new(0, 0, 100, 40);
+        let popup = centered_rect(80, 85, area);
+        assert_eq!((popup.width, popup.height), (80, 34));
+        assert_eq!((popup.x, popup.y), (10, 3));
+    }
+
+    #[test]
+    fn centered_rect_clamps_to_tiny_terminals() {
+        let area = Rect::new(0, 0, 10, 6);
+        let popup = centered_rect(80, 85, area);
+        assert!(popup.width <= area.width);
+        assert!(popup.height <= area.height);
+        assert!(popup.width >= 1 && popup.height >= 1);
+    }
+
+    #[test]
+    fn clamp_scroll_pins_to_valid_range() {
+        assert_eq!(clamp_scroll(0, 50, 10), 0);
+        assert_eq!(clamp_scroll(5, 50, 10), 5);
+        assert_eq!(clamp_scroll(100, 50, 10), 40);
+        assert_eq!(clamp_scroll(7, 5, 10), 0);
+        assert_eq!(clamp_scroll(3, 50, 0), 0);
     }
 }
