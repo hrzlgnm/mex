@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::io;
 use std::io::IsTerminal;
-use std::net::IpAddr;
+use std::net::SocketAddr;
 
 use crossterm::execute;
 use crossterm::terminal::{
@@ -293,13 +293,18 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
 /// with the ingress interface when pktinfo provided one, so multi-link
 /// traffic can be told apart. The `%iface` zone notation is only valid
 /// for IPv6 link-local unicast (RFC 4007); everything else uses `@iface`.
+/// A link-local source that already carries a zone (scope id) is shown
+/// as-is instead of gaining a second suffix.
 fn source_label(rec: &crate::browse::RawRecord) -> String {
     if rec.iface.is_empty() {
-        rec.source.to_string()
-    } else if matches!(rec.source.ip(), IpAddr::V6(v6) if v6.is_unicast_link_local()) {
-        format!("{}%{}", rec.source, rec.iface)
-    } else {
-        format!("{}@{}", rec.source, rec.iface)
+        return rec.source.to_string();
+    }
+    match rec.source {
+        SocketAddr::V6(v6) if v6.ip().is_unicast_link_local() && v6.scope_id() == 0 => {
+            format!("{}%{}", rec.source, rec.iface)
+        }
+        SocketAddr::V6(v6) if v6.ip().is_unicast_link_local() => rec.source.to_string(),
+        _ => format!("{}@{}", rec.source, rec.iface),
     }
 }
 
@@ -636,5 +641,12 @@ mod tests {
         assert_eq!(source_label(&rec), "[fe80::1]:5353%eth0");
         rec.source = "[2001:db8::1]:5353".parse().unwrap();
         assert_eq!(source_label(&rec), "[2001:db8::1]:5353@eth0");
+    }
+
+    #[test]
+    fn source_label_omits_interface_when_zone_present() {
+        let mut rec = test_record("eth0");
+        rec.source = "[fe80::1%2]:5353".parse().unwrap();
+        assert_eq!(source_label(&rec), "[fe80::1%2]:5353");
     }
 }
