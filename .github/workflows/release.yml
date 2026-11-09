@@ -41,10 +41,33 @@ jobs:
       tagName: ${{ needs.release-please.outputs.tag_name }}
       profile: release
 
+  approve-release-pr:
+    needs: [release-please]
+    if: needs.release-please.outputs.prs_created == 'true'
+    permissions:
+      actions: write # needed to approve workflow runs
+      contents: read
+      pull-requests: read
+    name: "✅ Approve Release PR workflows"
+    uses: hrzlgnm/actions/.github/workflows/approve-bot-pr-reusable.yml@a2e70543f16acf3105219e0e944c323afe88b269 # v2.14.13
+    with:
+      branch: release-please--branches--main--components--mex
+
+  source_checksums:
+    needs: [release-please]
+    if: needs.release-please.outputs.release_created == 'true'
+    permissions:
+      contents: write # to upload source checksums to release
+    name: 🔢 Generate Source Checksums
+    uses: ./.github/workflows/source-checksums-reusable.yml
+    secrets: inherit
+    with:
+      tagName: ${{ needs.release-please.outputs.tag_name }}
+
   publish:
     # Flips the draft live only when every build job succeeded. A cancelled
     # or failed build skips this job, so a partial release never goes live.
-    needs: [release-please, build_and_publish]
+    needs: [release-please, source_checksums, build_and_publish]
     if: needs.release-please.outputs.release_created == 'true'
     name: "📢 Publish Release"
     runs-on: ubuntu-latest
