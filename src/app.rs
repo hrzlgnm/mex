@@ -1359,6 +1359,19 @@ impl App {
         self.clamp_selection();
     }
 
+    /// `*` toggles every host group at once: unfold all when all are
+    /// collapsed, collapse all otherwise (so one press always lands in
+    /// a uniform state). Works from any pane.
+    fn toggle_collapse_all(&mut self) {
+        let labels = self.group_labels();
+        if labels.iter().all(|l| self.collapsed_hosts.contains(l)) {
+            self.collapsed_hosts.clear();
+        } else {
+            self.collapsed_hosts.extend(labels);
+        }
+        self.clamp_selection();
+    }
+
     fn handle_key(&mut self, key: &KeyEvent) {
         // Ctrl+C quits: raw mode turns it into a key event (no SIGINT).
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -1390,6 +1403,11 @@ impl App {
                 KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => self.page_metrics(1),
                 _ => {}
             }
+            return;
+        }
+        // `*` folds/unfolds all host groups from any pane.
+        if no_ctrl_alt && matches!(key.code, KeyCode::Char('*')) {
+            self.toggle_collapse_all();
             return;
         }
         // Tab cycles pane focus in both directions.
@@ -3723,5 +3741,35 @@ mod tests {
             rows.iter().any(|(k, _)| k == "suppressed queries"),
             "counter row carries the context"
         );
+    }
+
+    #[test]
+    fn star_collapses_and_unfolds_all_groups() {
+        let mut app = two_group_app();
+        let star = plain_key(KeyCode::Char('*'));
+        assert!(app.collapsed_hosts.is_empty());
+        // First press collapses every group.
+        app.handle_key(&star);
+        assert_eq!(app.group_labels().len(), 2);
+        for label in app.group_labels() {
+            assert!(app.is_host_collapsed(&label), "collapsed: {label}");
+        }
+        // Cursor still sits on a selectable stop.
+        let items = app.display_items();
+        assert!(app.is_selectable(&items[app.selected_display]));
+        // Second press unfolds everything again.
+        app.handle_key(&star);
+        assert!(app.collapsed_hosts.is_empty());
+    }
+
+    #[test]
+    fn star_from_mixed_state_collapses_all() {
+        let mut app = two_group_app();
+        let labels = app.group_labels();
+        app.collapsed_hosts.insert(labels[0].clone());
+        app.handle_key(&plain_key(KeyCode::Char('*')));
+        for label in app.group_labels() {
+            assert!(app.is_host_collapsed(&label), "collapsed: {label}");
+        }
     }
 }
