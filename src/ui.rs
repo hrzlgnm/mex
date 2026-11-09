@@ -308,6 +308,20 @@ fn source_label(rec: &crate::browse::RawRecord) -> String {
     }
 }
 
+/// Heat color for the TTL cell by fraction of the original TTL
+/// remaining: red when expired or nearly so (the record is being
+/// re-queried around now), yellow while it approaches the refresh
+/// window, `None` for a healthy record (keep the row style).
+fn ttl_cell_color(rem: u32, ttl: u32) -> Option<Color> {
+    if ttl == 0 || (rem as u64) * 5 < ttl as u64 {
+        Some(Color::Red)
+    } else if (rem as u64) * 2 < ttl as u64 {
+        Some(Color::Yellow)
+    } else {
+        None
+    }
+}
+
 fn detail_table_rows<'a>(
     app: &'a App,
     svc: &'a crate::app::ServiceEntry,
@@ -392,10 +406,14 @@ fn detail_table_rows<'a>(
             dim
         };
         raw_positions.push(rows.len());
+        let ttl_cell = match ttl_cell_color(rem, rec.ttl) {
+            Some(color) => Cell::from(ttl_str.clone()).style(Style::default().fg(color)),
+            None => Cell::from(ttl_str.clone()),
+        };
         rows.push(
             Row::new(vec![
                 Cell::from(rec.rtype_str.clone()),
-                Cell::from(ttl_str.clone()),
+                ttl_cell,
                 Cell::from(flush),
                 Cell::from(source_label(rec)),
                 Cell::from(rec.rdata.clone()),
@@ -648,5 +666,18 @@ mod tests {
         let mut rec = test_record("eth0");
         rec.source = "[fe80::1%2]:5353".parse().unwrap();
         assert_eq!(source_label(&rec), "[fe80::1%2]:5353");
+    }
+
+    #[test]
+    fn ttl_cell_color_marks_expiry_fraction() {
+        assert_eq!(ttl_cell_color(0, 120), Some(Color::Red));
+        assert_eq!(ttl_cell_color(10, 0), Some(Color::Red));
+        assert_eq!(ttl_cell_color(23, 120), Some(Color::Red));
+        assert_eq!(ttl_cell_color(24, 120), Some(Color::Yellow));
+        assert_eq!(ttl_cell_color(59, 120), Some(Color::Yellow));
+        assert_eq!(ttl_cell_color(60, 120), None);
+        assert_eq!(ttl_cell_color(120, 120), None);
+        // Clock skew (remaining beyond original) counts as healthy.
+        assert_eq!(ttl_cell_color(200, 120), None);
     }
 }

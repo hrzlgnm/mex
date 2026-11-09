@@ -19,7 +19,8 @@ standard browse queries (service enumeration, PTR/SRV/TXT/A/AAAA).
 - **Right top — Answers.** For the selected service: derived rows
   (`srvc`, `subt`, `host`), then one row per observed raw record
   (deduplicated across responders, sorted by type then source) with
-  remaining TTL, flush bit, source, and rdata. Multi-pair TXT records
+  remaining TTL (heat-colored by fraction left: yellow under half, red
+  under a fifth or expired), flush bit, source, and rdata. Multi-pair TXT records
   expand into unlabeled child rows. Records announced by this host are
   highlighted; goodbye (TTL 0) records show as expired.
 - **Right middle — Questions.** Recently observed queries asking for this
