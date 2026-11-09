@@ -1102,7 +1102,7 @@ impl App {
         );
         kv(
             &mut rows,
-            "suppressed (dup §7.3)",
+            "suppressed queries",
             format!(
                 "{supp} total · {} last 60s · {supp_pct:.0}% of due queries asked by a neighbor first",
                 self.suppressions_last_60s(),
@@ -3691,7 +3691,7 @@ mod tests {
         let rows = app.metrics_rows();
         let (_, value) = rows
             .iter()
-            .find(|(k, _)| k == "suppressed (dup §7.3)")
+            .find(|(k, _)| k == "suppressed queries")
             .expect("suppression row");
         assert!(value.contains("2 total"), "got: {value}");
         assert!(value.contains("1 last 60s"), "got: {value}");
@@ -3720,7 +3720,7 @@ mod tests {
             "no per-entry overheard rows"
         );
         assert!(
-            rows.iter().any(|(k, _)| k == "suppressed (dup §7.3)"),
+            rows.iter().any(|(k, _)| k == "suppressed queries"),
             "counter row carries the context"
         );
     }
