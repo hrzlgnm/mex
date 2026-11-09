@@ -43,6 +43,13 @@ Headless run (no TTY) logs to stderr.
 * Unique answers (flush bit) dampen the exponential stream to hourly;
   the 80%-TTL refresh takes over.
 
+## Workflow
+
+* Changes land via pull requests against `main`; never push to `main` directly.
+* Create branches from `origin/main` (`git fetch origin` first).
+* Commit messages must follow Conventional Commits (`feat:`, `fix:`, `docs:`,
+  …): release-please owns the changelog and derives releases from them.
+
 ## Conventions
 
 * `cargo fmt` before commit; clippy with `-D warnings` must pass.
