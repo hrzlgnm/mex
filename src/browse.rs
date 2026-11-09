@@ -6,8 +6,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use hickory_proto::op::{Message, MessageType, Query};
-use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
+use hickory_proto::op::{Message, MessageType, OpCode, Query};
+use hickory_proto::rr::{Name, RData, Record, RecordType};
 
 use hickory_proto::serialize::binary::BinDecodable;
 use hickory_proto::serialize::binary::BinEncodable;
@@ -581,20 +581,19 @@ fn send_query(socket: &PktInfoUdpSocket, req: &QueryRequest, dest: SocketAddr, e
         Ok(n) => n,
         Err(_) => return,
     };
-    let mut msg = Message::new();
+    let mut msg = Message::new(0, MessageType::Query, OpCode::Query);
     let mut query = Query::query(qname.clone(), req.record_type);
     query.set_mdns_unicast_response(req.qu);
     msg.add_query(query);
-    msg.set_message_type(MessageType::Query);
-    msg.set_recursion_desired(false);
-    msg.set_id(0);
 
     for (ka_target, ka_ttl) in known_answers_for_iface(&req.known_answers, egress_iface) {
         let target = ka_target.trim_end_matches('.');
         if let Ok(rdata) = Name::from_ascii(format!("{target}.")) {
-            let mut rec = Record::with(qname.clone(), req.record_type, ka_ttl);
-            rec.set_data(Some(RData::PTR(hickory_proto::rr::rdata::PTR(rdata))));
-            rec.set_dns_class(DNSClass::IN);
+            let rec = Record::from_rdata(
+                qname.clone(),
+                ka_ttl,
+                RData::PTR(hickory_proto::rr::rdata::PTR(rdata)),
+            );
             msg.add_answer(rec);
         }
     }
@@ -617,24 +616,24 @@ fn parse_packet(raw: &[u8], source: SocketAddr, iface: &str, ifindex: u32) -> Op
     // link; multicast loop is disabled so never ourselves) is not their
     // source. Filing them would conjure phantom sightings on links the
     // device never touched.
-    if msg.message_type() == MessageType::Response {
+    if msg.metadata.message_type == MessageType::Response {
         for rec in msg
-            .answers()
+            .answers
             .iter()
-            .chain(msg.name_servers())
-            .chain(msg.additionals())
+            .chain(&msg.authorities)
+            .chain(&msg.additionals)
         {
             records.push(RawRecord {
-                name: unescape(&rec.name().to_string()),
+                name: unescape(&rec.name.to_string()),
                 rtype: u16::from(rec.record_type()),
                 rtype_str: rtype_label(rec.record_type()),
                 // hickory-proto strips the top CLASS bit at decode and
-                // exposes it via mdns_cache_flush(); reading dns_class()
-                // directly always yields a clear bit (RFC 6762 §10.2).
-                flush_bit: rec.mdns_cache_flush(),
+                // exposes it via the mdns_cache_flush field; reading
+                // dns_class directly always yields a clear bit (RFC 6762 §10.2).
+                flush_bit: rec.mdns_cache_flush,
                 qu: false,
-                ttl: rec.ttl(),
-                rdata: rdata_label(rec.data(), raw),
+                ttl: rec.ttl,
+                rdata: rdata_label(&rec.data, raw),
                 wire: rec.to_bytes().unwrap_or_default(),
                 source,
                 iface: iface.to_string(),
@@ -647,16 +646,16 @@ fn parse_packet(raw: &[u8], source: SocketAddr, iface: &str, ifindex: u32) -> Op
     // Known answers in queries are parsed separately for duplicate
     // question suppression (§7.3) and never filed as records.
     let mut query_kas = Vec::new();
-    if msg.message_type() == MessageType::Query {
-        for rec in msg.answers().iter() {
+    if msg.metadata.message_type == MessageType::Query {
+        for rec in msg.answers.iter() {
             query_kas.push(RawRecord {
-                name: unescape(&rec.name().to_string()),
+                name: unescape(&rec.name.to_string()),
                 rtype: u16::from(rec.record_type()),
                 rtype_str: rtype_label(rec.record_type()),
-                flush_bit: rec.mdns_cache_flush(),
+                flush_bit: rec.mdns_cache_flush,
                 qu: false,
-                ttl: rec.ttl(),
-                rdata: rdata_label(rec.data(), raw),
+                ttl: rec.ttl,
+                rdata: rdata_label(&rec.data, raw),
                 wire: Vec::new(),
                 source,
                 iface: iface.to_string(),
@@ -667,7 +666,7 @@ fn parse_packet(raw: &[u8], source: SocketAddr, iface: &str, ifindex: u32) -> Op
     }
 
     let mut questions = Vec::new();
-    for q in msg.queries() {
+    for q in &msg.queries {
         questions.push(RawRecord {
             name: unescape(&q.name().to_string()),
             rtype: u16::from(q.query_type()),
@@ -710,50 +709,47 @@ fn rtype_label(rtype: RecordType) -> String {
     }
 }
 
-fn rdata_label(data: Option<&RData>, msg: &[u8]) -> String {
+fn rdata_label(data: &RData, msg: &[u8]) -> String {
     match data {
-        Some(RData::A(ip)) => ip.to_string(),
-        Some(RData::AAAA(ip)) => ip.to_string(),
-        Some(RData::SRV(srv)) => {
+        RData::A(ip) => ip.to_string(),
+        RData::AAAA(ip) => ip.to_string(),
+        RData::SRV(srv) => {
             format!(
                 "{} {} {} {}",
-                srv.priority(),
-                srv.weight(),
-                srv.port(),
-                unescape(&srv.target().to_string())
+                srv.priority,
+                srv.weight,
+                srv.port,
+                unescape(&srv.target.to_string())
             )
         }
-        Some(RData::TXT(txt)) => txt
+        RData::TXT(txt) => txt
+            .txt_data
             .iter()
             .map(|b| String::from_utf8_lossy(b).to_string())
             .collect::<Vec<_>>()
             .join("; "),
-        Some(RData::PTR(n)) => unescape(&n.to_string()),
-        Some(RData::CNAME(n)) => unescape(&n.to_string()),
-        Some(RData::NS(n)) => unescape(&n.to_string()),
-        Some(RData::MX(mx)) => format!(
-            "{} {}",
-            mx.preference(),
-            unescape(&mx.exchange().to_string())
-        ),
-        Some(RData::SOA(soa)) => format!(
+        RData::PTR(n) => unescape(&n.to_string()),
+        RData::CNAME(n) => unescape(&n.to_string()),
+        RData::NS(n) => unescape(&n.to_string()),
+        RData::MX(mx) => format!("{} {}", mx.preference, unescape(&mx.exchange.to_string())),
+        RData::SOA(soa) => format!(
             "{} {} {} {} {} {} {}",
-            unescape(&soa.mname().to_string()),
-            unescape(&soa.rname().to_string()),
-            soa.serial(),
-            soa.refresh(),
-            soa.retry(),
-            soa.expire(),
-            soa.minimum()
+            unescape(&soa.mname.to_string()),
+            unescape(&soa.rname.to_string()),
+            soa.serial,
+            soa.refresh,
+            soa.retry,
+            soa.expire,
+            soa.minimum
         ),
-        Some(RData::HINFO(h)) => {
-            let cpu = String::from_utf8_lossy(h.cpu());
-            let os = String::from_utf8_lossy(h.os());
+        RData::HINFO(h) => {
+            let cpu = String::from_utf8_lossy(&h.cpu);
+            let os = String::from_utf8_lossy(&h.os);
             format!("{cpu} {os}")
         }
-        Some(RData::SVCB(svcb)) => unescape(&svcb.target_name().to_string()),
-        Some(RData::Unknown { code, rdata }) if *code == RecordType::NSEC => {
-            decode_nsec(rdata.anything(), msg)
+        RData::SVCB(svcb) => unescape(&svcb.target_name.to_string()),
+        RData::Unknown { code, rdata } if *code == RecordType::NSEC => {
+            decode_nsec(&rdata.anything, msg)
         }
         _ => String::new(),
     }
@@ -897,11 +893,12 @@ mod tests {
     }
 
     fn known_answer(owner: &str, target: &str, ttl: u32) -> Record {
-        let mut rec = Record::with(Name::from_ascii(owner).unwrap(), RecordType::PTR, ttl);
         let target = Name::from_ascii(target).unwrap();
-        rec.set_data(Some(RData::PTR(hickory_proto::rr::rdata::PTR(target))));
-        rec.set_dns_class(DNSClass::IN);
-        rec
+        Record::from_rdata(
+            Name::from_ascii(owner).unwrap(),
+            ttl,
+            RData::PTR(hickory_proto::rr::rdata::PTR(target)),
+        )
     }
 
     fn test_source() -> std::net::SocketAddr {
@@ -934,12 +931,11 @@ mod tests {
 
     #[test]
     fn query_known_answers_are_not_filed_as_records() {
-        let mut q = Message::new();
+        let mut q = Message::new(0, MessageType::Query, OpCode::Query);
         q.add_query(Query::query(
             Name::from_ascii("svc._http._tcp.local.").unwrap(),
             RecordType::PTR,
         ));
-        q.set_message_type(MessageType::Query);
         q.add_answer(known_answer(
             "svc._http._tcp.local.",
             "Inst.svc._http._tcp.local.",
@@ -956,8 +952,7 @@ mod tests {
         assert_eq!(ev.query_kas[0].rdata, "Inst.svc._http._tcp.local.");
         assert_eq!(ev.query_kas[0].iface, "enx");
 
-        let mut r = Message::new();
-        r.set_message_type(MessageType::Response);
+        let mut r = Message::new(0, MessageType::Response, OpCode::Query);
         r.add_answer(known_answer(
             "svc._http._tcp.local.",
             "Inst.svc._http._tcp.local.",
@@ -973,26 +968,26 @@ mod tests {
 
     #[test]
     fn query_qu_bit_is_parsed() {
-        let mut q = Message::new();
+        let mut q = Message::new(0, MessageType::Query, OpCode::Query);
         let mut query = Query::query(
             Name::from_ascii("svc._http._tcp.local.").unwrap(),
             RecordType::PTR,
         );
         query.set_mdns_unicast_response(true);
         q.add_query(query);
-        q.set_message_type(MessageType::Query);
         let ev = parse_packet(&q.to_vec().unwrap(), test_source(), "enx", 2).unwrap();
         assert_eq!(ev.questions.len(), 1);
         assert!(ev.questions[0].qu);
     }
 
     fn flush_response(flush: bool) -> Event {
-        let mut msg = Message::new();
-        msg.set_message_type(MessageType::Response);
-        let mut rec = Record::with(Name::from_ascii("test.local.").unwrap(), RecordType::A, 120);
-        rec.set_data(Some(RData::A(Ipv4Addr::new(192, 168, 1, 10).into())));
-        rec.set_dns_class(DNSClass::IN);
-        rec.set_mdns_cache_flush(flush);
+        let mut msg = Message::new(0, MessageType::Response, OpCode::Query);
+        let mut rec = Record::from_rdata(
+            Name::from_ascii("test.local.").unwrap(),
+            120,
+            RData::A(Ipv4Addr::new(192, 168, 1, 10).into()),
+        );
+        rec.mdns_cache_flush = flush;
         msg.add_answer(rec);
         parse_packet(&msg.to_vec().unwrap(), test_source(), "", 7).unwrap()
     }
@@ -1000,8 +995,8 @@ mod tests {
     #[test]
     fn response_flush_bit_survives_parse() {
         // hickory-proto strips the top CLASS bit at decode into
-        // mdns_cache_flush(); reading dns_class() directly always yields
-        // a clear bit (RFC 6762 §10.2).
+        // the mdns_cache_flush field; reading dns_class directly always
+        // yields a clear bit (RFC 6762 §10.2).
         assert!(flush_response(true).records[0].flush_bit);
         assert!(!flush_response(false).records[0].flush_bit);
     }
@@ -1017,16 +1012,17 @@ mod tests {
 
     #[test]
     fn query_ka_flush_bit_survives_parse() {
-        let mut q = Message::new();
+        let mut q = Message::new(0, MessageType::Query, OpCode::Query);
         q.add_query(Query::query(
             Name::from_ascii("test.local.").unwrap(),
             RecordType::A,
         ));
-        q.set_message_type(MessageType::Query);
-        let mut ka = Record::with(Name::from_ascii("test.local.").unwrap(), RecordType::A, 120);
-        ka.set_data(Some(RData::A(Ipv4Addr::new(192, 168, 1, 10).into())));
-        ka.set_dns_class(DNSClass::IN);
-        ka.set_mdns_cache_flush(true);
+        let mut ka = Record::from_rdata(
+            Name::from_ascii("test.local.").unwrap(),
+            120,
+            RData::A(Ipv4Addr::new(192, 168, 1, 10).into()),
+        );
+        ka.mdns_cache_flush = true;
         q.add_answer(ka);
         let ev = parse_packet(&q.to_vec().unwrap(), test_source(), "", 7).unwrap();
         assert!(ev.records.is_empty());
@@ -1139,14 +1135,15 @@ mod tests {
     #[test]
     fn response_nsec_shows_resolved_name_and_iface() {
         let owner = Name::from_ascii("host.local.").unwrap();
-        let mut msg = Message::new();
-        msg.set_message_type(MessageType::Response);
-        let mut nsec = Record::with(owner, RecordType::NSEC, 120);
-        nsec.set_data(Some(RData::Unknown {
-            code: RecordType::NSEC,
-            rdata: hickory_proto::rr::rdata::NULL::with(inline_host_rdata()),
-        }));
-        nsec.set_dns_class(DNSClass::IN);
+        let mut msg = Message::new(0, MessageType::Response, OpCode::Query);
+        let nsec = Record::from_rdata(
+            owner,
+            120,
+            RData::Unknown {
+                code: RecordType::NSEC,
+                rdata: hickory_proto::rr::rdata::NULL::with(inline_host_rdata()),
+            },
+        );
         msg.add_answer(nsec);
         let raw = msg.to_vec().unwrap();
         let addr: SocketAddr = "192.168.178.5:5353".parse().unwrap();
