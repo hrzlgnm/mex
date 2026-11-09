@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=mex
+Comment=Terminal UI for browsing mDNS traffic
+Exec=mex
+Terminal=true
+Categories=Network;
+Keywords=mdns;zeroconf;dns-sd;network;browser;
+Icon=mex
+StartupNotify=false

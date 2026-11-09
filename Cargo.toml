@@ -3,6 +3,49 @@ name = "mex"
 version = "0.1.1"
 edition = "2021"
 license = "MIT"
+description = "A terminal UI for browsing mDNS traffic on the local network"
+
+[package.metadata.deb]
+maintainer = "hrzlgnm"
+copyright = "Copyright 2026 hrzlgnm"
+license-file = "LICENSE"
+depends = "libgcc-s1 (>= 4.2)"
+assets = [
+    [
+        "target/release/mex",
+        "usr/bin/",
+        "755",
+    ],
+    [
+        "docs/mex.1",
+        "usr/share/man/man1/mex.1",
+        "644",
+    ],
+    [
+        "packaging/linux/mex.desktop",
+        "usr/share/applications/mex.desktop",
+        "644",
+    ],
+    [
+        "packaging/linux/mex.svg",
+        "usr/share/icons/hicolor/scalable/apps/mex.svg",
+        "644",
+    ],
+    [
+        "target/debian/changelog.gz",
+        "usr/share/doc/mex/changelog.gz",
+        "644",
+    ],
+]
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "z"
+panic = "abort"
+debug = true
+split-debuginfo = "packed"
+strip = true
 
 [dependencies]
 ratatui = "0.30"
@@ -15,3 +58,6 @@ chrono = "0.4"
 anyhow = "1"
 if-addrs = { version = "0.15", features = ["link-local"] }
 clap = { version = "4", features = ["derive"] }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

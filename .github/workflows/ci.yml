@@ -67,24 +67,14 @@ jobs:
 
   build:
     name: "🔨 Build"
-    runs-on: ubuntu-latest
-    steps:
-      - name: 🔄 Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-
-      - name: 🦀 Setup Rust cache
-        uses: ./.github/actions/setup-rust-cache
-        with:
-          save-cache: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: ⚡ Setup sccache
-        uses: ./.github/actions/setup-sccache
-
-      - name: 🔨 Build
-        shell: bash
-        run: cargo build --locked
+    permissions:
+      contents: read # Needed to run build and pass permissions to reusable workflow
+    uses: ./.github/workflows/build-reusable.yml
+    secrets: inherit
+    with:
+      branch: ${{ github.ref_name }}
+      profile: debug
+      upload_artifacts: ${{ github.event_name != 'pull_request' }}
 
   lockfile-fresh:
     name: "🔒 Lockfile Fresh"

@@ -34,6 +34,8 @@ jobs:
     needs: [release-please]
     if: needs.release-please.outputs.release_created == 'true'
     permissions:
+      id-token: write # needed for OIDC token for attestation
+      attestations: write # needed to create build attestations
       contents: write # needed to upload build artifacts
     name: 🔨 Build and Publish
     uses: ./.github/workflows/build-reusable.yml
