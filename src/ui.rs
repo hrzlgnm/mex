@@ -68,7 +68,7 @@ fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 .fg(Color::Cyan),
         ),
         Span::raw(format!(
-            "│ {} pkts │ {} svcs │ uptime {}  [q] quit [space←→] fold [j/k] row",
+            "│ {} pkts │ {} svcs │ uptime {}  [q] quit [space←→] fold [j/k] row [enter] txt [^j/k] scroll",
             app.packet_count,
             app.services.len(),
             uptime_str
@@ -237,6 +237,7 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     };
 
     let (rows, raw_positions) = detail_table_rows(app, svc);
+    let total_rows = rows.len();
 
     // Size SOURCE to the longest socket addr so IPv6 fits, clamped to
     // keep RDATA usable on narrow terminals.
@@ -256,7 +257,11 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         Constraint::Min(20),
     ];
 
-    let block_title = format!("Answers: {}", pane_ident(svc));
+    let block_title = if app.detail_free_scroll {
+        format!("Answers: {} ↕", pane_ident(svc))
+    } else {
+        format!("Answers: {}", pane_ident(svc))
+    };
 
     let table = Table::new(rows, widths)
         .header(
@@ -276,17 +281,66 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
 
     // Highlight the j/k-selected row, if the cursor is on a record.
     // TXT child rows are display-only; questions live in their own pane.
+    // In free-scroll mode the selection is withheld so ratatui (which
+    // always snaps the viewport back to the selected row) does not undo
+    // the manual offset; the cursor itself is untouched (hex pane follows).
     let selected_table_row =
         if app.selected_detail_entry().is_some() && app.detail_selected < raw_positions.len() {
             Some(raw_positions[app.detail_selected])
         } else {
             None
         };
+    // Auto-fit the selected record's child extent into view on
+    // cursor-follow frames, so an `Enter` expansion near the bottom of
+    // the pane reveals its children instead of clipping them. Capped to
+    // keep the parent visible: oversized expansions pin the parent to
+    // the top and show the first viewport-full of children (page the
+    // rest with Ctrl-j/k).
+    let mut offset = app.detail_offset.get();
+    if !app.detail_free_scroll {
+        if let Some(selected) = selected_table_row {
+            let extent_end = raw_positions
+                .get(app.detail_selected + 1)
+                .copied()
+                .unwrap_or(total_rows);
+            let viewport = area.height.saturating_sub(3) as usize;
+            offset = fit_row_extent(offset, selected, extent_end, viewport, total_rows);
+        }
+    } else {
+        let viewport = area.height.saturating_sub(3) as usize;
+        offset = offset.min(total_rows.saturating_sub(viewport));
+        offset = offset.min(total_rows.saturating_sub(1));
+    }
     let mut tstate = TableState::default();
-    tstate.select(selected_table_row);
-    *tstate.offset_mut() = app.detail_offset.get();
+    tstate.select(if app.detail_free_scroll {
+        None
+    } else {
+        selected_table_row
+    });
+    *tstate.offset_mut() = offset;
     frame.render_stateful_widget(table, area, &mut tstate);
     app.detail_offset.set(tstate.offset());
+}
+
+/// Viewport offset that keeps `selected` visible and pulls the child
+/// extent `[selected, extent_end)` into view when it fits; oversized
+/// extents pin the parent to the top. Pure helper, unit-tested below.
+fn fit_row_extent(
+    offset: usize,
+    selected: usize,
+    extent_end: usize,
+    viewport: usize,
+    total: usize,
+) -> usize {
+    if viewport == 0 || total == 0 {
+        return 0;
+    }
+    let max_offset = total.saturating_sub(viewport);
+    let mut fitted = offset.min(max_offset).min(selected);
+    if extent_end > fitted + viewport {
+        fitted = extent_end.saturating_sub(viewport).min(selected);
+    }
+    fitted.min(max_offset)
 }
 
 /// Source cell for the Records table: the responder address, suffixed
@@ -382,8 +436,9 @@ fn detail_table_rows<'a>(
 
     // Raw records, deduped and sorted by type then TTL.
     // (Ordering lives on ServiceEntry so the j/k cursor and hex lookup share it.)
-    // TXT records carry their key=value pairs as child rows which the cursor
-    // skips; raw_positions maps each raw record to its table row.
+    // Multi-pair TXT records carry their key=value pairs as collapsible
+    // child rows (collapsed by default, `Enter` expands); the cursor skips
+    // child rows. raw_positions maps each raw record to its table row.
     let unique_recs = svc.ordered_records();
     let mut raw_positions = Vec::with_capacity(unique_recs.len());
     for rec in unique_recs {
@@ -410,9 +465,19 @@ fn detail_table_rows<'a>(
             Some(color) => Cell::from(ttl_str.clone()).style(Style::default().fg(color)),
             None => Cell::from(ttl_str.clone()),
         };
+        let expandable = crate::app::App::is_expandable_txt(rec);
+        let type_label = if expandable {
+            if app.is_txt_expanded(rec) {
+                "▾ TXT"
+            } else {
+                "▸ TXT"
+            }
+        } else {
+            rec.rtype_str.as_str()
+        };
         rows.push(
             Row::new(vec![
-                Cell::from(rec.rtype_str.clone()),
+                Cell::from(type_label),
                 ttl_cell,
                 Cell::from(flush),
                 Cell::from(source_label(rec)),
@@ -420,6 +485,9 @@ fn detail_table_rows<'a>(
             ])
             .style(style),
         );
+        if expandable && !app.is_txt_expanded(rec) {
+            continue;
+        }
         if rec.rtype == 16 {
             let mut seen_pair = HashSet::new();
             let mut pairs: Vec<&str> = rec
@@ -679,5 +747,23 @@ mod tests {
         assert_eq!(ttl_cell_color(120, 120), None);
         // Clock skew (remaining beyond original) counts as healthy.
         assert_eq!(ttl_cell_color(200, 120), None);
+    }
+
+    #[test]
+    fn fit_row_extent_pulls_children_into_view() {
+        // Parent at 8 with 3 children (extent end 12), viewport 10: the
+        // old offset 0 clips the children, so scroll to 2.
+        assert_eq!(fit_row_extent(0, 8, 12, 10, 20), 2);
+        // Already visible: offset untouched.
+        assert_eq!(fit_row_extent(2, 8, 12, 10, 20), 2);
+        // No children (extent is the row itself): no scroll.
+        assert_eq!(fit_row_extent(0, 3, 4, 10, 20), 0);
+    }
+
+    #[test]
+    fn fit_row_extent_pins_oversized_expansion_to_parent() {
+        // 10 children in a viewport of 5: cannot fit, so pin the parent
+        // (row 8) to the top; the rest pages via Ctrl-j/k.
+        assert_eq!(fit_row_extent(0, 8, 19, 5, 30), 8);
     }
 }

@@ -100,6 +100,11 @@ pub struct App {
     pub list_offset: Cell<usize>,
     pub detail_selected: usize,
     pub detail_offset: Cell<usize>,
+    /// Manual scroll of the Answers table (`Ctrl-j/k`): while set, the
+    /// viewport stays where the user put it instead of following the
+    /// `j/k` cursor, so arbitrarily tall TXT expansions can be paged
+    /// through. Any cursor or fold action clears it.
+    pub detail_free_scroll: bool,
     pub questions_offset: Cell<usize>,
     pub packet_count: u64,
     pub start_time: Instant,
@@ -133,6 +138,11 @@ pub struct App {
     startup_qu_sent: bool,
     last_ip_refresh: Instant,
     collapsed_types: HashSet<String>,
+    /// Expanded TXT records in the Answers table, keyed by
+    /// (name, rdata, source). Absent = collapsed (the default), so
+    /// multi-pair TXT rows render as a single `▸ TXT` line until
+    /// `Enter` expands them into `▾ TXT` plus child rows.
+    expanded_txt: HashSet<(String, String, std::net::SocketAddr)>,
     local_ips: HashSet<std::net::IpAddr>,
     detail_svc_key: Option<(String, String)>,
     detail_anchor: Option<DetailCursorKey>,
@@ -203,9 +213,11 @@ impl App {
             startup_qu_sent: false,
             last_ip_refresh: Instant::now(),
             collapsed_types: HashSet::new(),
+            expanded_txt: HashSet::new(),
             local_ips: browse::local_ips(),
             detail_selected: 0,
             detail_offset: Cell::new(0),
+            detail_free_scroll: false,
             questions_offset: Cell::new(0),
             detail_svc_key: None,
             detail_anchor: None,
@@ -675,16 +687,37 @@ impl App {
         }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.running = false,
+            KeyCode::Up | KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll_detail(if key.code == KeyCode::Down { 1 } else { -1 })
+            }
             KeyCode::Up => self.move_selection(-1),
             KeyCode::Down => self.move_selection(1),
             KeyCode::Left => self.set_collapsed(true),
             KeyCode::Right => self.set_collapsed(false),
+            // Manual viewport scroll for the Answers table: ratatui's Table
+            // always snaps the viewport back to the selected row, so paging
+            // through children taller than the pane needs a mode where the
+            // cursor does not drag the viewport along (see draw_records_tab).
+            KeyCode::Char('j') | KeyCode::Char('k')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.scroll_detail(if key.code == KeyCode::Char('j') {
+                    1
+                } else {
+                    -1
+                })
+            }
             // Record cursor, only meaningful while the Records table is shown.
             KeyCode::Char('j') => self.move_detail_cursor(1),
             KeyCode::Char('k') => self.move_detail_cursor(-1),
-            KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Char('+') | KeyCode::Char('-') => {
-                self.toggle_collapse()
+            // Enter folds/unfolds the TXT record under the j/k cursor;
+            // anywhere else it folds the service type like Space does.
+            KeyCode::Enter => {
+                if !self.toggle_txt_expanded() {
+                    self.toggle_collapse()
+                }
             }
+            KeyCode::Char(' ') | KeyCode::Char('+') | KeyCode::Char('-') => self.toggle_collapse(),
             _ => {}
         }
     }
@@ -735,6 +768,8 @@ impl App {
     /// re-announcements don't yank the selection to another row.
     fn move_detail_cursor(&mut self, delta: isize) {
         self.sync_detail_cursor();
+        // Resuming cursor-follow: manual scroll ends once the cursor moves.
+        self.detail_free_scroll = false;
         let total = self
             .display_service()
             .map(|s| s.ordered_records().len() + s.questions.len())
@@ -750,6 +785,20 @@ impl App {
         self.detail_anchor = self
             .display_service()
             .and_then(|svc| Self::identity_at(svc, self.detail_selected));
+    }
+
+    /// Nudge the Answers viewport without moving the `j/k` cursor, and pin
+    /// it there until the cursor, selection, or expansion changes. Upper
+    /// clamping happens at render time, where the row count is known.
+    fn scroll_detail(&mut self, delta: isize) {
+        let cur = self.detail_offset.get();
+        let next = if delta < 0 {
+            cur.saturating_sub(delta.unsigned_abs())
+        } else {
+            cur.saturating_add(delta.unsigned_abs())
+        };
+        self.detail_offset.set(next);
+        self.detail_free_scroll = true;
     }
 
     /// Identity of the table row at an index (raw records first, then
@@ -816,6 +865,7 @@ impl App {
             self.detail_svc_key = key;
             self.detail_selected = 0;
             self.detail_offset.set(0);
+            self.detail_free_scroll = false;
             self.questions_offset.set(0);
             self.detail_anchor = self
                 .selected_service()
@@ -1340,6 +1390,16 @@ impl App {
         }
         self.requeries.retain(|k, _| live.contains(k));
         self.continuous.retain(|k, _| live.contains(k));
+        // Drop TXT expansion state for records that no longer exist.
+        let mut live_txt = HashSet::new();
+        for svc in &self.services {
+            for rec in &svc.records {
+                if rec.rtype == 16 {
+                    live_txt.insert(Self::txt_key(rec));
+                }
+            }
+        }
+        self.expanded_txt.retain(|k| live_txt.contains(k));
         // Expire enumeration known answers at 100% TTL; prune the type
         // cache to live interests so it cannot grow without bound.
         self.enum_known
@@ -1405,6 +1465,50 @@ impl App {
 
     pub fn is_type_collapsed(&self, label: &str) -> bool {
         self.collapsed_types.contains(label)
+    }
+
+    /// Number of distinct non-empty `; `-separated pairs in TXT rdata.
+    pub fn txt_pair_count(rdata: &str) -> usize {
+        let mut seen = HashSet::new();
+        rdata
+            .split("; ")
+            .filter(|pair| !pair.is_empty() && seen.insert(*pair))
+            .count()
+    }
+
+    /// Whether a record renders with collapsible TXT child rows (multi-pair TXT).
+    pub fn is_expandable_txt(rec: &browse::RawRecord) -> bool {
+        rec.rtype == 16 && Self::txt_pair_count(&rec.rdata) > 1
+    }
+
+    fn txt_key(rec: &browse::RawRecord) -> (String, String, std::net::SocketAddr) {
+        (rec.name.clone(), rec.rdata.clone(), rec.source)
+    }
+
+    /// Collapsed by default: only records explicitly expanded via `Enter`
+    /// show their child rows.
+    pub fn is_txt_expanded(&self, rec: &browse::RawRecord) -> bool {
+        self.expanded_txt.contains(&Self::txt_key(rec))
+    }
+
+    /// Toggle the TXT record under the j/k cursor. Returns false when the
+    /// cursor is not on an expandable TXT row (caller falls back to the
+    /// service-type fold). Headers select nothing, so `Enter` on a header
+    /// keeps folding the service type instead of touching TXT state.
+    fn toggle_txt_expanded(&mut self) -> bool {
+        if self.selected_service().is_none() {
+            return false;
+        }
+        let key = match self.selected_detail_entry() {
+            Some(DetailEntry::Record(rec)) if Self::is_expandable_txt(rec) => Self::txt_key(rec),
+            _ => return false,
+        };
+        if !self.expanded_txt.remove(&key) {
+            self.expanded_txt.insert(key);
+        }
+        // Let the next frame auto-fit the newly shown/hidden children.
+        self.detail_free_scroll = false;
+        true
     }
 
     pub fn is_local_record(&self, rec: &browse::RawRecord) -> bool {
@@ -1665,5 +1769,127 @@ mod tests {
         let ptrs = live_ptr_rows(&app);
         assert_eq!(ptrs.len(), 1);
         assert_eq!(ptrs[0].ttl, 120);
+    }
+
+    fn txt_record(rdata: &str) -> browse::RawRecord {
+        raw_record("Test._http._tcp.local.", 16, "TXT", rdata, 120)
+    }
+
+    fn service_with_txt(app: &mut App, rdata: &str) {
+        ingest(app, &ptr_record(120));
+        ingest(app, &txt_record(rdata));
+        ingest(app, &srv_record(120));
+        // Settle the cursors onto the instance row like the main loop does,
+        // then park the j/k cursor on the TXT row (it defaults to the
+        // first record, usually PTR).
+        app.evict_expired();
+        assert!(app.selected_service().is_some());
+        let idx = {
+            let svc = app.display_service().expect("service displayed");
+            svc.ordered_records()
+                .iter()
+                .position(|r| r.rtype == 16)
+                .expect("TXT record merged into service")
+        };
+        // Park the j/k cursor on the TXT row without going through
+        // sync_detail_cursor (which would re-anchor to the old PTR row).
+        app.detail_selected = idx;
+        app.detail_anchor = app
+            .display_service()
+            .and_then(|svc| App::identity_at(svc, idx));
+    }
+
+    #[test]
+    fn txt_children_collapsed_by_default_and_enter_toggles() {
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1; b=2; c=3");
+        let rec = app.services[0]
+            .ordered_records()
+            .into_iter()
+            .find(|r| r.rtype == 16)
+            .cloned()
+            .expect("TXT record merged into service");
+        assert!(App::is_expandable_txt(&rec));
+        assert!(!app.is_txt_expanded(&rec));
+        assert!(app.toggle_txt_expanded());
+        assert!(app.is_txt_expanded(&rec));
+        assert!(app.toggle_txt_expanded());
+        assert!(!app.is_txt_expanded(&rec));
+    }
+
+    #[test]
+    fn txt_single_pair_is_not_expandable() {
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1");
+        let rec = app.services[0]
+            .ordered_records()
+            .into_iter()
+            .find(|r| r.rtype == 16)
+            .cloned()
+            .expect("TXT record merged into service");
+        assert!(!App::is_expandable_txt(&rec));
+        assert!(!app.toggle_txt_expanded());
+    }
+
+    #[test]
+    fn txt_enter_key_expands_and_falls_back() {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1; b=2");
+        let key = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        app.handle_key(&key(KeyCode::Enter));
+        let rec = app.services[0]
+            .ordered_records()
+            .into_iter()
+            .find(|r| r.rtype == 16)
+            .cloned()
+            .unwrap();
+        assert!(app.is_txt_expanded(&rec));
+        // Second Enter collapses again.
+        app.handle_key(&key(KeyCode::Enter));
+        assert!(!app.is_txt_expanded(&rec));
+    }
+
+    #[test]
+    fn ctrl_j_pins_viewport_and_j_resumes_follow() {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1; b=2");
+        let ctrl = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        let plain = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        assert!(!app.detail_free_scroll);
+        app.handle_key(&ctrl(KeyCode::Char('j')));
+        assert!(app.detail_free_scroll);
+        assert_eq!(app.detail_offset.get(), 1);
+        app.handle_key(&ctrl(KeyCode::Char('k')));
+        assert_eq!(app.detail_offset.get(), 0);
+        // Plain j/k resumes cursor-following.
+        app.handle_key(&plain(KeyCode::Char('j')));
+        assert!(!app.detail_free_scroll);
+    }
+
+    #[test]
+    fn expand_clears_manual_scroll() {
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1; b=2");
+        app.scroll_detail(5);
+        assert!(app.detail_free_scroll);
+        assert!(app.toggle_txt_expanded());
+        assert!(!app.detail_free_scroll);
     }
 }
