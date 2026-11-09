@@ -103,6 +103,10 @@ fn refresh_step(ttl_secs: u32, jitter_pct: u32) -> Duration {
     Duration::from_millis(step_millis.max(1))
 }
 
+/// How long an overheard QM query suppresses our own duplicate (RFC 6762
+/// §7.3). Checked only when our query is due, so this is the window for
+/// near-simultaneous queries from multiple queriers.
+const OVERHEARD_WINDOW: Duration = Duration::from_secs(2);
 
 pub struct App {
     pub services: Vec<ServiceEntry>,
@@ -154,6 +158,12 @@ pub struct App {
     /// `Enter` expands them into `▾ TXT` plus child rows.
     expanded_txt: HashSet<(String, String, std::net::SocketAddr)>,
     local_ips: HashSet<std::net::IpAddr>,
+    /// Recently overheard QM questions from other queriers (RFC 6762 §7.3):
+    /// key (lowercased name, type) -> (seen_at, remote KA targets lowercased
+    /// and dot-trimmed, ingress iface). Consumed to suppress our own
+    /// duplicate once; pruned after OVERHEARD_WINDOW. Own loopback and QU
+    /// questions are never stored.
+    overheard: HashMap<(String, u16), (Instant, HashSet<String>, String)>,
     detail_svc_key: Option<(String, String)>,
     detail_anchor: Option<DetailCursorKey>,
     sticky_key: Option<(String, String)>,
@@ -225,6 +235,7 @@ impl App {
             collapsed_types: HashSet::new(),
             expanded_txt: HashSet::new(),
             local_ips: browse::local_ips(),
+            overheard: HashMap::new(),
             detail_selected: 0,
             detail_offset: Cell::new(0),
             detail_free_scroll: false,
@@ -476,6 +487,18 @@ impl App {
             } else {
                 Vec::new()
             };
+            // RFC 6762 §7.3: another querier just asked the same QM
+            // question with no KA we wouldn't send — count ours as sent.
+            if self.suppressed_by_overheard(&key, &ka) {
+                self.postpone_continuous_for_refresh(&key, now);
+                let unanswered = (count + 1).min(4);
+                if unanswered >= 4 {
+                    self.requeries.remove(&key);
+                } else {
+                    self.requeries.insert(key, (now + step, unanswered));
+                }
+                continue;
+            }
             self.query_tx.send(browse::QueryRequest {
                 name: key.0.clone(),
                 record_type: rt,
@@ -584,6 +607,14 @@ impl App {
             // QU only on the very first startup enumeration batch
             // (RFC 6762 §5.4); everything afterwards is QM.
             let qu = !self.startup_qu_sent && key.0 == ENUM_SERVICE && key.1 == 12;
+            // RFC 6762 §7.3: another querier just asked the same QM
+            // question with no KA we wouldn't send — treat ours as sent.
+            // QU elicits unicast and is never suppressed.
+            if !qu && self.suppressed_by_overheard(&key, &ka) {
+                let now = Instant::now();
+                self.advance_continuous(&key, now);
+                continue;
+            }
             if qu {
                 self.startup_qu_sent = true;
             }
@@ -598,11 +629,7 @@ impl App {
             // current interval, then double for the following gap, so the
             // stream is 1s, 2s, 4s, ... (doubling before use would skip
             // the 1s gap and start at 2s).
-            if let Some(entry) = self.continuous.get_mut(&key) {
-                let current = entry.interval.max(Duration::from_secs(1));
-                entry.next_due = now + current;
-                entry.interval = (current * 2).min(MAX_CONTINUOUS_INTERVAL);
-            }
+            self.advance_continuous(&key, now);
         }
     }
 
@@ -944,12 +971,77 @@ impl App {
             self.ingest_record(rec, ev);
         }
         for q in &ev.questions {
+            self.note_overheard(q, ev);
             self.route_question(q, ev);
         }
     }
 
-    /// Postpone the exponential stream after a refresh so the two §5.2
-    /// timers don't emit back-to-back duplicates.
+    /// Record an overheard QM question for duplicate question suppression
+    /// (RFC 6762 §7.3). Own loopback and QU questions are never stored.
+    /// The remote Known-Answer set is stored dot-trimmed and lowercased;
+    /// the subset check runs at send time against the KA we would send.
+    fn note_overheard(&mut self, q: &browse::RawRecord, ev: &browse::Event) {
+        if q.qu {
+            return;
+        }
+        if self.is_local_source(&ev.source) {
+            return;
+        }
+        let key = (q.name.trim_end_matches('.').to_lowercase(), q.rtype);
+        let mut remote = HashSet::new();
+        for ka in &ev.query_kas {
+            if ka.rtype == q.rtype && ka.name.eq_ignore_ascii_case(&q.name) {
+                remote.insert(ka.rdata.trim_end_matches('.').to_lowercase());
+            }
+        }
+        self.overheard
+            .insert(key, (Instant::now(), remote, q.iface.clone()));
+    }
+
+    /// RFC 6762 §7.3: if we overheard the same QM question recently and its
+    /// Known-Answer section holds nothing we wouldn't send ourselves,
+    /// treat our query as sent. Consumes the entry so one overheard query
+    /// suppresses one transmission. `local_ka` is the KA list we computed
+    /// for the send; filtering is scoped to the link the overheard query
+    /// arrived on.
+    fn suppressed_by_overheard(
+        &mut self,
+        key: &(String, u16),
+        local_ka: &[browse::KnownAnswer],
+    ) -> bool {
+        let lookup = (key.0.trim_end_matches('.').to_lowercase(), key.1);
+        let (seen, remote, iface) = match self.overheard.get(&lookup) {
+            Some(v) => v.clone(),
+            None => return false,
+        };
+        if seen.elapsed() >= OVERHEARD_WINDOW {
+            return false;
+        }
+        let mut local = HashSet::new();
+        for ka in local_ka {
+            if ka.iface.is_empty() || iface.is_empty() || ka.iface == iface {
+                local.insert(ka.target.trim_end_matches('.').to_lowercase());
+            }
+        }
+        if remote.iter().all(|r| local.contains(r)) {
+            self.overheard.remove(&lookup);
+            return true;
+        }
+        false
+    }
+
+    /// Advance the exponential stream as if a query had been sent (shared
+    /// by real sends and §7.3 suppression).
+    fn advance_continuous(&mut self, key: &(String, u16), now: Instant) {
+        if let Some(entry) = self.continuous.get_mut(key) {
+            let current = entry.interval.max(Duration::from_secs(1));
+            entry.next_due = now + current;
+            entry.interval = (current * 2).min(MAX_CONTINUOUS_INTERVAL);
+        }
+    }
+
+    /// Postpone the exponential stream after a refresh (real or suppressed)
+    /// so the two §5.2 timers don't emit back-to-back duplicates.
     fn postpone_continuous_for_refresh(&mut self, key: &(String, u16), now: Instant) {
         let mut postponed = false;
         for (ckey, entry) in self.continuous.iter_mut() {
@@ -1447,6 +1539,9 @@ impl App {
         }
         self.requeries.retain(|k, _| live.contains(k));
         self.continuous.retain(|k, _| live.contains(k));
+        // Overheard QM queries are single-use and short-lived (§7.3).
+        self.overheard
+            .retain(|_, (seen, _, _)| seen.elapsed() < OVERHEARD_WINDOW);
         // Drop TXT expansion state for records that no longer exist.
         let mut live_txt = HashSet::new();
         for svc in &self.services {
@@ -1688,6 +1783,7 @@ mod tests {
             rtype,
             rtype_str: rtype_str.to_string(),
             flush_bit: false,
+            qu: false,
             ttl,
             rdata: rdata.to_string(),
             wire: Vec::new(),
@@ -1721,6 +1817,7 @@ mod tests {
         browse::Event {
             records: vec![rec.clone()],
             questions: Vec::new(),
+            query_kas: Vec::new(),
             raw_bytes: Vec::new(),
             source: test_source(),
         }
@@ -2042,4 +2139,143 @@ mod tests {
         assert!(entry.next_due > Instant::now() + Duration::from_millis(500));
     }
 
+    fn query_event(
+        name: &str,
+        rtype: u16,
+        rtype_str: &str,
+        qu: bool,
+        kas: Vec<browse::RawRecord>,
+        source: std::net::SocketAddr,
+    ) -> browse::Event {
+        let q = browse::RawRecord {
+            name: name.to_string(),
+            rtype,
+            rtype_str: rtype_str.to_string(),
+            flush_bit: false,
+            qu,
+            ttl: 0,
+            rdata: String::new(),
+            wire: Vec::new(),
+            source,
+            iface: String::new(),
+            received_at: Instant::now(),
+        };
+        browse::Event {
+            records: Vec::new(),
+            questions: vec![q],
+            query_kas: kas,
+            raw_bytes: Vec::new(),
+            source,
+        }
+    }
+
+    fn ka_record(owner: &str, target: &str) -> browse::RawRecord {
+        raw_record(owner, 12, "PTR", target, 120)
+    }
+
+    fn remote_source() -> std::net::SocketAddr {
+        "192.168.1.99:5353".parse().unwrap()
+    }
+
+    #[test]
+    fn duplicate_qm_with_subset_ka_suppresses_continuous() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        let ckey = ("_http._tcp.local".to_string(), 12);
+        app.continuous.insert(
+            ckey.clone(),
+            ContinuousQuery {
+                next_due: Instant::now() - Duration::from_millis(1),
+                interval: Duration::from_secs(2),
+                qname: "_http._tcp.local".to_string(),
+            },
+        );
+        // Remote asks the same QM question with a KA subset (empty ⊆ ours).
+        let ev = query_event(
+            "_http._tcp.local.",
+            12,
+            "PTR",
+            false,
+            Vec::new(),
+            remote_source(),
+        );
+        app.ingest_event(&ev);
+        app.poll_continuous();
+        let entry = app.continuous.get(&ckey).expect("still scheduled");
+        // Treated as sent: backed off instead of transmitting.
+        assert_eq!(entry.interval, Duration::from_secs(4));
+        assert!(entry.next_due > Instant::now() + Duration::from_secs(1));
+        // Single-use: entry consumed.
+        assert!(!app
+            .overheard
+            .contains_key(&("_http._tcp.local".to_string(), 12)));
+    }
+
+    #[test]
+    fn duplicate_qm_with_extra_ka_does_not_suppress() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        let ckey = ("_http._tcp.local".to_string(), 12);
+        app.continuous.insert(
+            ckey.clone(),
+            ContinuousQuery {
+                next_due: Instant::now() - Duration::from_millis(1),
+                interval: Duration::from_secs(2),
+                qname: "_http._tcp.local".to_string(),
+            },
+        );
+        // Remote KA holds a target we don't know — must not suppress.
+        let ev = query_event(
+            "_http._tcp.local.",
+            12,
+            "PTR",
+            false,
+            vec![ka_record("_http._tcp.local.", "Other._http._tcp.local.")],
+            remote_source(),
+        );
+        app.ingest_event(&ev);
+        app.poll_continuous();
+        let entry = app.continuous.get(&ckey).expect("still scheduled");
+        assert_eq!(entry.interval, Duration::from_secs(4));
+        // Not suppressed: next_due is now+2s from the real send, but the
+        // overheard entry remains since it wasn't consumed.
+        assert!(app
+            .overheard
+            .contains_key(&("_http._tcp.local".to_string(), 12)));
+    }
+
+    #[test]
+    fn qu_and_local_source_never_suppress() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        let ckey = ("_http._tcp.local".to_string(), 12);
+        app.continuous.insert(
+            ckey.clone(),
+            ContinuousQuery {
+                next_due: Instant::now() - Duration::from_millis(1),
+                interval: Duration::from_secs(2),
+                qname: "_http._tcp.local".to_string(),
+            },
+        );
+        // QU bit set: not a QM question.
+        let ev = query_event(
+            "_http._tcp.local.",
+            12,
+            "PTR",
+            true,
+            Vec::new(),
+            remote_source(),
+        );
+        app.ingest_event(&ev);
+        assert!(app.overheard.is_empty());
+        // Loopback from ourselves: ignored even with subset KA.
+        let local: std::net::SocketAddr = test_source();
+        app.local_ips.insert(local.ip());
+        let ev = query_event("_http._tcp.local.", 12, "PTR", false, Vec::new(), local);
+        app.ingest_event(&ev);
+        assert!(app.overheard.is_empty());
+    }
 }

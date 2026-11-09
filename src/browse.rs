@@ -66,6 +66,7 @@ pub struct RawRecord {
     pub rtype: u16,
     pub rtype_str: String,
     pub flush_bit: bool,
+    pub qu: bool,
     pub ttl: u32,
     pub rdata: String,
     /// Standalone wire encoding of this record, captured at parse time so
@@ -82,6 +83,10 @@ pub struct RawRecord {
 pub struct Event {
     pub records: Vec<RawRecord>,
     pub questions: Vec<RawRecord>,
+    /// Known answers carried in query packets (RFC 6762 §7.1). Never filed
+    /// as sightings (queries are beliefs, not facts); used only for
+    /// duplicate question suppression (§7.3) subset checks.
+    pub query_kas: Vec<RawRecord>,
     pub raw_bytes: Vec<u8>,
     pub source: SocketAddr,
 }
@@ -442,9 +447,32 @@ fn parse_packet(raw: &[u8], source: SocketAddr, iface: &str) -> Option<Event> {
                 rtype: u16::from(rec.record_type()),
                 rtype_str: rtype_label(rec.record_type()),
                 flush_bit: class & 0x8000 != 0,
+                qu: false,
                 ttl: rec.ttl(),
                 rdata: rdata_label(rec.data(), raw),
                 wire: rec.to_bytes().unwrap_or_default(),
+                source,
+                iface: iface.to_string(),
+                received_at: Instant::now(),
+            });
+        }
+    }
+
+    // Known answers in queries are parsed separately for duplicate
+    // question suppression (§7.3) and never filed as records.
+    let mut query_kas = Vec::new();
+    if msg.message_type() == MessageType::Query {
+        for rec in msg.answers().iter() {
+            let class: u16 = rec.dns_class().into();
+            query_kas.push(RawRecord {
+                name: unescape(&rec.name().to_string()),
+                rtype: u16::from(rec.record_type()),
+                rtype_str: rtype_label(rec.record_type()),
+                flush_bit: class & 0x8000 != 0,
+                qu: false,
+                ttl: rec.ttl(),
+                rdata: rdata_label(rec.data(), raw),
+                wire: Vec::new(),
                 source,
                 iface: iface.to_string(),
                 received_at: Instant::now(),
@@ -459,6 +487,7 @@ fn parse_packet(raw: &[u8], source: SocketAddr, iface: &str) -> Option<Event> {
             rtype: u16::from(q.query_type()),
             rtype_str: rtype_label(q.query_type()),
             flush_bit: false,
+            qu: q.mdns_unicast_response(),
             ttl: 0,
             rdata: String::new(),
             wire: Vec::new(),
@@ -471,6 +500,7 @@ fn parse_packet(raw: &[u8], source: SocketAddr, iface: &str) -> Option<Event> {
     Some(Event {
         records,
         questions,
+        query_kas,
         raw_bytes: raw.to_vec(),
         source,
     })
@@ -733,6 +763,11 @@ mod tests {
         assert!(ev.records.is_empty());
         assert_eq!(ev.questions.len(), 1);
         assert_eq!(ev.questions[0].name, "svc._http._tcp.local.");
+        assert!(!ev.questions[0].qu);
+        // ... but the KA is retained for §7.3 duplicate suppression.
+        assert_eq!(ev.query_kas.len(), 1);
+        assert_eq!(ev.query_kas[0].rdata, "Inst.svc._http._tcp.local.");
+        assert_eq!(ev.query_kas[0].iface, "enx");
 
         let mut r = Message::new();
         r.set_message_type(MessageType::Response);
@@ -746,6 +781,22 @@ mod tests {
         assert_eq!(ev.records[0].rdata, "Inst.svc._http._tcp.local.");
         assert_eq!(ev.records[0].iface, "enx");
         assert!(ev.questions.is_empty());
+        assert!(ev.query_kas.is_empty());
+    }
+
+    #[test]
+    fn query_qu_bit_is_parsed() {
+        let mut q = Message::new();
+        let mut query = Query::query(
+            Name::from_ascii("svc._http._tcp.local.").unwrap(),
+            RecordType::PTR,
+        );
+        query.set_mdns_unicast_response(true);
+        q.add_query(query);
+        q.set_message_type(MessageType::Query);
+        let ev = parse_packet(&q.to_vec().unwrap(), test_source(), "enx").unwrap();
+        assert_eq!(ev.questions.len(), 1);
+        assert!(ev.questions[0].qu);
     }
 
     #[test]

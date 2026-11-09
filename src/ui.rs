@@ -705,6 +705,7 @@ mod tests {
             rtype: 12,
             rtype_str: "PTR".to_string(),
             flush_bit: false,
+            qu: false,
             ttl: 120,
             rdata: "Test._http._tcp.local.".to_string(),
             wire: Vec::new(),
