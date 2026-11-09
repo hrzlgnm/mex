@@ -19,6 +19,8 @@ Headless run (no TTY) logs to stderr.
   `[FF02::FB]:5353` via `socket-pktinfo`, `send_query` (QM/QU + known
   answers, one copy per interface), packet parse with ingress interface.
   Down, point-to-point, `lo`/`docker`/`veth` interfaces are skipped.
+  Multicast loop disabled; unicast-dst packets from off-link subnets are
+  refused (RFC 6762 §11) with a metrics counter.
 * `src/app.rs` — browser state, query scheduling, ingest/expire, selection.
 * `src/ui.rs` — ratatui rendering only, no state mutations.
 

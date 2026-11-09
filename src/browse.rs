@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -76,6 +77,10 @@ pub struct RawRecord {
     /// Name of the interface the packet arrived on (e.g. `"br0"`), from
     /// IP_PKTINFO. Empty when unknown; used only for display/diagnosis.
     pub iface: String,
+    /// Kernel interface index the packet arrived on (0 when the kernel
+    /// supplied none). Survives when `iface` is empty so unmapped
+    /// traffic stays identifiable (`if#7`) instead of one opaque pile.
+    pub ifindex: u32,
     pub received_at: Instant,
 }
 
@@ -128,12 +133,39 @@ impl QueryTx {
     }
 }
 
-pub fn spawn() -> Result<(QueryTx, mpsc::Receiver<Event>)> {
+/// Refused-packet accounting shared with the App thread (RFC 6762 §11
+/// off-link discards). Listener threads only bump it; rendering reads it.
+#[derive(Debug, Default)]
+pub struct DropStats {
+    count: AtomicU64,
+    last: Mutex<Option<(SocketAddr, Instant)>>,
+}
+
+impl DropStats {
+    pub fn note(&self, source: SocketAddr) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut last) = self.last.lock() {
+            *last = Some((source, Instant::now()));
+        }
+    }
+
+    pub fn total(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    pub fn last(&self) -> Option<(SocketAddr, Instant)> {
+        self.last.lock().ok().and_then(|last| *last)
+    }
+}
+
+pub fn spawn() -> Result<(QueryTx, mpsc::Receiver<Event>, Arc<DropStats>)> {
     let (tx, rx) = mpsc::channel();
     let (tx_v4, rx_v4) = mpsc::channel();
     let (tx_v6, rx_v6) = mpsc::channel();
+    let drops = Arc::new(DropStats::default());
 
     let tx4 = tx.clone();
+    let drops4 = drops.clone();
     thread::spawn(move || {
         let socket = match create_v4_socket() {
             Ok(s) => s,
@@ -142,9 +174,10 @@ pub fn spawn() -> Result<(QueryTx, mpsc::Receiver<Event>)> {
                 return;
             }
         };
-        listen(&socket, tx4, rx_v4, Family::V4);
+        listen(&socket, tx4, rx_v4, drops4, Family::V4);
     });
 
+    let drops6 = drops.clone();
     thread::spawn(move || {
         let socket = match create_v6_socket() {
             Ok(s) => s,
@@ -153,7 +186,7 @@ pub fn spawn() -> Result<(QueryTx, mpsc::Receiver<Event>)> {
                 return;
             }
         };
-        listen(&socket, tx, rx_v6, Family::V6);
+        listen(&socket, tx, rx_v6, drops6, Family::V6);
     });
 
     Ok((
@@ -162,6 +195,7 @@ pub fn spawn() -> Result<(QueryTx, mpsc::Receiver<Event>)> {
             v6: tx_v6,
         },
         rx,
+        drops,
     ))
 }
 
@@ -229,16 +263,74 @@ pub fn link_stats() -> LinkStats {
     stats
 }
 
-fn iface_names() -> HashMap<u32, String> {
-    // Unfiltered on purpose: this only labels observed packets for
-    // display (including looped-back ones), it does not select links.
-    let mut out = HashMap::new();
+/// Per-link ingress data in one if-addrs pass: index → name plus
+/// index → [(address, netmask)] for the RFC 6762 §11 locality test.
+/// Unfiltered on purpose: locality labeling and subnet checks must see
+/// every link, including ones skipped for multicast joins.
+type SubnetMap = HashMap<u32, Vec<(IpAddr, IpAddr)>>;
+
+fn link_maps() -> (HashMap<u32, String>, SubnetMap) {
+    let mut names = HashMap::new();
+    let mut subnets: SubnetMap = HashMap::new();
     for iface in if_addrs::get_if_addrs().unwrap_or_default() {
-        if let Some(idx) = iface.index {
-            out.entry(idx).or_insert(iface.name);
-        }
+        let Some(idx) = iface.index else { continue };
+        names.entry(idx).or_insert_with(|| iface.name.clone());
+        let (addr, mask) = match iface.addr {
+            if_addrs::IfAddr::V4(v4) => (IpAddr::V4(v4.ip), IpAddr::V4(v4.netmask)),
+            if_addrs::IfAddr::V6(v6) => (IpAddr::V6(v6.ip), IpAddr::V6(v6.netmask)),
+        };
+        subnets.entry(idx).or_default().push((addr, mask));
     }
-    out
+    (names, subnets)
+}
+
+/// Fill gaps in the cached link maps: the interface may have appeared
+/// since the last 10s refresh. Re-queries if-addrs once per unknown
+/// index (remembered in `unknown` until the next refresh) so a
+/// permanently unmapped index costs one scan, not one per packet.
+/// The scan is injected for testing; the listener passes `link_maps`.
+fn backfill_link(
+    ifindex: u32,
+    ifnames: &mut HashMap<u32, String>,
+    subnets: &mut SubnetMap,
+    unknown: &mut HashSet<u32>,
+    scan: &dyn Fn() -> (HashMap<u32, String>, SubnetMap),
+) {
+    if !unknown.insert(ifindex) {
+        return;
+    }
+    let (names, nets) = scan();
+    if let Some(name) = names.get(&ifindex) {
+        ifnames.insert(ifindex, name.clone());
+    }
+    if let Some(net) = nets.get(&ifindex) {
+        subnets.insert(ifindex, net.clone());
+    }
+}
+
+/// The two mDNS link-local multicast destinations (RFC 6762 §3).
+fn mdns_multicast_dest(dst: &IpAddr) -> bool {
+    *dst == IpAddr::V4(MDNS_V4) || *dst == IpAddr::V6(MDNS_V6)
+}
+
+/// RFC 6762 §11 locality test for unicast-destination packets: the
+/// source shares a local subnet ((I&M)==(P&M)) on the ingress link.
+/// Unknown links and family mismatches fail closed (refuse).
+fn source_on_link(subnets: &SubnetMap, ifindex: u32, src: &IpAddr) -> bool {
+    let Some(nets) = subnets.get(&ifindex) else {
+        return false;
+    };
+    nets.iter().any(|(addr, mask)| match (addr, mask, src) {
+        (IpAddr::V4(i), IpAddr::V4(m), IpAddr::V4(p)) => {
+            u32::from_be_bytes(i.octets()) & u32::from_be_bytes(m.octets())
+                == u32::from_be_bytes(p.octets()) & u32::from_be_bytes(m.octets())
+        }
+        (IpAddr::V6(i), IpAddr::V6(m), IpAddr::V6(p)) => {
+            u128::from_be_bytes(i.octets()) & u128::from_be_bytes(m.octets())
+                == u128::from_be_bytes(p.octets()) & u128::from_be_bytes(m.octets())
+        }
+        _ => false,
+    })
 }
 
 /// Whether an interface is usable for mDNS: it must be operationally
@@ -290,6 +382,14 @@ fn create_v4_socket() -> Result<PktInfoUdpSocket> {
     let socket = PktInfoUdpSocket::new(Domain::IPV4)?;
     socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
+    // Querier-only: our own transmissions must not loop back and be
+    // re-ingested as sightings (suppression already ignores self, and
+    // the Questions pane has no use for our own queries either).
+    socket.set_multicast_loop_v4(false)?;
+    // RFC 6762 §11 sends with IP TTL 255 (a SHOULD for responses, and
+    // ecosystem convention for queries too): link-local scope is
+    // unaffected, but legacy checkers discard anything else.
+    socket.set_multicast_ttl_v4(255)?;
     let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MDNS_PORT);
     socket.bind(&addr.into())?;
     Ok(socket)
@@ -299,6 +399,8 @@ fn create_v6_socket() -> Result<PktInfoUdpSocket> {
     let socket = PktInfoUdpSocket::new(Domain::IPV6)?;
     socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
+    socket.set_multicast_loop_v6(false)?;
+    socket.set_multicast_hops_v6(255)?;
     let addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, MDNS_PORT, 0, 0);
     socket.bind(&addr.into())?;
     Ok(socket)
@@ -315,12 +417,15 @@ fn listen(
     socket: &PktInfoUdpSocket,
     tx: mpsc::Sender<Event>,
     query_rx: mpsc::Receiver<QueryRequest>,
+    drops: Arc<DropStats>,
     family: Family,
 ) {
     let mut buf = vec![0u8; 65535];
     let mut ifaces_v4: Vec<(String, Ipv4Addr)> = Vec::new();
     let mut ifaces_v6: Vec<(String, u32)> = Vec::new();
     let mut ifnames: HashMap<u32, String> = HashMap::new();
+    let mut subnets: SubnetMap = HashMap::new();
+    let mut unknown: HashSet<u32> = HashSet::new();
     let mut last_refresh: Option<Instant> = None;
 
     loop {
@@ -329,7 +434,8 @@ fn listen(
             .unwrap_or(true)
         {
             last_refresh = Some(Instant::now());
-            ifnames = iface_names();
+            (ifnames, subnets) = link_maps();
+            unknown.clear();
             // Joins run unconditionally every pass: they are idempotent,
             // and a rejoin is required after an interface went away and
             // came back (same name, new incarnation).
@@ -374,11 +480,31 @@ fn listen(
                     continue;
                 }
                 let raw = buf[..len].to_vec();
-                let iface = ifnames
-                    .get(&(info.if_index as u32))
-                    .map(String::as_str)
-                    .unwrap_or("");
-                if let Some(ev) = parse_packet(&raw, info.addr_src, iface) {
+                let ifindex = info.if_index as u32;
+                if !ifnames.contains_key(&ifindex) || !subnets.contains_key(&ifindex) {
+                    // Stale maps (interface appeared mid-window) or an
+                    // index if-addrs never reports: re-query once
+                    // instead of waiting out the 10s refresh.
+                    backfill_link(
+                        ifindex,
+                        &mut ifnames,
+                        &mut subnets,
+                        &mut unknown,
+                        &link_maps,
+                    );
+                }
+                // RFC 6762 §11: multicast-destination packets are local
+                // regardless of source; unicast-destination ones must
+                // come from a local subnet, else silently discard (this
+                // is the spoof guard for our QU unicast replies).
+                if !mdns_multicast_dest(&info.addr_dst)
+                    && !source_on_link(&subnets, ifindex, &info.addr_src.ip())
+                {
+                    drops.note(info.addr_src);
+                    continue;
+                }
+                let iface = ifnames.get(&ifindex).map(String::as_str).unwrap_or("");
+                if let Some(ev) = parse_packet(&raw, info.addr_src, iface, ifindex) {
                     if tx.send(ev).is_err() {
                         break;
                     }
@@ -480,16 +606,17 @@ fn send_query(socket: &PktInfoUdpSocket, req: &QueryRequest, dest: SocketAddr, e
     let _ = socket.send_to(&bytes, &SockAddr::from(dest));
 }
 
-fn parse_packet(raw: &[u8], source: SocketAddr, iface: &str) -> Option<Event> {
+fn parse_packet(raw: &[u8], source: SocketAddr, iface: &str, ifindex: u32) -> Option<Event> {
     let msg = Message::from_bytes(raw).ok()?;
 
     let mut records = Vec::new();
 
     // Only responses carry authoritative records. Queries may carry the
     // same records as known answers (RFC 6762 §7.1 suppression), which
-    // are beliefs, not facts: the querier (often ourselves, via
-    // multicast loopback) is not their source. Filing them would conjure
-    // phantom sightings on links the device never touched.
+    // are beliefs, not facts: the querier (e.g. another browser on the
+    // link; multicast loop is disabled so never ourselves) is not their
+    // source. Filing them would conjure phantom sightings on links the
+    // device never touched.
     if msg.message_type() == MessageType::Response {
         for rec in msg
             .answers()
@@ -511,6 +638,7 @@ fn parse_packet(raw: &[u8], source: SocketAddr, iface: &str) -> Option<Event> {
                 wire: rec.to_bytes().unwrap_or_default(),
                 source,
                 iface: iface.to_string(),
+                ifindex,
                 received_at: Instant::now(),
             });
         }
@@ -532,6 +660,7 @@ fn parse_packet(raw: &[u8], source: SocketAddr, iface: &str) -> Option<Event> {
                 wire: Vec::new(),
                 source,
                 iface: iface.to_string(),
+                ifindex,
                 received_at: Instant::now(),
             });
         }
@@ -550,6 +679,7 @@ fn parse_packet(raw: &[u8], source: SocketAddr, iface: &str) -> Option<Event> {
             wire: Vec::new(),
             source,
             iface: iface.to_string(),
+            ifindex,
             received_at: Instant::now(),
         });
     }
@@ -815,7 +945,7 @@ mod tests {
             "Inst.svc._http._tcp.local.",
             120,
         ));
-        let ev = parse_packet(&q.to_vec().unwrap(), test_source(), "enx").unwrap();
+        let ev = parse_packet(&q.to_vec().unwrap(), test_source(), "enx", 2).unwrap();
         // The known answer must not become a sighting; the question stays.
         assert!(ev.records.is_empty());
         assert_eq!(ev.questions.len(), 1);
@@ -833,7 +963,7 @@ mod tests {
             "Inst.svc._http._tcp.local.",
             120,
         ));
-        let ev = parse_packet(&r.to_vec().unwrap(), test_source(), "enx").unwrap();
+        let ev = parse_packet(&r.to_vec().unwrap(), test_source(), "enx", 2).unwrap();
         assert_eq!(ev.records.len(), 1);
         assert_eq!(ev.records[0].rdata, "Inst.svc._http._tcp.local.");
         assert_eq!(ev.records[0].iface, "enx");
@@ -851,7 +981,7 @@ mod tests {
         query.set_mdns_unicast_response(true);
         q.add_query(query);
         q.set_message_type(MessageType::Query);
-        let ev = parse_packet(&q.to_vec().unwrap(), test_source(), "enx").unwrap();
+        let ev = parse_packet(&q.to_vec().unwrap(), test_source(), "enx", 2).unwrap();
         assert_eq!(ev.questions.len(), 1);
         assert!(ev.questions[0].qu);
     }
@@ -864,7 +994,7 @@ mod tests {
         rec.set_dns_class(DNSClass::IN);
         rec.set_mdns_cache_flush(flush);
         msg.add_answer(rec);
-        parse_packet(&msg.to_vec().unwrap(), test_source(), "").unwrap()
+        parse_packet(&msg.to_vec().unwrap(), test_source(), "", 7).unwrap()
     }
 
     #[test]
@@ -874,6 +1004,15 @@ mod tests {
         // a clear bit (RFC 6762 §10.2).
         assert!(flush_response(true).records[0].flush_bit);
         assert!(!flush_response(false).records[0].flush_bit);
+    }
+
+    #[test]
+    fn packet_index_survives_parse_without_name() {
+        // flush_response parses with ("", 7): no name, index kept.
+        let ev = flush_response(false);
+        assert_eq!(ev.records.len(), 1);
+        assert!(ev.records[0].iface.is_empty());
+        assert_eq!(ev.records[0].ifindex, 7);
     }
 
     #[test]
@@ -889,7 +1028,7 @@ mod tests {
         ka.set_dns_class(DNSClass::IN);
         ka.set_mdns_cache_flush(true);
         q.add_answer(ka);
-        let ev = parse_packet(&q.to_vec().unwrap(), test_source(), "").unwrap();
+        let ev = parse_packet(&q.to_vec().unwrap(), test_source(), "", 7).unwrap();
         assert!(ev.records.is_empty());
         assert_eq!(ev.query_kas.len(), 1);
         assert!(ev.query_kas[0].flush_bit);
@@ -1011,11 +1150,140 @@ mod tests {
         msg.add_answer(nsec);
         let raw = msg.to_vec().unwrap();
         let addr: SocketAddr = "192.168.178.5:5353".parse().unwrap();
-        let ev = parse_packet(&raw, addr, "br0").unwrap();
+        let ev = parse_packet(&raw, addr, "br0", 3).unwrap();
         assert_eq!(ev.records.len(), 1);
         assert_eq!(ev.records[0].rdata, "host.local. A");
         assert_eq!(ev.records[0].iface, "br0");
         assert!(ev.questions.is_empty());
+    }
+
+    #[test]
+    fn backfill_rescans_once_per_unknown_index() {
+        use std::cell::Cell;
+        use std::net::{IpAddr, Ipv4Addr};
+        let scans = Cell::new(0);
+        let scan = || {
+            scans.set(scans.get() + 1);
+            (
+                HashMap::from([(7u32, "wlp13s0".to_string())]),
+                HashMap::from([(
+                    7u32,
+                    vec![(
+                        IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+                        IpAddr::V4(Ipv4Addr::new(255, 255, 255, 0)),
+                    )],
+                )]),
+            )
+        };
+        let mut ifnames = HashMap::new();
+        let mut subnets: SubnetMap = HashMap::new();
+        let mut unknown = HashSet::new();
+        // Miss + scan finds it: both maps backfilled for later packets.
+        backfill_link(7, &mut ifnames, &mut subnets, &mut unknown, &scan);
+        assert_eq!(ifnames.get(&7).map(String::as_str), Some("wlp13s0"));
+        assert!(subnets.contains_key(&7));
+        assert_eq!(scans.get(), 1);
+        // Remembered from here on: no second scan for the same index.
+        backfill_link(7, &mut ifnames, &mut subnets, &mut unknown, &scan);
+        assert_eq!(scans.get(), 1);
+        // Miss + absent from scan: one scan, stays unknown.
+        backfill_link(9, &mut ifnames, &mut subnets, &mut unknown, &scan);
+        assert_eq!(scans.get(), 2);
+        assert!(unknown.contains(&9));
+        assert!(!ifnames.contains_key(&9));
+        assert!(!subnets.contains_key(&9));
+    }
+
+    #[test]
+    fn mdns_multicast_dest_matches_only_mdns_groups() {
+        assert!(mdns_multicast_dest(&IpAddr::V4(Ipv4Addr::new(
+            224, 0, 0, 251
+        ))));
+        assert!(mdns_multicast_dest(&MDNS_V6.into()));
+        assert!(!mdns_multicast_dest(&IpAddr::V4(Ipv4Addr::new(
+            224, 0, 0, 252
+        ))));
+        assert!(!mdns_multicast_dest(&IpAddr::V4(Ipv4Addr::new(
+            192, 168, 1, 10
+        ))));
+    }
+
+    #[test]
+    fn source_on_link_applies_subnet_mask() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let subnets: SubnetMap = HashMap::from([
+            (
+                2u32,
+                vec![(
+                    IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+                    IpAddr::V4(Ipv4Addr::new(255, 255, 255, 0)),
+                )],
+            ),
+            (
+                3u32,
+                vec![(
+                    IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+                    IpAddr::V6(Ipv6Addr::new(0xffff, 0xfc00, 0, 0, 0, 0, 0, 0)),
+                )],
+            ),
+        ]);
+        // Same /24: local.
+        assert!(source_on_link(
+            &subnets,
+            2,
+            &IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99))
+        ));
+        // Different subnet: off-link, refuse.
+        assert!(!source_on_link(
+            &subnets,
+            2,
+            &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))
+        ));
+        // Same fe80::/10: local.
+        assert!(source_on_link(
+            &subnets,
+            3,
+            &IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2))
+        ));
+        // Global source against a link-local prefix: refuse.
+        assert!(!source_on_link(
+            &subnets,
+            3,
+            &IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))
+        ));
+        // Unknown index and family mismatch fail closed.
+        assert!(!source_on_link(
+            &subnets,
+            9,
+            &IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99))
+        ));
+        assert!(!source_on_link(
+            &subnets,
+            2,
+            &IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2))
+        ));
+    }
+
+    #[test]
+    fn multicast_loop_is_disabled() {
+        // Querier-only: own transmissions must not loop back and be
+        // re-ingested. Failure here is loud (startup errors propagate).
+        let std4 = create_v4_socket().unwrap().try_clone_std().unwrap();
+        assert!(!socket2::Socket::from(std4).multicast_loop_v4().unwrap());
+        let std6 = create_v6_socket().unwrap().try_clone_std().unwrap();
+        assert!(!socket2::Socket::from(std6).multicast_loop_v6().unwrap());
+    }
+
+    #[test]
+    fn multicast_ttl_is_255() {
+        // RFC 6762 §11: mDNS packets go out with TTL 255.
+        let std4 = create_v4_socket().unwrap().try_clone_std().unwrap();
+        assert_eq!(socket2::Socket::from(std4).multicast_ttl_v4().unwrap(), 255);
+        let std6 = create_v6_socket().unwrap().try_clone_std().unwrap();
+        assert_eq!(
+            socket2::Socket::from(std6).multicast_hops_v6().unwrap(),
+            255
+        );
     }
 
     #[test]

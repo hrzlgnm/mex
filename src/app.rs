@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -203,6 +204,8 @@ pub struct App {
     pub metrics: MetricsCounters,
     /// Cached usable/skipped link snapshot, refreshed on the 10s tick.
     pub link_stats: browse::LinkStats,
+    /// Refused-packet accounting from the listener threads (RFC 6762 §11).
+    pub drop_stats: Arc<browse::DropStats>,
 
     rx: mpsc::Receiver<browse::Event>,
     query_tx: browse::QueryTx,
@@ -314,7 +317,7 @@ impl ServiceEntry {
 
 impl App {
     pub fn new() -> Result<Self> {
-        let (query_tx, rx) = browse::spawn()?;
+        let (query_tx, rx, drop_stats) = browse::spawn()?;
         Ok(Self {
             services: Vec::new(),
             selected_display: 0,
@@ -352,6 +355,7 @@ impl App {
             metrics_viewport: Cell::new(0),
             metrics: MetricsCounters::default(),
             link_stats: browse::link_stats(),
+            drop_stats,
         })
     }
 
@@ -494,16 +498,31 @@ impl App {
             }
         }
         m.kas_seen += ev.query_kas.len() as u64;
-        // Ingress link of the packet: first record/question/KA iface.
-        let iface = ev
+        // Ingress link of the packet: first record/question/KA. A name
+        // that never resolved falls back to the kernel index (`if#7`)
+        // so unmapped traffic stays identifiable instead of piling up
+        // under one opaque bucket.
+        let (iface, ifindex) = ev
             .records
             .first()
-            .map(|r| r.iface.as_str())
-            .or_else(|| ev.questions.first().map(|q| q.iface.as_str()))
-            .or_else(|| ev.query_kas.first().map(|k| k.iface.as_str()))
-            .unwrap_or("");
-        *m.iface_rx.entry(iface.to_string()).or_insert(0) += 1;
+            .or(ev.questions.first())
+            .or(ev.query_kas.first())
+            .map(|r| (r.iface.as_str(), r.ifindex))
+            .unwrap_or(("", 0));
+        *m.iface_rx
+            .entry(Self::link_key(iface, ifindex))
+            .or_insert(0) += 1;
         *m.source_rx.entry(ev.source).or_insert(0) += 1;
+    }
+
+    /// Display key for an ingress link: the interface name, or the
+    /// kernel index when the name never resolved.
+    fn link_key(iface: &str, ifindex: u32) -> String {
+        if iface.is_empty() {
+            format!("if#{ifindex}")
+        } else {
+            iface.to_string()
+        }
     }
 
     fn remaining_ttl(rec: &browse::RawRecord) -> u32 {
@@ -1199,11 +1218,11 @@ impl App {
                 self.link_stats.v6.len().max(1)
             ),
         );
+        kv(&mut rows, "refused off-link", self.offlink_row());
         let mut iface_rows: Vec<(&String, &u64)> = self.metrics.iface_rx.iter().collect();
         iface_rows.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
         for (iface, count) in iface_rows.iter().take(8) {
-            let label = if iface.is_empty() { "(unknown)" } else { iface };
-            kv(&mut rows, &format!("rx {label}"), count.to_string());
+            kv(&mut rows, &format!("rx {iface}"), count.to_string());
         }
         if iface_rows.len() > 8 {
             kv(
@@ -1320,6 +1339,19 @@ impl App {
             .iter()
             .filter(|t| t.elapsed() <= Duration::from_secs(60))
             .count()
+    }
+
+    /// RFC 6762 §11 refusal counter: unicast-destination packets from
+    /// off-link sources, silently discarded by the listeners.
+    fn offlink_row(&self) -> String {
+        let total = self.drop_stats.total();
+        match self.drop_stats.last() {
+            Some((src, at)) => format!(
+                "{total} total · last {src} {} ago",
+                fmt_age(at.elapsed().as_secs())
+            ),
+            None => format!("{total} total"),
+        }
     }
 
     fn unanswered_histogram(&self) -> String {
@@ -2715,6 +2747,7 @@ mod tests {
             wire: Vec::new(),
             source: test_source(),
             iface: String::new(),
+            ifindex: 0,
             received_at: Instant::now(),
         }
     }
@@ -3435,6 +3468,7 @@ mod tests {
             wire: Vec::new(),
             source,
             iface: String::new(),
+            ifindex: 0,
             received_at: Instant::now(),
         };
         browse::Event {
@@ -3580,6 +3614,22 @@ mod tests {
     }
 
     #[test]
+    fn packet_metrics_buckets_unmapped_link_by_index() {
+        let mut app = App::new().unwrap();
+        let mut rec = ptr_record(120);
+        rec.iface = String::new();
+        rec.ifindex = 7;
+        app.note_packet_metrics(&event_for(&rec));
+        assert_eq!(app.metrics.iface_rx.get("if#7"), Some(&1));
+        assert!(
+            !app.metrics.iface_rx.contains_key(""),
+            "no opaque empty bucket"
+        );
+        assert_eq!(App::link_key("", 0), "if#0");
+        assert_eq!(App::link_key("br0", 2), "br0");
+    }
+
+    #[test]
     fn packet_metrics_counts_goodbyes_and_qu() {
         let mut app = App::new().unwrap();
         let ev = browse::Event {
@@ -3595,6 +3645,7 @@ mod tests {
                 wire: Vec::new(),
                 source: remote_source(),
                 iface: String::new(),
+                ifindex: 0,
                 received_at: Instant::now(),
             }],
             query_kas: vec![ptr_record(120)],
@@ -3696,6 +3747,25 @@ mod tests {
         app.poll_continuous();
         assert_eq!(app.metrics.suppressed_continuous, 1);
         assert_eq!(app.metrics.q_sent_continuous, 0);
+    }
+
+    #[test]
+    fn metrics_offlink_row_counts_refusals() {
+        let app = App::new().unwrap();
+        let rows = app.metrics_rows();
+        let (_, value) = rows
+            .iter()
+            .find(|(k, _)| k == "refused off-link")
+            .expect("refused row");
+        assert_eq!(value, "0 total");
+        app.drop_stats.note("203.0.113.9:5353".parse().unwrap());
+        let rows = app.metrics_rows();
+        let (_, value) = rows
+            .iter()
+            .find(|(k, _)| k == "refused off-link")
+            .expect("refused row");
+        assert!(value.contains("1 total"), "got: {value}");
+        assert!(value.contains("203.0.113.9:5353"), "got: {value}");
     }
 
     #[test]

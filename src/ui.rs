@@ -827,6 +827,7 @@ mod tests {
             wire: Vec::new(),
             source: "192.168.1.5:5353".parse().unwrap(),
             iface: iface.to_string(),
+            ifindex: 0,
             received_at: Instant::now(),
         }
     }
