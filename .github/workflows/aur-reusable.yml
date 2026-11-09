@@ -54,7 +54,7 @@ jobs:
       matrix:
         package:
           - name: mex
-            checksum_url: "https://github.com/hrzlgnm/mex/releases/download/${{ needs.release-info.outputs.tagName }}/${{ needs.release-info.outputs.version }}.tar.gz.sha256"
+            checksum_url: "https://github.com/hrzlgnm/mex/releases/download/${{ needs.release-info.outputs.tagName }}/${{ needs.release-info.outputs.tagName }}.tar.gz.sha256"
             generate_script: "./packaging/aur/generate-mex.sh"
     steps:
       - name: 🔄 Checkout
