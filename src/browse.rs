@@ -497,12 +497,14 @@ fn parse_packet(raw: &[u8], source: SocketAddr, iface: &str) -> Option<Event> {
             .chain(msg.name_servers())
             .chain(msg.additionals())
         {
-            let class: u16 = rec.dns_class().into();
             records.push(RawRecord {
                 name: unescape(&rec.name().to_string()),
                 rtype: u16::from(rec.record_type()),
                 rtype_str: rtype_label(rec.record_type()),
-                flush_bit: class & 0x8000 != 0,
+                // hickory-proto strips the top CLASS bit at decode and
+                // exposes it via mdns_cache_flush(); reading dns_class()
+                // directly always yields a clear bit (RFC 6762 §10.2).
+                flush_bit: rec.mdns_cache_flush(),
                 qu: false,
                 ttl: rec.ttl(),
                 rdata: rdata_label(rec.data(), raw),
@@ -519,12 +521,11 @@ fn parse_packet(raw: &[u8], source: SocketAddr, iface: &str) -> Option<Event> {
     let mut query_kas = Vec::new();
     if msg.message_type() == MessageType::Query {
         for rec in msg.answers().iter() {
-            let class: u16 = rec.dns_class().into();
             query_kas.push(RawRecord {
                 name: unescape(&rec.name().to_string()),
                 rtype: u16::from(rec.record_type()),
                 rtype_str: rtype_label(rec.record_type()),
-                flush_bit: class & 0x8000 != 0,
+                flush_bit: rec.mdns_cache_flush(),
                 qu: false,
                 ttl: rec.ttl(),
                 rdata: rdata_label(rec.data(), raw),
@@ -853,6 +854,45 @@ mod tests {
         let ev = parse_packet(&q.to_vec().unwrap(), test_source(), "enx").unwrap();
         assert_eq!(ev.questions.len(), 1);
         assert!(ev.questions[0].qu);
+    }
+
+    fn flush_response(flush: bool) -> Event {
+        let mut msg = Message::new();
+        msg.set_message_type(MessageType::Response);
+        let mut rec = Record::with(Name::from_ascii("test.local.").unwrap(), RecordType::A, 120);
+        rec.set_data(Some(RData::A(Ipv4Addr::new(192, 168, 1, 10).into())));
+        rec.set_dns_class(DNSClass::IN);
+        rec.set_mdns_cache_flush(flush);
+        msg.add_answer(rec);
+        parse_packet(&msg.to_vec().unwrap(), test_source(), "").unwrap()
+    }
+
+    #[test]
+    fn response_flush_bit_survives_parse() {
+        // hickory-proto strips the top CLASS bit at decode into
+        // mdns_cache_flush(); reading dns_class() directly always yields
+        // a clear bit (RFC 6762 §10.2).
+        assert!(flush_response(true).records[0].flush_bit);
+        assert!(!flush_response(false).records[0].flush_bit);
+    }
+
+    #[test]
+    fn query_ka_flush_bit_survives_parse() {
+        let mut q = Message::new();
+        q.add_query(Query::query(
+            Name::from_ascii("test.local.").unwrap(),
+            RecordType::A,
+        ));
+        q.set_message_type(MessageType::Query);
+        let mut ka = Record::with(Name::from_ascii("test.local.").unwrap(), RecordType::A, 120);
+        ka.set_data(Some(RData::A(Ipv4Addr::new(192, 168, 1, 10).into())));
+        ka.set_dns_class(DNSClass::IN);
+        ka.set_mdns_cache_flush(true);
+        q.add_answer(ka);
+        let ev = parse_packet(&q.to_vec().unwrap(), test_source(), "").unwrap();
+        assert!(ev.records.is_empty());
+        assert_eq!(ev.query_kas.len(), 1);
+        assert!(ev.query_kas[0].flush_bit);
     }
 
     #[test]
