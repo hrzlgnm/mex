@@ -160,11 +160,30 @@ pub fn local_ips() -> HashSet<IpAddr> {
 fn iface_names() -> HashMap<u32, String> {
     let mut out = HashMap::new();
     for iface in if_addrs::get_if_addrs().unwrap_or_default() {
+        if !is_oper_up(&iface.name) {
+            continue;
+        }
         if let Some(idx) = iface.index {
             out.entry(idx).or_insert(iface.name);
         }
     }
     out
+}
+
+/// Whether an interface is usable for multicast: skip links that are
+/// operationally down (they may still carry addresses, so the address
+/// list alone does not filter them). Anything unexpected — missing
+/// sysfs entry, unparsable state, non-Linux — counts as up (fail-open),
+/// so exotic links (tunnels, VPNs reporting `unknown`) keep working.
+fn is_oper_up(name: &str) -> bool {
+    match std::fs::read_to_string(format!("/sys/class/net/{name}/operstate")) {
+        Ok(state) => oper_state_is_up(state.trim()),
+        Err(_) => true,
+    }
+}
+
+fn oper_state_is_up(state: &str) -> bool {
+    !matches!(state, "down" | "lowerlayerdown")
 }
 
 fn skipped_interface(name: &str) -> bool {
@@ -175,7 +194,7 @@ fn v4_interfaces() -> Vec<(String, Ipv4Addr)> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for iface in if_addrs::get_if_addrs().unwrap_or_default() {
-        if skipped_interface(&iface.name) {
+        if skipped_interface(&iface.name) || !is_oper_up(&iface.name) {
             continue;
         }
         if let if_addrs::IfAddr::V4(v4) = iface.addr {
@@ -192,7 +211,7 @@ fn v6_interfaces() -> Vec<(String, u32)> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for iface in if_addrs::get_if_addrs().unwrap_or_default() {
-        if skipped_interface(&iface.name) {
+        if skipped_interface(&iface.name) || !is_oper_up(&iface.name) {
             continue;
         }
         if let if_addrs::IfAddr::V6(v6) = iface.addr {
@@ -587,5 +606,18 @@ mod tests {
             SocketAddr::V6(v6) => assert_eq!(v6.scope_id(), 7),
             _ => panic!("expected v6 mDNS dest"),
         }
+    }
+
+    #[test]
+    fn oper_state_down_links_are_skipped() {
+        assert!(oper_state_is_up("up"));
+        assert!(oper_state_is_up("unknown"));
+        assert!(oper_state_is_up("dormant"));
+        assert!(oper_state_is_up("testing"));
+        assert!(oper_state_is_up("notpresent"));
+        assert!(!oper_state_is_up("down"));
+        assert!(!oper_state_is_up("lowerlayerdown"));
+        // Unknown sysfs entries fail open: missing interface, non-Linux.
+        assert!(is_oper_up("definitely-not-an-interface-mex"));
     }
 }
