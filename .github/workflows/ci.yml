@@ -82,6 +82,32 @@ jobs:
         shell: bash
         run: cargo build --locked
 
+  lockfile-fresh:
+    name: "🔒 Lockfile Fresh"
+    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-please--')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout only; the check never commits anything
+    steps:
+      - name: 🔄 Checkout PR head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: 🦀 Setup Rust cache
+        uses: ./.github/actions/setup-rust-cache
+
+      - name: 🔒 Verify lockfile is fully maximized
+        shell: bash
+        run: |
+          cargo update --manifest-path Cargo.toml
+          if ! git diff --quiet -- Cargo.lock; then
+            echo "::error::Cargo.lock is not fully maximized. Run Renovate lock maintenance and let release-please refresh this PR (CI re-runs automatically on the update)."
+            git diff --stat -- Cargo.lock
+            exit 1
+          fi
+          echo "Cargo.lock is fully maximized"
+
   ci-status:
     name: CI Status
     runs-on: ubuntu-latest
@@ -89,9 +115,11 @@ jobs:
       - lint
       - test
       - build
+      - lockfile-fresh
     if: always()
     steps:
       - name: Check whether all jobs succeeded
         uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0
         with:
+          allowed-skips: lockfile-fresh
           jobs: ${{ toJSON(needs) }}
