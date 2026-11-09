@@ -34,7 +34,8 @@ Headless run (no TTY) logs to stderr.
 * A/AAAA query names keep wire case; dedup keys are lowercase.
 * No queries for dead interests: `evict_expired` prunes `continuous`,
   `requeries`, `enum_known`, `known_types` to live names.
-* Records show the ingress interface (`addr%iface`) from IP_PKTINFO.
+* Records show the ingress interface (`%iface` for IPv6 link-local,
+  `@iface` otherwise) from IP_PKTINFO.
 * Unique answers (flush bit) dampen the exponential stream to hourly;
   the 80%-TTL refresh takes over.
 

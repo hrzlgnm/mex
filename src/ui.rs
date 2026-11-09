@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::io;
 use std::io::IsTerminal;
+use std::net::IpAddr;
 
 use crossterm::execute;
 use crossterm::terminal::{
@@ -289,13 +290,16 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
 }
 
 /// Source cell for the Records table: the responder address, suffixed
-/// with the ingress interface (`addr%iface`) when pktinfo provided one,
-/// so multi-link traffic can be told apart.
+/// with the ingress interface when pktinfo provided one, so multi-link
+/// traffic can be told apart. The `%iface` zone notation is only valid
+/// for IPv6 link-local unicast (RFC 4007); everything else uses `@iface`.
 fn source_label(rec: &crate::browse::RawRecord) -> String {
     if rec.iface.is_empty() {
         rec.source.to_string()
-    } else {
+    } else if matches!(rec.source.ip(), IpAddr::V6(v6) if v6.is_unicast_link_local()) {
         format!("{}%{}", rec.source, rec.iface)
+    } else {
+        format!("{}@{}", rec.source, rec.iface)
     }
 }
 
@@ -621,7 +625,16 @@ mod tests {
 
     #[test]
     fn source_label_shows_interface_when_known() {
-        assert_eq!(source_label(&test_record("br0")), "192.168.1.5:5353%br0");
+        assert_eq!(source_label(&test_record("br0")), "192.168.1.5:5353@br0");
         assert_eq!(source_label(&test_record("")), "192.168.1.5:5353");
+    }
+
+    #[test]
+    fn source_label_uses_zone_notation_only_for_v6_link_local() {
+        let mut rec = test_record("eth0");
+        rec.source = "[fe80::1]:5353".parse().unwrap();
+        assert_eq!(source_label(&rec), "[fe80::1]:5353%eth0");
+        rec.source = "[2001:db8::1]:5353".parse().unwrap();
+        assert_eq!(source_label(&rec), "[2001:db8::1]:5353@eth0");
     }
 }
