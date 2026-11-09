@@ -199,7 +199,12 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
 
     let mut state = ListState::default()
         .with_offset(app.list_offset.get())
-        .with_selected(Some(app.selected_display));
+        // The highlight lives in the focused pane; Tab moves it along.
+        .with_selected(if app.focus == Focus::Services {
+            Some(app.selected_display)
+        } else {
+            None
+        });
     frame.render_stateful_widget(list, area, &mut state);
     app.list_offset.set(state.offset());
 }
@@ -325,7 +330,7 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         offset = offset.min(total_rows.saturating_sub(1));
     }
     let mut tstate = TableState::default();
-    tstate.select(if app.detail_free_scroll {
+    tstate.select(if app.detail_free_scroll || app.focus != Focus::Records {
         None
     } else {
         selected_table_row
@@ -630,7 +635,11 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
         None
     };
     let mut tstate = TableState::default();
-    tstate.select(selected_table_row);
+    tstate.select(if app.focus == Focus::Records {
+        selected_table_row
+    } else {
+        None
+    });
     *tstate.offset_mut() = app.questions_offset.get();
     frame.render_stateful_widget(table, area, &mut tstate);
     app.questions_offset.set(tstate.offset());
