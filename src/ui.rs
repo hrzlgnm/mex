@@ -122,7 +122,7 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
     let items = app.display_items();
 
     // An Instance is last in its group if the next row is not another
-    // Instance (i.e. next is a ServiceType header or end of list).
+    // Instance (i.e. next is a Host header or end of list).
     let is_last_instance =
         |pos: usize| !matches!(items.get(pos + 1), Some(DisplayItem::Instance { .. }));
 
@@ -132,13 +132,19 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
         .map(|(i, item)| {
             let is_selected = i == app.selected_display;
             match item {
-                DisplayItem::ServiceType { label } => {
-                    let collapsed = app.is_type_collapsed(label);
+                DisplayItem::Host { label } => {
+                    let collapsed = app.is_host_collapsed(label);
                     let glyph = if collapsed { "▸" } else { "▾" };
-                    let count = app.service_type_count(label);
-                    let short = short_service_type(label);
+                    let display = app.host_display_name(label);
+                    let count = app.host_service_count(label);
+                    let addrs = app.host_addresses(label);
+                    let addr_suffix = match addrs.as_slice() {
+                        [] => String::new(),
+                        [first] => format!(" · {first}"),
+                        [first, rest @ ..] => format!(" · {first} (+{})", rest.len()),
+                    };
                     let line = Line::from(Span::styled(
-                        format!("{glyph} {short} ({count})"),
+                        format!("{glyph} {display} ({count}){addr_suffix}"),
                         if is_selected {
                             Style::default()
                                 .add_modifier(Modifier::BOLD)
@@ -156,13 +162,18 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
                     let last = is_last_instance(i);
                     let branch = if last { "└─" } else { "├─" };
                     let active = if svc.is_active { "●" } else { "○" };
-                    // One uniform style for all rows: the leading ●/○
-                    // carries the state and the list's bold highlight
-                    // marks the cursor. Same instance@host:port notation
-                    // as the right-pane titles.
+                    // Host context lives in the group header, so rows lead
+                    // with the graspable instance name; type and port share
+                    // one badge: [type:port].
+                    let short = short_service_type(&svc.service_type);
+                    let badge = if svc.port > 0 {
+                        format!("[{}:{}]", short, svc.port)
+                    } else {
+                        format!("[{short}]")
+                    };
                     let style = Style::default();
                     ListItem::new(Line::from(Span::styled(
-                        format!("{branch} {active} {}", pane_ident(svc)),
+                        format!("{branch} {active} {} {badge}", svc.instance),
                         style,
                     )))
                 }
@@ -170,18 +181,21 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
         })
         .collect();
 
-    // Always show the selected row's service type in the border title:
-    // instance rows carry no type themselves, so the type would otherwise
+    // Always show the selected row's host in the border title:
+    // instance rows carry no host themselves, so the host would otherwise
     // be invisible once its group header scrolls out of view.
     let title = match app.display_items().get(app.selected_display) {
-        Some(DisplayItem::Instance { index }) => format!(
-            " Services: {} ",
-            short_service_type(&app.services[*index].service_type)
-        ),
-        Some(DisplayItem::ServiceType { label }) => {
-            format!(" Services: {} ", short_service_type(label))
+        Some(DisplayItem::Instance { index }) => {
+            let key = app.services[*index]
+                .hostname
+                .trim_end_matches('.')
+                .to_lowercase();
+            format!(" Hosts: {} ", app.host_display_name(&key))
         }
-        None => " Services ".to_string(),
+        Some(DisplayItem::Host { label }) => {
+            format!(" Hosts: {} ", app.host_display_name(label))
+        }
+        None => " Hosts ".to_string(),
     };
     let list = List::new(list_items)
         .block(
@@ -429,24 +443,6 @@ fn detail_table_rows<'a>(
                 Cell::from(""),
                 Cell::from(""),
                 Cell::from(sub.clone()),
-            ])
-            .style(info_style),
-        );
-    }
-
-    if !svc.hostname.is_empty() {
-        let port_str = if svc.port > 0 {
-            format!(":{}", svc.port)
-        } else {
-            String::new()
-        };
-        rows.push(
-            Row::new(vec![
-                Cell::from("host"),
-                Cell::from(""),
-                Cell::from(""),
-                Cell::from(""),
-                Cell::from(format!("{}{}", svc.hostname, port_str)),
             ])
             .style(info_style),
         );

@@ -11,13 +11,17 @@ standard browse queries (service enumeration, PTR/SRV/TXT/A/AAAA).
 
 ## Layout
 
-- **Left — Services.** Collapsible tree grouped by shortened service type
-  (`http.tcp` is short for `_http._tcp.local`); each row shows
-  `instance @ host:port` with the state dot up front. `Up`/`Down` skips
-  open headers (collapsed ones stay selectable), the selection is inverted,
-  and the pane title always names the selected row's service type.
+- **Left — Hosts.** Collapsible tree grouped by hostname (`printer.local`);
+  each header shows `(service count) · primary address (+extra)` — e.g.
+  `printer.local (2) · 192.168.1.10 (+1)` — with `(+N)` only when more
+  than one live address is known. Each row shows `instance [short
+  type:port]` (`http.tcp` is short for `_http._tcp.local`, e.g.
+  `My Printer [http.tcp:9100]`) with the state dot
+  up front. `Up`/`Down` skips open headers (collapsed ones stay
+  selectable), the selection is inverted, and the pane title always names
+  the selected row's host.
 - **Right top — Answers.** For the selected service: derived rows
-  (`srvc`, `subt`, `host`), then one row per observed raw record
+  (`srvc`, `subt`), then one row per observed raw record
   (deduplicated across responders, sorted by type then source) with
   remaining TTL (heat-colored by fraction left: yellow under half, red
   under a fifth or expired), flush bit, source, and rdata. Multi-pair TXT records

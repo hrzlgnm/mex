@@ -23,7 +23,7 @@ pub enum Focus {
 
 #[derive(Clone)]
 pub enum DisplayItem {
-    ServiceType { label: String },
+    Host { label: String },
     Instance { index: usize },
 }
 
@@ -170,7 +170,7 @@ pub struct App {
     /// QU only on wake/interface-activation batch, QM afterwards).
     startup_qu_sent: bool,
     last_ip_refresh: Instant,
-    collapsed_types: HashSet<String>,
+    collapsed_hosts: HashSet<String>,
     /// Expanded TXT records in the Answers table, keyed by
     /// (name, rdata, source). Absent = collapsed (the default), so
     /// multi-pair TXT rows render as a single `▸ TXT` line until
@@ -272,7 +272,7 @@ impl App {
             enum_known: HashMap::new(),
             startup_qu_sent: false,
             last_ip_refresh: Instant::now(),
-            collapsed_types: HashSet::new(),
+            collapsed_hosts: HashSet::new(),
             expanded_txt: HashSet::new(),
             local_ips: browse::local_ips(),
             overheard: HashMap::new(),
@@ -706,24 +706,32 @@ impl App {
 
         let mut groups: Vec<G> = Vec::new();
         for (i, s) in self.services.iter().enumerate() {
-            match groups.iter_mut().find(|g| g.label == s.service_type) {
+            let key = Self::host_key(&s.hostname);
+            match groups.iter_mut().find(|g| g.label == key) {
                 Some(g) => g.indices.push(i),
                 None => groups.push(G {
-                    label: s.service_type.clone(),
+                    label: key,
                     indices: vec![i],
                 }),
             }
         }
 
         let mut items = Vec::new();
-        groups.sort_by(|a, b| a.label.cmp(&b.label));
+        groups.sort_by(|a, b| {
+            // Unknown hosts (empty key) sort last.
+            match (a.label.is_empty(), b.label.is_empty()) {
+                (true, false) => std::cmp::Ordering::Greater,
+                (false, true) => std::cmp::Ordering::Less,
+                _ => a.label.cmp(&b.label),
+            }
+        });
         for g in &groups {
             let mut sorted = g.indices.clone();
             sorted.sort_by(|&a, &b| self.services[a].instance.cmp(&self.services[b].instance));
-            items.push(DisplayItem::ServiceType {
+            items.push(DisplayItem::Host {
                 label: g.label.clone(),
             });
-            if self.collapsed_types.contains(&g.label) {
+            if self.collapsed_hosts.contains(&g.label) {
                 continue;
             }
             for idx in sorted {
@@ -733,21 +741,91 @@ impl App {
         items
     }
 
+    /// Normalized group key for host grouping: lowercased hostname without
+    /// trailing dot, `""` when the service has no hostname yet.
+    fn host_key(hostname: &str) -> String {
+        hostname.trim_end_matches('.').to_lowercase()
+    }
+
+    /// Display name for a host group key: first-seen hostname trimmed of its
+    /// trailing dot, or `(unknown host)` when no hostname is known yet.
+    pub fn host_display_name(&self, key: &str) -> String {
+        if key.is_empty() {
+            return "(unknown host)".to_string();
+        }
+        for s in &self.services {
+            if Self::host_key(&s.hostname) == key {
+                let trimmed = s.hostname.trim_end_matches('.');
+                if !trimmed.is_empty() {
+                    return trimmed.to_string();
+                }
+            }
+        }
+        key.to_string()
+    }
+
+    /// Live addresses (A/AAAA rdata) aggregated across all services on the
+    /// host, deduped with IPv4 first. Expired rows are omitted.
+    pub fn host_addresses(&self, key: &str) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut v4 = Vec::new();
+        let mut v6 = Vec::new();
+        for s in &self.services {
+            if Self::host_key(&s.hostname) != key {
+                continue;
+            }
+            for rec in &s.records {
+                if rec.rtype != 1 && rec.rtype != 28 {
+                    continue;
+                }
+                if rec.ttl <= rec.received_at.elapsed().as_secs() as u32 {
+                    continue;
+                }
+                let ip = rec.rdata.trim().to_string();
+                if ip.is_empty() || !seen.insert(ip.clone()) {
+                    continue;
+                }
+                if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
+                    if addr.is_ipv4() {
+                        v4.push(ip);
+                    } else {
+                        v6.push(ip);
+                    }
+                } else if rec.rtype == 1 {
+                    v4.push(ip);
+                } else {
+                    v6.push(ip);
+                }
+            }
+        }
+        v4.sort();
+        v6.sort();
+        v4.extend(v6);
+        v4
+    }
+
+    pub fn host_service_count(&self, key: &str) -> usize {
+        self.services
+            .iter()
+            .filter(|s| Self::host_key(&s.hostname) == key)
+            .count()
+    }
+
     fn toggle_collapse(&mut self) {
         let items = self.display_items();
         match items.get(self.selected_display) {
-            Some(DisplayItem::ServiceType { label }) => {
+            Some(DisplayItem::Host { label }) => {
                 let label = label.clone();
-                if !self.collapsed_types.remove(&label) {
-                    self.collapsed_types.insert(label);
+                if !self.collapsed_hosts.remove(&label) {
+                    self.collapsed_hosts.insert(label);
                 }
             }
-            // Hostname is folded into the instance row, so +/- on an
-            // instance folds its parent service type.
+            // Hostname is folded into the host header, so +/- on an
+            // instance folds its parent host.
             Some(DisplayItem::Instance { index }) => {
-                let label = self.services[*index].service_type.clone();
-                if !self.collapsed_types.remove(&label) {
-                    self.collapsed_types.insert(label);
+                let label = Self::host_key(&self.services[*index].hostname);
+                if !self.collapsed_hosts.remove(&label) {
+                    self.collapsed_hosts.insert(label);
                 }
             }
             None => {}
@@ -816,7 +894,7 @@ impl App {
                 KeyCode::Down => self.move_selection(1),
                 KeyCode::Char('k') => self.move_selection(-1),
                 KeyCode::Char('j') => self.move_selection(1),
-                // Jump between service-type groups.
+                // Jump between host groups.
                 KeyCode::Char('h') | KeyCode::Left => self.jump_group(-1),
                 KeyCode::Char('l') | KeyCode::Right => self.jump_group(1),
                 // Shift jumps to the first/last group (uppercase from Shift).
@@ -828,7 +906,7 @@ impl App {
                 KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => {
                     self.page_selection(1)
                 }
-                // Enter folds the service type like +/- does.
+                // Enter folds the host like +/- does.
                 KeyCode::Enter => self.toggle_collapse(),
                 KeyCode::Char('+') | KeyCode::Char('-') => self.toggle_collapse(),
                 _ => {}
@@ -862,13 +940,13 @@ impl App {
         }
     }
 
-    /// Selectable stops for Up/Down: instances always, service-type
-    /// headers only while collapsed (so a collapsed type can be
+    /// Selectable stops for Up/Down: instances always, host
+    /// headers only while collapsed (so a collapsed host can be
     /// uncollapsed again; folding is also available from member rows).
     fn is_selectable(&self, item: &DisplayItem) -> bool {
         match item {
             DisplayItem::Instance { .. } => true,
-            DisplayItem::ServiceType { label } => self.collapsed_types.contains(label),
+            DisplayItem::Host { label } => self.collapsed_hosts.contains(label),
         }
     }
 
@@ -906,11 +984,11 @@ impl App {
         }
     }
 
-    /// Service-type group labels in display order.
+    /// Host group keys in display order.
     fn group_labels(&self) -> Vec<String> {
         let mut labels = Vec::new();
         for it in self.display_items() {
-            if let DisplayItem::ServiceType { label } = it {
+            if let DisplayItem::Host { label } = it {
                 if !labels.contains(&label) {
                     labels.push(label);
                 }
@@ -919,15 +997,17 @@ impl App {
         labels
     }
 
-    /// Label of the group containing the cursor row.
+    /// Key of the host group containing the cursor row.
     fn cursor_group(&self) -> Option<String> {
         match self.display_items().get(self.selected_display)? {
-            DisplayItem::ServiceType { label } => Some(label.clone()),
-            DisplayItem::Instance { index } => Some(self.services[*index].service_type.clone()),
+            DisplayItem::Host { label } => Some(label.clone()),
+            DisplayItem::Instance { index } => {
+                Some(Self::host_key(&self.services[*index].hostname))
+            }
         }
     }
 
-    /// Jump to the neighbouring type group, landing on its first
+    /// Jump to the neighbouring host group, landing on its first
     /// selectable stop.
     fn jump_group(&mut self, delta: isize) {
         let labels = self.group_labels();
@@ -951,7 +1031,7 @@ impl App {
         self.select_group_first(&labels[next]);
     }
 
-    /// Jump to the first/last type group (Shift+h/l).
+    /// Jump to the first/last host group (Shift+h/l).
     fn jump_group_edge(&mut self, first: bool) {
         let labels = self.group_labels();
         if labels.is_empty() {
@@ -965,17 +1045,17 @@ impl App {
         self.select_group_first(label);
     }
 
-    /// Select the first selectable stop of a group: its header while
+    /// Select the first selectable stop of a host group: its header while
     /// collapsed, otherwise its first instance row.
     fn select_group_first(&mut self, label: &str) {
         let items = self.display_items();
         for (i, it) in items.iter().enumerate() {
             let belongs = match it {
-                DisplayItem::ServiceType { label: l } => l == label,
+                DisplayItem::Host { label: l } => l == label,
                 DisplayItem::Instance { index } => self
                     .services
                     .get(*index)
-                    .is_some_and(|s| s.service_type == label),
+                    .is_some_and(|s| Self::host_key(&s.hostname) == label),
             };
             if belongs && self.is_selectable(it) {
                 self.selected_display = i;
@@ -993,7 +1073,7 @@ impl App {
         let max = items.len().saturating_sub(1);
         let mut cur = self.selected_display;
 
-        // Service-type headers are not stops; Up/Down lands on instances.
+        // Host headers are not stops; Up/Down lands on instances.
         loop {
             if delta > 0 {
                 if cur >= max {
@@ -1828,16 +1908,16 @@ impl App {
         }
         // Expanded headers are not selectable stops (e.g. after a collapse
         // stranded the cursor on one, or at startup); settle on an instance.
-        // Collapsed headers stay put so their type can be unfolded again.
+        // Collapsed headers stay put so their host can be unfolded again.
         if matches!(
             self.display_items().get(self.selected_display),
-            Some(DisplayItem::ServiceType { label }) if !self.is_type_collapsed(label)
+            Some(DisplayItem::Host { label }) if !self.is_host_collapsed(label)
         ) {
             self.move_selection(1);
         }
         if matches!(
             self.display_items().get(self.selected_display),
-            Some(DisplayItem::ServiceType { label }) if !self.is_type_collapsed(label)
+            Some(DisplayItem::Host { label }) if !self.is_host_collapsed(label)
         ) {
             self.move_selection(-1);
         }
@@ -1870,8 +1950,8 @@ impl App {
         self.sync_detail_cursor();
     }
 
-    pub fn is_type_collapsed(&self, label: &str) -> bool {
-        self.collapsed_types.contains(label)
+    pub fn is_host_collapsed(&self, label: &str) -> bool {
+        self.collapsed_hosts.contains(label)
     }
 
     /// Number of distinct non-empty `; `-separated pairs in TXT rdata.
@@ -1900,8 +1980,8 @@ impl App {
 
     /// Toggle the TXT record under the Tab cursor. Returns false when the
     /// cursor is not on an expandable TXT row (caller falls back to the
-    /// service-type fold). Headers select nothing, so `Enter` on a header
-    /// keeps folding the service type instead of touching TXT state.
+    /// host fold). Headers select nothing, so `Enter` on a header
+    /// keeps folding the host instead of touching TXT state.
     fn toggle_txt_expanded(&mut self) -> bool {
         if self.selected_service().is_none() {
             return false;
@@ -1924,13 +2004,6 @@ impl App {
 
     pub fn is_local_source(&self, source: &std::net::SocketAddr) -> bool {
         self.local_ips.contains(&source.ip())
-    }
-
-    pub fn service_type_count(&self, label: &str) -> usize {
-        self.services
-            .iter()
-            .filter(|s| s.service_type == label)
-            .count()
     }
 
     pub fn selected_service(&self) -> Option<&ServiceEntry> {
@@ -2339,11 +2412,16 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::empty(),
         };
-        // Two questions on the selected service, oldest first.
+        // Two questions on the selected service, oldest first. The selected
+        // service is the first host group (shell.local), not services[0].
         let src: std::net::SocketAddr = "192.168.1.9:5353".parse().unwrap();
         let old = Instant::now() - Duration::from_secs(60);
         {
-            let svc = &mut app.services[0];
+            let sel_idx = match app.display_items().get(app.selected_display) {
+                Some(DisplayItem::Instance { index }) => *index,
+                _ => panic!("expected instance selected"),
+            };
+            let svc = &mut app.services[sel_idx];
             svc.questions.push((
                 "_http._tcp.local".to_string(),
                 "PTR".to_string(),
@@ -2359,7 +2437,11 @@ mod tests {
                 Vec::new(),
             ));
         }
-        let raw_count = app.services[0].ordered_records().len();
+        let raw_count = app
+            .display_service()
+            .expect("service displayed")
+            .ordered_records()
+            .len();
         // Tab twice to reach Questions; the cursor snaps to its first row.
         app.handle_key(&plain(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Answers);
@@ -2377,9 +2459,9 @@ mod tests {
         assert_eq!(app.detail_selected, raw_count);
         app.handle_key(&plain(KeyCode::End));
         assert_eq!(app.detail_selected, raw_count + 1);
-        // Enter has nothing to expand here and must not fold the type.
+        // Enter has nothing to expand here and must not fold the host.
         app.handle_key(&plain(KeyCode::Enter));
-        assert!(app.collapsed_types.is_empty());
+        assert!(app.collapsed_hosts.is_empty());
     }
 
     #[test]
@@ -2399,10 +2481,10 @@ mod tests {
             .find(|r| r.rtype == 16)
             .cloned()
             .expect("TXT record merged into service");
-        // Services focus: Enter folds the type, never expands TXT.
+        // Services focus: Enter folds the host, never expands TXT.
         app.handle_key(&key(KeyCode::Enter));
         assert!(!app.is_txt_expanded(&rec));
-        assert!(app.is_type_collapsed("_http._tcp.local"));
+        assert!(app.is_host_collapsed("test.local"));
         // Answers focus: Enter expands TXT instead.
         app.handle_key(&key(KeyCode::Char('+')));
         app.handle_key(&key(KeyCode::Tab));
@@ -2443,8 +2525,8 @@ mod tests {
         assert!(!app.detail_free_scroll);
     }
 
-    /// Two groups (http, ssh) with one instance each, cursor settled like
-    /// the main loop does.
+    /// Two hosts (shell.local, test.local) with one instance each, cursor
+    /// settled like the main loop does.
     fn two_group_app() -> App {
         let mut app = App::new().unwrap();
         ingest(&mut app, &ptr_record(120));
@@ -2478,10 +2560,73 @@ mod tests {
     }
 
     #[test]
+    fn groups_by_hostname_with_unknown_last() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        // Second service without hostname yet: instance known via PTR only
+        // would normally sit in pending; force a service with empty host.
+        app.services.push(ServiceEntry {
+            instance: "Lonely".to_string(),
+            service_type: "_http._tcp.local".to_string(),
+            hostname: String::new(),
+            port: 0,
+            subtypes: Vec::new(),
+            records: Vec::new(),
+            questions: Vec::new(),
+            last_seen: Instant::now(),
+            is_active: true,
+            last_event: None,
+        });
+        app.evict_expired();
+        let labels: Vec<String> = app
+            .display_items()
+            .into_iter()
+            .filter_map(|it| match it {
+                DisplayItem::Host { label } => Some(label),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, vec!["test.local".to_string(), String::new()]);
+        assert_eq!(app.host_display_name("test.local"), "test.local");
+        assert_eq!(app.host_display_name(""), "(unknown host)");
+        assert_eq!(app.host_service_count("test.local"), 1);
+        assert_eq!(app.host_service_count(""), 1);
+    }
+
+    #[test]
+    fn host_addresses_ipv4_first_live_only() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        // A + AAAA for the same host, plus a duplicate and an expired row.
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 1, "A", "192.168.1.10", 120),
+        );
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 1, "A", "192.168.1.10", 120),
+        );
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 28, "AAAA", "fe80::1", 120),
+        );
+        ingest(&mut app, &raw_record("test.local.", 1, "A", "10.0.0.9", 0));
+        let addrs = app.host_addresses("test.local");
+        assert_eq!(
+            addrs,
+            vec!["192.168.1.10".to_string(), "fe80::1".to_string()]
+        );
+        // (+N) suffix shows additional addresses beyond the primary.
+        assert_eq!(addrs.len() - 1, 1);
+    }
+
+    #[test]
     fn jk_moves_service_selection() {
         let mut app = two_group_app();
-        // Items: [http header, Test, ssh header, Shell]; clamp settles the
-        // cursor on the first instance.
+        // Items: [shell host header, Shell, test host header, Test]; clamp
+        // settles the cursor on the first instance.
         assert_eq!(app.selected_display, 1);
         app.handle_key(&plain_key(KeyCode::Char('j')));
         assert_eq!(app.selected_display, 3);
@@ -2525,7 +2670,7 @@ mod tests {
         // Space pages down one viewport (2 stops); b pages back up.
         app.handle_key(&plain_key(KeyCode::Char(' ')));
         assert_eq!(app.selected_display, 3);
-        assert!(app.collapsed_types.is_empty());
+        assert!(app.collapsed_hosts.is_empty());
         app.handle_key(&plain_key(KeyCode::Char('b')));
         assert_eq!(app.selected_display, 1);
     }
