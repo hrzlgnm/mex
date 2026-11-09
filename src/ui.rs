@@ -68,7 +68,7 @@ fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 .fg(Color::Cyan),
         ),
         Span::raw(format!(
-            "│ {} pkts │ {} svcs │ uptime {}  [q] quit [space←→] fold [j/k] row [enter] txt [^j/k] scroll",
+            "│ {} pkts │ {} svcs │ uptime {}  [q] quit [j/k] move [tab] row [h/l] group [space] page [+-] fold",
             app.packet_count,
             app.services.len(),
             uptime_str
@@ -117,6 +117,8 @@ fn short_service_type(label: &str) -> String {
 }
 
 fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    app.list_viewport
+        .set(area.height.saturating_sub(2) as usize);
     let items = app.display_items();
 
     // An Instance is last in its group if the next row is not another

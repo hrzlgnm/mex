@@ -112,6 +112,9 @@ pub struct App {
     pub services: Vec<ServiceEntry>,
     pub selected_display: usize,
     pub list_offset: Cell<usize>,
+    /// Visible rows of the service list pane (minus borders), recorded
+    /// during draw so PageUp/PageDown paging matches the viewport.
+    pub list_viewport: Cell<usize>,
     pub detail_selected: usize,
     pub detail_offset: Cell<usize>,
     /// Manual scroll of the Answers table (`Ctrl-j/k`): while set, the
@@ -239,6 +242,7 @@ impl App {
             services: Vec::new(),
             selected_display: 0,
             list_offset: Cell::new(0),
+            list_viewport: Cell::new(0),
             packet_count: 0,
             start_time: Instant::now(),
             running: true,
@@ -762,17 +766,13 @@ impl App {
         }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.running = false,
-            KeyCode::Up | KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Detail viewport scroll (sibling: Shift+Up/Down, J/K).
+            KeyCode::Up | KeyCode::Down
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
                 self.scroll_detail(if key.code == KeyCode::Down { 1 } else { -1 })
             }
-            KeyCode::Up => self.move_selection(-1),
-            KeyCode::Down => self.move_selection(1),
-            KeyCode::Left => self.set_collapsed(true),
-            KeyCode::Right => self.set_collapsed(false),
-            // Manual viewport scroll for the Answers table: ratatui's Table
-            // always snaps the viewport back to the selected row, so paging
-            // through children taller than the pane needs a mode where the
-            // cursor does not drag the viewport along (see draw_records_tab).
             KeyCode::Char('j') | KeyCode::Char('k')
                 if key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
@@ -782,17 +782,36 @@ impl App {
                     -1
                 })
             }
-            // Record cursor, only meaningful while the Records table is shown.
-            KeyCode::Char('j') => self.move_detail_cursor(1),
-            KeyCode::Char('k') => self.move_detail_cursor(-1),
-            // Enter folds/unfolds the TXT record under the j/k cursor;
-            // anywhere else it folds the service type like Space does.
+            KeyCode::Char('J') => self.scroll_detail(1),
+            KeyCode::Char('K') => self.scroll_detail(-1),
+            // Service selection (sibling: j/k + arrows).
+            KeyCode::Up => self.move_selection(-1),
+            KeyCode::Down => self.move_selection(1),
+            KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::Char('j') => self.move_selection(1),
+            // Record cursor over the Answers table.
+            KeyCode::Tab => self.move_detail_cursor(1),
+            KeyCode::BackTab => self.move_detail_cursor(-1),
+            // Service-type group jumps (sibling: h/l switch types).
+            KeyCode::Char('h') => self.jump_group(-1),
+            KeyCode::Char('l') => self.jump_group(1),
+            // Shift jumps to the first/last group (uppercase from Shift).
+            KeyCode::Char('H') => self.jump_group_edge(true),
+            KeyCode::Char('L') => self.jump_group_edge(false),
+            KeyCode::Home => self.select_edge(true),
+            KeyCode::End => self.select_edge(false),
+            KeyCode::PageUp | KeyCode::Char('b') => self.page_selection(-1),
+            KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => self.page_selection(1),
+            KeyCode::Left => self.set_collapsed(true),
+            KeyCode::Right => self.set_collapsed(false),
+            // Enter folds/unfolds the TXT record under the Tab cursor;
+            // anywhere else it folds the service type like +/- does.
             KeyCode::Enter => {
                 if !self.toggle_txt_expanded() {
                     self.toggle_collapse()
                 }
             }
-            KeyCode::Char(' ') | KeyCode::Char('+') | KeyCode::Char('-') => self.toggle_collapse(),
+            KeyCode::Char('+') | KeyCode::Char('-') => self.toggle_collapse(),
             _ => {}
         }
     }
@@ -804,6 +823,118 @@ impl App {
         match item {
             DisplayItem::Instance { .. } => true,
             DisplayItem::ServiceType { label } => self.collapsed_types.contains(label),
+        }
+    }
+
+    /// First/last selectable stop (sibling: Home/End).
+    fn select_edge(&mut self, first: bool) {
+        let items = self.display_items();
+        let mut target = None;
+        for (i, it) in items.iter().enumerate() {
+            if self.is_selectable(it) {
+                if first {
+                    target = Some(i);
+                    break;
+                }
+                target = Some(i);
+            }
+        }
+        if let Some(i) = target {
+            self.selected_display = i;
+        }
+    }
+
+    /// Page the service selection by one viewport of stops (sibling:
+    /// PageUp/PageDown/b/f/Space). Falls back to 10 stops before the
+    /// first draw records the real height.
+    fn page_selection(&mut self, pages: isize) {
+        let per_page = self.list_viewport.get().max(1) as isize;
+        let steps = pages * per_page;
+        let n = steps.unsigned_abs().min(1000);
+        for _ in 0..n {
+            let before = self.selected_display;
+            self.move_selection(steps.signum());
+            if self.selected_display == before {
+                break;
+            }
+        }
+    }
+
+    /// Service-type group labels in display order.
+    fn group_labels(&self) -> Vec<String> {
+        let mut labels = Vec::new();
+        for it in self.display_items() {
+            if let DisplayItem::ServiceType { label } = it {
+                if !labels.contains(&label) {
+                    labels.push(label);
+                }
+            }
+        }
+        labels
+    }
+
+    /// Label of the group containing the cursor row.
+    fn cursor_group(&self) -> Option<String> {
+        match self.display_items().get(self.selected_display)? {
+            DisplayItem::ServiceType { label } => Some(label.clone()),
+            DisplayItem::Instance { index } => Some(self.services[*index].service_type.clone()),
+        }
+    }
+
+    /// Jump to the neighbouring type group (sibling: h/l switch types):
+    /// lands on its first selectable stop.
+    fn jump_group(&mut self, delta: isize) {
+        let labels = self.group_labels();
+        if labels.is_empty() {
+            return;
+        }
+        let cur = self
+            .cursor_group()
+            .and_then(|g| labels.iter().position(|l| l == &g));
+        let next = match cur {
+            Some(i) if delta > 0 => (i + 1).min(labels.len() - 1),
+            Some(i) if delta < 0 => i.saturating_sub(1),
+            _ => {
+                if delta > 0 {
+                    0
+                } else {
+                    labels.len() - 1
+                }
+            }
+        };
+        self.select_group_first(&labels[next]);
+    }
+
+    /// Jump to the first/last type group (Shift+h/l).
+    fn jump_group_edge(&mut self, first: bool) {
+        let labels = self.group_labels();
+        if labels.is_empty() {
+            return;
+        }
+        let label = if first {
+            &labels[0]
+        } else {
+            &labels[labels.len() - 1]
+        };
+        self.select_group_first(label);
+    }
+
+    /// Select the first selectable stop of a group: its header while
+    /// collapsed, otherwise its first instance row.
+    fn select_group_first(&mut self, label: &str) {
+        let items = self.display_items();
+        for (i, it) in items.iter().enumerate() {
+            let belongs = match it {
+                DisplayItem::ServiceType { label: l } => l == label,
+                DisplayItem::Instance { index } => self
+                    .services
+                    .get(*index)
+                    .is_some_and(|s| s.service_type == label),
+            };
+            if belongs && self.is_selectable(it) {
+                self.selected_display = i;
+                return;
+            }
         }
     }
 
@@ -838,7 +969,7 @@ impl App {
         }
     }
 
-    /// j/k cursor over the Records table rows: raw records first, then
+    /// Tab cursor over the Records table rows: raw records first, then
     /// questions. The cursor tracks row identity, so TTL resorting and
     /// re-announcements don't yank the selection to another row.
     fn move_detail_cursor(&mut self, delta: isize) {
@@ -1659,7 +1790,7 @@ impl App {
         self.expanded_txt.contains(&Self::txt_key(rec))
     }
 
-    /// Toggle the TXT record under the j/k cursor. Returns false when the
+    /// Toggle the TXT record under the Tab cursor. Returns false when the
     /// cursor is not on an expandable TXT row (caller falls back to the
     /// service-type fold). Headers select nothing, so `Enter` on a header
     /// keeps folding the service type instead of touching TXT state.
@@ -1732,7 +1863,7 @@ impl App {
             .find(|s| s.service_type == key.0 && s.instance == key.1)
     }
 
-    /// Entry under the j/k cursor in the Records table: a raw record row or
+    /// Entry under the Tab cursor in the Records table: a raw record row or
     /// a question row (table order is raw records first, then questions
     /// by type/newest-first, matching the rendered table).
     pub fn selected_detail_entry(&self) -> Option<DetailEntry<'_>> {
@@ -1949,7 +2080,7 @@ mod tests {
         ingest(app, &txt_record(rdata));
         ingest(app, &srv_record(120));
         // Settle the cursors onto the instance row like the main loop does,
-        // then park the j/k cursor on the TXT row (it defaults to the
+        // then park the Tab cursor on the TXT row (it defaults to the
         // first record, usually PTR).
         app.evict_expired();
         assert!(app.selected_service().is_some());
@@ -1960,7 +2091,7 @@ mod tests {
                 .position(|r| r.rtype == 16)
                 .expect("TXT record merged into service")
         };
-        // Park the j/k cursor on the TXT row without going through
+        // Park the Tab cursor on the TXT row without going through
         // sync_detail_cursor (which would re-anchor to the old PTR row).
         app.detail_selected = idx;
         app.detail_anchor = app
@@ -2025,7 +2156,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_j_pins_viewport_and_j_resumes_follow() {
+    fn ctrl_j_pins_viewport_and_tab_resumes_follow() {
         use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
         let mut app = App::new().unwrap();
         service_with_txt(&mut app, "a=1; b=2");
@@ -2047,9 +2178,13 @@ mod tests {
         assert_eq!(app.detail_offset.get(), 1);
         app.handle_key(&ctrl(KeyCode::Char('k')));
         assert_eq!(app.detail_offset.get(), 0);
-        // Plain j/k resumes cursor-following.
-        app.handle_key(&plain(KeyCode::Char('j')));
+        // Shift+Tab resumes cursor-following and moves the record cursor
+        // up (Tab is parked on the last row, TXT, so it cannot move down).
+        let before = app.detail_selected;
+        assert!(before > 0);
+        app.handle_key(&plain(KeyCode::BackTab));
         assert!(!app.detail_free_scroll);
+        assert_eq!(app.detail_selected, before - 1);
     }
 
     #[test]
@@ -2060,6 +2195,105 @@ mod tests {
         assert!(app.detail_free_scroll);
         assert!(app.toggle_txt_expanded());
         assert!(!app.detail_free_scroll);
+    }
+
+    /// Two groups (http, ssh) with one instance each, cursor settled like
+    /// the main loop does.
+    fn two_group_app() -> App {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        ingest(
+            &mut app,
+            &raw_record("_ssh._tcp.local.", 12, "PTR", "Shell._ssh._tcp.local.", 120),
+        );
+        ingest(
+            &mut app,
+            &raw_record(
+                "Shell._ssh._tcp.local.",
+                33,
+                "SRV",
+                "0 0 22 shell.local.",
+                120,
+            ),
+        );
+        app.evict_expired();
+        app
+    }
+
+    fn plain_key(code: KeyCode) -> KeyEvent {
+        use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        }
+    }
+
+    #[test]
+    fn jk_moves_service_selection() {
+        let mut app = two_group_app();
+        // Items: [http header, Test, ssh header, Shell]; clamp settles the
+        // cursor on the first instance.
+        assert_eq!(app.selected_display, 1);
+        app.handle_key(&plain_key(KeyCode::Char('j')));
+        assert_eq!(app.selected_display, 3);
+        app.handle_key(&plain_key(KeyCode::Char('k')));
+        assert_eq!(app.selected_display, 1);
+    }
+
+    #[test]
+    fn hl_jumps_between_groups() {
+        let mut app = two_group_app();
+        assert_eq!(app.selected_display, 1);
+        app.handle_key(&plain_key(KeyCode::Char('l')));
+        assert_eq!(app.selected_display, 3);
+        app.handle_key(&plain_key(KeyCode::Char('h')));
+        assert_eq!(app.selected_display, 1);
+        // Shift jumps to the first/last group.
+        app.handle_key(&plain_key(KeyCode::Char('L')));
+        assert_eq!(app.selected_display, 3);
+        app.handle_key(&plain_key(KeyCode::Char('H')));
+        assert_eq!(app.selected_display, 1);
+    }
+
+    #[test]
+    fn home_end_and_space_paging() {
+        let mut app = two_group_app();
+        app.list_viewport.set(2);
+        app.handle_key(&plain_key(KeyCode::End));
+        assert_eq!(app.selected_display, 3);
+        app.handle_key(&plain_key(KeyCode::Home));
+        assert_eq!(app.selected_display, 1);
+        // Space pages down one viewport (2 stops); b pages back up.
+        app.handle_key(&plain_key(KeyCode::Char(' ')));
+        assert_eq!(app.selected_display, 3);
+        assert!(app.collapsed_types.is_empty());
+        app.handle_key(&plain_key(KeyCode::Char('b')));
+        assert_eq!(app.selected_display, 1);
+    }
+
+    #[test]
+    fn shift_arrows_and_jk_scroll_detail() {
+        use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1; b=2");
+        let shift = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        app.handle_key(&shift(KeyCode::Down));
+        assert!(app.detail_free_scroll);
+        assert_eq!(app.detail_offset.get(), 1);
+        app.handle_key(&plain_key(KeyCode::Char('J')));
+        assert_eq!(app.detail_offset.get(), 2);
+        app.handle_key(&plain_key(KeyCode::Char('K')));
+        assert_eq!(app.detail_offset.get(), 1);
+        app.handle_key(&shift(KeyCode::Up));
+        assert_eq!(app.detail_offset.get(), 0);
     }
 
     #[test]
