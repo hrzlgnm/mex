@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::mpsc;
 use std::thread;
@@ -40,11 +39,24 @@ fn unescape(s: &str) -> String {
     }
     out
 }
-use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use socket2::{Domain, SockAddr};
+use socket_pktinfo::PktInfoUdpSocket;
 
 const MDNS_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 const MDNS_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
 const MDNS_PORT: u16 = 5353;
+/// How often the listener threads re-enumerate interfaces: picks up
+/// bridges and other links that appear at runtime (and drops dead ones
+/// from the transmit set on the next pass).
+const IFACE_REFRESH: Duration = Duration::from_secs(60);
+
+/// Address family of a listener thread: selects the interface list,
+/// the join call, and the per-packet transmit interface.
+#[derive(Clone, Copy)]
+enum Family {
+    V4,
+    V6,
+}
 
 #[derive(Debug, Clone)]
 pub struct RawRecord {
@@ -102,9 +114,7 @@ pub fn spawn() -> Result<(QueryTx, mpsc::Receiver<Event>)> {
     let (tx_v4, rx_v4) = mpsc::channel();
     let (tx_v6, rx_v6) = mpsc::channel();
 
-    let v4_interfaces = v4_interfaces();
     let tx4 = tx.clone();
-    let dest_v4 = SocketAddr::from(SocketAddrV4::new(MDNS_V4, MDNS_PORT));
     thread::spawn(move || {
         let socket = match create_v4_socket() {
             Ok(s) => s,
@@ -113,16 +123,9 @@ pub fn spawn() -> Result<(QueryTx, mpsc::Receiver<Event>)> {
                 return;
             }
         };
-        for (name, ip) in &v4_interfaces {
-            if let Err(e) = socket.join_multicast_v4(&MDNS_V4, ip) {
-                eprintln!("mex: v4 mcast {name}: {e}");
-            }
-        }
-        listen(&socket, tx4, rx_v4, dest_v4);
+        listen(&socket, tx4, rx_v4, Family::V4);
     });
 
-    let v6_interfaces = v6_interfaces();
-    let dest_v6 = SocketAddr::from(SocketAddrV6::new(MDNS_V6, MDNS_PORT, 0, 0));
     thread::spawn(move || {
         let socket = match create_v6_socket() {
             Ok(s) => s,
@@ -131,12 +134,7 @@ pub fn spawn() -> Result<(QueryTx, mpsc::Receiver<Event>)> {
                 return;
             }
         };
-        for (name, idx) in &v6_interfaces {
-            if let Err(e) = socket.join_multicast_v6(&MDNS_V6, *idx) {
-                eprintln!("mex: v6 mcast {name}: {e}");
-            }
-        }
-        listen(&socket, tx, rx_v6, dest_v6);
+        listen(&socket, tx, rx_v6, Family::V6);
     });
 
     Ok((
@@ -194,61 +192,99 @@ fn v6_interfaces() -> Vec<(String, u32)> {
     out
 }
 
-fn create_v4_socket() -> Result<Socket> {
-    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+fn create_v4_socket() -> Result<PktInfoUdpSocket> {
+    let socket = PktInfoUdpSocket::new(Domain::IPV4)?;
     socket.set_reuse_address(true)?;
-    socket.set_read_timeout(Some(Duration::from_millis(500)))?;
+    socket.set_nonblocking(true)?;
     let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MDNS_PORT);
     socket.bind(&addr.into())?;
     Ok(socket)
 }
 
-fn create_v6_socket() -> Result<Socket> {
-    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+fn create_v6_socket() -> Result<PktInfoUdpSocket> {
+    let socket = PktInfoUdpSocket::new(Domain::IPV6)?;
     socket.set_reuse_address(true)?;
-    let _ = socket.set_only_v6(true);
-    socket.set_read_timeout(Some(Duration::from_millis(500)))?;
+    socket.set_nonblocking(true)?;
     let addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, MDNS_PORT, 0, 0);
     socket.bind(&addr.into())?;
     Ok(socket)
 }
 
+/// mDNS destination for one interface: link-local multicast needs the
+/// egress interface's scope id, otherwise the packet leaves via whatever
+/// the kernel picks as the default multicast interface (or fails).
+fn mdns_dest_v6(ifindex: u32) -> SocketAddr {
+    SocketAddr::from(SocketAddrV6::new(MDNS_V6, MDNS_PORT, 0, ifindex))
+}
+
 fn listen(
-    socket: &Socket,
+    socket: &PktInfoUdpSocket,
     tx: mpsc::Sender<Event>,
     query_rx: mpsc::Receiver<QueryRequest>,
-    dest: SocketAddr,
+    family: Family,
 ) {
-    let mut buf = vec![MaybeUninit::uninit(); 65535];
+    let mut buf = vec![0u8; 65535];
+    let mut ifaces_v4: Vec<(String, Ipv4Addr)> = Vec::new();
+    let mut ifaces_v6: Vec<(String, u32)> = Vec::new();
+    let mut joined_v4: HashSet<String> = HashSet::new();
+    let mut joined_v6: HashSet<String> = HashSet::new();
+    let mut last_refresh: Option<Instant> = None;
 
     loop {
-        // drain any pending outgoing queries
-        while let Ok(req) = query_rx.try_recv() {
-            send_query(socket, &req, dest);
+        if last_refresh
+            .map(|t| t.elapsed() >= IFACE_REFRESH)
+            .unwrap_or(true)
+        {
+            last_refresh = Some(Instant::now());
+            match family {
+                Family::V4 => {
+                    ifaces_v4 = v4_interfaces();
+                    for (name, ip) in &ifaces_v4 {
+                        if !joined_v4.insert(name.clone()) {
+                            continue;
+                        }
+                        if let Err(e) = socket.join_multicast_v4(&MDNS_V4, ip) {
+                            eprintln!("mex: v4 mcast {name}: {e}");
+                        }
+                    }
+                }
+                Family::V6 => {
+                    ifaces_v6 = v6_interfaces();
+                    for (name, idx) in &ifaces_v6 {
+                        if !joined_v6.insert(name.clone()) {
+                            continue;
+                        }
+                        if let Err(e) = socket.join_multicast_v6(&MDNS_V6, *idx) {
+                            eprintln!("mex: v6 mcast {name}: {e}");
+                        }
+                    }
+                }
+            }
         }
 
-        match socket.recv_from(&mut buf) {
-            Ok((len, sockaddr)) => {
-                let addr = match sockaddr.as_socket() {
-                    Some(a) => a,
-                    None => continue,
-                };
-                let raw: Vec<u8> = buf[..len]
-                    .iter()
-                    .map(|x| unsafe { x.assume_init() })
-                    .collect();
+        // drain any pending outgoing queries
+        while let Ok(req) = query_rx.try_recv() {
+            send_on_all_interfaces(socket, &req, family, &ifaces_v4, &ifaces_v6);
+        }
 
-                if let Some(ev) = parse_packet(&raw, addr) {
+        match socket.recv(&mut buf) {
+            Ok((len, info)) => {
+                // The v6 socket is dual-stack (no IPV6_V6ONLY setter on the
+                // wrapper): v4 traffic also arrives here as v4-mapped. Drop
+                // it so the v4 socket remains the single owner of v4
+                // packets instead of recording everything twice.
+                if is_v4_mapped(&info.addr_src) {
+                    continue;
+                }
+                let raw = buf[..len].to_vec();
+                if let Some(ev) = parse_packet(&raw, info.addr_src) {
                     if tx.send(ev).is_err() {
                         break;
                     }
                 }
             }
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                continue;
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
                 eprintln!("mex: recv error: {e}");
@@ -258,7 +294,51 @@ fn listen(
     }
 }
 
-fn send_query(socket: &Socket, req: &QueryRequest, dest: SocketAddr) {
+/// One copy of the query per local interface, each forced out its own
+/// link: without the per-packet interface the kernel sends everything
+/// via the default multicast interface and other links (e.g. a bridge)
+/// never see our queries.
+fn send_on_all_interfaces(
+    socket: &PktInfoUdpSocket,
+    req: &QueryRequest,
+    family: Family,
+    ifaces_v4: &[(String, Ipv4Addr)],
+    ifaces_v6: &[(String, u32)],
+) {
+    match family {
+        Family::V4 => {
+            if ifaces_v4.is_empty() {
+                let dest = SocketAddr::from(SocketAddrV4::new(MDNS_V4, MDNS_PORT));
+                send_query(socket, req, dest);
+                return;
+            }
+            for (_name, ip) in ifaces_v4 {
+                let _ = socket.set_multicast_if_v4(ip);
+                let dest = SocketAddr::from(SocketAddrV4::new(MDNS_V4, MDNS_PORT));
+                send_query(socket, req, dest);
+            }
+        }
+        Family::V6 => {
+            if ifaces_v6.is_empty() {
+                send_query(socket, req, mdns_dest_v6(0));
+                return;
+            }
+            for (_name, idx) in ifaces_v6 {
+                let _ = socket.set_multicast_if_v6(*idx);
+                send_query(socket, req, mdns_dest_v6(*idx));
+            }
+        }
+    }
+}
+
+fn is_v4_mapped(addr: &SocketAddr) -> bool {
+    match addr.ip() {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().is_some(),
+        _ => false,
+    }
+}
+
+fn send_query(socket: &PktInfoUdpSocket, req: &QueryRequest, dest: SocketAddr) {
     let qname = match Name::from_ascii(format!("{}.", req.name)) {
         Ok(n) => n,
         Err(_) => return,
@@ -473,5 +553,18 @@ fn decode_nsec(rdata: &[u8]) -> String {
         name
     } else {
         format!("{name} {}", types.join(" "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v6_dest_carries_interface_scope() {
+        match mdns_dest_v6(7) {
+            SocketAddr::V6(v6) => assert_eq!(v6.scope_id(), 7),
+            _ => panic!("expected v6 mDNS dest"),
+        }
     }
 }
