@@ -6,7 +6,11 @@ use anyhow::Result;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(name = "mex", about = "Browse mDNS/DNS-SD services on the local link")]
+#[command(
+    name = "mex",
+    version,
+    about = "Browse mDNS/DNS-SD services on the local link"
+)]
 struct Args {
     /// Listen only: never transmit queries, just observe announcements
     #[arg(long)]
@@ -37,5 +41,18 @@ mod tests {
         assert!(!args.passive);
         let args = Args::try_parse_from(["mex", "--passive"]).unwrap();
         assert!(args.passive);
+    }
+
+    #[test]
+    fn standard_flags_exist() {
+        use clap::error::ErrorKind;
+        for flag in ["--help", "-h"] {
+            let err = Args::try_parse_from(["mex", flag]).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+        }
+        for flag in ["--version", "-V"] {
+            let err = Args::try_parse_from(["mex", flag]).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::DisplayVersion);
+        }
     }
 }
