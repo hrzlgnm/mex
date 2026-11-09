@@ -11,13 +11,14 @@ use hickory_proto::rr::RecordType;
 use crate::browse;
 use crate::ui;
 
-/// Pane with keyboard focus: Tab cycles between the service list and
-/// the record (Answers/Questions) tables.
+/// Pane with keyboard focus: Tab cycles the service list and the two
+/// record tables. Arrows and j/k navigate inside the focused pane.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Focus {
     #[default]
     Services,
-    Records,
+    Answers,
+    Questions,
 }
 
 #[derive(Clone)]
@@ -762,15 +763,22 @@ impl App {
         }
         // Tab cycles pane focus in both directions.
         match key.code {
-            KeyCode::Tab | KeyCode::BackTab => {
+            KeyCode::Tab => {
                 self.focus = match self.focus {
-                    Focus::Services => Focus::Records,
-                    Focus::Records => Focus::Services,
+                    Focus::Services => Focus::Answers,
+                    Focus::Answers => Focus::Questions,
+                    Focus::Questions => Focus::Services,
                 };
-                if self.focus == Focus::Records {
-                    // Anchor the record cursor without moving it.
-                    self.move_detail_cursor(0);
-                }
+                self.snap_detail_to_focus();
+                return;
+            }
+            KeyCode::BackTab => {
+                self.focus = match self.focus {
+                    Focus::Services => Focus::Questions,
+                    Focus::Answers => Focus::Services,
+                    Focus::Questions => Focus::Answers,
+                };
+                self.snap_detail_to_focus();
                 return;
             }
             _ => {}
@@ -825,7 +833,7 @@ impl App {
                 KeyCode::Char('+') | KeyCode::Char('-') => self.toggle_collapse(),
                 _ => {}
             },
-            Focus::Records => match key.code {
+            Focus::Answers => match key.code {
                 KeyCode::Up => self.move_detail_cursor(-1),
                 KeyCode::Down => self.move_detail_cursor(1),
                 KeyCode::Char('k') => self.move_detail_cursor(-1),
@@ -838,6 +846,17 @@ impl App {
                 KeyCode::Enter => {
                     self.toggle_txt_expanded();
                 }
+                _ => {}
+            },
+            Focus::Questions => match key.code {
+                KeyCode::Up => self.move_detail_cursor(-1),
+                KeyCode::Down => self.move_detail_cursor(1),
+                KeyCode::Char('k') => self.move_detail_cursor(-1),
+                KeyCode::Char('j') => self.move_detail_cursor(1),
+                KeyCode::Home => self.move_detail_edge(true),
+                KeyCode::End => self.move_detail_edge(false),
+                KeyCode::PageUp | KeyCode::Char('b') => self.page_detail(-1),
+                KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => self.page_detail(1),
                 _ => {}
             },
         }
@@ -996,23 +1015,59 @@ impl App {
         }
     }
 
-    /// Record cursor over the Records table rows: raw records first, then
-    /// questions. The cursor tracks row identity, so TTL resorting and
-    /// re-announcements don't yank the selection to another row.
+    /// Index range of the focused record table inside the combined
+    /// [records, questions] cursor order: Answers covers the raw records,
+    /// Questions the question rows. Services focus is unused by the
+    /// record cursor; it spans everything.
+    fn detail_range(&self) -> (usize, usize) {
+        let (raws, total) = self
+            .display_service()
+            .map(|s| {
+                (
+                    s.ordered_records().len(),
+                    s.ordered_records().len() + s.questions.len(),
+                )
+            })
+            .unwrap_or((0, 0));
+        match self.focus {
+            Focus::Answers => (0, raws),
+            Focus::Questions => (raws, total),
+            Focus::Services => (0, total),
+        }
+    }
+
+    /// Snap the cursor into the newly focused table (first row), keeping
+    /// it where it is when already inside.
+    fn snap_detail_to_focus(&mut self) {
+        self.sync_detail_cursor();
+        let (lo, hi) = self.detail_range();
+        if hi > lo && (self.detail_selected < lo || self.detail_selected >= hi) {
+            self.detail_selected = lo;
+        }
+        self.detail_anchor = self
+            .display_service()
+            .and_then(|svc| Self::identity_at(svc, self.detail_selected));
+    }
+
+    /// Record cursor over the focused table: raw records for Answers,
+    /// question rows for Questions. The cursor tracks row identity, so
+    /// TTL resorting and re-announcements don't yank the selection to
+    /// another row.
     fn move_detail_cursor(&mut self, delta: isize) {
         self.sync_detail_cursor();
         // Resuming cursor-follow: manual scroll ends once the cursor moves.
         self.detail_free_scroll = false;
-        let total = self
-            .display_service()
-            .map(|s| s.ordered_records().len() + s.questions.len())
-            .unwrap_or(0);
-        let max = total.saturating_sub(1);
-        if delta > 0 {
-            if self.detail_selected < max {
+        let (lo, hi) = self.detail_range();
+        if hi <= lo {
+            return;
+        }
+        if self.detail_selected < lo || self.detail_selected >= hi {
+            self.detail_selected = if delta < 0 { hi - 1 } else { lo };
+        } else if delta > 0 {
+            if self.detail_selected + 1 < hi {
                 self.detail_selected += 1;
             }
-        } else if delta < 0 && self.detail_selected > 0 {
+        } else if delta < 0 && self.detail_selected > lo {
             self.detail_selected -= 1;
         }
         self.detail_anchor = self
@@ -1020,15 +1075,12 @@ impl App {
             .and_then(|svc| Self::identity_at(svc, self.detail_selected));
     }
 
-    /// First/last record row.
+    /// First/last row of the focused table.
     fn move_detail_edge(&mut self, first: bool) {
         self.sync_detail_cursor();
         self.detail_free_scroll = false;
-        let total = self
-            .display_service()
-            .map(|s| s.ordered_records().len() + s.questions.len())
-            .unwrap_or(0);
-        self.detail_selected = if first || total == 0 { 0 } else { total - 1 };
+        let (lo, hi) = self.detail_range();
+        self.detail_selected = if hi <= lo || first { lo } else { hi - 1 };
         self.detail_anchor = self
             .display_service()
             .and_then(|svc| Self::identity_at(svc, self.detail_selected));
@@ -2198,7 +2250,7 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::empty(),
         };
-        // Enter acts on the record cursor, so focus the Records pane first.
+        // Enter acts on the record cursor, so focus the Answers pane first.
         app.handle_key(&key(KeyCode::Tab));
         app.handle_key(&key(KeyCode::Enter));
         let rec = app.services[0]
@@ -2236,21 +2288,23 @@ mod tests {
         assert_eq!(app.detail_offset.get(), 1);
         app.handle_key(&ctrl(KeyCode::Char('k')));
         assert_eq!(app.detail_offset.get(), 0);
-        // Tab focuses Records; moving the record cursor resumes follow.
+        // Tab focuses Answers; moving the record cursor resumes follow.
         app.handle_key(&plain(KeyCode::Tab));
-        assert_eq!(app.focus, Focus::Records);
+        assert_eq!(app.focus, Focus::Answers);
         let before = app.detail_selected;
         assert!(before > 0);
         app.handle_key(&plain(KeyCode::Char('k')));
         assert!(!app.detail_free_scroll);
         assert_eq!(app.detail_selected, before - 1);
-        // Tab cycles back to the service list.
+        // Tab cycles Answers -> Questions -> Services.
+        app.handle_key(&plain(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Questions);
         app.handle_key(&plain(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Services);
     }
 
     #[test]
-    fn tab_switches_panes_and_scopes_navigation() {
+    fn tab_cycles_services_answers_questions() {
         use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
         let mut app = two_group_app();
         let plain = |code| KeyEvent {
@@ -2264,15 +2318,68 @@ mod tests {
         app.handle_key(&plain(KeyCode::Char('j')));
         assert_eq!(app.selected_display, 3);
         let detail_before = app.detail_selected;
-        // Tab focuses Records: j/k now move the record cursor instead.
+        // Tab focuses Answers: j now moves the record cursor instead.
         app.handle_key(&plain(KeyCode::Tab));
-        assert_eq!(app.focus, Focus::Records);
+        assert_eq!(app.focus, Focus::Answers);
         app.handle_key(&plain(KeyCode::Char('j')));
         assert_eq!(app.selected_display, 3);
         assert_eq!(app.detail_selected, detail_before + 1);
-        // Tab cycles back to the service list.
-        app.handle_key(&plain(KeyCode::Tab));
+        // BackTab steps back to Services.
+        app.handle_key(&plain(KeyCode::BackTab));
         assert_eq!(app.focus, Focus::Services);
+    }
+
+    #[test]
+    fn questions_pane_moves_within_questions() {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = two_group_app();
+        let plain = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        // Two questions on the selected service, oldest first.
+        let src: std::net::SocketAddr = "192.168.1.9:5353".parse().unwrap();
+        let old = Instant::now() - Duration::from_secs(60);
+        {
+            let svc = &mut app.services[0];
+            svc.questions.push((
+                "_http._tcp.local".to_string(),
+                "PTR".to_string(),
+                src,
+                old,
+                Vec::new(),
+            ));
+            svc.questions.push((
+                "_http._tcp.local".to_string(),
+                "PTR".to_string(),
+                src,
+                Instant::now(),
+                Vec::new(),
+            ));
+        }
+        let raw_count = app.services[0].ordered_records().len();
+        // Tab twice to reach Questions; the cursor snaps to its first row.
+        app.handle_key(&plain(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Answers);
+        app.handle_key(&plain(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Questions);
+        assert_eq!(app.detail_selected, raw_count);
+        // j/k stay inside the question rows; the selection is untouched.
+        let selected_before = app.selected_display;
+        app.handle_key(&plain(KeyCode::Char('j')));
+        assert_eq!(app.detail_selected, raw_count + 1);
+        assert_eq!(app.selected_display, selected_before);
+        app.handle_key(&plain(KeyCode::Char('k')));
+        assert_eq!(app.detail_selected, raw_count);
+        app.handle_key(&plain(KeyCode::Home));
+        assert_eq!(app.detail_selected, raw_count);
+        app.handle_key(&plain(KeyCode::End));
+        assert_eq!(app.detail_selected, raw_count + 1);
+        // Enter has nothing to expand here and must not fold the type.
+        app.handle_key(&plain(KeyCode::Enter));
+        assert!(app.collapsed_types.is_empty());
     }
 
     #[test]
@@ -2296,7 +2403,7 @@ mod tests {
         app.handle_key(&key(KeyCode::Enter));
         assert!(!app.is_txt_expanded(&rec));
         assert!(app.is_type_collapsed("_http._tcp.local"));
-        // Records focus: Enter expands TXT instead.
+        // Answers focus: Enter expands TXT instead.
         app.handle_key(&key(KeyCode::Char('+')));
         app.handle_key(&key(KeyCode::Tab));
         app.handle_key(&key(KeyCode::Enter));

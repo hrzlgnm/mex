@@ -289,7 +289,7 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(format!(" {block_title} "))
-                .border_style(Style::default().fg(if app.focus == Focus::Records {
+                .border_style(Style::default().fg(if app.focus == Focus::Answers {
                     Color::White
                 } else {
                     Color::Gray
@@ -330,7 +330,7 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         offset = offset.min(total_rows.saturating_sub(1));
     }
     let mut tstate = TableState::default();
-    tstate.select(if app.detail_free_scroll || app.focus != Focus::Records {
+    tstate.select(if app.detail_free_scroll || app.focus != Focus::Answers {
         None
     } else {
         selected_table_row
@@ -600,8 +600,8 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
         Constraint::Min(20),
     ];
 
-    // The Questions table shares the record cursor: light its border when
-    // the cursor sits on a question row.
+    // The Questions table is its own focus stop: light its border when
+    // focused.
     let raw_count = svc.ordered_records().len();
     let cursor_in_questions =
         app.selected_detail_entry().is_some() && app.detail_selected >= raw_count;
@@ -618,13 +618,11 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
             Block::default()
                 .borders(Borders::ALL)
                 .title(format!(" Questions: {} ", pane_ident(svc)))
-                .border_style(Style::default().fg(
-                    if app.focus == Focus::Records && cursor_in_questions {
-                        Color::White
-                    } else {
-                        Color::Gray
-                    },
-                )),
+                .border_style(Style::default().fg(if app.focus == Focus::Questions {
+                    Color::White
+                } else {
+                    Color::Gray
+                })),
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
@@ -635,7 +633,7 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
         None
     };
     let mut tstate = TableState::default();
-    tstate.select(if app.focus == Focus::Records {
+    tstate.select(if app.focus == Focus::Questions {
         selected_table_row
     } else {
         None
