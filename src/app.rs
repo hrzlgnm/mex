@@ -61,8 +61,13 @@ struct PendingService {
     service_type: String,
     records: Vec<browse::RawRecord>,
     subtypes: Vec<String>,
+    questions: Vec<QuestionRow>,
     last_seen: Instant,
 }
+
+/// One Questions-pane row: (name, type label, querier, seen at, query
+/// packet bytes). `SELF_SOURCE` marks our own inferred sends.
+type QuestionRow = (String, String, std::net::SocketAddr, Instant, Vec<u8>);
 
 /// Continuous-browse state per (name, type), RFC 6762 §5.2: first query
 /// after 20-120ms, then >=1s, doubling each time, capped at 1/hour.
@@ -104,6 +109,12 @@ const ENUM_SERVICE: &str = "_services._dns-sd._udp.local";
 const MAX_CONTINUOUS_INTERVAL: Duration = Duration::from_secs(3600);
 /// Local address refresh is unrelated to querying; keep it on its own timer.
 const LOCAL_IPS_REFRESH: Duration = Duration::from_secs(10);
+
+/// Sentinel querier address marking questions inferred from our own send
+/// path (multicast loop is disabled, so our transmissions never arrive
+/// as events). Port 0 can never be a real mDNS querier.
+pub const SELF_SOURCE: std::net::SocketAddr =
+    std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
 
 /// Cache-refresh spacing: 5% of the TTL plus 0-2% random variation, so
 /// queries land at ~80/85/90/95% with 80-82/85-87/90-92/95-97% jitter
@@ -266,7 +277,7 @@ pub struct ServiceEntry {
     pub records: Vec<browse::RawRecord>,
     /// Recently seen questions asking for this service:
     /// (name, type, querier, received_at, query packet bytes). Capped.
-    pub questions: Vec<(String, String, std::net::SocketAddr, Instant, Vec<u8>)>,
+    pub questions: Vec<QuestionRow>,
     pub last_seen: Instant,
     pub is_active: bool,
     /// Most recent packet that touched this service; the right panes fall
@@ -684,6 +695,7 @@ impl App {
             if self.suppressed_by_overheard(&key, &ka) {
                 self.metrics.suppressed_refresh += 1;
                 self.metrics.suppressed_times.push_back(now);
+                self.route_own_question(&key.0, key.1);
                 self.postpone_continuous_for_refresh(&key, now);
                 let unanswered = (count + 1).min(4);
                 if unanswered >= 4 {
@@ -701,6 +713,7 @@ impl App {
                 known_answers: ka,
                 qu: false,
             });
+            self.route_own_question(&key.0, key.1);
             // A refresh query also elicits new answers, so postpone the
             // exponential stream for the same question: otherwise the two
             // timers can fire on the same tick and emit back-to-back
@@ -810,6 +823,7 @@ impl App {
                 let now = Instant::now();
                 self.metrics.suppressed_continuous += 1;
                 self.metrics.suppressed_times.push_back(now);
+                self.route_own_question(&key.0, key.1);
                 self.advance_continuous(&key, now);
                 continue;
             }
@@ -822,11 +836,12 @@ impl App {
             }
             self.metrics.ka_sent += ka.len() as u64;
             self.query_tx.send(browse::QueryRequest {
-                name: send_name,
+                name: send_name.clone(),
                 record_type: rt,
                 known_answers: ka,
                 qu,
             });
+            self.route_own_question(&send_name, key.1);
             // RFC 6762 §5.2: at least 1s between the first two, then at
             // least doubling, capped at one query per hour. Send using the
             // current interval, then double for the following gap, so the
@@ -1102,7 +1117,10 @@ impl App {
         let mut queriers = HashSet::new();
         for s in &self.services {
             for q in &s.questions {
-                queriers.insert(q.2);
+                // Own inferred sends are demand, not queriers.
+                if q.2 != SELF_SOURCE {
+                    queriers.insert(q.2);
+                }
             }
         }
         kv(
@@ -2091,32 +2109,108 @@ impl App {
                 .to_lowercase();
             if full == name || host == name || self.services[i].service_type.to_lowercase() == name
             {
-                let s = &mut self.services[i];
-                match s.questions.iter().position(|(n, t, src, _, _)| {
-                    n == &q.name && t == &q.rtype_str && src == &ev.source
-                }) {
-                    Some(pos) => {
-                        s.questions[pos] = (
-                            q.name.clone(),
-                            q.rtype_str.clone(),
-                            ev.source,
-                            q.received_at,
-                            ev.raw_bytes.clone(),
-                        );
-                    }
-                    None => {
-                        s.questions.push((
-                            q.name.clone(),
-                            q.rtype_str.clone(),
-                            ev.source,
-                            q.received_at,
-                            ev.raw_bytes.clone(),
-                        ));
-                        if s.questions.len() > 10 {
-                            s.questions.remove(0);
-                        }
-                    }
+                Self::file_question_row(
+                    &mut self.services[i].questions,
+                    q.name.clone(),
+                    q.rtype_str.clone(),
+                    ev.source,
+                    q.received_at,
+                    ev.raw_bytes.clone(),
+                );
+            }
+        }
+    }
+
+    /// File one question row, refreshing the timestamp when the same
+    /// (name, type, source) asks again. Caps the list at 10 rows.
+    fn file_question_row(
+        rows: &mut Vec<QuestionRow>,
+        name: String,
+        rtype_str: String,
+        source: std::net::SocketAddr,
+        at: Instant,
+        bytes: Vec<u8>,
+    ) {
+        match rows
+            .iter()
+            .position(|(n, t, src, _, _)| n == &name && t == &rtype_str && src == &source)
+        {
+            Some(pos) => {
+                rows[pos] = (name, rtype_str, source, at, bytes);
+            }
+            None => {
+                rows.push((name, rtype_str, source, at, bytes));
+                if rows.len() > 10 {
+                    rows.remove(0);
                 }
+            }
+        }
+    }
+
+    /// Short label for the record types we ever transmit (the only ones
+    /// `route_own_question` can see).
+    fn own_rtype_label(rtype: u16) -> Option<&'static str> {
+        match rtype {
+            12 => Some("PTR"),
+            33 => Some("SRV"),
+            16 => Some("TXT"),
+            1 => Some("A"),
+            28 => Some("AAAA"),
+            _ => None,
+        }
+    }
+
+    /// File a question we sent ourselves, inferred from the send path:
+    /// multicast loop is disabled so our transmissions never arrive as
+    /// events. Same matching as observed questions, marked with the
+    /// `SELF_SOURCE` sentinel; no packet bytes, so the hex pane falls
+    /// back to the latest event. Filed for real sends and §7.3
+    /// suppressions alike: both are browse demand. Discovery sends
+    /// precede the service, so matching pending instances park them
+    /// until `handle_srv` moves them over on promotion. Passive mode
+    /// sends nothing, so it files nothing.
+    fn route_own_question(&mut self, name: &str, rtype: u16) {
+        let display = name.trim_end_matches('.').to_string();
+        let key = display.to_lowercase();
+        if key == "_services._dns-sd._udp.local" {
+            return;
+        }
+        let Some(label) = Self::own_rtype_label(rtype) else {
+            return;
+        };
+        let at = Instant::now();
+        for i in 0..self.services.len() {
+            let full = format!(
+                "{}.{}",
+                self.services[i].instance, self.services[i].service_type
+            )
+            .to_lowercase();
+            let host = self.services[i]
+                .hostname
+                .trim_end_matches('.')
+                .to_lowercase();
+            if full == key || host == key || self.services[i].service_type.to_lowercase() == key {
+                Self::file_question_row(
+                    &mut self.services[i].questions,
+                    display.clone(),
+                    label.to_string(),
+                    SELF_SOURCE,
+                    at,
+                    Vec::new(),
+                );
+            }
+        }
+        for p in &mut self.pending_instances {
+            let full = format!("{}.{}", p.instance, p.service_type).to_lowercase();
+            if full == key || p.service_type.to_lowercase() == key {
+                Self::file_question_row(
+                    &mut p.questions,
+                    display.clone(),
+                    label.to_string(),
+                    SELF_SOURCE,
+                    at,
+                    Vec::new(),
+                );
             }
         }
     }
@@ -2271,6 +2365,16 @@ impl App {
                         self.services[svc_idx].subtypes.push(sub);
                     }
                 }
+                for q in p.questions {
+                    Self::file_question_row(
+                        &mut self.services[svc_idx].questions,
+                        q.0,
+                        q.1,
+                        q.2,
+                        q.3,
+                        q.4,
+                    );
+                }
                 self.services[svc_idx].last_seen =
                     self.services[svc_idx].last_seen.max(p.last_seen);
                 let records = p.records;
@@ -2352,6 +2456,7 @@ impl App {
             service_type: service_type.to_string(),
             records: Vec::new(),
             subtypes: Vec::new(),
+            questions: Vec::new(),
             last_seen: Instant::now(),
         });
         i
@@ -2731,7 +2836,14 @@ impl App {
                 name,
                 rtype_str,
                 raw,
-            } => Some((raw.to_vec(), format!(" QRY {rtype_str} {name} "))),
+            } => {
+                // Own inferred sends carry no packet bytes; fall back to
+                // the latest event instead of an empty dump.
+                if raw.is_empty() {
+                    return None;
+                }
+                Some((raw.to_vec(), format!(" QRY {rtype_str} {name} ")))
+            }
         }
     }
 }
@@ -3110,6 +3222,95 @@ mod tests {
         // Enter has nothing to expand here and must not fold the host.
         app.handle_key(&plain(KeyCode::Enter));
         assert!(app.collapsed_hosts.is_empty());
+    }
+
+    #[test]
+    fn own_questions_filed_on_type_full_and_host() {
+        let mut app = two_group_app();
+        // Type-level: only the _http service matches.
+        app.route_own_question("_http._tcp.local.", 12);
+        assert_eq!(app.services[0].questions.len(), 1);
+        assert!(app.services[1].questions.is_empty());
+        let q = &app.services[0].questions[0];
+        assert_eq!(q.0, "_http._tcp.local");
+        assert_eq!(q.1, "PTR");
+        assert_eq!(q.2, SELF_SOURCE);
+        assert!(q.4.is_empty());
+        // Full instance name and host name file further rows.
+        app.route_own_question("Test._http._tcp.local.", 33);
+        app.route_own_question("test.local.", 1);
+        assert_eq!(app.services[0].questions.len(), 3);
+        // Re-sending refreshes instead of duplicating.
+        app.route_own_question("_http._tcp.local.", 12);
+        assert_eq!(app.services[0].questions.len(), 3);
+        // Enumeration and unknown types file nothing.
+        app.route_own_question("_services._dns-sd._udp.local.", 12);
+        app.route_own_question("_http._tcp.local.", 99);
+        assert_eq!(app.services[0].questions.len(), 3);
+        assert!(app.services[1].questions.is_empty());
+    }
+
+    #[test]
+    fn discovery_self_question_survives_promotion() {
+        let mut app = App::new().unwrap();
+        // PTR first: the instance lives in pending, no service yet.
+        ingest(&mut app, &ptr_record(120));
+        assert!(app.services.is_empty());
+        assert_eq!(app.pending_instances.len(), 1);
+        // Our continuous stream asks for the pending SRV: parked, not dropped.
+        app.route_own_question("Test._http._tcp.local.", 33);
+        assert!(app.services.is_empty());
+        assert_eq!(app.pending_instances[0].questions.len(), 1);
+        // The SRV reply promotes the service with the question kept.
+        ingest(&mut app, &srv_record(120));
+        assert!(app.pending_instances.is_empty());
+        let filed: Vec<_> = app.services[0]
+            .questions
+            .iter()
+            .filter(|q| q.2 == SELF_SOURCE)
+            .collect();
+        assert_eq!(filed.len(), 1);
+        assert_eq!(filed[0].1, "SRV");
+    }
+
+    #[test]
+    fn active_sends_file_self_questions() {
+        let mut app = due_query_setup();
+        assert!(app.services[0].questions.is_empty());
+        app.send_queries();
+        assert_eq!(app.metrics.q_sent_refresh, 1);
+        let filed: Vec<_> = app.services[0]
+            .questions
+            .iter()
+            .filter(|q| q.2 == SELF_SOURCE)
+            .collect();
+        assert_eq!(filed.len(), 1);
+        assert_eq!(filed[0].1, "PTR");
+    }
+
+    #[test]
+    fn passive_mode_files_no_self_questions() {
+        let setup = due_query_setup();
+        let mut app = setup;
+        app.passive = true;
+        app.send_queries();
+        assert!(app.services.iter().all(|s| s.questions.is_empty()));
+    }
+
+    #[test]
+    fn metrics_queriers_exclude_self() {
+        let mut app = two_group_app();
+        app.route_own_question("_http._tcp.local.", 12);
+        let row = app
+            .metrics_rows()
+            .into_iter()
+            .find(|(k, _)| k == "questions")
+            .expect("questions row");
+        assert!(
+            row.1.starts_with("1 current (0 queriers)"),
+            "got: {}",
+            row.1
+        );
     }
 
     #[test]

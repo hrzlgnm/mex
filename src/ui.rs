@@ -657,7 +657,9 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
         };
         // Questions asked from this host's own addresses (including our
         // own looped-back queries) get the same highlight as local records.
-        let style = if app.is_local_source(source) {
+        // Our own inferred sends render as `self`.
+        let self_row = *source == crate::app::SELF_SOURCE;
+        let style = if self_row || app.is_local_source(source) {
             local_style
         } else {
             dim
@@ -666,7 +668,7 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
             Row::new(vec![
                 Cell::from(rtype.clone()),
                 Cell::from(age_str),
-                Cell::from(source.to_string()),
+                Cell::from(question_source_label(source)),
                 Cell::from(name.clone()),
             ])
             .style(style),
@@ -728,6 +730,16 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
     *tstate.offset_mut() = app.questions_offset.get();
     frame.render_stateful_widget(table, area, &mut tstate);
     app.questions_offset.set(tstate.offset());
+}
+
+/// Source cell for the Questions table: our own inferred sends render
+/// as `self`, everything else as the querier address.
+fn question_source_label(source: &SocketAddr) -> String {
+    if *source == crate::app::SELF_SOURCE {
+        "self".to_string()
+    } else {
+        source.to_string()
+    }
 }
 
 fn draw_hex_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
@@ -853,6 +865,13 @@ mod tests {
         let mut rec = test_record("eth0");
         rec.source = "[fe80::1%2]:5353".parse().unwrap();
         assert_eq!(source_label(&rec), "[fe80::1%2]:5353");
+    }
+
+    #[test]
+    fn question_source_label_marks_self() {
+        assert_eq!(question_source_label(&crate::app::SELF_SOURCE), "self");
+        let addr: SocketAddr = "192.168.1.5:5353".parse().unwrap();
+        assert_eq!(question_source_label(&addr), "192.168.1.5:5353");
     }
 
     #[test]
