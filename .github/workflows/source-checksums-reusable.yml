@@ -1,0 +1,58 @@
+# Copyright 2026 hrzlgnm
+# SPDX-License-Identifier: MIT
+
+name: Create and publish source checksum
+on:
+  workflow_call:
+    inputs:
+      tagName:
+        description: The tag name of the release to publish for
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      semver:
+        description: The semver of the release to publish for
+        type: string
+        required: true
+
+permissions:
+  contents: write # Needed to upload checksums to the release
+
+jobs:
+  checksums:
+    name: 🔢 sha256
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Download source archives
+        shell: bash
+        env:
+          TAG: ${{ inputs.tagName || format('v{0}', inputs.semver) }}
+        run: |
+          if [ -z "$TAG" ]; then
+            echo "Error: No tag information available"
+            exit 1
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          curl -f -sL --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 15 -O "https://github.com/hrzlgnm/mex/archive/refs/tags/${TAG}.tar.gz"
+          curl -f -sL --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 15 -O "https://github.com/hrzlgnm/mex/archive/refs/tags/${TAG}.zip"
+
+      - name: 🔢 Compute sha256 checksums
+        shell: bash
+        run: |
+          for file in *.tar.gz *.zip; do
+            [ -f "$file" ] || continue
+            sha256sum "$file" > "$file.sha256"
+          done
+
+      - name: 📰 Upload checksums to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CHECKSUMS=(./*.sha256)
+          if [ ! -f "${CHECKSUMS[0]}" ]; then
+            echo "No checksum files to upload"
+            exit 1
+          fi
+          gh release upload "$TAG" "${CHECKSUMS[@]}" --clobber --repo "$GITHUB_REPOSITORY"
