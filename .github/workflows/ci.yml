@@ -87,6 +87,6 @@ jobs:
     if: always()
     steps:
       - name: Check whether all jobs succeeded
-        uses: re-actors/alls-green@v1
+        uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0
         with:
           jobs: ${{ toJSON(needs) }}
