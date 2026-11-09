@@ -94,6 +94,16 @@ const MAX_CONTINUOUS_INTERVAL: Duration = Duration::from_secs(3600);
 /// Local address refresh is unrelated to querying; keep it on its own timer.
 const LOCAL_IPS_REFRESH: Duration = Duration::from_secs(10);
 
+/// Cache-refresh spacing: 5% of the TTL plus 0-2% random variation, so
+/// queries land at ~80/85/90/95% with 80-82/85-87/90-92/95-97% jitter
+/// (RFC 6762 §5.2). No 1s floor: the >=1s rule governs the continuous
+/// stream, while refresh must still hit its windows for small TTLs.
+fn refresh_step(ttl_secs: u32, jitter_pct: u32) -> Duration {
+    let step_millis = (ttl_secs as u64) * 50 + (ttl_secs as u64) * (jitter_pct as u64) / 10;
+    Duration::from_millis(step_millis.max(1))
+}
+
+
 pub struct App {
     pub services: Vec<ServiceEntry>,
     pub selected_display: usize,
@@ -269,7 +279,9 @@ impl App {
                 );
             }
             self.evict_expired();
-            std::thread::sleep(Duration::from_millis(1000));
+            // Short tick like the TUI loop so the RFC 6762 §5.2 20-120ms
+            // first-query delay is not quantized to a full second.
+            std::thread::sleep(Duration::from_millis(50));
         }
         Ok(())
     }
@@ -403,9 +415,12 @@ impl App {
 
     fn requery_expiring(&mut self) {
         let now = Instant::now();
-        // Per-key minimum TTL plus whether any row reached the 80% window.
+        // Per-key minimum TTL plus whether any *live* row reached the 80%
+        // window. Expired rows (elapsed > TTL) are not refreshed: RFC 6762
+        // §5.2 deletes the record at 100% after four unanswered queries.
         let mut ttl_by_key: HashMap<(String, u16), u32> = HashMap::new();
         let mut triggered: HashSet<(String, u16)> = HashSet::new();
+        let mut live_keys: HashSet<(String, u16)> = HashSet::new();
         for svc in &self.services {
             for rec in &svc.records {
                 if rec.ttl == 0 {
@@ -416,28 +431,35 @@ impl App {
                     _ => continue,
                 }
                 let key = (rec.name.trim_end_matches('.').to_string(), rec.rtype);
+                let elapsed = rec.received_at.elapsed().as_secs() as u32;
+                if elapsed > rec.ttl {
+                    continue;
+                }
+                live_keys.insert(key.clone());
                 ttl_by_key
                     .entry(key.clone())
                     .and_modify(|t| *t = (*t).min(rec.ttl))
                     .or_insert(rec.ttl);
-                let elapsed = rec.received_at.elapsed().as_secs() as u32;
                 if elapsed * 5 >= rec.ttl * 4 {
                     triggered.insert(key);
                 }
             }
         }
+        // Drop refresh schedules whose rows all expired: no maintenance
+        // without a live record (RFC 6762 §5.2 deletes at 100%).
+        self.requeries.retain(|k, _| live_keys.contains(k));
         if triggered.is_empty() {
             return;
         }
         for key in triggered {
             let ttl = ttl_by_key.get(&key).copied().unwrap_or(120);
             // 0-2% random variation so queriers do not stay in lockstep
-            // (RFC 6762 §5.2: 80-82%, 85-87%, 90-92%, 95-97%).
+            // (RFC 6762 §5.2: 80-82%, 85-87%, 90-92%, 95-97%). No 1s floor
+            // here: the >=1s rule applies to the continuous stream, while
+            // refresh spacing is 5% of the TTL (floors would push small
+            // TTLs past 100%).
             let jitter_pct = rand_u32() % 201;
-            // 5% of TTL plus jitter, floored at 1s (RFC 6762 §5.2 wants
-            // >=1s between the first two queries).
-            let step_millis = (ttl as u64) * 50 + (ttl as u64) * (jitter_pct as u64) / 10;
-            let step = Duration::from_millis(step_millis.max(1000));
+            let step = refresh_step(ttl, jitter_pct);
             let (due, count) = self.requeries.get(&key).copied().unwrap_or((now, 0));
             if count > 0 && now < due {
                 continue;
@@ -460,6 +482,11 @@ impl App {
                 known_answers: ka,
                 qu: false,
             });
+            // A refresh query also elicits new answers, so postpone the
+            // exponential stream for the same question: otherwise the two
+            // timers can fire on the same tick and emit back-to-back
+            // duplicates (RFC 6762 §5.2 spacing).
+            self.postpone_continuous_for_refresh(&key, now);
             let unanswered = (count + 1).min(4);
             if unanswered >= 4 {
                 // RFC 6762 §5.2: after queries at ~80/85/90/95% with no
@@ -567,11 +594,14 @@ impl App {
                 qu,
             });
             // RFC 6762 §5.2: at least 1s between the first two, then at
-            // least doubling, capped at one query per hour.
+            // least doubling, capped at one query per hour. Send using the
+            // current interval, then double for the following gap, so the
+            // stream is 1s, 2s, 4s, ... (doubling before use would skip
+            // the 1s gap and start at 2s).
             if let Some(entry) = self.continuous.get_mut(&key) {
-                let next_interval = (entry.interval * 2).min(MAX_CONTINUOUS_INTERVAL);
-                entry.interval = next_interval.max(Duration::from_secs(1));
-                entry.next_due = now + entry.interval;
+                let current = entry.interval.max(Duration::from_secs(1));
+                entry.next_due = now + current;
+                entry.interval = (current * 2).min(MAX_CONTINUOUS_INTERVAL);
             }
         }
     }
@@ -590,8 +620,8 @@ impl App {
             self.known_types.insert(t.clone());
         }
 
-        self.poll_continuous();
         self.requery_expiring();
+        self.poll_continuous();
 
         // Refresh in case interfaces/addresses changed (cheap: ~1 fork/min).
         // Independent of query backoff.
@@ -915,6 +945,31 @@ impl App {
         }
         for q in &ev.questions {
             self.route_question(q, ev);
+        }
+    }
+
+    /// Postpone the exponential stream after a refresh so the two §5.2
+    /// timers don't emit back-to-back duplicates.
+    fn postpone_continuous_for_refresh(&mut self, key: &(String, u16), now: Instant) {
+        let mut postponed = false;
+        for (ckey, entry) in self.continuous.iter_mut() {
+            if ckey.1 == key.1 && ckey.0.eq_ignore_ascii_case(&key.0) {
+                let floor = now + entry.interval.max(Duration::from_secs(1));
+                if entry.next_due < floor {
+                    entry.next_due = floor;
+                }
+                postponed = true;
+            }
+        }
+        if !postponed {
+            let ckey = Self::continuous_key(&key.0, key.1);
+            if let std::collections::hash_map::Entry::Vacant(e) = self.continuous.entry(ckey) {
+                e.insert(ContinuousQuery {
+                    next_due: now + Duration::from_secs(1),
+                    interval: Duration::from_secs(1),
+                    qname: key.0.clone(),
+                });
+            }
         }
     }
 
@@ -1285,10 +1340,12 @@ impl App {
         if rec.ttl > 0 {
             let key = (rec.name.trim_end_matches('.').to_string(), rec.rtype);
             let still_expiring = self.services[svc_idx].records.iter().any(|r| {
-                r.ttl > 0
-                    && r.name.trim_end_matches('.') == key.0.as_str()
-                    && r.rtype == key.1
-                    && r.received_at.elapsed().as_secs() as u32 * 5 >= r.ttl * 4
+                if r.ttl == 0 || r.name.trim_end_matches('.') != key.0.as_str() || r.rtype != key.1
+                {
+                    return false;
+                }
+                let elapsed = r.received_at.elapsed().as_secs() as u32;
+                elapsed <= r.ttl && elapsed * 5 >= r.ttl * 4
             });
             if !still_expiring {
                 self.requeries.remove(&key);
@@ -1892,4 +1949,97 @@ mod tests {
         assert!(app.toggle_txt_expanded());
         assert!(!app.detail_free_scroll);
     }
+
+    #[test]
+    fn continuous_backoff_is_1s_then_doubling() {
+        let mut app = App::new().unwrap();
+        app.known_types.insert("_http._tcp.local".to_string());
+        let key = ("_http._tcp.local".to_string(), 12);
+        app.continuous.insert(
+            key.clone(),
+            ContinuousQuery {
+                next_due: Instant::now() - Duration::from_millis(1),
+                interval: Duration::from_secs(1),
+                qname: "_http._tcp.local".to_string(),
+            },
+        );
+        app.poll_continuous();
+        let entry = app.continuous.get(&key).expect("still scheduled");
+        assert_eq!(entry.interval, Duration::from_secs(2));
+        // First gap uses the 1s interval, not the doubled 2s.
+        assert!(entry.next_due > Instant::now() + Duration::from_millis(500));
+        assert!(entry.next_due <= Instant::now() + Duration::from_secs(1));
+
+        // Second gap uses the 2s interval, then doubles to 4s.
+        app.continuous.get_mut(&key).unwrap().next_due = Instant::now() - Duration::from_millis(1);
+        app.poll_continuous();
+        let entry = app.continuous.get(&key).expect("still scheduled");
+        assert_eq!(entry.interval, Duration::from_secs(4));
+        assert!(entry.next_due > Instant::now() + Duration::from_secs(1));
+        assert!(entry.next_due <= Instant::now() + Duration::from_secs(2));
+    }
+
+    #[test]
+    fn refresh_step_has_no_1s_floor() {
+        // TTL 120: classic 6s + 0-2.4s jitter.
+        assert_eq!(refresh_step(120, 0), Duration::from_millis(6000));
+        assert_eq!(refresh_step(120, 200), Duration::from_millis(8400));
+        // TTL 10: 0.5s + 0-0.2s must stay sub-second so the 85/90/95%
+        // windows are still reachable; the old 1s floor pushed them
+        // past 100%.
+        assert_eq!(refresh_step(10, 0), Duration::from_millis(500));
+        assert_eq!(refresh_step(10, 200), Duration::from_millis(700));
+    }
+
+    #[test]
+    fn requery_ignores_expired_rows() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        // Age the PTR past 100% TTL: no live row remains for the key.
+        for svc in &mut app.services {
+            for rec in &mut svc.records {
+                if rec.rtype == 12 {
+                    rec.received_at = Instant::now() - Duration::from_secs(130);
+                }
+            }
+        }
+        app.requery_expiring();
+        let key = ("_http._tcp.local".to_string(), 12);
+        assert!(
+            !app.requeries.contains_key(&key),
+            "expired rows must not schedule refresh queries"
+        );
+    }
+
+    #[test]
+    fn requery_postpones_continuous_for_same_key() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        // Age PTR into the 80-100% window so a refresh is due.
+        for svc in &mut app.services {
+            for rec in &mut svc.records {
+                if rec.rtype == 12 {
+                    rec.received_at = Instant::now() - Duration::from_secs(100);
+                }
+            }
+        }
+        // Continuous stream is due right now.
+        let ckey = ("_http._tcp.local".to_string(), 12);
+        app.continuous.insert(
+            ckey.clone(),
+            ContinuousQuery {
+                next_due: Instant::now() - Duration::from_millis(1),
+                interval: Duration::from_secs(2),
+                qname: "_http._tcp.local".to_string(),
+            },
+        );
+        app.requery_expiring();
+        let entry = app.continuous.get(&ckey).expect("still scheduled");
+        // Refresh sent now, so the exponential stream must wait at
+        // least its interval instead of firing on the same tick.
+        assert!(entry.next_due > Instant::now() + Duration::from_millis(500));
+    }
+
 }
