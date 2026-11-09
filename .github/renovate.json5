@@ -1,0 +1,53 @@
+{
+    $schema: "https://docs.renovatebot.com/renovate-schema.json",
+    extends: [
+        "config:best-practices",
+        "security:openssf-scorecard",
+        ":dependencyDashboard",
+        ":automergeDigest",
+        ":automergeMinor",
+        ":automergePr",
+        ":automergeRequireAllStatusChecks",
+        ":combinePatchMinorReleases",
+        ":docker",
+        ":enableVulnerabilityAlerts",
+        ":maintainLockFilesWeekly",
+        ":prConcurrentLimitNone",
+        ":prImmediately",
+        ":rebaseStalePrs",
+        ":semanticCommits",
+        ":semanticCommitTypeAll(deps)",
+        ":semanticCommitScopeDisabled",
+        ":separateMajorReleases",
+    ],
+    customManagers: [
+        {
+            matchStringsStrategy: 'any',
+            customType: 'regex',
+            managerFilePatterns: [
+                '/^\\.github/workflows/.*\\.yml$/',
+            ],
+            depTypeTemplate: 'container',
+            datasourceTemplate: 'docker',
+            versioningTemplate: 'docker',
+            matchStrings: [
+                'container_image: (?<depName>.*):(?<currentValue>.*?)@(?<currentDigest>sha256:[a-f0-9]+)?'
+            ],
+            autoReplaceStringTemplate: 'container_image: {{depName}}{{#if newValue}}:{{newValue}}{{/if}}{{#if newDigest}}@{{newDigest}}{{/if}}',
+        },
+        {
+            matchStringsStrategy: "any",
+            customType: "regex",
+            managerFilePatterns: [
+                "/^\\.github/workflows/.*\\.yml$/",
+                "/^\\.github/actions/.*/.*\\.yml$/",
+            ],
+            matchStrings: [
+                "crate:\\s*(?<depName>[^\\s]+)\\s*version:\\s*(?<currentValue>[^\\s]+)",
+            ],
+            depTypeTemplate: "build-dependencies",
+            datasourceTemplate: "crate",
+            versioningTemplate: "semver",
+        },
+    ],
+}
