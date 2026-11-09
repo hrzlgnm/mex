@@ -724,7 +724,7 @@ impl App {
                     self.collapsed_types.insert(label);
                 }
             }
-            // Hostname is folded into the instance row, so Space on an
+            // Hostname is folded into the instance row, so +/- on an
             // instance folds its parent service type.
             Some(DisplayItem::Instance { index }) => {
                 let label = self.services[*index].service_type.clone();
@@ -733,27 +733,6 @@ impl App {
                 }
             }
             None => {}
-        }
-        self.clamp_selection();
-    }
-
-    /// Directional fold for Left (collapse) / Right (expand). Operates on
-    /// the service type of the cursor row (own type, or the parent type
-    /// for an instance row).
-    fn set_collapsed(&mut self, collapse: bool) {
-        let label = match self.display_items().get(self.selected_display) {
-            Some(DisplayItem::ServiceType { label }) => Some(label.clone()),
-            Some(DisplayItem::Instance { index }) => {
-                Some(self.services[*index].service_type.clone())
-            }
-            None => None,
-        };
-        if let Some(label) = label {
-            if collapse {
-                self.collapsed_types.insert(label);
-            } else {
-                self.collapsed_types.remove(&label);
-            }
         }
         self.clamp_selection();
     }
@@ -784,7 +763,7 @@ impl App {
             }
             KeyCode::Char('J') => self.scroll_detail(1),
             KeyCode::Char('K') => self.scroll_detail(-1),
-            // Service selection (sibling: j/k + arrows).
+            // Service selection (sibling: j/k + up/down).
             KeyCode::Up => self.move_selection(-1),
             KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') => self.move_selection(-1),
@@ -792,9 +771,9 @@ impl App {
             // Record cursor over the Answers table.
             KeyCode::Tab => self.move_detail_cursor(1),
             KeyCode::BackTab => self.move_detail_cursor(-1),
-            // Service-type group jumps (sibling: h/l switch types).
-            KeyCode::Char('h') => self.jump_group(-1),
-            KeyCode::Char('l') => self.jump_group(1),
+            // Service-type group jumps (sibling: h/l and arrows switch types).
+            KeyCode::Char('h') | KeyCode::Left => self.jump_group(-1),
+            KeyCode::Char('l') | KeyCode::Right => self.jump_group(1),
             // Shift jumps to the first/last group (uppercase from Shift).
             KeyCode::Char('H') => self.jump_group_edge(true),
             KeyCode::Char('L') => self.jump_group_edge(false),
@@ -802,8 +781,6 @@ impl App {
             KeyCode::End => self.select_edge(false),
             KeyCode::PageUp | KeyCode::Char('b') => self.page_selection(-1),
             KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => self.page_selection(1),
-            KeyCode::Left => self.set_collapsed(true),
-            KeyCode::Right => self.set_collapsed(false),
             // Enter folds/unfolds the TXT record under the Tab cursor;
             // anywhere else it folds the service type like +/- does.
             KeyCode::Enter => {
@@ -2255,6 +2232,16 @@ mod tests {
         app.handle_key(&plain_key(KeyCode::Char('L')));
         assert_eq!(app.selected_display, 3);
         app.handle_key(&plain_key(KeyCode::Char('H')));
+        assert_eq!(app.selected_display, 1);
+    }
+
+    #[test]
+    fn arrows_jump_between_groups_like_hl() {
+        let mut app = two_group_app();
+        assert_eq!(app.selected_display, 1);
+        app.handle_key(&plain_key(KeyCode::Right));
+        assert_eq!(app.selected_display, 3);
+        app.handle_key(&plain_key(KeyCode::Left));
         assert_eq!(app.selected_display, 1);
     }
 
