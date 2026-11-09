@@ -71,10 +71,11 @@ fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 .fg(Color::Cyan),
         ),
         Span::raw(format!(
-            "│ {} pkts │ {} svcs │ uptime {}  [q] quit [tab] pane [j/k] move [enter] fold [*] all [m] metrics",
+            "│ {} pkts │ {} svcs │ uptime {}{}  [q] quit [tab] pane [j/k] move [enter] fold [*] all [m] metrics",
             app.packet_count,
             app.services.len(),
-            uptime_str
+            uptime_str,
+            if app.passive { " │ passive" } else { "" },
         )),
     ]);
 

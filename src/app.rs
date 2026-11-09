@@ -195,6 +195,8 @@ pub struct App {
     pub packet_count: u64,
     pub start_time: Instant,
     pub running: bool,
+    /// Listen-only mode (`--passive`): never transmit queries.
+    pub passive: bool,
     /// Metrics overlay popup (`m` toggles, `m`/`Esc` closes).
     pub show_metrics: bool,
     /// Scroll offset inside the metrics popup (viewport recorded at draw).
@@ -317,8 +319,17 @@ impl ServiceEntry {
 
 impl App {
     pub fn new() -> Result<Self> {
+        Self::new_with(false)
+    }
+
+    /// `passive` listens only: no QU batch, no continuous stream, no
+    /// TTL refreshes. Everything else (ingest, expiry, display) runs
+    /// as usual, so the view shows recently heard traffic decaying by
+    /// TTL instead of actively maintained state.
+    pub fn new_with(passive: bool) -> Result<Self> {
         let (query_tx, rx, drop_stats) = browse::spawn()?;
         Ok(Self {
+            passive,
             services: Vec::new(),
             selected_display: 0,
             list_offset: Cell::new(0),
@@ -827,20 +838,25 @@ impl App {
 
     fn send_queries(&mut self) {
         self.flush_pending_addrs();
-        // Learn service types before scheduling so new PTR owners are
-        // browsed without waiting for a record-bearing service entry.
-        for svc in &self.services {
-            self.known_types.insert(svc.service_type.clone());
-        }
-        for p in &self.pending_instances {
-            self.known_types.insert(p.service_type.clone());
-        }
-        for t in self.enum_known.keys() {
-            self.known_types.insert(t.clone());
-        }
+        // Passive mode transmits nothing: no QU batch, no continuous
+        // stream, no TTL refreshes. Filing received data and the link
+        // refresh below still run.
+        if !self.passive {
+            // Learn service types before scheduling so new PTR owners are
+            // browsed without waiting for a record-bearing service entry.
+            for svc in &self.services {
+                self.known_types.insert(svc.service_type.clone());
+            }
+            for p in &self.pending_instances {
+                self.known_types.insert(p.service_type.clone());
+            }
+            for t in self.enum_known.keys() {
+                self.known_types.insert(t.clone());
+            }
 
-        self.requery_expiring();
-        self.poll_continuous();
+            self.requery_expiring();
+            self.poll_continuous();
+        }
 
         // Refresh in case interfaces/addresses changed (cheap: ~1 fork/min).
         // Independent of query backoff.
@@ -3766,6 +3782,74 @@ mod tests {
             .expect("refused row");
         assert!(value.contains("1 total"), "got: {value}");
         assert!(value.contains("203.0.113.9:5353"), "got: {value}");
+    }
+
+    /// Due continuous entry plus an 80%-aged PTR: active mode must
+    /// transmit on both timers, passive mode on neither.
+    fn due_query_setup() -> App {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        for svc in &mut app.services {
+            for rec in &mut svc.records {
+                if rec.rtype == 12 {
+                    rec.received_at = Instant::now() - Duration::from_secs(100);
+                }
+            }
+        }
+        app.continuous.insert(
+            ("_http._tcp.local".to_string(), 12),
+            ContinuousQuery {
+                next_due: Instant::now() - Duration::from_millis(1),
+                interval: Duration::from_secs(2),
+                qname: "_http._tcp.local".to_string(),
+            },
+        );
+        app
+    }
+
+    #[test]
+    fn active_mode_sends_due_queries() {
+        let mut app = due_query_setup();
+        app.send_queries();
+        assert_eq!(app.metrics.q_sent_refresh, 1);
+        // The refresh postpones the continuous twin for the same key
+        // instead of emitting back-to-back duplicates.
+        assert_eq!(app.metrics.q_sent_continuous, 0);
+        let entry = app
+            .continuous
+            .get(&("_http._tcp.local".to_string(), 12))
+            .expect("still scheduled");
+        assert!(entry.next_due > Instant::now());
+    }
+
+    #[test]
+    fn passive_mode_sends_nothing() {
+        let setup = due_query_setup();
+        let due = setup
+            .continuous
+            .get(&("_http._tcp.local".to_string(), 12))
+            .expect("seeded entry")
+            .next_due;
+        let mut app = setup;
+        app.passive = true;
+        app.send_queries();
+        let entry = app
+            .continuous
+            .get(&("_http._tcp.local".to_string(), 12))
+            .expect("still scheduled");
+        assert_eq!(entry.next_due, due);
+        assert_eq!(entry.interval, Duration::from_secs(2));
+        assert_eq!(app.metrics.q_sent_continuous, 0);
+        assert_eq!(app.metrics.q_sent_refresh, 0);
+        assert!(app.requeries.is_empty());
+        assert!(!app.startup_qu_sent);
+    }
+
+    #[test]
+    fn passive_constructor_sets_flag() {
+        assert!(!App::new().unwrap().passive);
+        assert!(App::new_with(true).unwrap().passive);
     }
 
     #[test]
