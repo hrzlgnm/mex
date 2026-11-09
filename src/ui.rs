@@ -542,8 +542,8 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
         .fg(Color::Green)
         .add_modifier(Modifier::BOLD);
 
-    // Newest first, matching the j/k cursor order.
-    for (name, rtype, source, received, _) in svc.questions.iter().rev() {
+    // By type, newest first — same grouping as the Answers table.
+    for (name, rtype, source, received, _) in svc.ordered_questions() {
         let age = received.elapsed().as_secs();
         let age_str = if age >= 60 {
             format!("{}m{:02}s", age / 60, age % 60)

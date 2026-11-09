@@ -212,6 +212,24 @@ impl ServiceEntry {
         });
         out
     }
+
+    /// Questions sorted by type, then newest first — mirroring how answers
+    /// sort by type. Reverse age keeps the freshest query for each type on
+    /// top while the cursor identity (name/type/source) stays stable.
+    pub fn ordered_questions(
+        &self,
+    ) -> Vec<&(String, String, std::net::SocketAddr, Instant, Vec<u8>)> {
+        let mut out: Vec<_> = self.questions.iter().collect();
+        out.sort_by(|a, b| {
+            (&a.1, std::cmp::Reverse(a.3), a.2.to_string(), &a.0).cmp(&(
+                &b.1,
+                std::cmp::Reverse(b.3),
+                b.2.to_string(),
+                &b.0,
+            ))
+        });
+        out
+    }
 }
 
 impl App {
@@ -859,7 +877,7 @@ impl App {
     }
 
     /// Identity of the table row at an index (raw records first, then
-    /// questions newest-first, matching the rendered table).
+    /// questions by type/newest-first, matching the rendered table).
     fn identity_at(svc: &ServiceEntry, index: usize) -> Option<DetailCursorKey> {
         let raws = svc.ordered_records();
         if index < raws.len() {
@@ -871,14 +889,13 @@ impl App {
                 source: r.source,
             });
         }
-        svc.questions
-            .iter()
-            .rev()
+        svc.ordered_questions()
+            .into_iter()
             .nth(index - raws.len())
-            .map(|(name, rtype, source, _, _)| DetailCursorKey::Question {
-                name: name.clone(),
-                rtype: rtype.clone(),
-                source: *source,
+            .map(|q| DetailCursorKey::Question {
+                name: q.0.clone(),
+                rtype: q.1.clone(),
+                source: q.2,
             })
     }
 
@@ -899,10 +916,9 @@ impl App {
                 rtype,
                 source,
             } => svc
-                .questions
+                .ordered_questions()
                 .iter()
-                .rev()
-                .position(|(n, t, src, _, _)| n == name && t == rtype && src == source)
+                .position(|q| q.0 == *name && q.1 == *rtype && q.2 == *source)
                 .map(|pos| pos + raws.len()),
         }
     }
@@ -1718,7 +1734,7 @@ impl App {
 
     /// Entry under the j/k cursor in the Records table: a raw record row or
     /// a question row (table order is raw records first, then questions
-    /// newest-first, matching the rendered table).
+    /// by type/newest-first, matching the rendered table).
     pub fn selected_detail_entry(&self) -> Option<DetailEntry<'_>> {
         let svc = self.display_service()?;
         let key = (svc.service_type.clone(), svc.instance.clone());
@@ -1729,14 +1745,13 @@ impl App {
         if self.detail_selected < raws.len() {
             return Some(DetailEntry::Record(raws[self.detail_selected]));
         }
-        svc.questions
-            .iter()
-            .rev()
+        svc.ordered_questions()
+            .into_iter()
             .nth(self.detail_selected - raws.len())
-            .map(|(name, rtype, _, _, raw)| DetailEntry::Question {
-                name,
-                rtype_str: rtype,
-                raw,
+            .map(|q| DetailEntry::Question {
+                name: &q.0,
+                rtype_str: &q.1,
+                raw: &q.4,
             })
     }
 
@@ -2137,6 +2152,34 @@ mod tests {
         // Refresh sent now, so the exponential stream must wait at
         // least its interval instead of firing on the same tick.
         assert!(entry.next_due > Instant::now() + Duration::from_millis(500));
+    }
+
+    #[test]
+    fn ordered_questions_sort_by_type_then_newest_first() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        let svc = &mut app.services[0];
+        let old = Instant::now() - Duration::from_secs(30);
+        let new = Instant::now();
+        let src: std::net::SocketAddr = "192.168.1.9:5353".parse().unwrap();
+        svc.questions = vec![
+            ("h.local".to_string(), "SRV".to_string(), src, old, vec![]),
+            ("h.local".to_string(), "A".to_string(), src, old, vec![]),
+            ("h.local".to_string(), "A".to_string(), src, new, vec![]),
+        ];
+        let ordered = app.services[0].ordered_questions();
+        let got: Vec<(&str, bool)> = ordered
+            .iter()
+            .map(|q| {
+                (
+                    q.1.as_str(),
+                    q.3.duration_since(old) > Duration::from_secs(1),
+                )
+            })
+            .collect();
+        // Type first, then newest first within a type.
+        assert_eq!(got, vec![("A", true), ("A", false), ("SRV", false)]);
     }
 
     fn query_event(
