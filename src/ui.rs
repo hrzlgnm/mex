@@ -229,9 +229,9 @@ fn draw_detail_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
     let panes = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(40),
-            Constraint::Percentage(40),
-            Constraint::Percentage(20),
+            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 3),
         ])
         .split(area);
 
