@@ -11,6 +11,15 @@ use hickory_proto::rr::RecordType;
 use crate::browse;
 use crate::ui;
 
+/// Pane with keyboard focus: Tab cycles between the service list and
+/// the record (Answers/Questions) tables.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Focus {
+    #[default]
+    Services,
+    Records,
+}
+
 #[derive(Clone)]
 pub enum DisplayItem {
     ServiceType { label: String },
@@ -115,6 +124,12 @@ pub struct App {
     /// Visible rows of the service list pane (minus borders), recorded
     /// during draw so PageUp/PageDown paging matches the viewport.
     pub list_viewport: Cell<usize>,
+    /// Visible rows of the Answers table (minus header/borders), recorded
+    /// during draw so paging the record cursor matches the viewport.
+    pub record_viewport: Cell<usize>,
+    /// Which pane the cursor keys act on. Tab switches panes; arrows and
+    /// j/k navigate inside the focused pane.
+    pub focus: Focus,
     pub detail_selected: usize,
     pub detail_offset: Cell<usize>,
     /// Manual scroll of the Answers table (`Ctrl-j/k`): while set, the
@@ -243,6 +258,8 @@ impl App {
             selected_display: 0,
             list_offset: Cell::new(0),
             list_viewport: Cell::new(0),
+            record_viewport: Cell::new(0),
+            focus: Focus::default(),
             packet_count: 0,
             start_time: Instant::now(),
             running: true,
@@ -743,9 +760,23 @@ impl App {
             self.running = false;
             return;
         }
+        // Pane switching works from anywhere.
+        match key.code {
+            KeyCode::Tab => {
+                self.focus = Focus::Records;
+                // Anchor the record cursor without moving it.
+                self.move_detail_cursor(0);
+                return;
+            }
+            KeyCode::BackTab => {
+                self.focus = Focus::Services;
+                return;
+            }
+            _ => {}
+        }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.running = false,
-            // Detail viewport scroll: Shift+Up/Down, J/K (Ctrl chords kept).
+            // Detail viewport scroll works from either pane.
             KeyCode::Up | KeyCode::Down
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     || key.modifiers.contains(KeyModifiers::SHIFT) =>
@@ -763,33 +794,51 @@ impl App {
             }
             KeyCode::Char('J') => self.scroll_detail(1),
             KeyCode::Char('K') => self.scroll_detail(-1),
-            // Service list selection.
-            KeyCode::Up => self.move_selection(-1),
-            KeyCode::Down => self.move_selection(1),
-            KeyCode::Char('k') => self.move_selection(-1),
-            KeyCode::Char('j') => self.move_selection(1),
-            // Record cursor over the Answers table.
-            KeyCode::Tab => self.move_detail_cursor(1),
-            KeyCode::BackTab => self.move_detail_cursor(-1),
-            // Jump between service-type groups.
-            KeyCode::Char('h') | KeyCode::Left => self.jump_group(-1),
-            KeyCode::Char('l') | KeyCode::Right => self.jump_group(1),
-            // Shift jumps to the first/last group (uppercase from Shift).
-            KeyCode::Char('H') => self.jump_group_edge(true),
-            KeyCode::Char('L') => self.jump_group_edge(false),
-            KeyCode::Home => self.select_edge(true),
-            KeyCode::End => self.select_edge(false),
-            KeyCode::PageUp | KeyCode::Char('b') => self.page_selection(-1),
-            KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => self.page_selection(1),
-            // Enter folds/unfolds the TXT record under the Tab cursor;
-            // anywhere else it folds the service type like +/- does.
-            KeyCode::Enter => {
-                if !self.toggle_txt_expanded() {
-                    self.toggle_collapse()
+            _ => self.handle_focused_key(key),
+        }
+    }
+
+    /// Cursor keys routed to the focused pane. Tab switches panes; arrows
+    /// and j/k navigate inside the focused pane.
+    fn handle_focused_key(&mut self, key: &KeyEvent) {
+        match self.focus {
+            Focus::Services => match key.code {
+                KeyCode::Up => self.move_selection(-1),
+                KeyCode::Down => self.move_selection(1),
+                KeyCode::Char('k') => self.move_selection(-1),
+                KeyCode::Char('j') => self.move_selection(1),
+                // Jump between service-type groups.
+                KeyCode::Char('h') | KeyCode::Left => self.jump_group(-1),
+                KeyCode::Char('l') | KeyCode::Right => self.jump_group(1),
+                // Shift jumps to the first/last group (uppercase from Shift).
+                KeyCode::Char('H') => self.jump_group_edge(true),
+                KeyCode::Char('L') => self.jump_group_edge(false),
+                KeyCode::Home => self.select_edge(true),
+                KeyCode::End => self.select_edge(false),
+                KeyCode::PageUp | KeyCode::Char('b') => self.page_selection(-1),
+                KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => {
+                    self.page_selection(1)
                 }
-            }
-            KeyCode::Char('+') | KeyCode::Char('-') => self.toggle_collapse(),
-            _ => {}
+                // Enter folds the service type like +/- does.
+                KeyCode::Enter => self.toggle_collapse(),
+                KeyCode::Char('+') | KeyCode::Char('-') => self.toggle_collapse(),
+                _ => {}
+            },
+            Focus::Records => match key.code {
+                KeyCode::Up => self.move_detail_cursor(-1),
+                KeyCode::Down => self.move_detail_cursor(1),
+                KeyCode::Char('k') => self.move_detail_cursor(-1),
+                KeyCode::Char('j') => self.move_detail_cursor(1),
+                KeyCode::Home => self.move_detail_edge(true),
+                KeyCode::End => self.move_detail_edge(false),
+                KeyCode::PageUp | KeyCode::Char('b') => self.page_detail(-1),
+                KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => self.page_detail(1),
+                // Enter folds/unfolds the TXT record under the cursor.
+                KeyCode::Enter => {
+                    self.toggle_txt_expanded();
+                }
+                _ => {}
+            },
         }
     }
 
@@ -946,7 +995,7 @@ impl App {
         }
     }
 
-    /// Tab cursor over the Records table rows: raw records first, then
+    /// Record cursor over the Records table rows: raw records first, then
     /// questions. The cursor tracks row identity, so TTL resorting and
     /// re-announcements don't yank the selection to another row.
     fn move_detail_cursor(&mut self, delta: isize) {
@@ -970,7 +1019,36 @@ impl App {
             .and_then(|svc| Self::identity_at(svc, self.detail_selected));
     }
 
-    /// Nudge the Answers viewport without moving the `j/k` cursor, and pin
+    /// First/last record row.
+    fn move_detail_edge(&mut self, first: bool) {
+        self.sync_detail_cursor();
+        self.detail_free_scroll = false;
+        let total = self
+            .display_service()
+            .map(|s| s.ordered_records().len() + s.questions.len())
+            .unwrap_or(0);
+        self.detail_selected = if first || total == 0 { 0 } else { total - 1 };
+        self.detail_anchor = self
+            .display_service()
+            .and_then(|svc| Self::identity_at(svc, self.detail_selected));
+    }
+
+    /// Page the record cursor by one Answers-table viewport. Falls back
+    /// to 10 rows before the first draw records the real height.
+    fn page_detail(&mut self, pages: isize) {
+        let per_page = self.record_viewport.get().max(1) as isize;
+        let steps = pages * per_page;
+        let n = steps.unsigned_abs().min(1000);
+        for _ in 0..n {
+            let before = self.detail_selected;
+            self.move_detail_cursor(steps.signum());
+            if self.detail_selected == before {
+                break;
+            }
+        }
+    }
+
+    /// Nudge the Answers viewport without moving the record cursor, and pin
     /// it there until the cursor, selection, or expansion changes. Upper
     /// clamping happens at render time, where the row count is known.
     fn scroll_detail(&mut self, delta: isize) {
@@ -2119,6 +2197,8 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::empty(),
         };
+        // Enter acts on the record cursor, so focus the Records pane first.
+        app.handle_key(&key(KeyCode::Tab));
         app.handle_key(&key(KeyCode::Enter));
         let rec = app.services[0]
             .ordered_records()
@@ -2133,7 +2213,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_j_pins_viewport_and_tab_resumes_follow() {
+    fn ctrl_j_pins_viewport_and_cursor_resumes_follow() {
         use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
         let mut app = App::new().unwrap();
         service_with_txt(&mut app, "a=1; b=2");
@@ -2155,13 +2235,94 @@ mod tests {
         assert_eq!(app.detail_offset.get(), 1);
         app.handle_key(&ctrl(KeyCode::Char('k')));
         assert_eq!(app.detail_offset.get(), 0);
-        // Shift+Tab resumes cursor-following and moves the record cursor
-        // up (Tab is parked on the last row, TXT, so it cannot move down).
+        // Tab focuses Records; moving the record cursor resumes follow.
+        app.handle_key(&plain(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Records);
         let before = app.detail_selected;
         assert!(before > 0);
-        app.handle_key(&plain(KeyCode::BackTab));
+        app.handle_key(&plain(KeyCode::Char('k')));
         assert!(!app.detail_free_scroll);
         assert_eq!(app.detail_selected, before - 1);
+        // Shift+Tab returns to the service list.
+        app.handle_key(&plain(KeyCode::BackTab));
+        assert_eq!(app.focus, Focus::Services);
+    }
+
+    #[test]
+    fn tab_switches_panes_and_scopes_navigation() {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = two_group_app();
+        let plain = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        assert_eq!(app.focus, Focus::Services);
+        // Service navigation in the Services pane.
+        app.handle_key(&plain(KeyCode::Char('j')));
+        assert_eq!(app.selected_display, 3);
+        let detail_before = app.detail_selected;
+        // Tab focuses Records: j/k now move the record cursor instead.
+        app.handle_key(&plain(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Records);
+        app.handle_key(&plain(KeyCode::Char('j')));
+        assert_eq!(app.selected_display, 3);
+        assert_eq!(app.detail_selected, detail_before + 1);
+        // BackTab returns to the service list.
+        app.handle_key(&plain(KeyCode::BackTab));
+        assert_eq!(app.focus, Focus::Services);
+    }
+
+    #[test]
+    fn enter_is_scoped_to_focused_pane() {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1; b=2");
+        let key = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        let rec = app.services[0]
+            .ordered_records()
+            .into_iter()
+            .find(|r| r.rtype == 16)
+            .cloned()
+            .expect("TXT record merged into service");
+        // Services focus: Enter folds the type, never expands TXT.
+        app.handle_key(&key(KeyCode::Enter));
+        assert!(!app.is_txt_expanded(&rec));
+        assert!(app.is_type_collapsed("_http._tcp.local"));
+        // Records focus: Enter expands TXT instead.
+        app.handle_key(&key(KeyCode::Char('+')));
+        app.handle_key(&key(KeyCode::Tab));
+        app.handle_key(&key(KeyCode::Enter));
+        assert!(app.is_txt_expanded(&rec));
+    }
+
+    #[test]
+    fn records_home_end_and_paging() {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1; b=2");
+        let key = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        app.record_viewport.set(2);
+        app.handle_key(&key(KeyCode::Tab));
+        app.handle_key(&key(KeyCode::End));
+        assert_eq!(app.detail_selected, 2);
+        app.handle_key(&key(KeyCode::Home));
+        assert_eq!(app.detail_selected, 0);
+        app.handle_key(&key(KeyCode::Char(' ')));
+        assert_eq!(app.detail_selected, 2);
+        app.handle_key(&key(KeyCode::Char('b')));
+        assert_eq!(app.detail_selected, 0);
     }
 
     #[test]

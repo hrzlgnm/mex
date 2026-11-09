@@ -17,7 +17,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::app::{App, DisplayItem};
+use crate::app::{App, DisplayItem, Focus};
 
 pub type Terminal = ratatui::Terminal<CrosstermBackend<io::Stdout>>;
 
@@ -68,7 +68,7 @@ fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 .fg(Color::Cyan),
         ),
         Span::raw(format!(
-            "│ {} pkts │ {} svcs │ uptime {}  [q] quit [j/k] move [tab] row [h/l] group [space] page [+-] fold",
+            "│ {} pkts │ {} svcs │ uptime {}  [q] quit [tab] pane [j/k] move [enter] fold",
             app.packet_count,
             app.services.len(),
             uptime_str
@@ -188,7 +188,11 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
             Block::default()
                 .borders(Borders::ALL)
                 .title(title)
-                .border_style(Style::default().fg(Color::Gray)),
+                .border_style(Style::default().fg(if app.focus == Focus::Services {
+                    Color::White
+                } else {
+                    Color::Gray
+                })),
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_spacing(HighlightSpacing::Always);
@@ -264,6 +268,9 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     } else {
         format!("Answers: {}", pane_ident(svc))
     };
+    // Visible data rows: borders plus the header row are chrome.
+    app.record_viewport
+        .set(area.height.saturating_sub(3) as usize);
 
     let table = Table::new(rows, widths)
         .header(
@@ -277,11 +284,15 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(format!(" {block_title} "))
-                .border_style(Style::default().fg(Color::Gray)),
+                .border_style(Style::default().fg(if app.focus == Focus::Records {
+                    Color::White
+                } else {
+                    Color::Gray
+                })),
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
-    // Highlight the j/k-selected row, if the cursor is on a record.
+    // Highlight the record-cursor row, if the cursor is on a record.
     // TXT child rows are display-only; questions live in their own pane.
     // In free-scroll mode the selection is withheld so ratatui (which
     // always snaps the viewport back to the selected row) does not undo
@@ -584,6 +595,12 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
         Constraint::Min(20),
     ];
 
+    // The Questions table shares the record cursor: light its border when
+    // the cursor sits on a question row.
+    let raw_count = svc.ordered_records().len();
+    let cursor_in_questions =
+        app.selected_detail_entry().is_some() && app.detail_selected >= raw_count;
+
     let table = Table::new(rows, widths)
         .header(
             Row::new(vec!["TYPE", "AGE", "SOURCE", "QUESTION"]).style(
@@ -596,18 +613,22 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
             Block::default()
                 .borders(Borders::ALL)
                 .title(format!(" Questions: {} ", pane_ident(svc)))
-                .border_style(Style::default().fg(Color::Gray)),
+                .border_style(Style::default().fg(
+                    if app.focus == Focus::Records && cursor_in_questions {
+                        Color::White
+                    } else {
+                        Color::Gray
+                    },
+                )),
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
-    // Highlight the j/k-selected question row, if the cursor is on one.
-    let raw_count = svc.ordered_records().len();
-    let selected_table_row =
-        if app.selected_detail_entry().is_some() && app.detail_selected >= raw_count {
-            Some(app.detail_selected - raw_count)
-        } else {
-            None
-        };
+    // Highlight the record-cursor question row, if the cursor is on one.
+    let selected_table_row = if cursor_in_questions {
+        Some(app.detail_selected - raw_count)
+    } else {
+        None
+    };
     let mut tstate = TableState::default();
     tstate.select(selected_table_row);
     *tstate.offset_mut() = app.questions_offset.get();
@@ -616,7 +637,7 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
 }
 
 fn draw_hex_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    // The hex pane follows the j/k cursor: wire bytes of the selected
+    // The hex pane follows the record cursor: wire bytes of the selected
     // record, the query packet of the selected question row, otherwise the
     // whole latest packet for the service.
     if let Some((bytes, title)) = app.selected_detail_bytes() {
