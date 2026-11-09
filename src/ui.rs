@@ -242,7 +242,7 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     let src_w = svc
         .records
         .iter()
-        .map(|r| r.source.to_string().len())
+        .map(|r| source_label(r).len())
         .max()
         .unwrap_or(14)
         .clamp(14, 45) as u16;
@@ -286,6 +286,17 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     *tstate.offset_mut() = app.detail_offset.get();
     frame.render_stateful_widget(table, area, &mut tstate);
     app.detail_offset.set(tstate.offset());
+}
+
+/// Source cell for the Records table: the responder address, suffixed
+/// with the ingress interface (`addr%iface`) when pktinfo provided one,
+/// so multi-link traffic can be told apart.
+fn source_label(rec: &crate::browse::RawRecord) -> String {
+    if rec.iface.is_empty() {
+        rec.source.to_string()
+    } else {
+        format!("{}%{}", rec.source, rec.iface)
+    }
 }
 
 fn detail_table_rows<'a>(
@@ -377,7 +388,7 @@ fn detail_table_rows<'a>(
                 Cell::from(rec.rtype_str.clone()),
                 Cell::from(ttl_str.clone()),
                 Cell::from(flush),
-                Cell::from(rec.source.to_string()),
+                Cell::from(source_label(rec)),
                 Cell::from(rec.rdata.clone()),
             ])
             .style(style),
@@ -586,4 +597,31 @@ fn hex_dump(data: &[u8], width: usize) -> Vec<Line<'_>> {
     }
 
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn test_record(iface: &str) -> crate::browse::RawRecord {
+        crate::browse::RawRecord {
+            name: "_http._tcp.local.".to_string(),
+            rtype: 12,
+            rtype_str: "PTR".to_string(),
+            flush_bit: false,
+            ttl: 120,
+            rdata: "Test._http._tcp.local.".to_string(),
+            wire: Vec::new(),
+            source: "192.168.1.5:5353".parse().unwrap(),
+            iface: iface.to_string(),
+            received_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn source_label_shows_interface_when_known() {
+        assert_eq!(source_label(&test_record("br0")), "192.168.1.5:5353%br0");
+        assert_eq!(source_label(&test_record("")), "192.168.1.5:5353");
+    }
 }

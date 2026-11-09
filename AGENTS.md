@@ -16,7 +16,8 @@ Headless run (no TTY) logs to stderr.
 
 * `src/main.rs` — entry, TUI init/restore.
 * `src/browse.rs` — raw mDNS transport: v4/v6 sockets on `224.0.0.251:5353` /
-  `[FF02::FB]:5353`, `send_query` (QM/QU + known answers), packet parse.
+  `[FF02::FB]:5353` via `socket-pktinfo`, `send_query` (QM/QU + known
+  answers, one copy per interface), packet parse with ingress interface.
 * `src/app.rs` — browser state, query scheduling, ingest/expire, selection.
 * `src/ui.rs` — ratatui rendering only, no state mutations.
 
@@ -33,6 +34,7 @@ Headless run (no TTY) logs to stderr.
 * A/AAAA query names keep wire case; dedup keys are lowercase.
 * No queries for dead interests: `evict_expired` prunes `continuous`,
   `requeries`, `enum_known`, `known_types` to live names.
+* Records show the ingress interface (`addr%iface`) from IP_PKTINFO.
 * Unique answers (flush bit) dampen the exponential stream to hourly;
   the 80%-TTL refresh takes over.
 

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::mpsc;
 use std::thread;
@@ -70,6 +70,9 @@ pub struct RawRecord {
     /// the hex view doesn't depend on the shared packet buffer.
     pub wire: Vec<u8>,
     pub source: SocketAddr,
+    /// Name of the interface the packet arrived on (e.g. `"br0"`), from
+    /// IP_PKTINFO. Empty when unknown; used only for display/diagnosis.
+    pub iface: String,
     pub received_at: Instant,
 }
 
@@ -154,6 +157,16 @@ pub fn local_ips() -> HashSet<IpAddr> {
     out
 }
 
+fn iface_names() -> HashMap<u32, String> {
+    let mut out = HashMap::new();
+    for iface in if_addrs::get_if_addrs().unwrap_or_default() {
+        if let Some(idx) = iface.index {
+            out.entry(idx).or_insert(iface.name);
+        }
+    }
+    out
+}
+
 fn skipped_interface(name: &str) -> bool {
     name == "lo" || name.starts_with("docker") || name.starts_with("veth")
 }
@@ -228,6 +241,7 @@ fn listen(
     let mut ifaces_v6: Vec<(String, u32)> = Vec::new();
     let mut joined_v4: HashSet<String> = HashSet::new();
     let mut joined_v6: HashSet<String> = HashSet::new();
+    let mut ifnames: HashMap<u32, String> = HashMap::new();
     let mut last_refresh: Option<Instant> = None;
 
     loop {
@@ -236,6 +250,7 @@ fn listen(
             .unwrap_or(true)
         {
             last_refresh = Some(Instant::now());
+            ifnames = iface_names();
             match family {
                 Family::V4 => {
                     ifaces_v4 = v4_interfaces();
@@ -277,7 +292,11 @@ fn listen(
                     continue;
                 }
                 let raw = buf[..len].to_vec();
-                if let Some(ev) = parse_packet(&raw, info.addr_src) {
+                let iface = ifnames
+                    .get(&(info.if_index as u32))
+                    .map(String::as_str)
+                    .unwrap_or("");
+                if let Some(ev) = parse_packet(&raw, info.addr_src, iface) {
                     if tx.send(ev).is_err() {
                         break;
                     }
@@ -368,7 +387,7 @@ fn send_query(socket: &PktInfoUdpSocket, req: &QueryRequest, dest: SocketAddr) {
     let _ = socket.send_to(&bytes, &SockAddr::from(dest));
 }
 
-fn parse_packet(raw: &[u8], source: SocketAddr) -> Option<Event> {
+fn parse_packet(raw: &[u8], source: SocketAddr, iface: &str) -> Option<Event> {
     let msg = Message::from_bytes(raw).ok()?;
 
     let mut records = Vec::new();
@@ -389,6 +408,7 @@ fn parse_packet(raw: &[u8], source: SocketAddr) -> Option<Event> {
             rdata: rdata_label(rec.data()),
             wire: rec.to_bytes().unwrap_or_default(),
             source,
+            iface: iface.to_string(),
             received_at: Instant::now(),
         });
     }
@@ -404,6 +424,7 @@ fn parse_packet(raw: &[u8], source: SocketAddr) -> Option<Event> {
             rdata: String::new(),
             wire: Vec::new(),
             source,
+            iface: iface.to_string(),
             received_at: Instant::now(),
         });
     }

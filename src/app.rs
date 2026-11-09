@@ -1518,6 +1518,7 @@ mod tests {
             rdata: rdata.to_string(),
             wire: Vec::new(),
             source: test_source(),
+            iface: String::new(),
             received_at: Instant::now(),
         }
     }
@@ -1563,6 +1564,18 @@ mod tests {
             .filter(|r| r.rtype == 12)
             .cloned()
             .collect()
+    }
+
+    #[test]
+    fn record_carries_ingress_interface() {
+        let mut app = App::new().unwrap();
+        let mut rec = ptr_record(120);
+        rec.iface = "br0".to_string();
+        ingest(&mut app, &rec);
+        ingest(&mut app, &srv_record(120));
+        let ptrs = live_ptr_rows(&app);
+        assert_eq!(ptrs.len(), 1);
+        assert_eq!(ptrs[0].iface, "br0");
     }
 
     #[test]
