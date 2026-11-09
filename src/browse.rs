@@ -401,25 +401,32 @@ fn parse_packet(raw: &[u8], source: SocketAddr, iface: &str) -> Option<Event> {
 
     let mut records = Vec::new();
 
-    for rec in msg
-        .answers()
-        .iter()
-        .chain(msg.name_servers())
-        .chain(msg.additionals())
-    {
-        let class: u16 = rec.dns_class().into();
-        records.push(RawRecord {
-            name: unescape(&rec.name().to_string()),
-            rtype: u16::from(rec.record_type()),
-            rtype_str: rtype_label(rec.record_type()),
-            flush_bit: class & 0x8000 != 0,
-            ttl: rec.ttl(),
-            rdata: rdata_label(rec.data()),
-            wire: rec.to_bytes().unwrap_or_default(),
-            source,
-            iface: iface.to_string(),
-            received_at: Instant::now(),
-        });
+    // Only responses carry authoritative records. Queries may carry the
+    // same records as known answers (RFC 6762 §7.1 suppression), which
+    // are beliefs, not facts: the querier (often ourselves, via
+    // multicast loopback) is not their source. Filing them would conjure
+    // phantom sightings on links the device never touched.
+    if msg.message_type() == MessageType::Response {
+        for rec in msg
+            .answers()
+            .iter()
+            .chain(msg.name_servers())
+            .chain(msg.additionals())
+        {
+            let class: u16 = rec.dns_class().into();
+            records.push(RawRecord {
+                name: unescape(&rec.name().to_string()),
+                rtype: u16::from(rec.record_type()),
+                rtype_str: rtype_label(rec.record_type()),
+                flush_bit: class & 0x8000 != 0,
+                ttl: rec.ttl(),
+                rdata: rdata_label(rec.data()),
+                wire: rec.to_bytes().unwrap_or_default(),
+                source,
+                iface: iface.to_string(),
+                received_at: Instant::now(),
+            });
+        }
     }
 
     let mut questions = Vec::new();
@@ -596,6 +603,51 @@ mod tests {
             SocketAddr::V6(v6) => assert_eq!(v6.scope_id(), 7),
             _ => panic!("expected v6 mDNS dest"),
         }
+    }
+
+    fn known_answer(owner: &str, target: &str, ttl: u32) -> Record {
+        let mut rec = Record::with(Name::from_ascii(owner).unwrap(), RecordType::PTR, ttl);
+        let target = Name::from_ascii(target).unwrap();
+        rec.set_data(Some(RData::PTR(hickory_proto::rr::rdata::PTR(target))));
+        rec.set_dns_class(DNSClass::IN);
+        rec
+    }
+
+    fn test_source() -> std::net::SocketAddr {
+        "192.168.178.60:5353".parse().unwrap()
+    }
+
+    #[test]
+    fn query_known_answers_are_not_filed_as_records() {
+        let mut q = Message::new();
+        q.add_query(Query::query(
+            Name::from_ascii("svc._http._tcp.local.").unwrap(),
+            RecordType::PTR,
+        ));
+        q.set_message_type(MessageType::Query);
+        q.add_answer(known_answer(
+            "svc._http._tcp.local.",
+            "Inst.svc._http._tcp.local.",
+            120,
+        ));
+        let ev = parse_packet(&q.to_vec().unwrap(), test_source(), "enx").unwrap();
+        // The known answer must not become a sighting; the question stays.
+        assert!(ev.records.is_empty());
+        assert_eq!(ev.questions.len(), 1);
+        assert_eq!(ev.questions[0].name, "svc._http._tcp.local.");
+
+        let mut r = Message::new();
+        r.set_message_type(MessageType::Response);
+        r.add_answer(known_answer(
+            "svc._http._tcp.local.",
+            "Inst.svc._http._tcp.local.",
+            120,
+        ));
+        let ev = parse_packet(&r.to_vec().unwrap(), test_source(), "enx").unwrap();
+        assert_eq!(ev.records.len(), 1);
+        assert_eq!(ev.records[0].rdata, "Inst.svc._http._tcp.local.");
+        assert_eq!(ev.records[0].iface, "enx");
+        assert!(ev.questions.is_empty());
     }
 
     #[test]
