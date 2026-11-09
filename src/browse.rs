@@ -443,7 +443,7 @@ fn parse_packet(raw: &[u8], source: SocketAddr, iface: &str) -> Option<Event> {
                 rtype_str: rtype_label(rec.record_type()),
                 flush_bit: class & 0x8000 != 0,
                 ttl: rec.ttl(),
-                rdata: rdata_label(rec.data()),
+                rdata: rdata_label(rec.data(), raw),
                 wire: rec.to_bytes().unwrap_or_default(),
                 source,
                 iface: iface.to_string(),
@@ -493,7 +493,7 @@ fn rtype_label(rtype: RecordType) -> String {
     }
 }
 
-fn rdata_label(data: Option<&RData>) -> String {
+fn rdata_label(data: Option<&RData>, msg: &[u8]) -> String {
     match data {
         Some(RData::A(ip)) => ip.to_string(),
         Some(RData::AAAA(ip)) => ip.to_string(),
@@ -536,35 +536,47 @@ fn rdata_label(data: Option<&RData>) -> String {
         }
         Some(RData::SVCB(svcb)) => unescape(&svcb.target_name().to_string()),
         Some(RData::Unknown { code, rdata }) if *code == RecordType::NSEC => {
-            decode_nsec(rdata.anything())
+            decode_nsec(rdata.anything(), msg)
         }
         _ => String::new(),
     }
 }
 
 /// Decode NSEC rdata (next name + type bit maps, RFC 4034 §4.1) for display:
-/// "<next-name> <TYPE>...". Compression pointers in the next name can't be
-/// resolved from rdata alone, so those render as "…".
-fn decode_nsec(rdata: &[u8]) -> String {
+/// "<next-name> <TYPE>...". The next name is usually inline, but may be a
+/// compression pointer (or end in one) whose target lives outside rdata, so
+/// the full message is passed for context and pointers are resolved against
+/// it. Names that cannot be resolved render as "…".
+fn decode_nsec(rdata: &[u8], msg: &[u8]) -> String {
     let mut pos = 0;
     let mut labels = Vec::new();
-    let mut compressed = false;
-    // Next domain name in wire format.
+    let mut unresolved = false;
+    // Next domain name in wire format. Inline labels are collected here; a
+    // compression pointer terminates the inline part (`pos` still advances
+    // past it, so the type bitmaps below are read from the right offset).
     let mut truncated = false;
     while let Some(&len) = rdata.get(pos) {
         if len == 0 {
             pos += 1;
             break;
         }
-        if len & 0xC0 != 0 {
-            // Compression pointer (or extended label type): target lives
-            // outside rdata, so the name can't be resolved here.
-            compressed = true;
-            if len & 0xC0 == 0xC0 {
-                pos += 2;
-            } else {
+        if len & 0xC0 == 0xC0 {
+            let hi = (len & 0x3F) as usize;
+            let Some(&lo) = rdata.get(pos + 1) else {
                 truncated = true;
+                break;
+            };
+            match read_name_at(msg, (hi << 8) | lo as usize) {
+                Some(resolved) => labels.extend(resolved),
+                None => unresolved = true,
             }
+            pos += 2;
+            break;
+        }
+        if len & 0xC0 != 0 {
+            // Extended label type, not a compression pointer: give up on
+            // the name but still try the type bitmaps below.
+            truncated = true;
             break;
         }
         let len = len as usize;
@@ -582,7 +594,7 @@ fn decode_nsec(rdata: &[u8]) -> String {
     if !name.is_empty() {
         name.push('.');
     }
-    if compressed || name.is_empty() {
+    if unresolved || name.is_empty() {
         name.push('…');
     }
     if truncated {
@@ -614,6 +626,45 @@ fn decode_nsec(rdata: &[u8]) -> String {
     } else {
         format!("{name} {}", types.join(" "))
     }
+}
+
+/// Read a (possibly compressed) domain name starting at absolute `offset`
+/// in `msg`, returning its labels. Pointer loops, excessive depth, and
+/// overruns all yield None instead of hanging or panicking, so a corrupt
+/// name only affects its own display string.
+fn read_name_at(msg: &[u8], offset: usize) -> Option<Vec<String>> {
+    let mut labels = Vec::new();
+    let mut pos = offset;
+    let mut visited: Vec<usize> = Vec::new();
+    loop {
+        let len = *msg.get(pos)?;
+        if len == 0 {
+            break;
+        }
+        if len & 0xC0 == 0xC0 {
+            // Compression pointer: 14-bit absolute offset into the message.
+            let target = (((len & 0x3F) as usize) << 8) | (*msg.get(pos + 1)? as usize);
+            if visited.contains(&target) || visited.len() >= 32 {
+                return None;
+            }
+            visited.push(target);
+            pos = target;
+            continue;
+        }
+        if len & 0xC0 != 0 {
+            // Extended label type: not a plain name label.
+            return None;
+        }
+        let len = len as usize;
+        pos += 1;
+        let label = msg.get(pos..pos + len)?;
+        labels.push(String::from_utf8_lossy(label).into_owned());
+        if labels.len() > 127 {
+            return None;
+        }
+        pos += len;
+    }
+    Some(labels)
 }
 
 #[cfg(test)]
@@ -723,5 +774,100 @@ mod tests {
         assert!(!usable_interface(&iface(St::NotPresent, false)));
         assert!(!usable_interface(&iface(St::Up, true)));
         assert!(!usable_interface(&iface(St::Unknown, true)));
+    }
+
+    /// Message bytes with "host.local." at offset 20 for pointer tests.
+    fn msg_with_host_at_20() -> Vec<u8> {
+        let mut msg = vec![0u8; 64];
+        msg[20] = 4;
+        msg[21..25].copy_from_slice(b"host");
+        msg[25] = 5;
+        msg[26..31].copy_from_slice(b"local");
+        msg[31] = 0;
+        msg
+    }
+
+    /// Bitmap covering only A (type 1): window 0, len 1, 0x40.
+    fn a_bitmap() -> Vec<u8> {
+        vec![0, 1, 0x40]
+    }
+
+    fn inline_host_rdata() -> Vec<u8> {
+        let mut r = vec![4];
+        r.extend_from_slice(b"host");
+        r.push(5);
+        r.extend_from_slice(b"local");
+        r.push(0);
+        r.extend(a_bitmap());
+        r
+    }
+
+    #[test]
+    fn nsec_inline_name_unchanged() {
+        // Pre-existing rendering must not change: no pointers involved,
+        // so the message context is never consulted.
+        assert_eq!(decode_nsec(&inline_host_rdata(), &[]), "host.local. A");
+    }
+
+    #[test]
+    fn nsec_pointer_resolves_against_message() {
+        let msg = msg_with_host_at_20();
+        let mut rdata = vec![0xC0, 20];
+        rdata.extend(a_bitmap());
+        assert_eq!(decode_nsec(&rdata, &msg), "host.local. A");
+    }
+
+    #[test]
+    fn nsec_prefix_plus_pointer_suffix() {
+        let msg = msg_with_host_at_20();
+        let mut rdata = vec![3];
+        rdata.extend_from_slice(b"sub");
+        rdata.extend([0xC0, 20]);
+        rdata.extend(a_bitmap());
+        assert_eq!(decode_nsec(&rdata, &msg), "sub.host.local. A");
+    }
+
+    #[test]
+    fn nsec_dangling_pointer_renders_ellipsis() {
+        let msg = vec![0u8; 64];
+        let mut rdata = vec![0xC0, 200];
+        rdata.extend(a_bitmap());
+        assert_eq!(decode_nsec(&rdata, &msg), "… A");
+    }
+
+    #[test]
+    fn nsec_pointer_loop_terminates() {
+        let mut msg = vec![0u8; 64];
+        msg[10] = 0xC0;
+        msg[11] = 10;
+        let mut rdata = vec![0xC0, 10];
+        rdata.extend(a_bitmap());
+        assert_eq!(decode_nsec(&rdata, &msg), "… A");
+    }
+
+    #[test]
+    fn nsec_truncated_rdata_renders_ellipsis() {
+        assert_eq!(decode_nsec(&[4, b't'], &[]), "…");
+    }
+
+    #[test]
+    fn response_nsec_shows_resolved_name_and_iface() {
+        let owner = Name::from_ascii("host.local.").unwrap();
+        let mut msg = Message::new();
+        msg.set_message_type(MessageType::Response);
+        let mut nsec = Record::with(owner, RecordType::NSEC, 120);
+        nsec.set_data(Some(RData::Unknown {
+            code: RecordType::NSEC,
+            rdata: hickory_proto::rr::rdata::NULL::with(inline_host_rdata()),
+        }));
+        nsec.set_dns_class(DNSClass::IN);
+        msg.add_answer(nsec);
+        let raw = msg.to_vec().unwrap();
+        let addr: SocketAddr = "192.168.178.5:5353".parse().unwrap();
+        let ev = parse_packet(&raw, addr, "br0").unwrap();
+        assert_eq!(ev.records.len(), 1);
+        assert_eq!(ev.records[0].rdata, "host.local. A");
+        assert_eq!(ev.records[0].iface, "br0");
+        assert!(ev.questions.is_empty());
     }
 }
