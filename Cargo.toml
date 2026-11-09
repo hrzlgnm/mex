@@ -9,7 +9,7 @@ description = "A terminal UI for browsing mDNS traffic on the local network"
 maintainer = "hrzlgnm"
 copyright = "Copyright 2026 hrzlgnm"
 license-file = "LICENSE"
-depends = "libgcc-s1 (>= 4.2)"
+depends = "$auto, libgcc-s1 (>= 4.2)"
 assets = [
     [
         "target/release/mex",

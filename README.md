@@ -67,7 +67,8 @@ decaying by TTL instead of actively maintained state.
 | `H` / `L` | first / last host group |
 | `Home` / `End` | first / last row of the focused pane |
 | `PageUp` / `PageDown`, `b` / `f`, `Space` | page |
-| `Enter`, `+` / `-` | fold / unfold host (Services) or TXT record (Answers) |
+| `Enter` | fold / unfold host (Hosts) or TXT record (Answers) |
+| `+` / `-` | fold / unfold host (Hosts) |
 | `*` | collapse all host groups / unfold all |
 | `Ctrl+↑/↓`, `Ctrl+j/k`, `Shift+↑/↓`, `J` / `K` | scroll Answers viewport freely |
 | `m` | metrics overlay (traffic, discovery, queries, links) |

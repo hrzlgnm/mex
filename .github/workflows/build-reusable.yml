@@ -294,8 +294,10 @@ jobs:
               cp "$DEB_FILE" .
               DEB_NAME=$(basename "$DEB_FILE")
               echo "DEB_ASSET=$DEB_NAME" >> "$GITHUB_ENV"
-              # Convert .deb to .ipk for aarch64 and armhf (OpenWrt)
-              if [[ "$TARGET" == "aarch64-unknown-linux-gnu" || "$TARGET" == "arm-unknown-linux-gnueabihf" ]]; then
+              # Convert .deb to .ipk for aarch64 and armhf (OpenWrt).
+              # These must be the statically linked musl builds: a glibc
+              # binary cannot run on musl-based OpenWrt systems.
+              if [[ "$TARGET" == "aarch64-unknown-linux-musl" || "$TARGET" == "arm-unknown-linux-musleabihf" ]]; then
                 TEMP_DIR=$(mktemp -d)
                 DEB_ABS_PATH="$GITHUB_WORKSPACE/$DEB_FILE"
                 cp "$DEB_ABS_PATH" "$TEMP_DIR/"
@@ -363,7 +365,7 @@ jobs:
           cat > "$DMG_STAGING/$APP_NAME/Contents/MacOS/run" << 'WRAPPER'
           #!/bin/bash
           EXE_PATH="$(cd "$(dirname "$0")" && pwd)/mex"
-          osascript -e 'tell app "Terminal"' -e "do script \"$EXE_PATH; exit\"" -e 'end tell'
+          osascript -e 'tell app "Terminal"' -e "do script (quoted form of \"$EXE_PATH\" & \"; exit\")" -e 'end tell'
           WRAPPER
           chmod +x "$DMG_STAGING/$APP_NAME/Contents/MacOS/run"
           # Set the wrapper as the executable in Info.plist
@@ -485,7 +487,7 @@ jobs:
           retention-days: 30
 
       - name: 📦 Upload ipk artifacts
-        if: (!inputs.tagName) && inputs.upload_artifacts && matrix.os == 'ubuntu-latest' && (matrix.target == 'aarch64-unknown-linux-gnu' || matrix.target == 'arm-unknown-linux-gnueabihf') && env.IPK_ASSET != ''
+        if: (!inputs.tagName) && inputs.upload_artifacts && matrix.os == 'ubuntu-latest' && (matrix.target == 'aarch64-unknown-linux-musl' || matrix.target == 'arm-unknown-linux-musleabihf') && env.IPK_ASSET != ''
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mex-${{ matrix.target }}-ipk
