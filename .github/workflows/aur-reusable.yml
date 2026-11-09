@@ -1,0 +1,107 @@
+# Copyright 2026 hrzlgnm
+# SPDX-License-Identifier: MIT
+
+name: Arch linux AUR
+
+on:
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Republish AUR packages for an existing release tag (must be the latest release). Empty runs checks only."
+        required: false
+        default: ""
+  release:
+    types: [released]
+
+jobs:
+  release-info:
+    permissions:
+      packages: read
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tagName: ${{ steps.version.outputs.tagName }}
+    steps:
+      - name: 🔄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: 🏷️ Get version info
+        id: version
+        uses: ./.github/actions/latest-release-info
+
+  lint-scripts:
+    name: "🧹 Lint shell scripts"
+    uses: hrzlgnm/actions/.github/workflows/shell-lint-reusable.yml@a2e70543f16acf3105219e0e944c323afe88b269 # v2.14.13
+    with:
+      runs-on: ubuntu-latest
+      scripts-dir: packaging/aur
+
+  update-aur:
+    needs:
+      - release-info
+      - lint-scripts
+    permissions:
+      packages: read
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/hrzlgnm/mdns-browser-arch-aur-builder:v1@sha256:3c41a3df77101b934b4ee551ae97095ae22e9c8e630093fa811f04afff448e35
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - name: mex
+            checksum_url: "https://github.com/hrzlgnm/mex/releases/download/${{ needs.release-info.outputs.tagName }}/${{ needs.release-info.outputs.version }}.tar.gz.sha256"
+            generate_script: "./packaging/aur/generate-mex.sh"
+    steps:
+      - name: 🔄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: 🔢 Get sha256sums
+        id: sha256sums
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
+        env:
+          CHECKSUM_URL: ${{ matrix.package.checksum_url }}
+        with:
+          timeout_minutes: 5
+          max_attempts: 5
+          retry_wait_seconds: 10
+          warning_on_retry: true
+          command: ./packaging/aur/resolve-sha256.sh
+
+      - name: 📐 Generate PKGBUILD
+        env:
+          VERSION: ${{ needs.release-info.outputs.version }}
+          SHA256: ${{ steps.sha256sums.outputs.sha256 }}
+          GENERATE_SCRIPT: ${{ matrix.package.generate_script }}
+        shell: bash
+        # su without --login keeps the step env and only resets
+        # HOME/SHELL/USER/LOGNAME, so the script reads inputs from env.
+        run: su runner -c "./packaging/aur/lint-pkgbuild.sh"
+
+      - name: 🧹 Check generated PKGBUILD
+        uses: hrzlgnm/actions/.github/actions/aur-makepkg-lint@a2e70543f16acf3105219e0e944c323afe88b269 # v2.14.13
+        with:
+          workdir: ~/lint
+
+      - name: 🛠️ Setup AUR packaging
+        if: github.event.release.tag_name || inputs.tag_name
+        uses: hrzlgnm/actions/.github/actions/aur-setup@a2e70543f16acf3105219e0e944c323afe88b269 # v2.14.13
+        with:
+          package-name: ${{ matrix.package.name }}
+          release-version: ${{ needs.release-info.outputs.version }}
+          deploy-key: ${{ secrets.AUR_DEPLOY_KEY }}
+
+      - name: 🌀 Generate PKGBUILD update and publish
+        if: github.event.release.tag_name || inputs.tag_name
+        env:
+          VERSION: ${{ needs.release-info.outputs.version }}
+          SHA256: ${{ steps.sha256sums.outputs.sha256 }}
+          GENERATE_SCRIPT: ${{ matrix.package.generate_script }}
+        run: su runner -c "./packaging/aur/publish-aur.sh"

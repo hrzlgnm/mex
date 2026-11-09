@@ -76,6 +76,13 @@ jobs:
       profile: debug
       upload_artifacts: ${{ github.event_name != 'pull_request' }}
 
+  aur:
+    name: AUR
+    permissions:
+      contents: read # Needed to checkout code and run local scripts for AUR build
+      packages: read # Needed to read container image for AUR build
+    uses: ./.github/workflows/aur-reusable.yml
+
   lockfile-fresh:
     name: "🔒 Lockfile Fresh"
     if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-please--')
@@ -109,6 +116,7 @@ jobs:
       - lint
       - test
       - build
+      - aur
       - lockfile-fresh
       - typos
     if: always()

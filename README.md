@@ -21,7 +21,13 @@ Options:
 ```
 
 Prebuilt Linux binaries (x86_64 glibc + musl static) are attached to
-[GitHub releases](https://github.com/hrzlgnm/mex/releases). With
+[GitHub releases](https://github.com/hrzlgnm/mex/releases). On Arch Linux,
+install from the [AUR](https://aur.archlinux.org/packages/mex) instead:
+
+```sh
+yay -S mex
+```
+With
 `--passive`, mex transmits nothing: no startup QU batch, no continuous
 queries, no TTL refreshes — the view shows recently heard traffic
 decaying by TTL instead of actively maintained state.
