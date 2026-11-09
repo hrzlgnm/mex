@@ -18,6 +18,7 @@ Headless run (no TTY) logs to stderr.
 * `src/browse.rs` — raw mDNS transport: v4/v6 sockets on `224.0.0.251:5353` /
   `[FF02::FB]:5353` via `socket-pktinfo`, `send_query` (QM/QU + known
   answers, one copy per interface), packet parse with ingress interface.
+  Down, point-to-point, `lo`/`docker`/`veth` interfaces are skipped.
 * `src/app.rs` — browser state, query scheduling, ingest/expire, selection.
 * `src/ui.rs` — ratatui rendering only, no state mutations.
 

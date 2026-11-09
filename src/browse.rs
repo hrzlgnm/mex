@@ -158,11 +158,10 @@ pub fn local_ips() -> HashSet<IpAddr> {
 }
 
 fn iface_names() -> HashMap<u32, String> {
+    // Unfiltered on purpose: this only labels observed packets for
+    // display (including looped-back ones), it does not select links.
     let mut out = HashMap::new();
     for iface in if_addrs::get_if_addrs().unwrap_or_default() {
-        if !is_oper_up(&iface.name) {
-            continue;
-        }
         if let Some(idx) = iface.index {
             out.entry(idx).or_insert(iface.name);
         }
@@ -170,20 +169,17 @@ fn iface_names() -> HashMap<u32, String> {
     out
 }
 
-/// Whether an interface is usable for multicast: skip links that are
-/// operationally down (they may still carry addresses, so the address
-/// list alone does not filter them). Anything unexpected — missing
-/// sysfs entry, unparsable state, non-Linux — counts as up (fail-open),
-/// so exotic links (tunnels, VPNs reporting `unknown`) keep working.
-fn is_oper_up(name: &str) -> bool {
-    match std::fs::read_to_string(format!("/sys/class/net/{name}/operstate")) {
-        Ok(state) => oper_state_is_up(state.trim()),
-        Err(_) => true,
-    }
-}
-
-fn oper_state_is_up(state: &str) -> bool {
-    !matches!(state, "down" | "lowerlayerdown")
+/// Whether an interface is usable for mDNS: skip links that are
+/// operationally down (Down, LowerLayerDown) and point-to-point links,
+/// which have no multicast group to browse. Anything else counts as
+/// usable (fail-open), so tunnels and VPNs reporting `unknown` keep
+/// working. Sourced from if-addrs so this stays cross-platform.
+fn usable_interface(iface: &if_addrs::Interface) -> bool {
+    !iface.is_p2p()
+        && !matches!(
+            iface.oper_status,
+            if_addrs::IfOperStatus::Down | if_addrs::IfOperStatus::LowerLayerDown
+        )
 }
 
 fn skipped_interface(name: &str) -> bool {
@@ -194,7 +190,7 @@ fn v4_interfaces() -> Vec<(String, Ipv4Addr)> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for iface in if_addrs::get_if_addrs().unwrap_or_default() {
-        if skipped_interface(&iface.name) || !is_oper_up(&iface.name) {
+        if skipped_interface(&iface.name) || !usable_interface(&iface) {
             continue;
         }
         if let if_addrs::IfAddr::V4(v4) = iface.addr {
@@ -211,7 +207,7 @@ fn v6_interfaces() -> Vec<(String, u32)> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for iface in if_addrs::get_if_addrs().unwrap_or_default() {
-        if skipped_interface(&iface.name) || !is_oper_up(&iface.name) {
+        if skipped_interface(&iface.name) || !usable_interface(&iface) {
             continue;
         }
         if let if_addrs::IfAddr::V6(v6) = iface.addr {
@@ -609,15 +605,30 @@ mod tests {
     }
 
     #[test]
-    fn oper_state_down_links_are_skipped() {
-        assert!(oper_state_is_up("up"));
-        assert!(oper_state_is_up("unknown"));
-        assert!(oper_state_is_up("dormant"));
-        assert!(oper_state_is_up("testing"));
-        assert!(oper_state_is_up("notpresent"));
-        assert!(!oper_state_is_up("down"));
-        assert!(!oper_state_is_up("lowerlayerdown"));
-        // Unknown sysfs entries fail open: missing interface, non-Linux.
-        assert!(is_oper_up("definitely-not-an-interface-mex"));
+    fn unusable_interfaces_are_skipped() {
+        fn iface(status: if_addrs::IfOperStatus, p2p: bool) -> if_addrs::Interface {
+            if_addrs::Interface {
+                name: "eth0".into(),
+                addr: if_addrs::IfAddr::V4(if_addrs::Ifv4Addr {
+                    ip: Ipv4Addr::new(192, 168, 1, 2),
+                    netmask: Ipv4Addr::new(255, 255, 255, 0),
+                    prefixlen: 24,
+                    broadcast: None,
+                }),
+                index: Some(2),
+                oper_status: status,
+                is_p2p: p2p,
+            }
+        }
+        use if_addrs::IfOperStatus as St;
+        assert!(usable_interface(&iface(St::Up, false)));
+        assert!(!usable_interface(&iface(St::Down, false)));
+        assert!(!usable_interface(&iface(St::LowerLayerDown, false)));
+        assert!(usable_interface(&iface(St::Unknown, false)));
+        assert!(usable_interface(&iface(St::Dormant, false)));
+        assert!(usable_interface(&iface(St::Testing, false)));
+        assert!(usable_interface(&iface(St::NotPresent, false)));
+        assert!(!usable_interface(&iface(St::Up, true)));
+        assert!(!usable_interface(&iface(St::Unknown, true)));
     }
 }
