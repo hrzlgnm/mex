@@ -23,13 +23,14 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: 🦀 Setup Rust
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: 🦀 Setup Rust cache
+        uses: ./.github/actions/setup-rust-cache
         with:
           components: rustfmt, clippy
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: 📦 Cache
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: ⚡ Setup sccache
+        uses: ./.github/actions/setup-sccache
 
       - name: 🎨 Check formatting
         shell: bash
@@ -48,11 +49,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: 🦀 Setup Rust
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: 🦀 Setup Rust cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: 📦 Cache
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: ⚡ Setup sccache
+        uses: ./.github/actions/setup-sccache
 
       - name: 🧪 Test
         shell: bash
@@ -67,11 +70,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: 🦀 Setup Rust
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: 🦀 Setup Rust cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: 📦 Cache
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: ⚡ Setup sccache
+        uses: ./.github/actions/setup-sccache
 
       - name: 🔨 Build
         shell: bash
