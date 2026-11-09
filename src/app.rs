@@ -170,18 +170,6 @@ fn fmt_bytes(bytes: u64) -> String {
     }
 }
 
-/// Short label for an overheard question's numeric type.
-fn overheard_rtype_label(rtype: u16) -> String {
-    match rtype {
-        12 => "PTR".to_string(),
-        33 => "SRV".to_string(),
-        16 => "TXT".to_string(),
-        1 => "A".to_string(),
-        28 => "AAAA".to_string(),
-        _ => format!("TYPE{rtype}"),
-    }
-}
-
 pub struct App {
     pub services: Vec<ServiceEntry>,
     pub selected_display: usize,
@@ -1120,38 +1108,6 @@ impl App {
                 self.suppressions_last_60s(),
             ),
         );
-        // The context that makes the counter meaningful: neighbor QM
-        // questions currently holding our transmissions (2s window, so
-        // this is usually empty — that absence is the normal state).
-        let mut heard: Vec<_> = self.overheard.iter().collect();
-        heard.sort_by(|a, b| a.0.cmp(b.0));
-        if heard.is_empty() {
-            kv(&mut rows, "overheard now", "none (2s window)".to_string());
-        }
-        for ((name, rtype), (seen, remote, iface)) in heard.iter().take(5) {
-            let link = if iface.is_empty() {
-                "(unknown link)".to_string()
-            } else {
-                format!("@{iface}")
-            };
-            kv(
-                &mut rows,
-                &format!("heard {name}"),
-                format!(
-                    "{} · {} ago {link} · {} remote KAs",
-                    overheard_rtype_label(*rtype),
-                    fmt_age(seen.elapsed().as_secs()),
-                    remote.len(),
-                ),
-            );
-        }
-        if heard.len() > 5 {
-            kv(
-                &mut rows,
-                "heard more",
-                format!("+{} more", heard.len() - 5),
-            );
-        }
         kv(
             &mut rows,
             "KAs attached",
@@ -3742,17 +3698,11 @@ mod tests {
     }
 
     #[test]
-    fn metrics_overheard_rows_name_the_neighbor() {
+    fn metrics_has_no_flickering_overheard_rows() {
         let mut app = App::new().unwrap();
-        // Empty overheard set states the normal case explicitly.
-        let rows = app.metrics_rows();
-        let (_, value) = rows
-            .iter()
-            .find(|(k, _)| k == "overheard now")
-            .expect("overheard-now row");
-        assert!(value.contains("none"), "got: {value}");
-
-        // A live overheard QM question names who asked what, where.
+        // A live overheard QM question must not sprout short-lived rows:
+        // suppression context lives in the counter row (total + last
+        // 60s), not in a feed of 2s-lifetime entries.
         let ev = query_event(
             "_http._tcp.local.",
             12,
@@ -3762,15 +3712,16 @@ mod tests {
             remote_source(),
         );
         app.ingest_event(&ev);
+        assert_eq!(app.overheard.len(), 1);
         let rows = app.metrics_rows();
         assert!(
-            rows.iter().all(|(k, _)| k != "overheard now"),
-            "pending entries replace the empty-state row"
+            rows.iter()
+                .all(|(k, _)| !k.starts_with("heard ") && k != "overheard now"),
+            "no per-entry overheard rows"
         );
-        let (key, value) = rows
-            .iter()
-            .find(|(k, _)| k == "heard _http._tcp.local")
-            .expect("overheard entry row");
-        assert!(value.contains("PTR"), "key: {key}, value: {value}");
+        assert!(
+            rows.iter().any(|(k, _)| k == "suppressed (dup §7.3)"),
+            "counter row carries the context"
+        );
     }
 }
