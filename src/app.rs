@@ -745,7 +745,7 @@ impl App {
         }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.running = false,
-            // Detail viewport scroll (sibling: Shift+Up/Down, J/K).
+            // Detail viewport scroll: Shift+Up/Down, J/K (Ctrl chords kept).
             KeyCode::Up | KeyCode::Down
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     || key.modifiers.contains(KeyModifiers::SHIFT) =>
@@ -763,7 +763,7 @@ impl App {
             }
             KeyCode::Char('J') => self.scroll_detail(1),
             KeyCode::Char('K') => self.scroll_detail(-1),
-            // Service selection (sibling: j/k + up/down).
+            // Service list selection.
             KeyCode::Up => self.move_selection(-1),
             KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') => self.move_selection(-1),
@@ -771,7 +771,7 @@ impl App {
             // Record cursor over the Answers table.
             KeyCode::Tab => self.move_detail_cursor(1),
             KeyCode::BackTab => self.move_detail_cursor(-1),
-            // Service-type group jumps (sibling: h/l and arrows switch types).
+            // Jump between service-type groups.
             KeyCode::Char('h') | KeyCode::Left => self.jump_group(-1),
             KeyCode::Char('l') | KeyCode::Right => self.jump_group(1),
             // Shift jumps to the first/last group (uppercase from Shift).
@@ -803,7 +803,7 @@ impl App {
         }
     }
 
-    /// First/last selectable stop (sibling: Home/End).
+    /// First/last selectable stop.
     fn select_edge(&mut self, first: bool) {
         let items = self.display_items();
         let mut target = None;
@@ -821,8 +821,8 @@ impl App {
         }
     }
 
-    /// Page the service selection by one viewport of stops (sibling:
-    /// PageUp/PageDown/b/f/Space). Falls back to 10 stops before the
+    /// Page the service selection by one viewport of stops
+    /// (PageUp/PageDown/b/f/Space). Falls back to 10 stops before the
     /// first draw records the real height.
     fn page_selection(&mut self, pages: isize) {
         let per_page = self.list_viewport.get().max(1) as isize;
@@ -858,8 +858,8 @@ impl App {
         }
     }
 
-    /// Jump to the neighbouring type group (sibling: h/l switch types):
-    /// lands on its first selectable stop.
+    /// Jump to the neighbouring type group, landing on its first
+    /// selectable stop.
     fn jump_group(&mut self, delta: isize) {
         let labels = self.group_labels();
         if labels.is_empty() {
