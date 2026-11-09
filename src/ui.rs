@@ -398,7 +398,7 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                     Color::Gray
                 })),
         )
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
     // Highlight the record-cursor row, if the cursor is on a record.
     // TXT child rows are display-only; questions live in their own pane.
@@ -713,7 +713,7 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
                     Color::Gray
                 })),
         )
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
     // Highlight the record-cursor question row, if the cursor is on one.
     let selected_table_row = if cursor_in_questions {
