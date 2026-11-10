@@ -38,7 +38,7 @@ pub enum DragMode {
     HorizLower,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum DisplayItem {
     Host { label: String },
     Instance { index: usize },
@@ -2088,12 +2088,30 @@ impl App {
             }
             DisplayItem::Host { label } => {
                 let label = label.clone();
+                // Capture the selected item first: folding below the cursor
+                // removes rows and unfolding above it inserts them, so the
+                // raw index is stale after the toggle either way.
+                let prev = items.get(self.selected_display).cloned();
                 if !self.collapsed_hosts.remove(&label) {
                     self.collapsed_hosts.insert(label);
                 }
-                // A collapsed-then-expanded header is not a stop; only keep
-                // the cursor on it while it stays collapsed (unfoldable).
-                if self.is_selectable(&items[idx]) {
+                let items = self.display_items();
+                let mut restored = false;
+                if let Some(p) = prev {
+                    if let Some(pos) = items.iter().position(|it| *it == p) {
+                        // Same item, new row: selecting the clicked header
+                        // can wait for clamp_selection below.
+                        self.selected_display = pos;
+                        restored = true;
+                    }
+                }
+                // Only fall back to the clicked header when the previous
+                // selection folded away with its group: it is selectable
+                // exactly when the click just collapsed its host.
+                if !restored
+                    && matches!(items.get(idx), Some(DisplayItem::Host { .. }))
+                    && self.is_selectable(&items[idx])
+                {
                     self.selected_display = idx;
                 }
                 self.clamp_selection();
@@ -2449,9 +2467,14 @@ impl App {
     /// it where it is when already inside.
     fn snap_detail_to_focus(&mut self) {
         self.sync_detail_cursor();
+        let before = self.detail_selected;
         let (lo, hi) = self.detail_range();
         if hi > lo && (self.detail_selected < lo || self.detail_selected >= hi) {
             self.detail_selected = lo;
+        }
+        // New row means new hex bytes: restart the dump at the top.
+        if self.detail_selected != before {
+            self.hex_offset.set(0);
         }
         self.detail_anchor = self
             .display_detail()
@@ -5688,6 +5711,78 @@ mod tests {
         assert!(!app.show_metrics);
         app.handle_mouse(&moved);
         assert_eq!(app.hover.get(), DragMode::Vertical);
+    }
+
+    #[test]
+    fn mouse_click_unfold_above_keeps_selection() {
+        use ratatui::layout::Rect;
+        let mut app = two_group_app();
+        select_instance(&mut app, "Test");
+        // Collapse the host above the selection, then click its header to
+        // unfold: the inserted rows must not steal the cursor.
+        app.collapsed_hosts.insert("shell.local".to_string());
+        app.left_rect.set(Rect::new(0, 3, 33, 30));
+        app.right_rect.set(Rect::new(33, 3, 67, 30));
+        let header = app
+            .display_items()
+            .iter()
+            .position(|it| matches!(it, DisplayItem::Host { label } if label == "shell.local"))
+            .expect("shell header");
+        app.click_service_list(3 + 1 + header as u16);
+        assert!(!app.is_host_collapsed("shell.local"));
+        assert!(
+            matches!(app.display_items().get(app.selected_display),
+                Some(DisplayItem::Instance { index }) if app.services[*index].instance == "Test"),
+            "selection must stay on Test, not jump into the unfolded host",
+        );
+        // Folding a host above the selection keeps it too.
+        let header = app
+            .display_items()
+            .iter()
+            .position(|it| matches!(it, DisplayItem::Host { label } if label == "shell.local"))
+            .expect("shell header");
+        app.click_service_list(3 + 1 + header as u16);
+        assert!(app.is_host_collapsed("shell.local"));
+        assert!(matches!(app.display_items().get(app.selected_display),
+                Some(DisplayItem::Instance { index }) if app.services[*index].instance == "Test"),);
+    }
+
+    #[test]
+    fn snap_to_focused_table_resets_hex_scroll() {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = two_group_app();
+        let plain = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        // One question so Tab into Questions snaps the cursor off its record.
+        let src: std::net::SocketAddr = "192.168.1.9:5353".parse().unwrap();
+        let raw_count = {
+            let sel_idx = match app.display_items().get(app.selected_display) {
+                Some(DisplayItem::Instance { index }) => *index,
+                _ => panic!("expected instance selected"),
+            };
+            app.services[sel_idx].questions.push((
+                "_http._tcp.local".to_string(),
+                "PTR".to_string(),
+                src,
+                Instant::now(),
+                Vec::new(),
+            ));
+            app.services[sel_idx].ordered_records().len()
+        };
+        // Park the cursor on a record, scroll the hex dump, then Tab across:
+        // the snap moves the cursor and must restart the dump at the top.
+        app.handle_key(&plain(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Answers);
+        assert!(app.detail_selected < raw_count);
+        app.hex_offset.set(9);
+        app.handle_key(&plain(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Questions);
+        assert_eq!(app.detail_selected, raw_count);
+        assert_eq!(app.hex_offset.get(), 0);
     }
 
     #[test]
