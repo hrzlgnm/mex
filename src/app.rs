@@ -580,7 +580,7 @@ impl App {
             }
         };
         for s in &self.services {
-            if s.service_type != owner {
+            if !s.service_type.eq_ignore_ascii_case(owner) {
                 continue;
             }
             for rec in &s.records {
@@ -588,7 +588,7 @@ impl App {
             }
         }
         for p in &self.pending_instances {
-            if p.service_type != owner {
+            if !p.service_type.eq_ignore_ascii_case(owner) {
                 continue;
             }
             for rec in &p.records {
@@ -682,7 +682,7 @@ impl App {
                 continue;
             };
             let ka = if rt == RecordType::PTR {
-                if key.0 == ENUM_SERVICE {
+                if key.0.eq_ignore_ascii_case(ENUM_SERVICE) {
                     self.known_enum_answers()
                 } else {
                     self.known_ptrs(&key.0)
@@ -732,15 +732,27 @@ impl App {
         }
     }
 
-    /// Map key for `continuous`: host names (A/AAAA) are matched
-    /// case-insensitively, everything else keeps wire case. The query
-    /// itself always uses the original case (see `qname`).
+    /// Map key for `continuous` and `requeries`: lowercased name per
+    /// RFC 6763 §7 / RFC 1035 §2.3.1 (service types and subtypes compare
+    /// case-insensitively; host names too). The query itself keeps wire
+    /// case via `qname` / the desired-map value.
     fn continuous_key(name: &str, rtype: u16) -> (String, u16) {
-        if rtype == 1 || rtype == 28 {
-            (name.to_lowercase(), rtype)
-        } else {
-            (name.to_string(), rtype)
+        (name.to_lowercase(), rtype)
+    }
+
+    /// Strip a dot-separated suffix case-insensitively, returning the
+    /// wire-case prefix without the separating dot. Lengths are compared
+    /// in bytes: ASCII case folding never changes length, and service
+    /// types are ASCII, so byte slicing is safe.
+    fn strip_suffix_ci<'a>(full: &'a str, suffix: &str) -> Option<&'a str> {
+        if full.len() <= suffix.len() {
+            return None;
         }
+        let (prefix, tail) = full.split_at(full.len() - suffix.len());
+        if !tail.eq_ignore_ascii_case(suffix) {
+            return None;
+        }
+        prefix.strip_suffix('.')
     }
 
     /// Desired continuous-browse queries: enumeration plus every live PTR /
@@ -805,17 +817,18 @@ impl App {
                 continue;
             };
             let ka = if rt == RecordType::PTR {
-                if key.0 == ENUM_SERVICE {
+                if key.0.eq_ignore_ascii_case(ENUM_SERVICE) {
                     self.known_enum_answers()
                 } else {
-                    self.known_ptrs(&send_name)
+                    self.known_ptrs(&key.0)
                 }
             } else {
                 Vec::new()
             };
             // QU only on the very first startup enumeration batch
             // (RFC 6762 §5.4); everything afterwards is QM.
-            let qu = !self.startup_qu_sent && key.0 == ENUM_SERVICE && key.1 == 12;
+            let qu =
+                !self.startup_qu_sent && key.0.eq_ignore_ascii_case(ENUM_SERVICE) && key.1 == 12;
             // RFC 6762 §7.3: another querier just asked the same QM
             // question with no KA we wouldn't send — treat ours as sent.
             // QU elicits unicast and is never suppressed.
@@ -859,11 +872,12 @@ impl App {
         if !self.passive {
             // Learn service types before scheduling so new PTR owners are
             // browsed without waiting for a record-bearing service entry.
+            // Lowercased: `_HTTP` and `_http` are the same type (RFC 6763 §7).
             for svc in &self.services {
-                self.known_types.insert(svc.service_type.clone());
+                self.known_types.insert(svc.service_type.to_lowercase());
             }
             for p in &self.pending_instances {
-                self.known_types.insert(p.service_type.clone());
+                self.known_types.insert(p.service_type.to_lowercase());
             }
             for t in self.enum_known.keys() {
                 self.known_types.insert(t.clone());
@@ -2219,7 +2233,7 @@ impl App {
         match rec.rtype {
             12 => self.handle_ptr(rec, ev),
             33 => self.handle_srv(rec, ev),
-            16 => self.handle_txt(rec),
+            16 => self.handle_txt(rec, ev),
             1 | 28 => self.handle_addr(rec, ev),
             _ => self.handle_other(rec, ev),
         }
@@ -2229,31 +2243,51 @@ impl App {
         let st = rec.name.trim_end_matches('.');
         let target = rec.rdata.trim_end_matches('.');
 
-        if st == ENUM_SERVICE {
+        if st.eq_ignore_ascii_case(ENUM_SERVICE) {
             // Track enumeration answers for known-answer suppression and
             // for the continuous browse set; polling itself runs through
-            // the §5.2 backoff in poll_continuous.
-            self.known_types.insert(target.to_string());
+            // the §5.2 backoff in poll_continuous. Keys are lowercased so
+            // `_HTTP` and `_http` announcements coalesce (RFC 6763 §7).
+            self.known_types.insert(target.to_lowercase());
+            let enum_key = target.to_lowercase();
             if rec.ttl > 0 {
-                self.enum_known.insert(
-                    target.to_string(),
-                    (rec.ttl, rec.received_at, rec.iface.clone()),
-                );
+                self.enum_known
+                    .insert(enum_key, (rec.ttl, rec.received_at, rec.iface.clone()));
             } else {
-                self.enum_known.remove(target);
+                self.enum_known.remove(&enum_key);
             }
             return;
         }
 
-        if let Some(sub_pos) = st.find("._sub.") {
+        if let Some(sub_pos) = st.to_ascii_lowercase().find("._sub.") {
             let subtype = &st[..sub_pos];
             let svc_type = &st[sub_pos + 6..];
-            let suffix = format!(".{svc_type}");
-            let instance = target.strip_suffix(&suffix).unwrap_or(target);
+            let instance = Self::strip_suffix_ci(target, svc_type).unwrap_or(target);
+            // Late subtype PTRs (arriving after the SRV already promoted
+            // the service, the normal passive-mode order) land on the live
+            // service directly; otherwise they wait in pending for the SRV
+            // merge. Touching pending when the service exists strands a
+            // duplicate entry that only expires via the grace timeout.
+            if let Some(idx) = self.services.iter().position(|s| {
+                s.instance.eq_ignore_ascii_case(instance)
+                    && s.service_type.eq_ignore_ascii_case(svc_type)
+            }) {
+                if !self.services[idx]
+                    .subtypes
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(subtype))
+                {
+                    self.services[idx].subtypes.push(subtype.to_string());
+                }
+                self.services[idx].last_event = Some(ev.clone());
+                self.push_record(idx, rec);
+                return;
+            }
             let pi = self.ensure_pending(instance, svc_type);
             if !self.pending_instances[pi]
                 .subtypes
-                .contains(&subtype.to_string())
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(subtype))
             {
                 self.pending_instances[pi]
                     .subtypes
@@ -2263,8 +2297,7 @@ impl App {
             return;
         }
 
-        let suffix = format!(".{st}");
-        let instance = target.strip_suffix(&suffix).unwrap_or(target);
+        let instance = Self::strip_suffix_ci(target, st).unwrap_or(target);
         let pi = self.ensure_pending(instance, st);
         self.pending_instances[pi].records.push(rec.clone());
         // A live PTR for an already-confirmed service must reactivate it
@@ -2273,11 +2306,9 @@ impl App {
         // SRV arrives, leaving a returned service stuck offline.
         // push_record only reactivates on live PTR, so SRV/TXT answers
         // still cannot resurrect a withdrawn service.
-        if let Some(idx) = self
-            .services
-            .iter()
-            .position(|s| s.instance == instance && s.service_type == st)
-        {
+        if let Some(idx) = self.services.iter().position(|s| {
+            s.instance.eq_ignore_ascii_case(instance) && s.service_type.eq_ignore_ascii_case(st)
+        }) {
             self.services[idx].last_event = Some(ev.clone());
             self.push_record(idx, rec);
         }
@@ -2287,29 +2318,34 @@ impl App {
     /// service type). Instance names may legally contain dots (e.g. Fire TV
     /// style "amzn.dmgr:...:..."), so splitting on the first dot misparses
     /// them. Match against known service types instead (longest suffix
-    /// wins); the caller falls back to the naive split when nothing is
-    /// known yet. Case is preserved as-is since all candidates come from
-    /// the same wire data.
+    /// wins, case-insensitively per RFC 6763 §7); the caller falls back to
+    /// the naive split when nothing is known yet. Both parts keep wire
+    /// case; callers compare case-insensitively.
     fn split_instance_type(&self, full_name: &str) -> Option<(String, String)> {
         let mut best: Option<(String, String)> = None;
         let mut consider = |known: &str| {
             if known.is_empty() {
                 return;
             }
-            if let Some(instance) = full_name
-                .strip_suffix(known)
-                .and_then(|prefix| prefix.strip_suffix('.'))
-            {
-                if instance.is_empty() {
-                    return;
-                }
-                let replace = match &best {
-                    Some((_, current)) => known.len() > current.len(),
-                    None => true,
-                };
-                if replace {
-                    best = Some((instance.to_string(), known.to_string()));
-                }
+            if full_name.len() <= known.len() {
+                return;
+            }
+            let (prefix, tail) = full_name.split_at(full_name.len() - known.len());
+            if !tail.eq_ignore_ascii_case(known) {
+                return;
+            }
+            let Some(instance) = prefix.strip_suffix('.') else {
+                return;
+            };
+            if instance.is_empty() {
+                return;
+            }
+            let replace = match &best {
+                Some((_, current)) => known.len() > current.len(),
+                None => true,
+            };
+            if replace {
+                best = Some((instance.to_string(), tail.to_string()));
             }
         };
         for s in &self.services {
@@ -2356,12 +2392,20 @@ impl App {
         let svc_idx = idx;
         let mut i = 0;
         while i < self.pending_instances.len() {
-            if self.pending_instances[i].instance == instance
-                && self.pending_instances[i].service_type == service_type
+            if self.pending_instances[i]
+                .instance
+                .eq_ignore_ascii_case(&instance)
+                && self.pending_instances[i]
+                    .service_type
+                    .eq_ignore_ascii_case(&service_type)
             {
                 let p = self.pending_instances.swap_remove(i);
                 for sub in p.subtypes {
-                    if !self.services[svc_idx].subtypes.contains(&sub) {
+                    if !self.services[svc_idx]
+                        .subtypes
+                        .iter()
+                        .any(|s| s.eq_ignore_ascii_case(&sub))
+                    {
                         self.services[svc_idx].subtypes.push(sub);
                     }
                 }
@@ -2387,7 +2431,7 @@ impl App {
         }
     }
 
-    fn handle_txt(&mut self, rec: &browse::RawRecord) {
+    fn handle_txt(&mut self, rec: &browse::RawRecord, ev: &browse::Event) {
         let name = rec.name.trim_end_matches('.');
         let (instance, service_type) = match self.split_instance_type(name) {
             Some(split) => split,
@@ -2399,6 +2443,17 @@ impl App {
                 (parts[0].to_string(), parts[1].to_string())
             }
         };
+        // Late TXT (arriving after the SRV already promoted the service,
+        // the normal passive-mode order) lands on the live service
+        // directly; otherwise it waits in pending for the SRV merge.
+        if let Some(idx) = self.services.iter().position(|s| {
+            s.instance.eq_ignore_ascii_case(&instance)
+                && s.service_type.eq_ignore_ascii_case(&service_type)
+        }) {
+            self.services[idx].last_event = Some(ev.clone());
+            self.push_record(idx, rec);
+            return;
+        }
         let pi = self.ensure_pending(&instance, &service_type);
 
         self.pending_instances[pi].records.push(rec.clone());
@@ -2445,7 +2500,9 @@ impl App {
 
     fn ensure_pending(&mut self, instance: &str, service_type: &str) -> usize {
         for (i, p) in self.pending_instances.iter().enumerate() {
-            if p.instance == instance && p.service_type == service_type {
+            if p.instance.eq_ignore_ascii_case(instance)
+                && p.service_type.eq_ignore_ascii_case(service_type)
+            {
                 self.pending_instances[i].last_seen = Instant::now();
                 return i;
             }
@@ -2465,7 +2522,9 @@ impl App {
     fn ensure_svc(&mut self, instance: &str, service_type: &str) -> usize {
         let now = Instant::now();
         for (i, s) in self.services.iter().enumerate() {
-            if s.instance == instance && s.service_type == service_type {
+            if s.instance.eq_ignore_ascii_case(instance)
+                && s.service_type.eq_ignore_ascii_case(service_type)
+            {
                 self.services[i].last_seen = now;
                 return i;
             }
@@ -2624,8 +2683,14 @@ impl App {
         for t in self.enum_known.keys() {
             live.insert((t.clone(), 12));
         }
-        self.requeries.retain(|k, _| live.contains(k));
-        self.continuous.retain(|k, _| live.contains(k));
+        // Names compare case-insensitively (RFC 6763 §7, RFC 1035 §2.3.1):
+        // `_HTTP` and `_http` are one interest, not two.
+        let live_contains = |k: &(String, u16)| {
+            live.iter()
+                .any(|(n, t)| t == &k.1 && n.eq_ignore_ascii_case(&k.0))
+        };
+        self.requeries.retain(|k, _| live_contains(k));
+        self.continuous.retain(|k, _| live_contains(k));
         // Overheard QM queries are single-use and short-lived (§7.3).
         self.overheard
             .retain(|_, (seen, _, _)| seen.elapsed() < OVERHEARD_WINDOW);
@@ -2648,7 +2713,8 @@ impl App {
             .filter(|(_, t)| *t == 12)
             .map(|(n, _)| n.clone())
             .collect();
-        self.known_types.retain(|t| live_types.contains(t));
+        self.known_types
+            .retain(|t| live_types.iter().any(|n| n.eq_ignore_ascii_case(t)));
         self.clamp_selection();
     }
 
@@ -3070,6 +3136,102 @@ mod tests {
             .expect("TXT record merged into service");
         assert!(!App::is_expandable_txt(&rec));
         assert!(!app.toggle_txt_expanded());
+    }
+
+    #[test]
+    fn txt_after_srv_lands_on_live_service() {
+        // Passive-mode order: PTR, SRV (service confirmed), then TXT.
+        // The late TXT must not strand in pending.
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        assert!(app.services[0]
+            .ordered_records()
+            .iter()
+            .all(|r| r.rtype != 16));
+        ingest(&mut app, &txt_record("a=1; b=2"));
+        assert!(app.services[0]
+            .ordered_records()
+            .iter()
+            .any(|r| r.rtype == 16));
+    }
+
+    #[test]
+    fn subtype_after_srv_merges_into_live_service() {
+        // Same passive-mode order for DNS-SD subtypes (e.g. Google Cast
+        // group IDs under `..._sub._googlecast._tcp.local`).
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        assert!(app.services[0].subtypes.is_empty());
+        ingest(
+            &mut app,
+            &raw_record(
+                "_printer._sub._http._tcp.local.",
+                12,
+                "PTR",
+                "Test._http._tcp.local.",
+                120,
+            ),
+        );
+        assert_eq!(app.services[0].subtypes, vec!["_printer".to_string()]);
+        assert!(app.services[0]
+            .ordered_records()
+            .iter()
+            .any(|r| r.rtype == 12 && r.name == "_printer._sub._http._tcp.local."));
+        // No stranded pending entry for the confirmed instance.
+        assert!(app.pending_instances.is_empty());
+    }
+
+    #[test]
+    fn service_types_match_case_insensitively() {
+        // `_HTTP` and `_http` are one service (RFC 6763 §7); same for the
+        // `._sub.` marker and instance matching.
+        let mut app = App::new().unwrap();
+        ingest(
+            &mut app,
+            &raw_record(
+                "_HTTP._TCP.LOCAL.",
+                12,
+                "PTR",
+                "Test._HTTP._TCP.LOCAL.",
+                120,
+            ),
+        );
+        ingest(
+            &mut app,
+            &raw_record(
+                "Test._http._tcp.local.",
+                33,
+                "SRV",
+                "0 0 80 test.local.",
+                120,
+            ),
+        );
+        assert_eq!(app.services.len(), 1);
+        ingest(
+            &mut app,
+            &raw_record(
+                "_PRINTER._SUB._http._tcp.local.",
+                12,
+                "PTR",
+                "Test._http._tcp.local.",
+                120,
+            ),
+        );
+        assert_eq!(app.services.len(), 1);
+        assert_eq!(app.services[0].subtypes.len(), 1);
+        // One continuous interest, not one per case variant.
+        let desired = app.desired_continuous();
+        let ptr_keys: Vec<_> = desired.keys().filter(|(_, t)| *t == 12).collect();
+        assert!(ptr_keys.iter().any(|(n, _)| n == "_http._tcp.local"));
+        assert_eq!(
+            ptr_keys
+                .iter()
+                .filter(|(n, _)| n.eq_ignore_ascii_case("_http._tcp.local"))
+                .count(),
+            1
+        );
     }
 
     #[test]
