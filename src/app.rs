@@ -1274,7 +1274,16 @@ impl App {
                 self.metrics.services_seen_total, self.metrics.services_expired_total
             ),
         );
-        kv(&mut rows, "hosts", self.group_labels().len().to_string());
+        kv(
+            &mut rows,
+            "hosts",
+            // The `(enumeration)` group is navigation, not a host.
+            self.group_labels()
+                .iter()
+                .filter(|l| *l != ENUM_HOST)
+                .count()
+                .to_string(),
+        );
         kv(
             &mut rows,
             "types / enum",
@@ -2344,10 +2353,13 @@ impl App {
             {
                 entry.last_seen = Instant::now();
                 entry.last_event = Some(ev.clone());
+                // DNS names compare case-insensitively (RFC 6763 §7): a
+                // peer varying the wire case must refresh the row, not
+                // grow the list.
                 if let Some(pos) = entry.records.iter().position(|r| {
-                    r.name == rec.name
+                    r.name.eq_ignore_ascii_case(&rec.name)
                         && r.rtype == rec.rtype
-                        && r.rdata == rec.rdata
+                        && r.rdata.eq_ignore_ascii_case(&rec.rdata)
                         && r.source == rec.source
                 }) {
                     entry.records[pos] = rec.clone();
@@ -2569,10 +2581,13 @@ impl App {
             {
                 entry.last_seen = Instant::now();
                 entry.last_event = Some(ev.clone());
+                // DNS names compare case-insensitively (RFC 6763 §7): a
+                // peer varying the wire case must refresh the row, not
+                // grow the list.
                 if let Some(pos) = entry.records.iter().position(|r| {
-                    r.name == rec.name
+                    r.name.eq_ignore_ascii_case(&rec.name)
                         && r.rtype == rec.rtype
-                        && r.rdata == rec.rdata
+                        && r.rdata.eq_ignore_ascii_case(&rec.rdata)
                         && r.source == rec.source
                 }) {
                     entry.records[pos] = rec.clone();
@@ -3123,15 +3138,18 @@ impl App {
         }
         // Sticky detail: headers select nothing, so remember the last
         // selected target to keep the right panes alive while navigating.
-        let key = self
+        // Selecting one kind clears the other, so a header never
+        // resurrects a stale target of the other kind.
+        if let Some(key) = self
             .selected_service()
-            .map(|s| (s.service_type.clone(), s.instance.clone()));
-        if key.is_some() {
-            self.sticky_key = key;
+            .map(|s| (s.service_type.clone(), s.instance.clone()))
+        {
+            self.sticky_key = Some(key);
+            self.sticky_enum_key = None;
         }
-        let enum_key = self.selected_enum().map(|e| e.name.clone());
-        if enum_key.is_some() {
-            self.sticky_enum_key = enum_key;
+        if let Some(enum_key) = self.selected_enum().map(|e| e.name.clone()) {
+            self.sticky_enum_key = Some(enum_key);
+            self.sticky_key = None;
         }
         self.sync_detail_cursor();
     }
@@ -3928,6 +3946,84 @@ mod tests {
         app.route_own_question("_services._dns-sd._udp.local.", 12);
         assert_eq!(app.enum_entries[0].questions.len(), 2);
         assert_eq!(app.enum_entries[0].questions[1].2, SELF_SOURCE);
+    }
+
+    #[test]
+    fn enum_answers_coalesce_wire_case_variants() {
+        let mut app = App::new().unwrap();
+        ingest(
+            &mut app,
+            &raw_record(
+                "_services._dns-sd._udp.local.",
+                12,
+                "PTR",
+                "_http._tcp.local.",
+                120,
+            ),
+        );
+        // Same answer in different wire case: DNS names compare
+        // case-insensitively, so this refreshes the row instead of
+        // growing the list.
+        ingest(
+            &mut app,
+            &raw_record(
+                "_SERVICES._DNS-SD._UDP.LOCAL.",
+                12,
+                "PTR",
+                "_HTTP._TCP.LOCAL.",
+                120,
+            ),
+        );
+        assert_eq!(app.enum_entries[0].records.len(), 1);
+    }
+
+    #[test]
+    fn header_falls_back_to_last_selected_kind() {
+        let mut app = two_group_app();
+        select_instance(&mut app, "Shell");
+        // Select the enumeration row, then collapse its group and park
+        // on the collapsed header.
+        let enum_pos = app
+            .display_items()
+            .iter()
+            .position(|it| matches!(it, DisplayItem::Enum { .. }))
+            .expect("enum row");
+        app.selected_display = enum_pos;
+        app.clamp_selection();
+        assert!(app.selected_enum().is_some());
+        app.collapsed_hosts.insert(ENUM_HOST.to_string());
+        let header_pos = app
+            .display_items()
+            .iter()
+            .position(|it| matches!(it, DisplayItem::Host { label } if label == ENUM_HOST))
+            .expect("enum header");
+        app.selected_display = header_pos;
+        app.clamp_selection();
+        assert!(app.selected_service().is_none());
+        assert!(app.selected_enum().is_none());
+        let target = app.display_detail().expect("sticky target survives header");
+        assert!(
+            matches!(target, DetailTarget::Enum(_)),
+            "collapsed header must show the last selected kind, not a stale service"
+        );
+    }
+
+    #[test]
+    fn metrics_hosts_exclude_enumeration_group() {
+        let app = App::new().unwrap();
+        let row = app
+            .metrics_rows()
+            .into_iter()
+            .find(|(k, _)| k == "hosts")
+            .expect("hosts row");
+        assert_eq!(row.1, "0");
+        let app = two_group_app();
+        let row = app
+            .metrics_rows()
+            .into_iter()
+            .find(|(k, _)| k == "hosts")
+            .expect("hosts row");
+        assert_eq!(row.1, "2");
     }
 
     #[test]
