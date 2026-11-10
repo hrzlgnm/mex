@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.4.0](https://github.com/hrzlgnm/mex/compare/v0.3.1...v0.4.0) (2026-11-10)
+
+
+### Features
+
+* strip redundant .local suffix from hostnames in left pane ([#35](https://github.com/hrzlgnm/mex/issues/35)) ([b473386](https://github.com/hrzlgnm/mex/commit/b4733869fa68c645db32a7750e177148a2553ca2))
+* track enumeration queries in selectable row ([#36](https://github.com/hrzlgnm/mex/issues/36)) ([b1f3ec1](https://github.com/hrzlgnm/mex/commit/b1f3ec1acbd5f1d2478ba6da03245d7a1f5c8c90))
+
+
+### Documentation
+
+* set up agent skills config for GitHub issue tracker ([#33](https://github.com/hrzlgnm/mex/issues/33)) ([03cb11a](https://github.com/hrzlgnm/mex/commit/03cb11ad3cc541d8bf8024ec281b9985a6196ffa))
+
+
+### Continuous Integration
+
+* skip release pushes and gate jobs on path-filter ([#32](https://github.com/hrzlgnm/mex/issues/32)) ([1635bcb](https://github.com/hrzlgnm/mex/commit/1635bcbfe42dd611617161833f8cb06c62a73572))
+
 ## [0.3.1](https://github.com/hrzlgnm/mex/compare/v0.3.0...v0.3.1) (2026-11-10)
 
 
