@@ -105,6 +105,7 @@ decaying by TTL instead of actively maintained state.
 | `q` / `Esc` / `Ctrl+C` | quit (`m` / `Esc` closes the overlay first) |
 | mouse drag on pane borders | resize panes |
 | mouse click | focus pane + move cursor (host header folds) |
+| mouse wheel | move cursor one row / scroll one line (focused pane; overlay when open) |
 
 The header always shows the live hints. In the metrics overlay, `j`/`k`
 and paging keys scroll instead, and `Tab`/`Enter` do nothing.
