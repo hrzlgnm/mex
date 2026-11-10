@@ -9,7 +9,7 @@ use clap::Parser;
 #[command(
     name = "mex",
     version,
-    about = "Browse mDNS/DNS-SD services on the local link"
+    about = "Terminal UI to browse and debug mDNS/DNS-SD on the local link — live services, records, queries, and raw packets"
 )]
 struct Args {
     /// Listen only: never transmit queries, just observe announcements

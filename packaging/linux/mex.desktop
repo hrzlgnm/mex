@@ -2,7 +2,7 @@
 Type=Application
 Version=1.5
 Name=mex
-Comment=Terminal UI for browsing mDNS traffic
+Comment=Terminal UI to browse and debug mDNS/DNS-SD on the local link
 Exec=mex
 Terminal=true
 Categories=Network;

@@ -1,8 +1,11 @@
 # mex
 
-A terminal UI for browsing mDNS (Multicast DNS / DNS-SD) traffic on the local
-network: services, their records, who is asking, and the raw packets behind
-it all.
+<p align="center">
+  <img src="packaging/linux/mex.svg" width="128" height="128" alt="mex icon">
+</p>
+
+Terminal UI to browse and debug mDNS/DNS-SD on the local link — live
+services, records, queries, and raw packets.
 
 Built with Rust ([ratatui](https://ratatui.rs/), [crossterm](https://github.com/crossterm-rs/crossterm),
 [hickory-proto](https://github.com/hickory-dns/hickory-dns)). Listens
