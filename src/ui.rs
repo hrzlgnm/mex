@@ -212,8 +212,12 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
 
     // An Instance is last in its group if the next row is not another
     // Instance (i.e. next is a Host header or end of list).
-    let is_last_instance =
-        |pos: usize| !matches!(items.get(pos + 1), Some(DisplayItem::Instance { .. }));
+    let is_last_instance = |pos: usize| {
+        !matches!(
+            items.get(pos + 1),
+            Some(DisplayItem::Instance { .. }) | Some(DisplayItem::Enum { .. })
+        )
+    };
 
     let list_items: Vec<ListItem<'_>> = items
         .iter()
@@ -266,6 +270,16 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
                         style,
                     )))
                 }
+                DisplayItem::Enum { index } => {
+                    let entry = &app.enum_entries[*index];
+                    let last = is_last_instance(i);
+                    let branch = if last { "└─" } else { "├─" };
+                    let style = Style::default();
+                    ListItem::new(Line::from(Span::styled(
+                        format!("{branch} ● {} [enum]", entry.name.trim_end_matches('.')),
+                        style,
+                    )))
+                }
             }
         })
         .collect();
@@ -274,6 +288,9 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
     // instance rows carry no host themselves, so the host would otherwise
     // be invisible once its group header scrolls out of view.
     let title = match app.display_items().get(app.selected_display) {
+        Some(DisplayItem::Enum { .. }) => {
+            format!(" Hosts: {} ", app.host_display_name(crate::app::ENUM_HOST))
+        }
         Some(DisplayItem::Instance { index }) => {
             let key = app.services[*index]
                 .hostname
@@ -312,18 +329,6 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
     app.list_offset.set(state.offset());
 }
 
-/// "instance @ host:port" identity used in the right-pane titles.
-fn pane_ident(svc: &crate::app::ServiceEntry) -> String {
-    let host = svc.hostname.trim_end_matches('.');
-    if host.is_empty() {
-        svc.instance.clone()
-    } else if svc.port > 0 {
-        format!("{} @ {}:{}", svc.instance, host, svc.port)
-    } else {
-        format!("{} @ {host}", svc.instance)
-    }
-}
-
 fn draw_detail_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     // Right side: Answers table on top, its questions in the middle with
     // their own captions (age, not TTL), hex dump of the selected entry
@@ -344,19 +349,19 @@ fn draw_detail_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
 }
 
 fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    let Some(svc) = app.display_service() else {
+    let Some(target) = app.display_detail() else {
         let empty = Paragraph::new("No service selected").style(Style::default().fg(Color::Gray));
         frame.render_widget(empty, area);
         return;
     };
 
-    let (rows, raw_positions) = detail_table_rows(app, svc);
+    let (rows, raw_positions) = detail_table_rows(app, &target);
     let total_rows = rows.len();
 
     // Size SOURCE to the longest socket addr so IPv6 fits, clamped to
     // keep RDATA usable on narrow terminals.
-    let src_w = svc
-        .records
+    let src_w = target
+        .all_records()
         .iter()
         .map(|r| source_label(r).len())
         .max()
@@ -372,9 +377,9 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     ];
 
     let block_title = if app.detail_free_scroll {
-        format!("Answers: {} ↕", pane_ident(svc))
+        format!("Answers: {} ↕", target.pane_ident())
     } else {
-        format!("Answers: {}", pane_ident(svc))
+        format!("Answers: {}", target.pane_ident())
     };
     // Visible data rows: borders plus the header row are chrome.
     app.record_viewport
@@ -501,7 +506,7 @@ fn ttl_cell_color(rem: u32, ttl: u32) -> Option<Color> {
 
 fn detail_table_rows<'a>(
     app: &'a App,
-    svc: &'a crate::app::ServiceEntry,
+    target: &'a crate::app::DetailTarget<'a>,
 ) -> (Vec<Row<'a>>, Vec<usize>) {
     let mut rows = Vec::new();
 
@@ -511,40 +516,56 @@ fn detail_table_rows<'a>(
         .fg(Color::Green)
         .add_modifier(Modifier::BOLD);
 
-    rows.push(
-        Row::new(vec![
-            Cell::from("srvc"),
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from(svc.service_type.clone()),
-        ])
-        .style(info_style),
-    );
+    match target {
+        crate::app::DetailTarget::Service(svc) => {
+            rows.push(
+                Row::new(vec![
+                    Cell::from("srvc"),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(svc.service_type.clone()),
+                ])
+                .style(info_style),
+            );
 
-    let mut seen_sub = HashSet::new();
-    for sub in &svc.subtypes {
-        if !seen_sub.insert(sub) {
-            continue;
+            let mut seen_sub = HashSet::new();
+            for sub in &svc.subtypes {
+                if !seen_sub.insert(sub) {
+                    continue;
+                }
+                rows.push(
+                    Row::new(vec![
+                        Cell::from("subt"),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(sub.clone()),
+                    ])
+                    .style(info_style),
+                );
+            }
         }
-        rows.push(
-            Row::new(vec![
-                Cell::from("subt"),
-                Cell::from(""),
-                Cell::from(""),
-                Cell::from(""),
-                Cell::from(sub.clone()),
-            ])
-            .style(info_style),
-        );
+        crate::app::DetailTarget::Enum(entry) => {
+            rows.push(
+                Row::new(vec![
+                    Cell::from("enum"),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(entry.name.clone()),
+                ])
+                .style(info_style),
+            );
+        }
     }
 
     // Raw records, deduped and sorted by type then TTL.
-    // (Ordering lives on ServiceEntry so the j/k cursor and hex lookup share it.)
+    // (Ordering lives on the target so the j/k cursor and hex lookup share it.)
     // Multi-pair TXT records carry their key=value pairs as collapsible
     // child rows (collapsed by default, `Enter` expands); the cursor skips
     // child rows. raw_positions maps each raw record to its table row.
-    let unique_recs = svc.ordered_records();
+    let unique_recs = target.ordered_records();
     let mut raw_positions = Vec::with_capacity(unique_recs.len());
     for rec in unique_recs {
         let flush = if rec.flush_bit { "flush" } else { "" };
@@ -635,7 +656,7 @@ fn detail_table_rows<'a>(
 }
 
 fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    let Some(svc) = app.display_service() else {
+    let Some(target) = app.display_detail() else {
         let empty = Paragraph::new("No service selected").style(Style::default().fg(Color::Gray));
         frame.render_widget(empty, area);
         return;
@@ -648,7 +669,7 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
         .add_modifier(Modifier::BOLD);
 
     // By type, newest first — same grouping as the Answers table.
-    for (name, rtype, source, received, _) in svc.ordered_questions() {
+    for (name, rtype, source, received, _) in target.ordered_questions() {
         let age = received.elapsed().as_secs();
         let age_str = if age >= 60 {
             format!("{}m{:02}s", age / 60, age % 60)
@@ -679,7 +700,8 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
         Constraint::Length(6),
         Constraint::Length(12),
         Constraint::Length(
-            svc.questions
+            target
+                .ordered_questions()
                 .iter()
                 .map(|(_, _, source, _, _)| source.to_string().len())
                 .max()
@@ -691,7 +713,7 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
 
     // The Questions table is its own focus stop: light its border when
     // focused.
-    let raw_count = svc.ordered_records().len();
+    let raw_count = target.ordered_records().len();
     let cursor_in_questions =
         app.selected_detail_entry().is_some() && app.detail_selected >= raw_count;
 
@@ -706,7 +728,7 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" Questions: {} ", pane_ident(svc)))
+                .title(format!(" Questions: {} ", target.pane_ident()))
                 .border_style(Style::default().fg(if app.focus == Focus::Questions {
                     Color::White
                 } else {
