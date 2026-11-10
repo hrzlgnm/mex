@@ -34,9 +34,10 @@ decaying by TTL instead of actively maintained state.
 
 ## Layout
 
-- **Left — Hosts.** Collapsible tree grouped by hostname (`printer.local`);
+- **Left — Hosts.** Collapsible tree grouped by hostname (`printer`,
+  `.local` stripped as redundant);
   each header shows `(service count) · primary address (+extra)` — e.g.
-  `printer.local (2) · 192.168.1.10 (+1)` — with `(+N)` only when more
+  `printer (2) · 192.168.1.10 (+1)` — with `(+N)` only when more
   than one live address is known. Each row shows `instance [short
   type:port]` (`http.tcp` is short for `_http._tcp.local`, e.g.
   `My Printer [http.tcp:9100]`) with the state dot
