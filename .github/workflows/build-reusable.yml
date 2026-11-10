@@ -255,11 +255,15 @@ jobs:
           echo "VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
           # Plain binary for other packaging systems / installers (e.g. nopkg):
           # same binary that goes into the archive, uploaded without wrapping.
+          # Kept in plain-dist/ so it never collides with the archive staging
+          # directory below (both would otherwise be mex-${VERSION_NAME}-${PLATFORM}
+          # on Unix and mkdir -p would fail).
+          mkdir -p plain-dist
           if [ "$OS" = "windows-latest" ]; then
-            PLAIN="mex-${VERSION_NAME}-${PLATFORM}.exe"
+            PLAIN="plain-dist/mex-${VERSION_NAME}-${PLATFORM}.exe"
             cp "target/$TARGET/$PROFILE_DIR/mex.exe" "$PLAIN"
           else
-            PLAIN="mex-${VERSION_NAME}-${PLATFORM}"
+            PLAIN="plain-dist/mex-${VERSION_NAME}-${PLATFORM}"
             cp "target/$TARGET/$PROFILE_DIR/mex" "$PLAIN"
             chmod +x "$PLAIN"
           fi
