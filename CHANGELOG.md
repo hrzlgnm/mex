@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.0](https://github.com/hrzlgnm/mex/compare/v0.4.2...v0.5.0) (2026-11-10)
+
+
+### Features
+
+* mouse pane resizing, click focus, and scrollable hex view ([#44](https://github.com/hrzlgnm/mex/issues/44)) ([66fd05b](https://github.com/hrzlgnm/mex/commit/66fd05be5dfbf1b1ce0995935409844e84f144c1))
+* scroll focused pane with mouse wheel ([#47](https://github.com/hrzlgnm/mex/issues/47)) ([3ed350a](https://github.com/hrzlgnm/mex/commit/3ed350ae5046300b94c5c8beb02e202eceb7ac18))
+
 ## [0.4.2](https://github.com/hrzlgnm/mex/compare/v0.4.1...v0.4.2) (2026-11-10)
 
 
