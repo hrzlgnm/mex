@@ -1,5 +1,14 @@
 # mex
 
+[![Scc Count Badge](https://sloc.xyz/github/hrzlgnm/mex)](https://github.com/hrzlgnm/mex)
+![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/hrzlgnm/mex/total)
+[![GitHub Downloads (all assets, latest release)](https://img.shields.io/github/downloads/hrzlgnm/mex/latest/total)](https://github.com/hrzlgnm/mex/releases/latest)
+[![GitHub Release](https://img.shields.io/github/v/release/hrzlgnm/mex)](https://github.com/hrzlgnm/mex/releases/latest)
+[![GitHub Release Date](https://img.shields.io/github/release-date/hrzlgnm/mex)](https://github.com/hrzlgnm/mex/releases/latest)
+[![AUR Version](https://img.shields.io/aur/version/mex)](https://aur.archlinux.org/packages/mex)
+[![License: MIT](https://img.shields.io/github/license/hrzlgnm/mex)](https://github.com/hrzlgnm/mex/blob/main/LICENSE)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/hrzlgnm/mex/ci.yml)](https://github.com/hrzlgnm/mex/actions)
+
 <p align="center">
   <img src="packaging/linux/mex.svg" width="128" height="128" alt="mex icon">
 </p>
