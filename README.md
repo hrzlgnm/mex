@@ -1,13 +1,44 @@
 # mex
 
-A terminal UI for browsing mDNS (Multicast DNS / DNS-SD) traffic on the local
-network: services, their records, who is asking, and the raw packets behind
-it all.
+[![Scc Count Badge](https://sloc.xyz/github/hrzlgnm/mex)](https://github.com/hrzlgnm/mex)
+![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/hrzlgnm/mex/total)
+[![GitHub Downloads (all assets, latest release)](https://img.shields.io/github/downloads/hrzlgnm/mex/latest/total)](https://github.com/hrzlgnm/mex/releases/latest)
+[![GitHub Release](https://img.shields.io/github/v/release/hrzlgnm/mex)](https://github.com/hrzlgnm/mex/releases/latest)
+[![GitHub Release Date](https://img.shields.io/github/release-date/hrzlgnm/mex)](https://github.com/hrzlgnm/mex/releases/latest)
+[![AUR Version](https://img.shields.io/aur/version/mex)](https://aur.archlinux.org/packages/mex)
+[![License: MIT](https://img.shields.io/github/license/hrzlgnm/mex)](https://github.com/hrzlgnm/mex/blob/main/LICENSE)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/hrzlgnm/mex/ci.yml)](https://github.com/hrzlgnm/mex/actions)
+
+<p align="center">
+  <img src="packaging/linux/mex.svg" width="128" height="128" alt="mex icon">
+</p>
+
+Terminal UI to browse and debug mDNS/DNS-SD on the local link — live
+services, records, queries, and raw packets.
 
 Built with Rust ([ratatui](https://ratatui.rs/), [crossterm](https://github.com/crossterm-rs/crossterm),
 [hickory-proto](https://github.com/hickory-dns/hickory-dns)). Listens
 passively on UDP port 5353 (IPv4 + IPv6 multicast) and also sends the
 standard browse queries (service enumeration, PTR/SRV/TXT/A/AAAA).
+
+## Contents
+
+- [Install](#install)
+- [Usage](#usage)
+- [Layout](#layout)
+- [Keys](#keys)
+- [Build & run](#build--run)
+- [Known limitations](#known-limitations)
+
+## Install
+
+Prebuilt Linux binaries (x86_64 glibc + musl static) are attached to
+[GitHub releases](https://github.com/hrzlgnm/mex/releases). On Arch Linux,
+install from the [AUR](https://aur.archlinux.org/packages/mex) instead:
+
+```sh
+yay -S mex
+```
 
 ## Usage
 
@@ -20,15 +51,7 @@ Options:
   -V, --version  Print version
 ```
 
-Prebuilt Linux binaries (x86_64 glibc + musl static) are attached to
-[GitHub releases](https://github.com/hrzlgnm/mex/releases). On Arch Linux,
-install from the [AUR](https://aur.archlinux.org/packages/mex) instead:
-
-```sh
-yay -S mex
-```
-With
-`--passive`, mex transmits nothing: no startup QU batch, no continuous
+With `--passive`, mex transmits nothing: no startup QU batch, no continuous
 queries, no TTL refreshes — the view shows recently heard traffic
 decaying by TTL instead of actively maintained state.
 

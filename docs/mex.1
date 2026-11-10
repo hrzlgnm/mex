@@ -1,17 +1,17 @@
 .TH mex 1 "2026-11-09" "mex" "User Commands"
 
 .SH NAME
-mex \- terminal UI for browsing mDNS traffic
+mex \- terminal UI to browse and debug mDNS/DNS-SD on the local link
 
 .SH SYNOPSIS
 .B mex
 [\fIOPTIONS\fR]
 
 .SH DESCRIPTION
-A terminal UI for browsing mDNS (Multicast DNS / DNS-SD) traffic on the local
-network: services, their records, who is asking, and the raw packets behind
-it all. Listens passively on UDP port 5353 (IPv4 + IPv6 multicast) and also
-sends the standard browse queries (service enumeration, PTR/SRV/TXT/A/AAAA).
+Terminal UI to browse and debug mDNS/DNS-SD on the local link \(em live
+services, records, queries, and raw packets. Listens passively on UDP port
+5353 (IPv4 + IPv6 multicast) and also sends the standard browse queries
+(service enumeration, PTR/SRV/TXT/A/AAAA).
 
 .SH OPTIONS
 .TP

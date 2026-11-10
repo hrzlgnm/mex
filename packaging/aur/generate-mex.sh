@@ -18,7 +18,7 @@ cat <<EOF
 pkgname=mex
 pkgver=${version#v}
 pkgrel=1
-pkgdesc="A terminal UI for browsing mDNS traffic"
+pkgdesc="Terminal UI to browse and debug mDNS/DNS-SD on the local link"
 arch=('x86_64')
 url="https://github.com/hrzlgnm/mex"
 license=('MIT')
