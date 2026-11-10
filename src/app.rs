@@ -3949,6 +3949,56 @@ mod tests {
     }
 
     #[test]
+    fn enum_query_kas_never_become_answers() {
+        // Sibling-style enumeration query: one question plus known answers
+        // (RFC 6762 §7.1). KAs are beliefs, not sightings: in passive mode
+        // (or any mode) they must never land in the Answers pane nor in the
+        // known-answer bookkeeping. A genuine response still files normally.
+        let mut app = App::new().unwrap();
+        app.passive = true;
+        let kas = [
+            "_dacp._tcp.local.",
+            "_mass._tcp.local.",
+            "_http._tcp.local.",
+        ]
+        .iter()
+        .map(|t| ka_record("_services._dns-sd._udp.local.", t))
+        .collect();
+        let ev = query_event(
+            "_services._dns-sd._udp.local.",
+            12,
+            "PTR",
+            false,
+            kas,
+            remote_source(),
+        );
+        app.ingest_event(&ev);
+        assert_eq!(app.enum_entries[0].questions.len(), 1);
+        assert!(
+            app.enum_entries[0].records.is_empty(),
+            "query KAs must not become enumeration answers"
+        );
+        assert!(
+            app.enum_known.is_empty(),
+            "query KAs must not seed known-answer bookkeeping"
+        );
+        assert!(app.known_types.is_empty());
+
+        let ans = raw_record(
+            "_services._dns-sd._udp.local.",
+            12,
+            "PTR",
+            "_dacp._tcp.local.",
+            4500,
+        );
+        let ev = event_for(&ans);
+        app.ingest_event(&ev);
+        assert_eq!(app.enum_entries[0].records.len(), 1);
+        assert!(app.enum_known.contains_key("_dacp._tcp.local"));
+        assert!(app.known_types.contains("_dacp._tcp.local"));
+    }
+
+    #[test]
     fn enum_answers_coalesce_wire_case_variants() {
         let mut app = App::new().unwrap();
         ingest(
