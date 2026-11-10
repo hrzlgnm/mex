@@ -26,6 +26,7 @@ pub enum Focus {
 pub enum DisplayItem {
     Host { label: String },
     Instance { index: usize },
+    Enum { index: usize },
 }
 
 /// Row selected by the j/k cursor in the Records table.
@@ -105,6 +106,14 @@ fn rand_range(lo_ms: u64, hi_ms: u64) -> Duration {
 }
 
 const ENUM_SERVICE: &str = "_services._dns-sd._udp.local";
+/// Group header for the selectable enumeration row in the Hosts pane.
+pub const ENUM_HOST: &str = "(enumeration)";
+
+/// The enumeration name (case-insensitive, trailing dot ignored).
+fn is_enum_name(name: &str) -> bool {
+    name.trim_end_matches('.')
+        .eq_ignore_ascii_case(ENUM_SERVICE)
+}
 /// Maximum interval between continuous queries (RFC 6762 §5.2 steady state).
 const MAX_CONTINUOUS_INTERVAL: Duration = Duration::from_secs(3600);
 /// Local address refresh is unrelated to querying; keep it on its own timer.
@@ -261,8 +270,14 @@ pub struct App {
     /// questions are never stored.
     overheard: HashMap<(String, u16), (Instant, HashSet<String>, String)>,
     detail_svc_key: Option<(String, String)>,
+    detail_enum_key: Option<String>,
     detail_anchor: Option<DetailCursorKey>,
     sticky_key: Option<(String, String)>,
+    sticky_enum_key: Option<String>,
+    /// Selectable enumeration row. Always present so our own enumeration
+    /// demand has a home; answers and questions file here instead of
+    /// being skipped as noise.
+    pub enum_entries: Vec<EnumEntry>,
     pending_instances: Vec<PendingService>,
     pending_addrs: Vec<(String, browse::RawRecord)>,
     pub raw_events: Vec<browse::Event>,
@@ -328,6 +343,121 @@ impl ServiceEntry {
     }
 }
 
+/// One selectable enumeration row: observed answers/questions for
+/// `_services._dns-sd._udp.local`.
+/// Stored separately from `ServiceEntry` so enumeration never pollutes
+/// service counts, expiry, or SRV/TXT/A interests.
+pub struct EnumEntry {
+    pub name: String,
+    pub records: Vec<browse::RawRecord>,
+    pub questions: Vec<QuestionRow>,
+    pub last_seen: Instant,
+    pub last_event: Option<browse::Event>,
+}
+
+impl EnumEntry {
+    pub fn ordered_records(&self) -> Vec<&browse::RawRecord> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for rec in self.records.iter().rev() {
+            if seen.insert((&rec.name, rec.rtype, &rec.rdata, rec.source)) {
+                out.push(rec);
+            }
+        }
+        out.sort_by(|a, b| {
+            (&a.rtype_str, a.source.to_string(), &a.name, &a.rdata).cmp(&(
+                &b.rtype_str,
+                b.source.to_string(),
+                &b.name,
+                &b.rdata,
+            ))
+        });
+        out
+    }
+
+    pub fn ordered_questions(
+        &self,
+    ) -> Vec<&(String, String, std::net::SocketAddr, Instant, Vec<u8>)> {
+        let mut out: Vec<_> = self.questions.iter().collect();
+        out.sort_by(|a, b| {
+            (&a.1, std::cmp::Reverse(a.3), a.2.to_string(), &a.0).cmp(&(
+                &b.1,
+                std::cmp::Reverse(b.3),
+                b.2.to_string(),
+                &b.0,
+            ))
+        });
+        out
+    }
+
+    pub fn pane_ident(&self) -> String {
+        format!("enumeration: {}", self.name.trim_end_matches('.'))
+    }
+}
+
+/// Right-pane target: a real service or an enumeration row. The Answers /
+/// Questions / Hex panes render through this so both kinds share one
+/// cursor, one hex lookup, and one metrics definition.
+pub enum DetailTarget<'a> {
+    Service(&'a ServiceEntry),
+    Enum(&'a EnumEntry),
+}
+
+impl<'a> DetailTarget<'a> {
+    pub fn ordered_records(&self) -> Vec<&'a browse::RawRecord> {
+        match self {
+            DetailTarget::Service(s) => s.ordered_records(),
+            DetailTarget::Enum(e) => e.ordered_records(),
+        }
+    }
+
+    pub fn ordered_questions(
+        &self,
+    ) -> Vec<&'a (String, String, std::net::SocketAddr, Instant, Vec<u8>)> {
+        match self {
+            DetailTarget::Service(s) => s.ordered_questions(),
+            DetailTarget::Enum(e) => e.ordered_questions(),
+        }
+    }
+
+    pub fn questions_len(&self) -> usize {
+        match self {
+            DetailTarget::Service(s) => s.questions.len(),
+            DetailTarget::Enum(e) => e.questions.len(),
+        }
+    }
+
+    pub fn all_records(&self) -> &'a [browse::RawRecord] {
+        match self {
+            DetailTarget::Service(s) => &s.records,
+            DetailTarget::Enum(e) => &e.records,
+        }
+    }
+
+    pub fn last_event(&self) -> Option<&'a browse::Event> {
+        match self {
+            DetailTarget::Service(s) => s.last_event.as_ref(),
+            DetailTarget::Enum(e) => e.last_event.as_ref(),
+        }
+    }
+
+    pub fn pane_ident(&self) -> String {
+        match self {
+            DetailTarget::Service(s) => {
+                let host = s.hostname.trim_end_matches('.');
+                if host.is_empty() {
+                    s.instance.clone()
+                } else if s.port > 0 {
+                    format!("{} @ {}:{}", s.instance, host, s.port)
+                } else {
+                    format!("{} @ {host}", s.instance)
+                }
+            }
+            DetailTarget::Enum(e) => e.pane_ident(),
+        }
+    }
+}
+
 impl App {
     pub fn new() -> Result<Self> {
         Self::new_with(false)
@@ -367,8 +497,17 @@ impl App {
             detail_free_scroll: false,
             questions_offset: Cell::new(0),
             detail_svc_key: None,
+            detail_enum_key: None,
             detail_anchor: None,
             sticky_key: None,
+            sticky_enum_key: None,
+            enum_entries: vec![EnumEntry {
+                name: ENUM_SERVICE.to_string(),
+                records: Vec::new(),
+                questions: Vec::new(),
+                last_seen: Instant::now(),
+                last_event: None,
+            }],
             pending_instances: Vec::new(),
             pending_addrs: Vec::new(),
             raw_events: Vec::new(),
@@ -635,28 +774,39 @@ impl App {
         let mut ttl_by_key: HashMap<(String, u16), u32> = HashMap::new();
         let mut triggered: HashSet<(String, u16)> = HashSet::new();
         let mut live_keys: HashSet<(String, u16)> = HashSet::new();
+        let scan = |rec: &browse::RawRecord,
+                    ttl_by_key: &mut HashMap<(String, u16), u32>,
+                    triggered: &mut HashSet<(String, u16)>,
+                    live_keys: &mut HashSet<(String, u16)>| {
+            if rec.ttl == 0 {
+                return;
+            }
+            match rec.rtype {
+                12 | 33 | 16 | 1 | 28 => {}
+                _ => return,
+            }
+            let key = (rec.name.trim_end_matches('.').to_string(), rec.rtype);
+            let elapsed = rec.received_at.elapsed().as_secs() as u32;
+            if elapsed > rec.ttl {
+                return;
+            }
+            live_keys.insert(key.clone());
+            ttl_by_key
+                .entry(key.clone())
+                .and_modify(|t| *t = (*t).min(rec.ttl))
+                .or_insert(rec.ttl);
+            if elapsed * 5 >= rec.ttl * 4 {
+                triggered.insert(key);
+            }
+        };
         for svc in &self.services {
             for rec in &svc.records {
-                if rec.ttl == 0 {
-                    continue;
-                }
-                match rec.rtype {
-                    12 | 33 | 16 | 1 | 28 => {}
-                    _ => continue,
-                }
-                let key = (rec.name.trim_end_matches('.').to_string(), rec.rtype);
-                let elapsed = rec.received_at.elapsed().as_secs() as u32;
-                if elapsed > rec.ttl {
-                    continue;
-                }
-                live_keys.insert(key.clone());
-                ttl_by_key
-                    .entry(key.clone())
-                    .and_modify(|t| *t = (*t).min(rec.ttl))
-                    .or_insert(rec.ttl);
-                if elapsed * 5 >= rec.ttl * 4 {
-                    triggered.insert(key);
-                }
+                scan(rec, &mut ttl_by_key, &mut triggered, &mut live_keys);
+            }
+        }
+        for entry in &self.enum_entries {
+            for rec in &entry.records {
+                scan(rec, &mut ttl_by_key, &mut triggered, &mut live_keys);
             }
         }
         // Drop refresh schedules whose rows all expired: no maintenance
@@ -682,7 +832,7 @@ impl App {
                 continue;
             };
             let ka = if rt == RecordType::PTR {
-                if key.0.eq_ignore_ascii_case(ENUM_SERVICE) {
+                if is_enum_name(&key.0) {
                     self.known_enum_answers()
                 } else {
                     self.known_ptrs(&key.0)
@@ -821,7 +971,7 @@ impl App {
                 continue;
             };
             let ka = if rt == RecordType::PTR {
-                if key.0.eq_ignore_ascii_case(ENUM_SERVICE) {
+                if is_enum_name(&key.0) {
                     self.known_enum_answers()
                 } else {
                     self.known_ptrs(&key.0)
@@ -829,10 +979,16 @@ impl App {
             } else {
                 Vec::new()
             };
-            // QU only on the very first startup enumeration batch
-            // (RFC 6762 §5.4); everything afterwards is QM.
-            let qu =
-                !self.startup_qu_sent && key.0.eq_ignore_ascii_case(ENUM_SERVICE) && key.1 == 12;
+            // QU on the first transmission of the enumeration query
+            // (RFC 6762 §5.4 startup batch); everything afterwards is QM.
+            // First-transmission (interval still 1s) rather than a single
+            // flag so the QU survives the 20-120ms first-query delay.
+            let qu = key.1 == 12
+                && is_enum_name(&key.0)
+                && self
+                    .continuous
+                    .get(&key)
+                    .is_some_and(|e| e.interval == Duration::from_secs(1));
             // RFC 6762 §7.3: another querier just asked the same QM
             // question with no KA we wouldn't send — treat ours as sent.
             // QU elicits unicast and is never suppressed.
@@ -846,6 +1002,8 @@ impl App {
             }
             if qu {
                 self.startup_qu_sent = true;
+                // Keep the flag for the passive-mode test; per-name QU above
+                // no longer depends on it.
             }
             self.metrics.q_sent_continuous += 1;
             if qu {
@@ -919,6 +1077,17 @@ impl App {
         }
 
         let mut items = Vec::new();
+        // Enumeration group first: global browse state, always present so
+        // our own enumeration demand has a home even before any answer.
+        items.push(DisplayItem::Host {
+            label: ENUM_HOST.to_string(),
+        });
+        if !self.collapsed_hosts.contains(ENUM_HOST) {
+            for (idx, entry) in self.enum_entries.iter().enumerate() {
+                let _ = entry;
+                items.push(DisplayItem::Enum { index: idx });
+            }
+        }
         groups.sort_by(|a, b| {
             // Unknown hosts (empty key) sort last.
             match (a.label.is_empty(), b.label.is_empty()) {
@@ -956,6 +1125,9 @@ impl App {
     pub fn host_display_name(&self, key: &str) -> String {
         if key.is_empty() {
             return "(unknown host)".to_string();
+        }
+        if key == ENUM_HOST {
+            return ENUM_HOST.to_string();
         }
         for s in &self.services {
             if Self::host_key(&s.hostname) == key {
@@ -1023,6 +1195,9 @@ impl App {
     }
 
     pub fn host_service_count(&self, key: &str) -> usize {
+        if key == ENUM_HOST {
+            return self.enum_entries.len();
+        }
         self.services
             .iter()
             .filter(|s| Self::host_key(&s.hostname) == key)
@@ -1105,6 +1280,30 @@ impl App {
             "types / enum",
             format!("{} / {}", self.known_types.len(), self.enum_known.len()),
         );
+        for entry in &self.enum_entries {
+            let live_answers = entry
+                .records
+                .iter()
+                .filter(|r| r.ttl > 0 && r.received_at.elapsed().as_secs() as u32 <= r.ttl)
+                .count();
+            let mut eq = HashSet::new();
+            for q in &entry.questions {
+                if q.2 != SELF_SOURCE {
+                    eq.insert(q.2);
+                }
+            }
+            kv(
+                &mut rows,
+                &format!("enum {}", entry.name.trim_end_matches('.')),
+                format!(
+                    "{} Q current ({} queriers) · {} answers ({} live)",
+                    entry.questions.len(),
+                    eq.len(),
+                    entry.records.len(),
+                    live_answers,
+                ),
+            );
+        }
         kv(
             &mut rows,
             "pending inst / addrs",
@@ -1147,11 +1346,27 @@ impl App {
                 flush_pct, self.metrics.goodbyes_seen
             ),
         );
-        let current_q: usize = self.services.iter().map(|s| s.questions.len()).sum();
+        let current_q: usize = self
+            .services
+            .iter()
+            .map(|s| s.questions.len())
+            .sum::<usize>()
+            + self
+                .enum_entries
+                .iter()
+                .map(|e| e.questions.len())
+                .sum::<usize>();
         let mut queriers = HashSet::new();
         for s in &self.services {
             for q in &s.questions {
                 // Own inferred sends are demand, not queriers.
+                if q.2 != SELF_SOURCE {
+                    queriers.insert(q.2);
+                }
+            }
+        }
+        for e in &self.enum_entries {
+            for q in &e.questions {
                 if q.2 != SELF_SOURCE {
                     queriers.insert(q.2);
                 }
@@ -1313,15 +1528,23 @@ impl App {
         let mut live = 0;
         let mut expired = 0;
         let mut goodbye = 0;
+        let mut count = |rec: &browse::RawRecord| {
+            if rec.ttl == 0 {
+                goodbye += 1;
+            } else if rec.received_at.elapsed().as_secs() as u32 <= rec.ttl {
+                live += 1;
+            } else {
+                expired += 1;
+            }
+        };
         for svc in &self.services {
             for rec in &svc.records {
-                if rec.ttl == 0 {
-                    goodbye += 1;
-                } else if rec.received_at.elapsed().as_secs() as u32 <= rec.ttl {
-                    live += 1;
-                } else {
-                    expired += 1;
-                }
+                count(rec);
+            }
+        }
+        for entry in &self.enum_entries {
+            for rec in &entry.records {
+                count(rec);
             }
         }
         (live, expired, goodbye)
@@ -1450,6 +1673,12 @@ impl App {
             // instance folds its parent host.
             Some(DisplayItem::Instance { index }) => {
                 let label = Self::host_key(&self.services[*index].hostname);
+                if !self.collapsed_hosts.remove(&label) {
+                    self.collapsed_hosts.insert(label);
+                }
+            }
+            Some(DisplayItem::Enum { .. }) => {
+                let label = ENUM_HOST.to_string();
                 if !self.collapsed_hosts.remove(&label) {
                     self.collapsed_hosts.insert(label);
                 }
@@ -1616,7 +1845,7 @@ impl App {
     /// uncollapsed again; folding is also available from member rows).
     fn is_selectable(&self, item: &DisplayItem) -> bool {
         match item {
-            DisplayItem::Instance { .. } => true,
+            DisplayItem::Instance { .. } | DisplayItem::Enum { .. } => true,
             DisplayItem::Host { label } => self.collapsed_hosts.contains(label),
         }
     }
@@ -1675,6 +1904,7 @@ impl App {
             DisplayItem::Instance { index } => {
                 Some(Self::host_key(&self.services[*index].hostname))
             }
+            DisplayItem::Enum { .. } => Some(ENUM_HOST.to_string()),
         }
     }
 
@@ -1727,6 +1957,7 @@ impl App {
                     .services
                     .get(*index)
                     .is_some_and(|s| Self::host_key(&s.hostname) == label),
+                DisplayItem::Enum { .. } => label == ENUM_HOST,
             };
             if belongs && self.is_selectable(it) {
                 self.selected_display = i;
@@ -1772,11 +2003,11 @@ impl App {
     /// record cursor; it spans everything.
     fn detail_range(&self) -> (usize, usize) {
         let (raws, total) = self
-            .display_service()
-            .map(|s| {
+            .display_detail()
+            .map(|d| {
                 (
-                    s.ordered_records().len(),
-                    s.ordered_records().len() + s.questions.len(),
+                    d.ordered_records().len(),
+                    d.ordered_records().len() + d.questions_len(),
                 )
             })
             .unwrap_or((0, 0));
@@ -1796,8 +2027,8 @@ impl App {
             self.detail_selected = lo;
         }
         self.detail_anchor = self
-            .display_service()
-            .and_then(|svc| Self::identity_at(svc, self.detail_selected));
+            .display_detail()
+            .and_then(|d| Self::identity_at_detail(&d, self.detail_selected));
     }
 
     /// Record cursor over the focused table: raw records for Answers,
@@ -1822,8 +2053,8 @@ impl App {
             self.detail_selected -= 1;
         }
         self.detail_anchor = self
-            .display_service()
-            .and_then(|svc| Self::identity_at(svc, self.detail_selected));
+            .display_detail()
+            .and_then(|d| Self::identity_at_detail(&d, self.detail_selected));
     }
 
     /// First/last row of the focused table.
@@ -1833,8 +2064,8 @@ impl App {
         let (lo, hi) = self.detail_range();
         self.detail_selected = if hi <= lo || first { lo } else { hi - 1 };
         self.detail_anchor = self
-            .display_service()
-            .and_then(|svc| Self::identity_at(svc, self.detail_selected));
+            .display_detail()
+            .and_then(|d| Self::identity_at_detail(&d, self.detail_selected));
     }
 
     /// Page the record cursor by one Answers-table viewport. Falls back
@@ -1893,8 +2124,8 @@ impl App {
 
     /// Identity of the table row at an index (raw records first, then
     /// questions by type/newest-first, matching the rendered table).
-    fn identity_at(svc: &ServiceEntry, index: usize) -> Option<DetailCursorKey> {
-        let raws = svc.ordered_records();
+    fn identity_at_detail(target: &DetailTarget<'_>, index: usize) -> Option<DetailCursorKey> {
+        let raws = target.ordered_records();
         if index < raws.len() {
             let r = raws[index];
             return Some(DetailCursorKey::Record {
@@ -1904,7 +2135,8 @@ impl App {
                 source: r.source,
             });
         }
-        svc.ordered_questions()
+        target
+            .ordered_questions()
             .into_iter()
             .nth(index - raws.len())
             .map(|q| DetailCursorKey::Question {
@@ -1915,8 +2147,8 @@ impl App {
     }
 
     /// Index of the row with an identity, if still present.
-    fn position_of(svc: &ServiceEntry, key: &DetailCursorKey) -> Option<usize> {
-        let raws = svc.ordered_records();
+    fn position_of_detail(target: &DetailTarget<'_>, key: &DetailCursorKey) -> Option<usize> {
+        let raws = target.ordered_records();
         match key {
             DetailCursorKey::Record {
                 name,
@@ -1930,7 +2162,7 @@ impl App {
                 name,
                 rtype,
                 source,
-            } => svc
+            } => target
                 .ordered_questions()
                 .iter()
                 .position(|q| q.0 == *name && q.1 == *rtype && q.2 == *source)
@@ -1938,54 +2170,58 @@ impl App {
         }
     }
 
-    /// Keep the detail cursor pointed at the displayed service, resetting to
-    /// the first entry when the service changes (or disappears) and
+    /// Keep the detail cursor pointed at the displayed target, resetting to
+    /// the first entry when the target changes (or disappears) and
     /// re-anchoring the index to the tracked identity otherwise. Headers
-    /// select nothing, so they leave the cursor (and sticky service) alone.
+    /// select nothing, so they leave the cursor (and sticky target) alone.
     fn sync_detail_cursor(&mut self) {
-        let key = self
+        let svc_key = self
             .selected_service()
             .map(|s| (s.service_type.clone(), s.instance.clone()));
-        if key.is_none() {
+        let enum_key = self.selected_enum().map(|e| e.name.clone());
+        if svc_key.is_none() && enum_key.is_none() {
             return;
         }
-        if self.detail_svc_key != key {
-            self.detail_svc_key = key;
+        if self.detail_svc_key != svc_key || self.detail_enum_key != enum_key {
+            self.detail_svc_key = svc_key;
+            self.detail_enum_key = enum_key;
             self.detail_selected = 0;
             self.detail_offset.set(0);
             self.detail_free_scroll = false;
             self.questions_offset.set(0);
             self.detail_anchor = self
-                .selected_service()
-                .and_then(|svc| Self::identity_at(svc, self.detail_selected));
+                .display_detail()
+                .and_then(|d| Self::identity_at_detail(&d, self.detail_selected));
             return;
         }
         // Re-anchor the index to the tracked identity; rows reshuffle as
         // TTLs tick and re-announcements land.
         let anchor = self.detail_anchor.clone();
-        let pos = self
-            .display_service()
-            .and_then(|svc| anchor.as_ref().and_then(|a| Self::position_of(svc, a)));
+        let pos = self.display_detail().and_then(|d| {
+            anchor
+                .as_ref()
+                .and_then(|a| Self::position_of_detail(&d, a))
+        });
         match (pos, anchor) {
             (Some(pos), _) => self.detail_selected = pos,
             (None, Some(_)) => {
                 // Tracked row expired away (capped question list): park on
                 // the last raw record instead of pointing at shifted churn.
                 let parked = self
-                    .display_service()
-                    .map(|s| s.ordered_records().len().saturating_sub(1))
+                    .display_detail()
+                    .map(|d| d.ordered_records().len().saturating_sub(1))
                     .unwrap_or(0);
                 self.detail_selected = parked;
                 self.detail_anchor = self
-                    .display_service()
-                    .and_then(|svc| Self::identity_at(svc, self.detail_selected));
+                    .display_detail()
+                    .and_then(|d| Self::identity_at_detail(&d, self.detail_selected));
             }
             (None, None) => {}
         }
         // Clamp against entries that aged away (capped question list).
         let max = self
-            .selected_service()
-            .map(|s| (s.ordered_records().len() + s.questions.len()).saturating_sub(1))
+            .display_detail()
+            .map(|d| (d.ordered_records().len() + d.questions_len()).saturating_sub(1))
             .unwrap_or(0);
         if self.detail_selected > max {
             self.detail_selected = max;
@@ -2100,6 +2336,27 @@ impl App {
     /// as an expired row instead of vanishing silently. PTR goodbyes name
     /// the type, so the withdrawn instance is matched via the rdata.
     fn ingest_goodbye(&mut self, rec: &browse::RawRecord, ev: &browse::Event) {
+        if is_enum_name(rec.name.trim_end_matches('.')) {
+            if let Some(entry) = self
+                .enum_entries
+                .iter_mut()
+                .find(|e| e.name.eq_ignore_ascii_case(rec.name.trim_end_matches('.')))
+            {
+                entry.last_seen = Instant::now();
+                entry.last_event = Some(ev.clone());
+                if let Some(pos) = entry.records.iter().position(|r| {
+                    r.name == rec.name
+                        && r.rtype == rec.rtype
+                        && r.rdata == rec.rdata
+                        && r.source == rec.source
+                }) {
+                    entry.records[pos] = rec.clone();
+                } else {
+                    entry.records.push(rec.clone());
+                }
+            }
+            return;
+        }
         let mut names = vec![rec.name.trim_end_matches('.').to_lowercase()];
         if rec.rtype == 12 {
             names.push(rec.rdata.trim_end_matches('.').to_lowercase());
@@ -2125,10 +2382,24 @@ impl App {
 
     /// File a question asking for a service, so the Records view can show
     /// who is asking (and the hex pane can show the query packet).
-    /// The enumeration query is network noise, skip it.
+    /// Enumeration questions file on their selectable enumeration row.
     fn route_question(&mut self, q: &browse::RawRecord, ev: &browse::Event) {
         let name = q.name.trim_end_matches('.').to_lowercase();
-        if name == "_services._dns-sd._udp.local" {
+        if is_enum_name(&name) {
+            for entry in &mut self.enum_entries {
+                if entry.name.to_lowercase() == name {
+                    Self::file_question_row(
+                        &mut entry.questions,
+                        q.name.clone(),
+                        q.rtype_str.clone(),
+                        ev.source,
+                        q.received_at,
+                        ev.raw_bytes.clone(),
+                    );
+                    entry.last_seen = Instant::now();
+                    entry.last_event = Some(ev.clone());
+                }
+            }
             return;
         }
         for i in 0..self.services.len() {
@@ -2206,13 +2477,26 @@ impl App {
     fn route_own_question(&mut self, name: &str, rtype: u16) {
         let display = name.trim_end_matches('.').to_string();
         let key = display.to_lowercase();
-        if key == "_services._dns-sd._udp.local" {
-            return;
-        }
         let Some(label) = Self::own_rtype_label(rtype) else {
             return;
         };
         let at = Instant::now();
+        if is_enum_name(&key) {
+            for entry in &mut self.enum_entries {
+                if entry.name.to_lowercase() == key {
+                    Self::file_question_row(
+                        &mut entry.questions,
+                        display.clone(),
+                        label.to_string(),
+                        SELF_SOURCE,
+                        at,
+                        Vec::new(),
+                    );
+                    entry.last_seen = at;
+                }
+            }
+            return;
+        }
         for i in 0..self.services.len() {
             let full = format!(
                 "{}.{}",
@@ -2263,11 +2547,13 @@ impl App {
         let st = rec.name.trim_end_matches('.');
         let target = rec.rdata.trim_end_matches('.');
 
-        if st.eq_ignore_ascii_case(ENUM_SERVICE) {
+        if is_enum_name(st) {
             // Track enumeration answers for known-answer suppression and
             // for the continuous browse set; polling itself runs through
             // the §5.2 backoff in poll_continuous. Keys are lowercased so
             // `_HTTP` and `_http` announcements coalesce (RFC 6763 §7).
+            // The full answer is also filed on the selectable enumeration
+            // row so the Answers pane shows what each link advertises.
             self.known_types.insert(target.to_lowercase());
             let enum_key = target.to_lowercase();
             if rec.ttl > 0 {
@@ -2275,6 +2561,40 @@ impl App {
                     .insert(enum_key, (rec.ttl, rec.received_at, rec.iface.clone()));
             } else {
                 self.enum_known.remove(&enum_key);
+            }
+            if let Some(entry) = self
+                .enum_entries
+                .iter_mut()
+                .find(|e| e.name.eq_ignore_ascii_case(st))
+            {
+                entry.last_seen = Instant::now();
+                entry.last_event = Some(ev.clone());
+                if let Some(pos) = entry.records.iter().position(|r| {
+                    r.name == rec.name
+                        && r.rtype == rec.rtype
+                        && r.rdata == rec.rdata
+                        && r.source == rec.source
+                }) {
+                    entry.records[pos] = rec.clone();
+                } else {
+                    entry.records.push(rec.clone());
+                }
+                // A fresh answer resets the requery schedule unless a
+                // sibling row is still inside its 80%-TTL window.
+                let key = (rec.name.trim_end_matches('.').to_string(), rec.rtype);
+                let still_expiring = entry.records.iter().any(|r| {
+                    if r.ttl == 0
+                        || r.name.trim_end_matches('.') != key.0.as_str()
+                        || r.rtype != key.1
+                    {
+                        return false;
+                    }
+                    let elapsed = r.received_at.elapsed().as_secs() as u32;
+                    elapsed <= r.ttl && elapsed * 5 >= r.ttl * 4
+                });
+                if !still_expiring {
+                    self.requeries.remove(&key);
+                }
             }
             return;
         }
@@ -2689,6 +3009,12 @@ impl App {
         // retains below stay O(1) `contains` lookups.
         let mut live: HashSet<(String, u16)> = HashSet::new();
         live.insert((ENUM_SERVICE.to_string(), 12));
+        for entry in &self.enum_entries {
+            live.insert((entry.name.to_lowercase(), 12));
+            for rec in &entry.records {
+                live.insert((rec.name.trim_end_matches('.').to_lowercase(), rec.rtype));
+            }
+        }
         for svc in &self.services {
             live.insert((svc.service_type.to_lowercase(), 12));
             let full = format!("{}.{}", svc.instance, svc.service_type).to_lowercase();
@@ -2727,7 +3053,22 @@ impl App {
                 }
             }
         }
+        for entry in &self.enum_entries {
+            for rec in &entry.records {
+                if rec.rtype == 16 {
+                    live_txt.insert(Self::txt_key(rec));
+                }
+            }
+            // Enumeration rows are persistent; prune only rows long past
+            // their TTL so the Answers pane stays bounded.
+        }
         self.expanded_txt.retain(|k| live_txt.contains(k));
+        for entry in &mut self.enum_entries {
+            entry
+                .records
+                .retain(|r| r.received_at.elapsed().as_secs() as u32 <= r.ttl.saturating_add(120));
+            entry.questions.retain(|_| true);
+        }
         // Expire enumeration known answers at 100% TTL; prune the type
         // cache to live interests so it cannot grow without bound.
         self.enum_known
@@ -2781,12 +3122,16 @@ impl App {
             }
         }
         // Sticky detail: headers select nothing, so remember the last
-        // selected service to keep the right panes alive while navigating.
+        // selected target to keep the right panes alive while navigating.
         let key = self
             .selected_service()
             .map(|s| (s.service_type.clone(), s.instance.clone()));
         if key.is_some() {
             self.sticky_key = key;
+        }
+        let enum_key = self.selected_enum().map(|e| e.name.clone());
+        if enum_key.is_some() {
+            self.sticky_enum_key = enum_key;
         }
         self.sync_detail_cursor();
     }
@@ -2824,7 +3169,7 @@ impl App {
     /// host fold). Headers select nothing, so `Enter` on a header
     /// keeps folding the host instead of touching TXT state.
     fn toggle_txt_expanded(&mut self) -> bool {
-        if self.selected_service().is_none() {
+        if self.selected_service().is_none() && self.selected_enum().is_none() {
             return false;
         }
         let key = match self.selected_detail_entry() {
@@ -2855,12 +3200,20 @@ impl App {
         }
     }
 
+    pub fn selected_enum(&self) -> Option<&EnumEntry> {
+        let items = self.display_items();
+        match items.get(self.selected_display)? {
+            DisplayItem::Enum { index } => self.enum_entries.get(*index),
+            _ => None,
+        }
+    }
+
     pub fn latest_event_for_selected(&self) -> Option<&browse::Event> {
-        // Newest record first, then the service's last-seen packet: the
-        // shared buffer ages with total traffic, so a quiet service's
+        // Newest record first, then the target's last-seen packet: the
+        // shared buffer ages with total traffic, so a quiet target's
         // packets may all be gone while its records live on.
-        let svc = self.display_service()?;
-        for rec in svc.records.iter().rev() {
+        let target = self.display_detail()?;
+        for rec in target.all_records().iter().rev() {
             if let Some(ev) = self
                 .raw_events
                 .iter()
@@ -2870,11 +3223,13 @@ impl App {
                 return Some(ev);
             }
         }
-        svc.last_event.as_ref()
+        target.last_event()
     }
 
     /// Service shown in the right panes: the selected one, or the last
     /// selected one while the cursor sits on a service-type header.
+    /// Kept for tests; the panes render through `display_detail`.
+    #[cfg(test)]
     pub fn display_service(&self) -> Option<&ServiceEntry> {
         if let Some(svc) = self.selected_service() {
             return Some(svc);
@@ -2885,20 +3240,56 @@ impl App {
             .find(|s| s.service_type == key.0 && s.instance == key.1)
     }
 
+    /// Right-pane target: the selected service or enumeration row, or the
+    /// last selected one while the cursor sits on a header.
+    pub fn display_detail(&self) -> Option<DetailTarget<'_>> {
+        if let Some(svc) = self.selected_service() {
+            return Some(DetailTarget::Service(svc));
+        }
+        if let Some(entry) = self.selected_enum() {
+            return Some(DetailTarget::Enum(entry));
+        }
+        if let Some(key) = self.sticky_key.as_ref() {
+            if let Some(svc) = self
+                .services
+                .iter()
+                .find(|s| s.service_type == key.0 && s.instance == key.1)
+            {
+                return Some(DetailTarget::Service(svc));
+            }
+        }
+        if let Some(key) = self.sticky_enum_key.as_ref() {
+            if let Some(entry) = self.enum_entries.iter().find(|e| &e.name == key) {
+                return Some(DetailTarget::Enum(entry));
+            }
+        }
+        None
+    }
+
     /// Entry under the Tab cursor in the Records table: a raw record row or
     /// a question row (table order is raw records first, then questions
     /// by type/newest-first, matching the rendered table).
     pub fn selected_detail_entry(&self) -> Option<DetailEntry<'_>> {
-        let svc = self.display_service()?;
-        let key = (svc.service_type.clone(), svc.instance.clone());
-        if self.detail_svc_key.as_ref() != Some(&key) {
-            return None;
+        let target = self.display_detail()?;
+        match &target {
+            DetailTarget::Service(svc) => {
+                let key = (svc.service_type.clone(), svc.instance.clone());
+                if self.detail_svc_key.as_ref() != Some(&key) {
+                    return None;
+                }
+            }
+            DetailTarget::Enum(entry) => {
+                if self.detail_enum_key.as_ref() != Some(&entry.name) {
+                    return None;
+                }
+            }
         }
-        let raws = svc.ordered_records();
+        let raws = target.ordered_records();
         if self.detail_selected < raws.len() {
             return Some(DetailEntry::Record(raws[self.detail_selected]));
         }
-        svc.ordered_questions()
+        target
+            .ordered_questions()
             .into_iter()
             .nth(self.detail_selected - raws.len())
             .map(|q| DetailEntry::Question {
@@ -3113,6 +3504,7 @@ mod tests {
         // then park the Tab cursor on the TXT row (it defaults to the
         // first record, usually PTR).
         app.evict_expired();
+        select_instance(app, "Test");
         assert!(app.selected_service().is_some());
         let idx = {
             let svc = app.display_service().expect("service displayed");
@@ -3125,8 +3517,8 @@ mod tests {
         // sync_detail_cursor (which would re-anchor to the old PTR row).
         app.detail_selected = idx;
         app.detail_anchor = app
-            .display_service()
-            .and_then(|svc| App::identity_at(svc, idx));
+            .display_detail()
+            .and_then(|d| App::identity_at_detail(&d, idx));
     }
 
     #[test]
@@ -3351,15 +3743,18 @@ mod tests {
             state: KeyEventState::empty(),
         };
         assert_eq!(app.focus, Focus::Services);
-        // Service navigation in the Services pane.
+        // Service navigation in the Services pane: j moves to the next
+        // selectable stop (Test).
+        let stops = selectable_positions(&app);
+        let test = stops[2];
         app.handle_key(&plain(KeyCode::Char('j')));
-        assert_eq!(app.selected_display, 3);
+        assert_eq!(app.selected_display, test);
         let detail_before = app.detail_selected;
         // Tab focuses Answers: j now moves the record cursor instead.
         app.handle_key(&plain(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Answers);
         app.handle_key(&plain(KeyCode::Char('j')));
-        assert_eq!(app.selected_display, 3);
+        assert_eq!(app.selected_display, test);
         assert_eq!(app.detail_selected, detail_before + 1);
         // BackTab steps back to Services.
         app.handle_key(&plain(KeyCode::BackTab));
@@ -3447,11 +3842,13 @@ mod tests {
         // Re-sending refreshes instead of duplicating.
         app.route_own_question("_http._tcp.local.", 12);
         assert_eq!(app.services[0].questions.len(), 3);
-        // Enumeration and unknown types file nothing.
+        // Enumeration files on its own row, unknown types file nothing.
         app.route_own_question("_services._dns-sd._udp.local.", 12);
         app.route_own_question("_http._tcp.local.", 99);
         assert_eq!(app.services[0].questions.len(), 3);
         assert!(app.services[1].questions.is_empty());
+        assert_eq!(app.enum_entries.len(), 1);
+        assert_eq!(app.enum_entries[0].questions.len(), 1);
     }
 
     #[test]
@@ -3490,6 +3887,61 @@ mod tests {
             .collect();
         assert_eq!(filed.len(), 1);
         assert_eq!(filed[0].1, "PTR");
+    }
+
+    #[test]
+    fn enum_answers_file_on_selectable_row() {
+        let mut app = App::new().unwrap();
+        assert_eq!(app.enum_entries.len(), 1);
+        ingest(
+            &mut app,
+            &raw_record(
+                "_services._dns-sd._udp.local.",
+                12,
+                "PTR",
+                "_http._tcp.local.",
+                120,
+            ),
+        );
+        assert!(app.known_types.contains("_http._tcp.local"));
+        assert_eq!(app.enum_entries[0].records.len(), 1);
+        assert_eq!(app.group_labels()[0], "(enumeration)");
+        // Metrics carry a per-name row for the enumeration name.
+        let rows = app.metrics_rows();
+        assert!(rows.iter().any(|(k, _)| k.contains("_dns-sd._udp")));
+    }
+
+    #[test]
+    fn enum_questions_observed_and_own() {
+        let mut app = App::new().unwrap();
+        let ev = query_event(
+            "_services._dns-sd._udp.local.",
+            12,
+            "PTR",
+            false,
+            Vec::new(),
+            remote_source(),
+        );
+        app.ingest_event(&ev);
+        assert_eq!(app.enum_entries[0].questions.len(), 1);
+        assert!(app.services.iter().all(|s| s.questions.is_empty()));
+        app.route_own_question("_services._dns-sd._udp.local.", 12);
+        assert_eq!(app.enum_entries[0].questions.len(), 2);
+        assert_eq!(app.enum_entries[0].questions[1].2, SELF_SOURCE);
+    }
+
+    #[test]
+    fn enum_gets_qu_on_first_send() {
+        let mut app = App::new().unwrap();
+        app.poll_continuous(); // seeds the enumeration interest
+        let past = Instant::now() - Duration::from_millis(1);
+        app.continuous
+            .get_mut(&(ENUM_SERVICE.to_string().to_lowercase(), 12))
+            .expect("enum interest seeded")
+            .next_due = past;
+        app.poll_continuous();
+        assert_eq!(app.metrics.qu_sent, 1);
+        assert_eq!(app.metrics.q_sent_continuous, 1);
     }
 
     #[test]
@@ -3579,7 +4031,7 @@ mod tests {
     }
 
     /// Two hosts (shell.local, test.local) with one instance each, cursor
-    /// settled like the main loop does.
+    /// settled on the first service row (past the enumeration group).
     fn two_group_app() -> App {
         let mut app = App::new().unwrap();
         ingest(&mut app, &ptr_record(120));
@@ -3599,7 +4051,32 @@ mod tests {
             ),
         );
         app.evict_expired();
+        select_instance(&mut app, "Shell");
         app
+    }
+
+    /// Move the cursor onto the instance row with this name.
+    fn select_instance(app: &mut App, instance: &str) {
+        let items = app.display_items();
+        for (i, it) in items.iter().enumerate() {
+            if let DisplayItem::Instance { index } = it {
+                if app.services[*index].instance == instance {
+                    app.selected_display = i;
+                    break;
+                }
+            }
+        }
+        app.clamp_selection();
+    }
+
+    /// Display positions of every selectable stop in order.
+    fn selectable_positions(app: &App) -> Vec<usize> {
+        app.display_items()
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| app.is_selectable(it))
+            .map(|(i, _)| i)
+            .collect()
     }
 
     fn plain_key(code: KeyCode) -> KeyEvent {
@@ -3640,7 +4117,14 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(labels, vec!["test.local".to_string(), String::new()]);
+        assert_eq!(
+            labels,
+            vec![
+                "(enumeration)".to_string(),
+                "test.local".to_string(),
+                String::new()
+            ]
+        );
         assert_eq!(app.host_display_name("test.local"), "test");
         assert_eq!(app.host_display_name(""), "(unknown host)");
         assert_eq!(app.host_service_count("test.local"), 1);
@@ -3690,54 +4174,61 @@ mod tests {
     #[test]
     fn jk_moves_service_selection() {
         let mut app = two_group_app();
-        // Items: [shell host header, Shell, test host header, Test]; clamp
-        // settles the cursor on the first instance.
-        assert_eq!(app.selected_display, 1);
+        // Cursor starts on Shell; j moves to Test, k back to Shell.
+        let shell = selectable_positions(&app)[1];
+        let test = selectable_positions(&app)[2];
+        assert_eq!(app.selected_display, shell);
         app.handle_key(&plain_key(KeyCode::Char('j')));
-        assert_eq!(app.selected_display, 3);
+        assert_eq!(app.selected_display, test);
         app.handle_key(&plain_key(KeyCode::Char('k')));
-        assert_eq!(app.selected_display, 1);
+        assert_eq!(app.selected_display, shell);
     }
 
     #[test]
     fn hl_jumps_between_groups() {
         let mut app = two_group_app();
-        assert_eq!(app.selected_display, 1);
+        let stops = selectable_positions(&app);
+        let (first, shell, test) = (stops[0], stops[1], stops[2]);
+        assert_eq!(app.selected_display, shell);
         app.handle_key(&plain_key(KeyCode::Char('l')));
-        assert_eq!(app.selected_display, 3);
+        assert_eq!(app.selected_display, test);
         app.handle_key(&plain_key(KeyCode::Char('h')));
-        assert_eq!(app.selected_display, 1);
+        assert_eq!(app.selected_display, shell);
         // Shift jumps to the first/last group.
         app.handle_key(&plain_key(KeyCode::Char('L')));
-        assert_eq!(app.selected_display, 3);
+        assert_eq!(app.selected_display, *stops.last().unwrap());
         app.handle_key(&plain_key(KeyCode::Char('H')));
-        assert_eq!(app.selected_display, 1);
+        assert_eq!(app.selected_display, first);
     }
 
     #[test]
     fn arrows_jump_between_groups_like_hl() {
         let mut app = two_group_app();
-        assert_eq!(app.selected_display, 1);
+        let stops = selectable_positions(&app);
+        let (shell, test) = (stops[1], stops[2]);
+        assert_eq!(app.selected_display, shell);
         app.handle_key(&plain_key(KeyCode::Right));
-        assert_eq!(app.selected_display, 3);
+        assert_eq!(app.selected_display, test);
         app.handle_key(&plain_key(KeyCode::Left));
-        assert_eq!(app.selected_display, 1);
+        assert_eq!(app.selected_display, shell);
     }
 
     #[test]
     fn home_end_and_space_paging() {
         let mut app = two_group_app();
         app.list_viewport.set(2);
+        let stops = selectable_positions(&app);
+        let (first, last) = (stops[0], *stops.last().unwrap());
         app.handle_key(&plain_key(KeyCode::End));
-        assert_eq!(app.selected_display, 3);
+        assert_eq!(app.selected_display, last);
         app.handle_key(&plain_key(KeyCode::Home));
-        assert_eq!(app.selected_display, 1);
+        assert_eq!(app.selected_display, first);
         // Space pages down one viewport (2 stops); b pages back up.
         app.handle_key(&plain_key(KeyCode::Char(' ')));
-        assert_eq!(app.selected_display, 3);
+        assert_eq!(app.selected_display, stops[2]);
         assert!(app.collapsed_hosts.is_empty());
         app.handle_key(&plain_key(KeyCode::Char('b')));
-        assert_eq!(app.selected_display, 1);
+        assert_eq!(app.selected_display, first);
     }
 
     #[test]
@@ -4321,7 +4812,7 @@ mod tests {
         assert!(app.collapsed_hosts.is_empty());
         // First press collapses every group.
         app.handle_key(&star);
-        assert_eq!(app.group_labels().len(), 2);
+        assert_eq!(app.group_labels().len(), 3);
         for label in app.group_labels() {
             assert!(app.is_host_collapsed(&label), "collapsed: {label}");
         }
