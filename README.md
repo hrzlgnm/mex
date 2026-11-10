@@ -12,6 +12,14 @@ Built with Rust ([ratatui](https://ratatui.rs/), [crossterm](https://github.com/
 passively on UDP port 5353 (IPv4 + IPv6 multicast) and also sends the
 standard browse queries (service enumeration, PTR/SRV/TXT/A/AAAA).
 
+## Contents
+
+- [Usage](#usage)
+- [Layout](#layout)
+- [Keys](#keys)
+- [Build & run](#build--run)
+- [Known limitations](#known-limitations)
+
 ## Usage
 
 ```sh
