@@ -1996,7 +1996,24 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) => {
                 self.drag = DragMode::None;
             }
+            MouseEventKind::ScrollDown => self.mouse_wheel(1),
+            MouseEventKind::ScrollUp => self.mouse_wheel(-1),
             _ => {}
+        }
+    }
+
+    /// Wheel notch: exactly one j/k press in the focused pane. Cursor panes
+    /// move the cursor (the hex dump follows); free-scroll panes nudge the
+    /// viewport. The metrics overlay owns the wheel while open.
+    fn mouse_wheel(&mut self, delta: isize) {
+        if self.show_metrics {
+            self.scroll_metrics(delta);
+            return;
+        }
+        match self.focus {
+            Focus::Services => self.move_selection(delta),
+            Focus::Answers | Focus::Questions => self.move_detail_cursor(delta),
+            Focus::Hex => self.scroll_hex(delta),
         }
     }
 
@@ -5783,6 +5800,94 @@ mod tests {
         assert_eq!(app.focus, Focus::Questions);
         assert_eq!(app.detail_selected, raw_count);
         assert_eq!(app.hex_offset.get(), 0);
+    }
+
+    #[test]
+    fn mouse_wheel_moves_focused_pane_like_jk() {
+        use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+        let mut app = two_group_app();
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        };
+        // Services: one notch moves the list selection one stop.
+        app.focus = Focus::Services;
+        let before = app.selected_display;
+        app.handle_mouse(&wheel(MouseEventKind::ScrollDown));
+        assert_ne!(app.selected_display, before);
+        app.handle_mouse(&wheel(MouseEventKind::ScrollUp));
+        assert_eq!(app.selected_display, before);
+        // Answers: one notch moves the record cursor one row.
+        service_with_txt(&mut app, "a=1; b=2");
+        app.focus = Focus::Answers;
+        let cursor = app.detail_selected;
+        assert!(cursor > 0);
+        app.handle_mouse(&wheel(MouseEventKind::ScrollUp));
+        assert_eq!(app.detail_selected, cursor - 1);
+        app.handle_mouse(&wheel(MouseEventKind::ScrollDown));
+        assert_eq!(app.detail_selected, cursor);
+        // Hex: one notch scrolls the dump one line.
+        app.focus = Focus::Hex;
+        app.handle_mouse(&wheel(MouseEventKind::ScrollDown));
+        assert_eq!(app.hex_offset.get(), 1);
+        app.handle_mouse(&wheel(MouseEventKind::ScrollUp));
+        assert_eq!(app.hex_offset.get(), 0);
+        // Metrics overlay owns the wheel while open.
+        app.show_metrics = true;
+        app.handle_mouse(&wheel(MouseEventKind::ScrollDown));
+        assert_eq!(app.metrics_scroll.get(), 1);
+        assert_eq!(app.detail_selected, cursor);
+        // Horizontal wheel is ignored everywhere.
+        app.show_metrics = false;
+        app.handle_mouse(&wheel(MouseEventKind::ScrollLeft));
+        app.handle_mouse(&wheel(MouseEventKind::ScrollRight));
+        assert_eq!(app.hex_offset.get(), 0);
+        assert_eq!(app.detail_selected, cursor);
+    }
+
+    #[test]
+    fn mouse_wheel_moves_question_cursor() {
+        use crossterm::event::{
+            KeyCode, KeyEventKind, KeyEventState, KeyModifiers, MouseEvent, MouseEventKind,
+        };
+        let mut app = two_group_app();
+        let plain = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        };
+        let src: std::net::SocketAddr = "192.168.1.9:5353".parse().unwrap();
+        let sel_idx = match app.display_items().get(app.selected_display) {
+            Some(DisplayItem::Instance { index }) => *index,
+            _ => panic!("expected instance selected"),
+        };
+        let raws = app.services[sel_idx].ordered_records().len();
+        for _ in 0..2 {
+            app.services[sel_idx].questions.push((
+                "_http._tcp.local".to_string(),
+                "PTR".to_string(),
+                src,
+                Instant::now(),
+                Vec::new(),
+            ));
+        }
+        app.handle_key(&plain(KeyCode::Tab));
+        app.handle_key(&plain(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Questions);
+        assert_eq!(app.detail_selected, raws);
+        app.handle_mouse(&wheel(MouseEventKind::ScrollDown));
+        assert_eq!(app.detail_selected, raws + 1);
+        app.handle_mouse(&wheel(MouseEventKind::ScrollUp));
+        assert_eq!(app.detail_selected, raws);
     }
 
     #[test]
