@@ -48,25 +48,32 @@ like local records.
 .TP
 .B Hex (right bottom)
 Wire bytes of the selected record or question packet, falling back to the
-service's latest packet.
+service's latest packet. Tab focuses it for scrolling.
+.TP
+.B Mouse
+Drag the shared pane borders to resize Hosts vs detail, and Answers /
+Questions / Hex (the seam lights up). Click a row to
+focus its pane and move the cursor there; clicking a host header folds it.
+While mouse input is captured, use Shift+drag to select text in most
+terminals.
 
 .SH CONTROLS
 .TP
 .B Pane switching
 .br
-Tab / Shift+Tab      - Switch pane (Hosts \(-> Answers \(-> Questions)
+Tab / Shift+Tab      - Switch pane (Hosts \(-> Answers \(-> Questions \(-> Hex)
 .TP
 .B Navigation
 .br
-Up/Down or j/k       - Move within the focused pane
+Up/Down or j/k       - Move within the focused pane (scroll Hex when focused)
 .br
 h/l or \(<-/\(->         - Jump between host groups
 .br
 H/L                  - First / last host group
 .br
-Home/End             - First / last row of the focused pane
+Home/End             - First / last row of the focused pane (top / bottom of Hex)
 .br
-PageUp/PageDown or b/f or Space - Page
+PageUp/PageDown or b/f or Space - Page (viewport scroll in Hex)
 .br
 Enter                - Fold / unfold host (Hosts) or TXT record (Answers)
 .br
@@ -74,13 +81,17 @@ Enter                - Fold / unfold host (Hosts) or TXT record (Answers)
 .br
 *                    - Collapse all host groups / unfold all
 .br
-Ctrl+Up/Down, Ctrl+j/k, Shift+Up/Down, J/K - Scroll Answers viewport freely
+Ctrl+Up/Down, Ctrl+j/k, Shift+Up/Down, J/K - Scroll Answers viewport freely (Hex viewport when Hex focused)
 .TP
 .B Other
 .br
 m                      - Metrics overlay (traffic, discovery, queries, links)
 .br
 q or Esc or Ctrl+C     - Quit (m / Esc closes the overlay first)
+.br
+Mouse drag on pane borders - Resize panes
+.br
+Mouse click            - Focus pane + move cursor (host header folds)
 
 .SH ENVIRONMENT
 Setting the NO_COLOR environment variable to any non-empty value (see https://no-color.org/) disables colors. The interface remains usable through text attributes such as reverse video for the selection.

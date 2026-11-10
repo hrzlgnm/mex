@@ -6,20 +6,36 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use hickory_proto::rr::RecordType;
+use ratatui::layout::Rect;
 
 use crate::browse;
 use crate::ui;
 
-/// Pane with keyboard focus: Tab cycles the service list and the two
-/// record tables. Arrows and j/k navigate inside the focused pane.
+/// Pane with keyboard focus: Tab cycles the service list, the two
+/// record tables, and the hex dump. Arrows and j/k navigate inside the
+/// focused pane; the hex pane has no cursor, so its keys scroll.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Focus {
     #[default]
     Services,
     Answers,
     Questions,
+    Hex,
+}
+
+/// Which pane divider is being dragged (or hovered) with the mouse.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DragMode {
+    #[default]
+    None,
+    Vertical,
+    HorizUpper,
+    HorizLower,
 }
 
 #[derive(Clone)]
@@ -212,6 +228,33 @@ pub struct App {
     /// through. Any cursor or fold action clears it.
     pub detail_free_scroll: bool,
     pub questions_offset: Cell<usize>,
+    /// Manual scroll of the Hex pane, which follows the record cursor and
+    /// has no cursor of its own. Reset when the cursor or target changes;
+    /// upper clamping happens at render time, where the line count is known.
+    pub hex_offset: Cell<usize>,
+    /// Visible rows of the Hex pane (minus borders), recorded during draw
+    /// so paging matches the viewport.
+    pub hex_viewport: Cell<usize>,
+    /// Horizontal split: percent of the body width given to the Hosts pane.
+    /// The shared pane borders are the mouse-drag handles.
+    pub left_pct: u16,
+    /// Vertical split of the right stack: percent of its height given to
+    /// Answers and Questions (the hex pane takes the remainder). The
+    /// shared pane borders are mouse-draggable.
+    pub answers_pct: u16,
+    pub questions_pct: u16,
+    /// Active mouse drag; `None` when no button is held on a pane border.
+    pub drag: DragMode,
+    /// Pane border under the mouse cursor, for highlight. Updated on
+    /// `Moved`/`Drag` events; render-only.
+    pub hover: Cell<DragMode>,
+    /// Last-frame geometry for mouse hit-testing (recorded during draw).
+    pub body_rect: Cell<Rect>,
+    pub left_rect: Cell<Rect>,
+    pub right_rect: Cell<Rect>,
+    pub answers_rect: Cell<Rect>,
+    pub questions_rect: Cell<Rect>,
+    pub hex_rect: Cell<Rect>,
     pub packet_count: u64,
     pub start_time: Instant,
     pub running: bool,
@@ -496,6 +539,19 @@ impl App {
             detail_offset: Cell::new(0),
             detail_free_scroll: false,
             questions_offset: Cell::new(0),
+            hex_offset: Cell::new(0),
+            hex_viewport: Cell::new(0),
+            left_pct: 33,
+            answers_pct: 34,
+            questions_pct: 33,
+            drag: DragMode::None,
+            hover: Cell::new(DragMode::None),
+            body_rect: Cell::new(Rect::default()),
+            left_rect: Cell::new(Rect::default()),
+            right_rect: Cell::new(Rect::default()),
+            answers_rect: Cell::new(Rect::default()),
+            questions_rect: Cell::new(Rect::default()),
+            hex_rect: Cell::new(Rect::default()),
             detail_svc_key: None,
             detail_enum_key: None,
             detail_anchor: None,
@@ -538,9 +594,21 @@ impl App {
             terminal.draw(|f| ui::draw(f, self))?;
 
             if event::poll(Duration::from_millis(80))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        self.handle_key(&key);
+                // Drain everything pending so mouse drags stay smooth at
+                // 12fps instead of handling one event per frame.
+                loop {
+                    match event::read()? {
+                        Event::Key(key) => {
+                            if key.kind == KeyEventKind::Press {
+                                self.handle_key(&key);
+                            }
+                        }
+                        Event::Mouse(mouse) => self.handle_mouse(&mouse),
+                        Event::Resize(_, _) => {}
+                        _ => {}
+                    }
+                    if !event::poll(Duration::ZERO)? {
+                        break;
                     }
                 }
             }
@@ -1724,17 +1792,22 @@ impl App {
             self.show_metrics = !self.show_metrics;
             if self.show_metrics {
                 self.metrics_scroll.set(0);
+                // The overlay owns all input while open: drop any active
+                // resize so borders behind it never glow.
+                self.drag = DragMode::None;
+                self.hover.set(DragMode::None);
             }
             return;
         }
         // While the overlay is open it owns every key except Ctrl+C:
-        // `m`/`Esc` closes, `q` quits, the rest scrolls.
+        // `m`/`Esc` closes, `q` quits, the rest scrolls. Uppercase and
+        // lowercase + SHIFT report the same intent on all protocols.
         if self.show_metrics {
             match key.code {
                 KeyCode::Esc => self.show_metrics = false,
                 KeyCode::Char('q') => self.running = false,
-                KeyCode::Up | KeyCode::Char('k') => self.scroll_metrics(-1),
-                KeyCode::Down | KeyCode::Char('j') => self.scroll_metrics(1),
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => self.scroll_metrics(-1),
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => self.scroll_metrics(1),
                 KeyCode::Home => self.scroll_metrics_edge(true),
                 KeyCode::End => self.scroll_metrics_edge(false),
                 KeyCode::PageUp | KeyCode::Char('b') => self.page_metrics(-1),
@@ -1754,16 +1827,18 @@ impl App {
                 self.focus = match self.focus {
                     Focus::Services => Focus::Answers,
                     Focus::Answers => Focus::Questions,
-                    Focus::Questions => Focus::Services,
+                    Focus::Questions => Focus::Hex,
+                    Focus::Hex => Focus::Services,
                 };
                 self.snap_detail_to_focus();
                 return;
             }
             KeyCode::BackTab => {
                 self.focus = match self.focus {
-                    Focus::Services => Focus::Questions,
+                    Focus::Services => Focus::Hex,
                     Focus::Answers => Focus::Services,
                     Focus::Questions => Focus::Answers,
+                    Focus::Hex => Focus::Questions,
                 };
                 self.snap_detail_to_focus();
                 return;
@@ -1772,25 +1847,356 @@ impl App {
         }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.running = false,
-            // Detail viewport scroll works from either pane.
+            // Detail viewport scroll works from either pane: the Answers
+            // table, or the Hex dump while it holds focus.
             KeyCode::Up | KeyCode::Down
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     || key.modifiers.contains(KeyModifiers::SHIFT) =>
             {
-                self.scroll_detail(if key.code == KeyCode::Down { 1 } else { -1 })
+                self.scroll_focused_detail(if key.code == KeyCode::Down { 1 } else { -1 })
             }
             KeyCode::Char('j') | KeyCode::Char('k')
                 if key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
-                self.scroll_detail(if key.code == KeyCode::Char('j') {
+                self.scroll_focused_detail(if key.code == KeyCode::Char('j') {
                     1
                 } else {
                     -1
                 })
             }
-            KeyCode::Char('J') => self.scroll_detail(1),
-            KeyCode::Char('K') => self.scroll_detail(-1),
+            KeyCode::Char('J') => self.scroll_focused_detail(1),
+            KeyCode::Char('K') => self.scroll_focused_detail(-1),
+            // Shifted j/k reported lowercase + SHIFT (some keyboard
+            // protocols) scroll too; they must never move the cursor.
+            KeyCode::Char('j') | KeyCode::Char('k')
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.scroll_focused_detail(if key.code == KeyCode::Char('j') {
+                    1
+                } else {
+                    -1
+                })
+            }
             _ => self.handle_focused_key(key),
+        }
+    }
+
+    /// Percent range kept for the Hosts pane; the detail side always keeps
+    /// the remainder, so tiny terminals cannot collapse either side away.
+    fn clamp_left_pct(pct: u16) -> u16 {
+        pct.clamp(15, 80)
+    }
+
+    /// Answers/Questions shares keep at least 10% each and leave at least
+    /// 10% for the hex pane (`answers + questions <= 90`).
+    fn clamp_answers_pct(pct: u16, questions_pct: u16) -> u16 {
+        let max = 90u16.saturating_sub(questions_pct).max(10);
+        pct.clamp(10, 70).min(max)
+    }
+
+    fn clamp_questions_pct(pct: u16, answers_pct: u16) -> u16 {
+        let max = 90u16.saturating_sub(answers_pct).max(10);
+        pct.clamp(10, 70).min(max)
+    }
+
+    fn pct_from_x(col: u16, body: Rect) -> u16 {
+        if body.width == 0 {
+            return 33;
+        }
+        (col.saturating_sub(body.x) as u32 * 100 / body.width.max(1) as u32).min(100) as u16
+    }
+
+    fn pct_from_y(row: u16, right: Rect) -> u16 {
+        if right.height == 0 {
+            return 34;
+        }
+        (row.saturating_sub(right.y) as u32 * 100 / right.height.max(1) as u32).min(100) as u16
+    }
+
+    fn point_in(rect: Rect, col: u16, row: u16) -> bool {
+        rect.width > 0
+            && rect.height > 0
+            && col >= rect.x
+            && col < rect.x.saturating_add(rect.width)
+            && row >= rect.y
+            && row < rect.y.saturating_add(rect.height)
+    }
+
+    /// Shared pane border under the cursor, if any. With no gutter the
+    /// two abutting border cells form a 2-cell grab zone: the Hosts
+    /// right edge / detail left edge vertically, and the Answers bottom
+    /// / Questions top (then Questions bottom / Hex top) horizontally.
+    /// Seams win over panes so the border stays grabbable.
+    fn divider_at(&self, col: u16, row: u16) -> DragMode {
+        let left = self.left_rect.get();
+        let right = self.right_rect.get();
+        if left.width > 0 && right.width > 0 {
+            let left_edge = left.x.saturating_add(left.width.saturating_sub(1));
+            if (col == left_edge || col == right.x)
+                && row >= left.y
+                && row < left.y.saturating_add(left.height)
+            {
+                return DragMode::Vertical;
+            }
+        }
+        let answers = self.answers_rect.get();
+        let questions = self.questions_rect.get();
+        if answers.height > 0 && questions.height > 0 {
+            let bottom = answers.y.saturating_add(answers.height.saturating_sub(1));
+            if (row == bottom || row == questions.y)
+                && col >= answers.x
+                && col < answers.x.saturating_add(answers.width)
+            {
+                return DragMode::HorizUpper;
+            }
+        }
+        let hex = self.hex_rect.get();
+        if questions.height > 0 && hex.height > 0 {
+            let bottom = questions
+                .y
+                .saturating_add(questions.height.saturating_sub(1));
+            if (row == bottom || row == hex.y)
+                && col >= questions.x
+                && col < questions.x.saturating_add(questions.width)
+            {
+                return DragMode::HorizLower;
+            }
+        }
+        DragMode::None
+    }
+
+    fn set_left_from_x(&mut self, col: u16) {
+        let pct = Self::pct_from_x(col, self.body_rect.get());
+        self.left_pct = Self::clamp_left_pct(pct);
+    }
+
+    fn set_answers_from_y(&mut self, row: u16) {
+        let pct = Self::pct_from_y(row, self.right_rect.get());
+        self.answers_pct = Self::clamp_answers_pct(pct, self.questions_pct);
+    }
+
+    fn set_lower_from_y(&mut self, row: u16) {
+        let combined = Self::pct_from_y(row, self.right_rect.get());
+        let want = combined.saturating_sub(self.answers_pct);
+        self.questions_pct = Self::clamp_questions_pct(want, self.answers_pct);
+    }
+
+    fn handle_mouse(&mut self, mouse: &MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.mouse_down(mouse.column, mouse.row);
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.mouse_drag(mouse.column, mouse.row);
+            }
+            MouseEventKind::Moved => {
+                self.mouse_moved(mouse.column, mouse.row);
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.drag = DragMode::None;
+            }
+            _ => {}
+        }
+    }
+
+    fn mouse_down(&mut self, col: u16, row: u16) {
+        // The metrics overlay owns all input while open (closed via m/Esc).
+        if self.show_metrics {
+            return;
+        }
+        match self.divider_at(col, row) {
+            DragMode::None => {}
+            mode => {
+                self.drag = mode;
+                self.hover.set(mode);
+                return;
+            }
+        }
+        if Self::point_in(self.left_rect.get(), col, row) {
+            self.click_service_list(row);
+        } else if Self::point_in(self.answers_rect.get(), col, row) {
+            self.click_answers(row);
+        } else if Self::point_in(self.questions_rect.get(), col, row) {
+            self.click_questions(row);
+        } else if Self::point_in(self.hex_rect.get(), col, row) {
+            // The hex pane follows the cursor; clicking focuses it so its
+            // keys scroll the dump.
+            self.focus = Focus::Hex;
+        }
+    }
+
+    fn mouse_drag(&mut self, col: u16, row: u16) {
+        // The metrics overlay owns all input while open (closed via m/Esc).
+        if self.show_metrics {
+            return;
+        }
+        match self.drag {
+            DragMode::Vertical => {
+                self.set_left_from_x(col);
+                self.hover.set(DragMode::Vertical);
+            }
+            DragMode::HorizUpper => {
+                self.set_answers_from_y(row);
+                self.hover.set(DragMode::HorizUpper);
+            }
+            DragMode::HorizLower => {
+                self.set_lower_from_y(row);
+                self.hover.set(DragMode::HorizLower);
+            }
+            DragMode::None => {
+                self.hover.set(self.divider_at(col, row));
+            }
+        }
+    }
+
+    fn mouse_moved(&mut self, col: u16, row: u16) {
+        // The metrics overlay owns all input while open (closed via m/Esc).
+        if self.show_metrics {
+            return;
+        }
+        // Some terminals report drags as Moved; keep following the active
+        // divider in that case.
+        if self.drag != DragMode::None {
+            self.mouse_drag(col, row);
+        } else {
+            self.hover.set(self.divider_at(col, row));
+        }
+    }
+
+    /// Click in the Hosts pane: instances select, headers fold. Mirrors the
+    /// keyboard rule that expanded headers are not selectable stops.
+    fn click_service_list(&mut self, row: u16) {
+        self.focus = Focus::Services;
+        let area = self.left_rect.get();
+        if area.height < 3
+            || row <= area.y
+            || row >= area.y.saturating_add(area.height).saturating_sub(1)
+        {
+            return;
+        }
+        let rel = row.saturating_sub(area.y.saturating_add(1)) as usize;
+        let idx = self.list_offset.get().saturating_add(rel);
+        let items = self.display_items();
+        let Some(item) = items.get(idx) else {
+            return;
+        };
+        match item {
+            DisplayItem::Instance { .. } | DisplayItem::Enum { .. } => {
+                self.selected_display = idx;
+                self.clamp_selection();
+            }
+            DisplayItem::Host { label } => {
+                let label = label.clone();
+                if !self.collapsed_hosts.remove(&label) {
+                    self.collapsed_hosts.insert(label);
+                }
+                // A collapsed-then-expanded header is not a stop; only keep
+                // the cursor on it while it stays collapsed (unfoldable).
+                if self.is_selectable(&items[idx]) {
+                    self.selected_display = idx;
+                }
+                self.clamp_selection();
+            }
+        }
+    }
+
+    /// Map an Answers table row (including info/child rows) to the detail
+    /// cursor index. Child rows select their parent record; info rows
+    /// select nothing. Mirrors `detail_table_rows` in `ui.rs`.
+    fn answers_table_row_to_detail(&self, table_row: usize) -> Option<usize> {
+        let target = self.display_detail()?;
+        let info_rows = match &target {
+            DetailTarget::Service(svc) => {
+                let mut seen = HashSet::new();
+                let mut subs = 0;
+                for sub in &svc.subtypes {
+                    if seen.insert(sub) {
+                        subs += 1;
+                    }
+                }
+                1 + subs
+            }
+            DetailTarget::Enum(_) => 1,
+        };
+        if table_row < info_rows {
+            return None;
+        }
+        let mut row = info_rows;
+        for (idx, rec) in target.ordered_records().into_iter().enumerate() {
+            if table_row == row {
+                return Some(idx);
+            }
+            let children = if self.is_txt_expanded(rec) {
+                let pairs = Self::txt_pair_count(&rec.rdata);
+                if pairs > 1 {
+                    pairs
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            // Child rows belong to the parent record.
+            if table_row > row && table_row <= row + children {
+                return Some(idx);
+            }
+            row += 1 + children;
+        }
+        None
+    }
+
+    fn click_answers(&mut self, row: u16) {
+        self.focus = Focus::Answers;
+        let area = self.answers_rect.get();
+        if area.height < 3 || row < area.y.saturating_add(2) {
+            return;
+        }
+        if row >= area.y.saturating_add(area.height).saturating_sub(1) {
+            return;
+        }
+        let rel = row.saturating_sub(area.y.saturating_add(2)) as usize;
+        let table_row = self.detail_offset.get().saturating_add(rel);
+        if let Some(idx) = self.answers_table_row_to_detail(table_row) {
+            // Stay on the clicked target: the cursor follows the click
+            // instead of the manual-scroll viewport. A new row also
+            // restarts the hex dump at the top.
+            self.detail_free_scroll = false;
+            if self.detail_selected != idx {
+                self.detail_selected = idx;
+                self.hex_offset.set(0);
+            }
+            self.detail_anchor = self
+                .display_detail()
+                .and_then(|d| Self::identity_at_detail(&d, self.detail_selected));
+        }
+    }
+
+    fn click_questions(&mut self, row: u16) {
+        self.focus = Focus::Questions;
+        let area = self.questions_rect.get();
+        if area.height < 3 || row < area.y.saturating_add(2) {
+            return;
+        }
+        if row >= area.y.saturating_add(area.height).saturating_sub(1) {
+            return;
+        }
+        let rel = row.saturating_sub(area.y.saturating_add(2)) as usize;
+        let Some(target) = self.display_detail() else {
+            return;
+        };
+        let raws = target.ordered_records().len();
+        let table_row = self.questions_offset.get().saturating_add(rel);
+        if table_row < target.questions_len() {
+            self.detail_free_scroll = false;
+            let idx = raws + table_row;
+            if self.detail_selected != idx {
+                self.detail_selected = idx;
+                self.hex_offset.set(0);
+            }
+            self.detail_anchor = self
+                .display_detail()
+                .and_then(|d| Self::identity_at_detail(&d, self.detail_selected));
         }
     }
 
@@ -1844,6 +2250,17 @@ impl App {
                 KeyCode::End => self.move_detail_edge(false),
                 KeyCode::PageUp | KeyCode::Char('b') => self.page_detail(-1),
                 KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => self.page_detail(1),
+                _ => {}
+            },
+            // The hex pane has no cursor; its keys scroll the dump, which
+            // follows the record cursor.
+            Focus::Hex => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.scroll_hex(-1),
+                KeyCode::Down | KeyCode::Char('j') => self.scroll_hex(1),
+                KeyCode::Home => self.scroll_hex_edge(true),
+                KeyCode::End => self.scroll_hex_edge(false),
+                KeyCode::PageUp | KeyCode::Char('b') => self.page_hex(-1),
+                KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => self.page_hex(1),
                 _ => {}
             },
         }
@@ -2009,7 +2426,7 @@ impl App {
     /// Index range of the focused record table inside the combined
     /// [records, questions] cursor order: Answers covers the raw records,
     /// Questions the question rows. Services focus is unused by the
-    /// record cursor; it spans everything.
+    /// record cursor; it spans everything. Hex has no cursor rows.
     fn detail_range(&self) -> (usize, usize) {
         let (raws, total) = self
             .display_detail()
@@ -2024,6 +2441,7 @@ impl App {
             Focus::Answers => (0, raws),
             Focus::Questions => (raws, total),
             Focus::Services => (0, total),
+            Focus::Hex => (0, 0),
         }
     }
 
@@ -2048,6 +2466,7 @@ impl App {
         self.sync_detail_cursor();
         // Resuming cursor-follow: manual scroll ends once the cursor moves.
         self.detail_free_scroll = false;
+        let before = self.detail_selected;
         let (lo, hi) = self.detail_range();
         if hi <= lo {
             return;
@@ -2064,17 +2483,25 @@ impl App {
         self.detail_anchor = self
             .display_detail()
             .and_then(|d| Self::identity_at_detail(&d, self.detail_selected));
+        // New row means new hex bytes: restart the dump at the top.
+        if self.detail_selected != before {
+            self.hex_offset.set(0);
+        }
     }
 
     /// First/last row of the focused table.
     fn move_detail_edge(&mut self, first: bool) {
         self.sync_detail_cursor();
         self.detail_free_scroll = false;
+        let before = self.detail_selected;
         let (lo, hi) = self.detail_range();
         self.detail_selected = if hi <= lo || first { lo } else { hi - 1 };
         self.detail_anchor = self
             .display_detail()
             .and_then(|d| Self::identity_at_detail(&d, self.detail_selected));
+        if self.detail_selected != before {
+            self.hex_offset.set(0);
+        }
     }
 
     /// Page the record cursor by one Answers-table viewport. Falls back
@@ -2104,6 +2531,44 @@ impl App {
         };
         self.detail_offset.set(next);
         self.detail_free_scroll = true;
+    }
+
+    /// Scroll the focused detail viewport: the Hex dump while it holds
+    /// focus, otherwise the Answers table (which also scrolls from the
+    /// Services and Questions panes).
+    fn scroll_focused_detail(&mut self, delta: isize) {
+        if self.focus == Focus::Hex {
+            self.scroll_hex(delta);
+        } else {
+            self.scroll_detail(delta);
+        }
+    }
+
+    /// Nudge the Hex viewport; the dump follows the record cursor, so
+    /// there is no cursor to resume and no pin flag. Upper clamping
+    /// happens at render time, where the line count is known.
+    fn scroll_hex(&mut self, delta: isize) {
+        let cur = self.hex_offset.get();
+        let next = if delta < 0 {
+            cur.saturating_sub(delta.unsigned_abs())
+        } else {
+            cur.saturating_add(delta.unsigned_abs())
+        };
+        self.hex_offset.set(next);
+    }
+
+    fn scroll_hex_edge(&mut self, first: bool) {
+        if first {
+            self.hex_offset.set(0);
+        } else {
+            self.hex_offset.set(usize::MAX / 2);
+        }
+    }
+
+    fn page_hex(&mut self, pages: isize) {
+        let per_page = self.hex_viewport.get().max(1) as isize;
+        let steps = pages * per_page;
+        self.scroll_hex(steps);
     }
 
     /// Scroll the metrics overlay; upper clamping happens at render time.
@@ -2198,6 +2663,7 @@ impl App {
             self.detail_offset.set(0);
             self.detail_free_scroll = false;
             self.questions_offset.set(0);
+            self.hex_offset.set(0);
             self.detail_anchor = self
                 .display_detail()
                 .and_then(|d| Self::identity_at_detail(&d, self.detail_selected));
@@ -3743,9 +4209,11 @@ mod tests {
         app.handle_key(&plain(KeyCode::Char('k')));
         assert!(!app.detail_free_scroll);
         assert_eq!(app.detail_selected, before - 1);
-        // Tab cycles Answers -> Questions -> Services.
+        // Tab cycles Answers -> Questions -> Hex -> Services.
         app.handle_key(&plain(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Questions);
+        app.handle_key(&plain(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Hex);
         app.handle_key(&plain(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Services);
     }
@@ -4400,6 +4868,112 @@ mod tests {
     }
 
     #[test]
+    fn shifted_jk_scroll_in_all_reported_shapes() {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1; b=2");
+        let plain = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        let shift = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        // Answers focus, where plain j/k move the record cursor.
+        app.handle_key(&plain(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Answers);
+        let cursor = app.detail_selected;
+        // Uppercase, with and without SHIFT flagged (terminal-dependent).
+        app.handle_key(&plain(KeyCode::Char('J')));
+        app.handle_key(&shift(KeyCode::Char('J')));
+        assert_eq!(app.detail_offset.get(), 2);
+        assert_eq!(app.detail_selected, cursor);
+        app.handle_key(&plain(KeyCode::Char('K')));
+        app.handle_key(&shift(KeyCode::Char('K')));
+        assert_eq!(app.detail_offset.get(), 0);
+        assert_eq!(app.detail_selected, cursor);
+        // Lowercase + SHIFT (other keyboard protocols) scrolls too and
+        // never moves the cursor.
+        app.handle_key(&shift(KeyCode::Char('j')));
+        assert_eq!(app.detail_offset.get(), 1);
+        assert_eq!(app.detail_selected, cursor);
+        app.handle_key(&shift(KeyCode::Char('k')));
+        assert_eq!(app.detail_offset.get(), 0);
+        assert_eq!(app.detail_selected, cursor);
+        assert!(app.detail_free_scroll);
+        // Plain lowercase still moves the cursor instead of scrolling.
+        app.handle_key(&plain(KeyCode::Char('k')));
+        assert_eq!(app.detail_selected, cursor - 1);
+    }
+
+    #[test]
+    fn hex_pane_scrolls_and_resets() {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
+        use ratatui::layout::Rect;
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1; b=2");
+        let plain = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        // Tab reaches Hex after Questions; the focused pane lights its border.
+        app.handle_key(&plain(KeyCode::Tab));
+        app.handle_key(&plain(KeyCode::Tab));
+        app.handle_key(&plain(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Hex);
+        // Viewport is recorded at draw; fake 10 rows for the scroll math.
+        app.hex_viewport.set(10);
+        app.handle_key(&plain(KeyCode::Char('j')));
+        assert_eq!(app.hex_offset.get(), 1);
+        app.handle_key(&plain(KeyCode::Char(' ')));
+        assert_eq!(app.hex_offset.get(), 11);
+        app.handle_key(&plain(KeyCode::Home));
+        assert_eq!(app.hex_offset.get(), 0);
+        app.handle_key(&plain(KeyCode::End));
+        assert!(app.hex_offset.get() > 1000);
+        // Moving the record cursor restarts the dump at the top.
+        app.handle_key(&plain(KeyCode::BackTab));
+        app.handle_key(&plain(KeyCode::BackTab));
+        assert_eq!(app.focus, Focus::Answers);
+        app.handle_key(&plain(KeyCode::Char('k')));
+        assert_eq!(app.hex_offset.get(), 0);
+        // Clicking another row restarts the dump; re-clicking keeps scroll.
+        app.answers_rect.set(Rect::new(33, 3, 67, 30));
+        app.right_rect.set(Rect::new(33, 3, 67, 30));
+        app.detail_offset.set(0);
+        app.hex_offset.set(5);
+        app.click_answers(3 + 2 + 1);
+        assert_eq!(app.detail_selected, 0);
+        assert_eq!(app.hex_offset.get(), 0);
+        app.hex_offset.set(5);
+        app.click_answers(3 + 2 + 1);
+        assert_eq!(app.hex_offset.get(), 5);
+        // Clicking the hex pane focuses it for scrolling.
+        app.left_rect.set(Rect::new(0, 3, 33, 30));
+        app.answers_rect.set(Rect::new(33, 3, 67, 10));
+        app.questions_rect.set(Rect::new(33, 13, 67, 8));
+        app.hex_rect.set(Rect::new(33, 21, 67, 12));
+        app.focus = Focus::Services;
+        app.mouse_down(40, 25);
+        assert_eq!(app.focus, Focus::Hex);
+    }
+
+    #[test]
+    fn hex_offset_resets_on_target_change() {
+        let mut app = two_group_app();
+        app.hex_offset.set(7);
+        select_instance(&mut app, "Test");
+        assert_eq!(app.hex_offset.get(), 0);
+    }
+
+    #[test]
     fn continuous_backoff_is_1s_then_doubling() {
         let mut app = App::new().unwrap();
         app.known_types.insert("_http._tcp.local".to_string());
@@ -4748,6 +5322,11 @@ mod tests {
         assert_eq!(app.metrics_scroll.get(), 1);
         app.handle_key(&key(KeyCode::Char('k')));
         assert_eq!(app.metrics_scroll.get(), 0);
+        // Uppercase reports the same intent.
+        app.handle_key(&key(KeyCode::Char('J')));
+        assert_eq!(app.metrics_scroll.get(), 1);
+        app.handle_key(&key(KeyCode::Char('K')));
+        assert_eq!(app.metrics_scroll.get(), 0);
         // Tab must not escape the overlay.
         app.handle_key(&key(KeyCode::Tab));
         assert!(app.show_metrics);
@@ -4979,5 +5558,221 @@ mod tests {
         for label in app.group_labels() {
             assert!(app.is_host_collapsed(&label), "collapsed: {label}");
         }
+    }
+
+    #[test]
+    fn mouse_pane_splits_clamp_and_convert() {
+        use ratatui::layout::Rect;
+        assert_eq!(App::clamp_left_pct(5), 15);
+        assert_eq!(App::clamp_left_pct(95), 80);
+        assert_eq!(App::clamp_left_pct(40), 40);
+        let body = Rect::new(0, 3, 100, 20);
+        assert_eq!(App::pct_from_x(5, body), 5);
+        assert_eq!(App::pct_from_x(50, body), 50);
+        let right = Rect::new(33, 3, 67, 30);
+        assert_eq!(App::pct_from_y(3 + 15, right), 50);
+        // Hex keeps at least 10%: answers + questions <= 90.
+        assert_eq!(App::clamp_answers_pct(80, 33), 57);
+        assert_eq!(App::clamp_questions_pct(80, 34), 56);
+        assert_eq!(App::clamp_answers_pct(30, 30), 30);
+    }
+
+    #[test]
+    fn mouse_drag_moves_splits_with_clamp() {
+        use ratatui::layout::Rect;
+        let mut app = App::new().unwrap();
+        app.body_rect.set(Rect::new(0, 3, 100, 40));
+        app.right_rect.set(Rect::new(33, 3, 67, 30));
+        app.set_left_from_x(5);
+        assert_eq!(app.left_pct, 15);
+        app.set_left_from_x(50);
+        assert_eq!(app.left_pct, 50);
+        app.questions_pct = 33;
+        app.set_answers_from_y(3 + 27);
+        assert!(app.answers_pct <= 57);
+        app.answers_pct = 34;
+        app.set_lower_from_y(3 + 27);
+        assert!(app.answers_pct + app.questions_pct <= 90);
+    }
+
+    #[test]
+    fn mouse_border_hit_test_prefers_seams() {
+        use ratatui::layout::Rect;
+        let app = App::new().unwrap();
+        // Abutting panes: the two border cells form the grab zone.
+        app.left_rect.set(Rect::new(0, 3, 33, 30));
+        app.right_rect.set(Rect::new(33, 3, 67, 30));
+        app.answers_rect.set(Rect::new(33, 3, 67, 10));
+        app.questions_rect.set(Rect::new(33, 13, 67, 8));
+        app.hex_rect.set(Rect::new(33, 21, 67, 12));
+        // Either border cell grabs vertically.
+        assert_eq!(app.divider_at(32, 5), DragMode::Vertical);
+        assert_eq!(app.divider_at(33, 5), DragMode::Vertical);
+        // Either border row grabs horizontally.
+        assert_eq!(app.divider_at(40, 12), DragMode::HorizUpper);
+        assert_eq!(app.divider_at(40, 13), DragMode::HorizUpper);
+        assert_eq!(app.divider_at(40, 20), DragMode::HorizLower);
+        assert_eq!(app.divider_at(40, 21), DragMode::HorizLower);
+        // Interior cells belong to panes.
+        assert_eq!(app.divider_at(10, 5), DragMode::None);
+        assert_eq!(app.divider_at(40, 5), DragMode::None);
+    }
+
+    #[test]
+    fn mouse_down_on_border_starts_drag() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::layout::Rect;
+        let mut app = App::new().unwrap();
+        app.body_rect.set(Rect::new(0, 3, 100, 40));
+        app.left_rect.set(Rect::new(0, 3, 33, 37));
+        app.right_rect.set(Rect::new(33, 3, 67, 37));
+        app.answers_rect.set(Rect::new(33, 3, 67, 12));
+        app.questions_rect.set(Rect::new(33, 15, 67, 12));
+        app.hex_rect.set(Rect::new(33, 27, 67, 13));
+        // Right border cell of the Hosts pane starts a vertical drag.
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 32,
+            row: 10,
+            modifiers: KeyModifiers::empty(),
+        };
+        app.handle_mouse(&down);
+        assert_eq!(app.drag, DragMode::Vertical);
+    }
+
+    #[test]
+    fn metrics_overlay_suppresses_resize_hover() {
+        use crossterm::event::{
+            KeyCode, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
+            MouseEventKind,
+        };
+        use ratatui::layout::Rect;
+        let mut app = App::new().unwrap();
+        app.left_rect.set(Rect::new(0, 3, 33, 30));
+        app.right_rect.set(Rect::new(33, 3, 67, 30));
+        app.answers_rect.set(Rect::new(33, 3, 67, 10));
+        app.questions_rect.set(Rect::new(33, 13, 67, 8));
+        app.hex_rect.set(Rect::new(33, 21, 67, 12));
+        let moved = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 32,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        };
+        app.handle_mouse(&moved);
+        assert_eq!(app.hover.get(), DragMode::Vertical);
+        // Opening the overlay clears resize state...
+        let m = KeyEvent {
+            code: KeyCode::Char('m'),
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        app.handle_key(&m);
+        assert!(app.show_metrics);
+        assert_eq!(app.drag, DragMode::None);
+        assert_eq!(app.hover.get(), DragMode::None);
+        // ...and motion over a seam while open stays inert.
+        app.handle_mouse(&moved);
+        assert_eq!(app.hover.get(), DragMode::None);
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 32,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        };
+        app.handle_mouse(&down);
+        assert_eq!(app.drag, DragMode::None);
+        // Closing restores hover tracking.
+        app.handle_key(&m);
+        assert!(!app.show_metrics);
+        app.handle_mouse(&moved);
+        assert_eq!(app.hover.get(), DragMode::Vertical);
+    }
+
+    #[test]
+    fn mouse_click_selects_service_and_focuses() {
+        use ratatui::layout::Rect;
+        let mut app = two_group_app();
+        app.focus = Focus::Answers;
+        // Left pane shows: enum header, enum row, then host groups.
+        let items = app.display_items();
+        let first_instance = items
+            .iter()
+            .position(|it| matches!(it, DisplayItem::Instance { .. }))
+            .expect("instance row");
+        app.list_offset.set(0);
+        app.left_rect.set(Rect::new(0, 3, 33, 30));
+        app.right_rect.set(Rect::new(33, 3, 67, 30));
+        app.answers_rect.set(Rect::new(33, 3, 67, 10));
+        app.questions_rect.set(Rect::new(33, 13, 67, 10));
+        app.hex_rect.set(Rect::new(33, 23, 67, 10));
+        let row = 3 + 1 + first_instance as u16;
+        app.click_service_list(row);
+        assert_eq!(app.focus, Focus::Services);
+        assert_eq!(app.selected_display, first_instance);
+    }
+
+    #[test]
+    fn mouse_click_header_folds_host() {
+        use ratatui::layout::Rect;
+        let mut app = two_group_app();
+        let header = app
+            .display_items()
+            .iter()
+            .position(|it| matches!(it, DisplayItem::Host { .. }))
+            .expect("host header");
+        app.list_offset.set(0);
+        app.left_rect.set(Rect::new(0, 3, 33, 30));
+        app.right_rect.set(Rect::new(33, 3, 67, 30));
+        app.answers_rect.set(Rect::default());
+        app.questions_rect.set(Rect::default());
+        app.hex_rect.set(Rect::default());
+        let row = 3 + 1 + header as u16;
+        app.click_service_list(row);
+        assert!(!app.collapsed_hosts.is_empty());
+    }
+
+    #[test]
+    fn mouse_click_answers_selects_record() {
+        use ratatui::layout::Rect;
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1; b=2");
+        app.focus = Focus::Services;
+        app.right_rect.set(Rect::new(33, 3, 67, 30));
+        app.answers_rect.set(Rect::new(33, 3, 67, 20));
+        app.questions_rect.set(Rect::new(33, 24, 67, 8));
+        app.hex_rect.set(Rect::default());
+        app.detail_offset.set(0);
+        // Table rows: 1 info row, then PTR/SRV/TXT in type order.
+        let info = 1;
+        let raws = app
+            .display_detail()
+            .expect("detail")
+            .ordered_records()
+            .len();
+        assert!(raws >= 2);
+        let row = 3 + 2 + (info + 1) as u16;
+        app.click_answers(row);
+        assert_eq!(app.focus, Focus::Answers);
+        assert_eq!(app.detail_selected, 1);
+    }
+
+    #[test]
+    fn mouse_click_answers_child_selects_parent() {
+        use ratatui::layout::Rect;
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1; b=2");
+        assert!(app.toggle_txt_expanded());
+        app.right_rect.set(Rect::new(33, 3, 67, 30));
+        app.answers_rect.set(Rect::new(33, 3, 67, 20));
+        app.questions_rect.set(Rect::new(33, 24, 67, 8));
+        app.hex_rect.set(Rect::default());
+        app.detail_offset.set(0);
+        // Info(1) + PTR(1) + SRV(1) + TXT parent(1), then 2 child rows.
+        // Clicking the first child must land on the TXT parent (index 2).
+        let row = 3 + 2 + 4u16;
+        app.click_answers(row);
+        assert_eq!(app.detail_selected, 2);
     }
 }

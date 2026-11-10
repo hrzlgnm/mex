@@ -3,6 +3,7 @@ use std::io;
 use std::io::IsTerminal;
 use std::net::SocketAddr;
 
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -17,7 +18,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::app::{App, DisplayItem, Focus};
+use crate::app::{App, DisplayItem, DragMode, Focus};
 
 pub type Terminal = ratatui::Terminal<CrosstermBackend<io::Stdout>>;
 
@@ -27,7 +28,7 @@ pub fn try_init() -> io::Result<Option<Terminal>> {
     }
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     Terminal::new(backend).map(Some)
 }
@@ -37,6 +38,7 @@ pub fn try_restore(initialized: bool) -> io::Result<()> {
         return Ok(());
     }
     disable_raw_mode()?;
+    execute!(io::stdout(), DisableMouseCapture)?;
     execute!(io::stdout(), LeaveAlternateScreen)?;
     Ok(())
 }
@@ -88,11 +90,17 @@ fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
 }
 
 fn draw_body(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    app.body_rect.set(area);
+    // No gutter: the abutting pane borders are the drag handles, so no
+    // space is lost to divider widgets.
+    let left = app.left_pct.clamp(15, 80);
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Ratio(1, 3), Constraint::Ratio(2, 3)])
+        .constraints([Constraint::Percentage(left), Constraint::Min(0)])
         .split(area);
 
+    app.left_rect.set(chunks[0]);
+    app.right_rect.set(chunks[1]);
     draw_service_list(frame, chunks[0], app);
     draw_detail_panel(frame, chunks[1], app);
 }
@@ -308,11 +316,10 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
             Block::default()
                 .borders(Borders::ALL)
                 .title(title)
-                .border_style(Style::default().fg(if app.focus == Focus::Services {
-                    Color::White
-                } else {
-                    Color::Gray
-                })),
+                .border_style(border_color(
+                    app.focus == Focus::Services,
+                    resize_active(app, DragMode::Vertical),
+                )),
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_spacing(HighlightSpacing::Always);
@@ -332,20 +339,43 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
 fn draw_detail_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     // Right side: Answers table on top, its questions in the middle with
     // their own captions (age, not TTL), hex dump of the selected entry
-    // at the bottom. Answers and Questions share the same height; the hex
-    // view keeps only what is left over.
+    // at the bottom. The abutting pane borders are the drag handles.
+    let answers = app.answers_pct.clamp(10, 70);
+    let questions = app
+        .questions_pct
+        .clamp(10, 70)
+        .min(90u16.saturating_sub(answers));
     let panes = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 3),
+            Constraint::Percentage(answers),
+            Constraint::Percentage(questions),
+            Constraint::Min(0),
         ])
         .split(area);
 
+    app.answers_rect.set(panes[0]);
+    app.questions_rect.set(panes[1]);
+    app.hex_rect.set(panes[2]);
     draw_records_tab(frame, panes[0], app);
     draw_questions_tab(frame, panes[1], app);
     draw_hex_tab(frame, panes[2], app);
+}
+
+/// Border color: resize hover/drag wins (subtle cyan seam) over focus white.
+fn border_color(focused: bool, resizing: bool) -> Style {
+    Style::default().fg(if resizing {
+        Color::Cyan
+    } else if focused {
+        Color::White
+    } else {
+        Color::Gray
+    })
+}
+
+fn resize_active(app: &App, mode: DragMode) -> bool {
+    // Never glow behind the metrics overlay: it owns all input while open.
+    !app.show_metrics && (app.drag == mode || app.hover.get() == mode)
 }
 
 fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
@@ -397,11 +427,11 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(format!(" {block_title} "))
-                .border_style(Style::default().fg(if app.focus == Focus::Answers {
-                    Color::White
-                } else {
-                    Color::Gray
-                })),
+                .border_style(border_color(
+                    app.focus == Focus::Answers,
+                    resize_active(app, DragMode::Vertical)
+                        || resize_active(app, DragMode::HorizUpper),
+                )),
         )
         .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
@@ -729,11 +759,12 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
             Block::default()
                 .borders(Borders::ALL)
                 .title(format!(" Questions: {} ", target.pane_ident()))
-                .border_style(Style::default().fg(if app.focus == Focus::Questions {
-                    Color::White
-                } else {
-                    Color::Gray
-                })),
+                .border_style(border_color(
+                    app.focus == Focus::Questions,
+                    resize_active(app, DragMode::Vertical)
+                        || resize_active(app, DragMode::HorizUpper)
+                        || resize_active(app, DragMode::HorizLower),
+                )),
         )
         .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
@@ -767,42 +798,45 @@ fn question_source_label(source: &SocketAddr) -> String {
 fn draw_hex_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     // The hex pane follows the record cursor: wire bytes of the selected
     // record, the query packet of the selected question row, otherwise the
-    // whole latest packet for the service.
-    if let Some((bytes, title)) = app.selected_detail_bytes() {
-        let hex = hex_dump(&bytes, 16);
-        let para = Paragraph::new(hex)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title)
-                    .border_style(Style::default().fg(Color::Gray)),
-            )
-            .style(Style::default().fg(Color::Green));
-        frame.render_widget(para, area);
-        return;
-    }
-
-    let Some(ev) = app.latest_event_for_selected() else {
+    // whole latest packet for the service. Tab focuses it; j/k and paging
+    // keys then scroll, and the offset resets when the cursor moves.
+    app.hex_viewport.set(area.height.saturating_sub(2) as usize);
+    let (lines, title) = if let Some((bytes, title)) = app.selected_detail_bytes() {
+        (hex_dump(&bytes, 16), title)
+    } else if let Some(ev) = app.latest_event_for_selected() {
+        (hex_dump(&ev.raw_bytes, 16), " Raw Packet ".to_string())
+    } else {
         let empty =
             Paragraph::new("No raw packet data available").style(Style::default().fg(Color::Gray));
         frame.render_widget(empty, area);
         return;
     };
 
-    let hex = hex_dump(&ev.raw_bytes, 16);
-    let para = Paragraph::new(hex)
+    let total = lines.len();
+    let offset = clamp_scroll(app.hex_offset.get(), total, app.hex_viewport.get());
+    app.hex_offset.set(offset);
+    let title = if offset > 0 {
+        format!("{} ↕", title.trim_end())
+    } else {
+        title
+    };
+    let para = Paragraph::new(lines)
+        .scroll((offset as u16, 0))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Raw Packet ")
-                .border_style(Style::default().fg(Color::Gray)),
+                .title(title)
+                .border_style(border_color(
+                    app.focus == Focus::Hex,
+                    resize_active(app, DragMode::Vertical)
+                        || resize_active(app, DragMode::HorizLower),
+                )),
         )
         .style(Style::default().fg(Color::Green));
-
     frame.render_widget(para, area);
 }
 
-fn hex_dump(data: &[u8], width: usize) -> Vec<Line<'_>> {
+fn hex_dump(data: &[u8], width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     lines.push(Line::from(Span::styled(
