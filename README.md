@@ -79,24 +79,32 @@ decaying by TTL instead of actively maintained state.
   service, newest first (capped), with per-query age instead of TTL.
   Questions from this host are highlighted like local records.
 - **Right bottom — Hex.** Wire bytes of the selected record or question
-  packet, falling back to the service's latest packet.
+  packet, falling back to the service's latest packet. `Tab` focuses it
+  for scrolling.
+- **Mouse.** Drag the shared pane borders to resize Hosts vs detail and
+  Answers / Questions / Hex (the seam lights up). Click a row to
+  focus its pane and move the cursor there; clicking a host header
+  folds it. While mouse input is captured, use Shift+drag to select
+  text in most terminals.
 
 ## Keys
 
 | Key | Action |
 | --- | ------ |
-| `Tab` / `Shift+Tab` | switch pane (Hosts → Answers → Questions) |
-| `Up` / `Down`, `j` / `k` | move within the focused pane |
+| `Tab` / `Shift+Tab` | switch pane (Hosts → Answers → Questions → Hex) |
+| `Up` / `Down`, `j` / `k` | move within the focused pane (scroll Hex when focused) |
 | `h` / `l`, `←` / `→` | jump between host groups |
 | `H` / `L` | first / last host group |
-| `Home` / `End` | first / last row of the focused pane |
-| `PageUp` / `PageDown`, `b` / `f`, `Space` | page |
+| `Home` / `End` | first / last row of the focused pane (top / bottom of Hex) |
+| `PageUp` / `PageDown`, `b` / `f`, `Space` | page (viewport scroll in Hex) |
 | `Enter` | fold / unfold host (Hosts) or TXT record (Answers) |
 | `+` / `-` | fold / unfold host (Hosts) |
 | `*` | collapse all host groups / unfold all |
-| `Ctrl+↑/↓`, `Ctrl+j/k`, `Shift+↑/↓`, `J` / `K` | scroll Answers viewport freely |
+| `Ctrl+↑/↓`, `Ctrl+j/k`, `Shift+↑/↓`, `J` / `K` | scroll Answers viewport freely (Hex viewport when Hex focused) |
 | `m` | metrics overlay (traffic, discovery, queries, links) |
 | `q` / `Esc` / `Ctrl+C` | quit (`m` / `Esc` closes the overlay first) |
+| mouse drag on pane borders | resize panes |
+| mouse click | focus pane + move cursor (host header folds) |
 
 The header always shows the live hints. In the metrics overlay, `j`/`k`
 and paging keys scroll instead, and `Tab`/`Enter` do nothing.
