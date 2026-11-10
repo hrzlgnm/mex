@@ -949,8 +949,10 @@ impl App {
         hostname.trim_end_matches('.').to_lowercase()
     }
 
-    /// Display name for a host group key: first-seen hostname trimmed of its
-    /// trailing dot, or `(unknown host)` when no hostname is known yet.
+    /// Display name for a host group key: first-seen hostname without its
+    /// trailing dot or redundant `.local` suffix, or `(unknown host)` when
+    /// no hostname is known yet. Grouping keys keep the full name; this
+    /// is display-only.
     pub fn host_display_name(&self, key: &str) -> String {
         if key.is_empty() {
             return "(unknown host)".to_string();
@@ -959,11 +961,25 @@ impl App {
             if Self::host_key(&s.hostname) == key {
                 let trimmed = s.hostname.trim_end_matches('.');
                 if !trimmed.is_empty() {
-                    return trimmed.to_string();
+                    return Self::short_hostname(trimmed);
                 }
             }
         }
-        key.to_string()
+        Self::short_hostname(key)
+    }
+
+    /// Short display form of a hostname: the redundant `.local` suffix
+    /// removed (`printer.local.` → `printer`). Case-insensitive; names
+    /// that merely contain `local` elsewhere are untouched.
+    fn short_hostname(name: &str) -> String {
+        let trimmed = name.trim_end_matches('.');
+        if trimmed.len() > ".local".len() {
+            let off = trimmed.len() - ".local".len();
+            if trimmed.is_char_boundary(off) && trimmed[off..].eq_ignore_ascii_case(".local") {
+                return trimmed[..off].to_string();
+            }
+        }
+        trimmed.to_string()
     }
 
     /// Live addresses (A/AAAA rdata) aggregated across all services on the
@@ -3625,10 +3641,22 @@ mod tests {
             })
             .collect();
         assert_eq!(labels, vec!["test.local".to_string(), String::new()]);
-        assert_eq!(app.host_display_name("test.local"), "test.local");
+        assert_eq!(app.host_display_name("test.local"), "test");
         assert_eq!(app.host_display_name(""), "(unknown host)");
         assert_eq!(app.host_service_count("test.local"), 1);
         assert_eq!(app.host_service_count(""), 1);
+    }
+
+    #[test]
+    fn host_display_name_strips_redundant_local_suffix() {
+        let app = App::new().unwrap();
+        assert_eq!(app.host_display_name("printer.local"), "printer");
+        assert_eq!(app.host_display_name("printer.local."), "printer");
+        assert_eq!(app.host_display_name("printer.LOCAL"), "printer");
+        // Bare `local` or `local` mid-name is not a suffix: untouched.
+        assert_eq!(app.host_display_name("local"), "local");
+        assert_eq!(app.host_display_name("mylocal"), "mylocal");
+        assert_eq!(app.host_display_name("local.domain"), "local.domain");
     }
 
     #[test]
