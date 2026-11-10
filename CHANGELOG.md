@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/hrzlgnm/mex/compare/v0.4.0...v0.4.1) (2026-11-10)
+
+
+### Tests
+
+* lock enumeration KA/question separation at ingest ([#37](https://github.com/hrzlgnm/mex/issues/37)) ([aef0ec9](https://github.com/hrzlgnm/mex/commit/aef0ec976f0f3047ce87786e288ddd285d8d4566))
+
 ## [0.4.0](https://github.com/hrzlgnm/mex/compare/v0.3.1...v0.4.0) (2026-11-10)
 
 
