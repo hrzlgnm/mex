@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.2](https://github.com/hrzlgnm/mex/compare/v0.4.1...v0.4.2) (2026-11-10)
+
+
+### Documentation
+
+* unify tagline, refresh icons and polish README ([#39](https://github.com/hrzlgnm/mex/issues/39)) ([99e5873](https://github.com/hrzlgnm/mex/commit/99e5873041671bce44298af10683ee54f5f5ecb2))
+
 ## [0.4.1](https://github.com/hrzlgnm/mex/compare/v0.4.0...v0.4.1) (2026-11-10)
 
 
