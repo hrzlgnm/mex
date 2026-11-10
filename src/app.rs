@@ -741,14 +741,18 @@ impl App {
     }
 
     /// Strip a dot-separated suffix case-insensitively, returning the
-    /// wire-case prefix without the separating dot. Lengths are compared
-    /// in bytes: ASCII case folding never changes length, and service
-    /// types are ASCII, so byte slicing is safe.
+    /// wire-case prefix without the separating dot. The split offset must
+    /// be a character boundary: instance names may hold multi-byte UTF-8
+    /// (RFC 6763 §4.1.1), so byte-slicing inside a character would panic.
     fn strip_suffix_ci<'a>(full: &'a str, suffix: &str) -> Option<&'a str> {
         if full.len() <= suffix.len() {
             return None;
         }
-        let (prefix, tail) = full.split_at(full.len() - suffix.len());
+        let off = full.len() - suffix.len();
+        if !full.is_char_boundary(off) {
+            return None;
+        }
+        let (prefix, tail) = full.split_at(off);
         if !tail.eq_ignore_ascii_case(suffix) {
             return None;
         }
@@ -2330,7 +2334,14 @@ impl App {
             if full_name.len() <= known.len() {
                 return;
             }
-            let (prefix, tail) = full_name.split_at(full_name.len() - known.len());
+            // Instance names may hold multi-byte UTF-8 (RFC 6763 §4.1.1):
+            // skip offsets landing inside a character instead of panicking
+            // in `split_at` (e.g. `é._ssh._tcp.local` vs `_https._tcp.local`).
+            let off = full_name.len() - known.len();
+            if !full_name.is_char_boundary(off) {
+                return;
+            }
+            let (prefix, tail) = full_name.split_at(off);
             if !tail.eq_ignore_ascii_case(known) {
                 return;
             }
@@ -2657,12 +2668,14 @@ impl App {
             .retain(|p| now.duration_since(p.last_seen) < grace);
         // Drop schedules for names that no longer exist, so dead services
         // stop costing even an hourly query (RFC 6762 §5.2: no maintenance
-        // without active interest).
+        // without active interest). Names are normalized to lowercase so
+        // `_HTTP` and `_http` share one set entry (RFC 6763 §7) and the
+        // retains below stay O(1) `contains` lookups.
         let mut live: HashSet<(String, u16)> = HashSet::new();
         live.insert((ENUM_SERVICE.to_string(), 12));
         for svc in &self.services {
-            live.insert((svc.service_type.clone(), 12));
-            let full = format!("{}.{}", svc.instance, svc.service_type);
+            live.insert((svc.service_type.to_lowercase(), 12));
+            let full = format!("{}.{}", svc.instance, svc.service_type).to_lowercase();
             live.insert((full.clone(), 33));
             live.insert((full, 16));
             if !svc.hostname.is_empty() {
@@ -2671,26 +2684,21 @@ impl App {
                 live.insert((host, 28));
             }
             for rec in &svc.records {
-                live.insert((rec.name.trim_end_matches('.').to_string(), rec.rtype));
+                live.insert((rec.name.trim_end_matches('.').to_lowercase(), rec.rtype));
             }
         }
         for p in &self.pending_instances {
-            live.insert((p.service_type.clone(), 12));
-            let full = format!("{}.{}", p.instance, p.service_type);
+            live.insert((p.service_type.to_lowercase(), 12));
+            let full = format!("{}.{}", p.instance, p.service_type).to_lowercase();
             live.insert((full.clone(), 33));
             live.insert((full, 16));
         }
         for t in self.enum_known.keys() {
             live.insert((t.clone(), 12));
         }
-        // Names compare case-insensitively (RFC 6763 §7, RFC 1035 §2.3.1):
-        // `_HTTP` and `_http` are one interest, not two.
-        let live_contains = |k: &(String, u16)| {
-            live.iter()
-                .any(|(n, t)| t == &k.1 && n.eq_ignore_ascii_case(&k.0))
-        };
-        self.requeries.retain(|k, _| live_contains(k));
-        self.continuous.retain(|k, _| live_contains(k));
+        self.requeries
+            .retain(|k, _| live.contains(&(k.0.to_lowercase(), k.1)));
+        self.continuous.retain(|k, _| live.contains(k));
         // Overheard QM queries are single-use and short-lived (§7.3).
         self.overheard
             .retain(|_, (seen, _, _)| seen.elapsed() < OVERHEARD_WINDOW);
@@ -2713,8 +2721,7 @@ impl App {
             .filter(|(_, t)| *t == 12)
             .map(|(n, _)| n.clone())
             .collect();
-        self.known_types
-            .retain(|t| live_types.iter().any(|n| n.eq_ignore_ascii_case(t)));
+        self.known_types.retain(|t| live_types.contains(t));
         self.clamp_selection();
     }
 
@@ -3231,6 +3238,25 @@ mod tests {
                 .filter(|(n, _)| n.eq_ignore_ascii_case("_http._tcp.local"))
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn non_ascii_instance_names_do_not_panic_split() {
+        // `é` is two bytes in UTF-8: byte-slicing at `len - known.len()`
+        // can land inside the character. Splitting must skip such
+        // candidates instead of panicking in `split_at`.
+        let mut app = App::new().unwrap();
+        app.known_types.insert("_https._tcp.local".to_string());
+        assert!(app.split_instance_type("é._ssh._tcp.local").is_none());
+        assert_eq!(
+            App::strip_suffix_ci("é._ssh._tcp.local", "_https._tcp.local"),
+            None
+        );
+        // Sanity: ASCII suffix matching still works.
+        assert_eq!(
+            App::strip_suffix_ci("Test._http._tcp.local", "_HTTP._TCP.LOCAL"),
+            Some("Test")
         );
     }
 
