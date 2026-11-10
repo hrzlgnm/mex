@@ -56,3 +56,13 @@ Headless run (no TTY) logs to stderr.
 * Prefer editing existing files; no new deps without need
   (`hickory-proto` uses the `mdns` feature for the QU bit).
 * Random jitter uses the std-only `rand_u32` helper in `app.rs`.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in this repo's GitHub Issues (via `gh`). See `docs/agents/issue-tracker.md`.
+
+### Domain docs
+
+Single-context: `GLOSSARY.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
