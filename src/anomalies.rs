@@ -393,6 +393,18 @@ fn is_reverse_ptr(name: &str) -> bool {
     lower.ends_with(".in-addr.arpa") || lower.ends_with(".ip6.arpa")
 }
 
+/// Shared verdict for unicast-only types observed on multicast: definite
+/// violations (SOA/NS/ANY) are errors, the MX soft case is a warning, and
+/// everything else is `None` (quiet). Used by answer checks now and
+/// observed-question checks next, so both surfaces classify identically.
+pub(crate) fn unicast_severity(rtype: u16) -> Option<Severity> {
+    match rtype {
+        2 | 6 | 255 => Some(Severity::Error),
+        15 => Some(Severity::Warning),
+        _ => None,
+    }
+}
+
 fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     let name = rec.name.clone();
     let rdata = rec.rdata.clone();
@@ -402,36 +414,30 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     // nothing in the RFCs legitimizes mail routing over mDNS, but unlike
     // SOA/NS/ANY it is not an explicitly unicast-only type, so it stays
     // a warning about a possible leak rather than a definite violation.
-    if matches!(rec.rtype, 2 | 6 | 255) {
-        out.push(Anomaly {
-            kind: "unicast-leak",
-            severity: Severity::Error,
-            service: service_id.to_string(),
-            record_name: Some(name.clone()),
-            rtype: Some(rec.rtype),
-            rtype_str: Some(rec.rtype_str.clone()),
-            rdata: Some(rdata.clone()),
-            source: Some(src.clone()),
-            message: format!(
+    // Single shared verdict (also used for observed questions): definite
+    // violations are errors, suspected leaks are warnings.
+    if let Some(severity) = unicast_severity(rec.rtype) {
+        let message = if severity == Severity::Error {
+            format!(
                 "{} record leaked onto multicast (unicast-only type)",
                 rec.rtype_str
-            ),
-            rfc: "RFC 6762 §3",
-        });
-    } else if rec.rtype == 15 {
+            )
+        } else {
+            format!(
+                "{} record on multicast (possible unicast leak)",
+                rec.rtype_str
+            )
+        };
         out.push(Anomaly {
             kind: "unicast-leak",
-            severity: Severity::Warning,
+            severity,
             service: service_id.to_string(),
             record_name: Some(name.clone()),
             rtype: Some(rec.rtype),
             rtype_str: Some(rec.rtype_str.clone()),
             rdata: Some(rdata.clone()),
             source: Some(src.clone()),
-            message: format!(
-                "{} record on multicast (possible unicast leak)",
-                rec.rtype_str
-            ),
+            message,
             rfc: "RFC 6762 §3",
         });
     }
@@ -844,6 +850,62 @@ mod tests {
         )];
         let found = analyze_service("My", "_http._tcp.local", "myhost.local.", &answers);
         assert!(!found.iter().any(|a| a.kind == "missing-addr"));
+    }
+
+    #[test]
+    fn unicast_severity_maps_known_types() {
+        // Single shared verdict for answers and (later) questions: definite
+        // unicast-only violations are errors, the MX soft case is a warning,
+        // everything else is quiet.
+        use super::unicast_severity;
+        use super::Severity;
+        assert_eq!(unicast_severity(2), Some(Severity::Error));
+        assert_eq!(unicast_severity(6), Some(Severity::Error));
+        assert_eq!(unicast_severity(255), Some(Severity::Error));
+        assert_eq!(unicast_severity(15), Some(Severity::Warning));
+        assert_eq!(unicast_severity(1), None);
+        assert_eq!(unicast_severity(12), None);
+        assert_eq!(unicast_severity(5), None);
+    }
+
+    #[test]
+    fn unicast_leak_flags_any_as_error() {
+        let answers = vec![rec("host.local.", 255, "ANY", "", 120, false)];
+        let found = analyze_service("My", "_http._tcp.local", "host.local.", &answers);
+        let item = found
+            .iter()
+            .find(|a| a.kind == "unicast-leak")
+            .expect("expected ANY leak");
+        assert_eq!(item.severity, Severity::Error);
+    }
+
+    #[test]
+    fn enumeration_soa_leak_names_service_and_source() {
+        let enum_rec = rec(
+            "_services._dns-sd._udp.local.",
+            6,
+            "SOA",
+            "host.local. admin 1794425867 21600 1800 43200 10",
+            120,
+            false,
+        );
+        let snap = Snapshot {
+            services: Vec::new(),
+            enum_answers: vec![&enum_rec],
+            pending_hosts: HashSet::new(),
+        };
+        let item = analyze(&snap)
+            .iter()
+            .find(|a| a.kind == "unicast-leak")
+            .expect("expected enumeration SOA leak")
+            .clone();
+        assert_eq!(item.service, "enumeration");
+        assert_eq!(item.severity, Severity::Error);
+        assert!(
+            item.message.contains("192.168.1.2"),
+            "message should name the announcer, got: {}",
+            item.message
+        );
     }
 
     #[test]
