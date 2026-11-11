@@ -1813,23 +1813,19 @@ impl App {
         anomalies::analyze(&snap)
     }
 
-    /// Per-service anomaly counts keyed by (service_type, instance),
-    /// matching the sticky detail key. Used for host-list markers and the
-    /// Answers table without recomputing per row.
-    pub fn anomaly_counts(&self) -> HashMap<(String, String), usize> {
-        let mut counts: HashMap<(String, String), usize> = HashMap::new();
+    /// Per-service anomaly counts keyed by `instance.service_type`
+    /// service id. Used for host-list markers and the Answers table
+    /// without recomputing per row. Informational notes never count.
+    pub fn anomaly_counts(&self) -> HashMap<String, usize> {
+        let mut counts: HashMap<String, usize> = HashMap::new();
         for a in self.anomalies() {
-            // Service id is `instance.service_type`; enumeration is global.
+            if matches!(a.severity, anomalies::Severity::Info) {
+                continue;
+            }
             if a.service == "enumeration" {
                 continue;
             }
-            if let Some(dot) = a.service.find('.') {
-                let (inst, typ) = a.service.split_at(dot);
-                let typ = typ.trim_start_matches('.');
-                *counts
-                    .entry((typ.to_string(), inst.to_string()))
-                    .or_insert(0) += 1;
-            }
+            *counts.entry(a.service.clone()).or_insert(0) += 1;
         }
         counts
     }

@@ -355,7 +355,7 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
                     };
                     let style = Style::default();
                     let warn = anomaly_counts
-                        .get(&(svc.service_type.clone(), svc.instance.clone()))
+                        .get(&format!("{}.{}", svc.instance, svc.service_type))
                         .copied()
                         .unwrap_or(0);
                     let suffix = if warn > 0 {
