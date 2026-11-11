@@ -1605,6 +1605,7 @@ impl App {
             ),
         );
         kv(&mut rows, "refused off-link", self.offlink_row());
+        kv(&mut rows, "malformed packets", self.malformed_row());
         let mut iface_rows: Vec<(&String, &u64)> = self.metrics.iface_rx.iter().collect();
         iface_rows.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
         for (iface, count) in iface_rows.iter().take(8) {
@@ -1770,6 +1771,19 @@ impl App {
     fn offlink_row(&self) -> String {
         let total = self.drop_stats.total();
         match self.drop_stats.last() {
+            Some((src, at)) => format!(
+                "{total} total · last {src} {} ago",
+                fmt_age(at.elapsed().as_secs())
+            ),
+            None => format!("{total} total"),
+        }
+    }
+
+    /// Message-level decode failures: counted in the listener threads so
+    /// a garbage storm reads differently from a quiet network.
+    fn malformed_row(&self) -> String {
+        let total = self.drop_stats.malformed_total();
+        match self.drop_stats.malformed_last() {
             Some((src, at)) => format!(
                 "{total} total · last {src} {} ago",
                 fmt_age(at.elapsed().as_secs())
@@ -2007,6 +2021,10 @@ impl App {
                 .iter()
                 .filter(|a| matches!(a.severity, anomalies::Severity::Warning))
                 .count() as u64,
+        );
+        metrics.insert(
+            "malformed_packets".to_string(),
+            self.drop_stats.malformed_total(),
         );
         dump::StateDump {
             metadata: dump::Metadata {

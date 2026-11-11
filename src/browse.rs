@@ -133,12 +133,15 @@ impl QueryTx {
     }
 }
 
-/// Refused-packet accounting shared with the App thread (RFC 6762 §11
-/// off-link discards). Listener threads only bump it; rendering reads it.
+/// Refused-packet accounting shared with the App thread: RFC 6762 §11
+/// off-link discards plus messages hickory-proto cannot decode at all.
+/// Listener threads only bump these; rendering reads them.
 #[derive(Debug, Default)]
 pub struct DropStats {
     count: AtomicU64,
     last: Mutex<Option<(SocketAddr, Instant)>>,
+    malformed: AtomicU64,
+    malformed_last: Mutex<Option<(SocketAddr, Instant)>>,
 }
 
 impl DropStats {
@@ -155,6 +158,24 @@ impl DropStats {
 
     pub fn last(&self) -> Option<(SocketAddr, Instant)> {
         self.last.lock().ok().and_then(|last| *last)
+    }
+
+    /// A datagram that failed message-level decode: no event, no records,
+    /// nothing for the browser to file. Counted so a garbage storm is
+    /// distinguishable from a quiet network.
+    pub fn note_malformed(&self, source: SocketAddr) {
+        self.malformed.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut last) = self.malformed_last.lock() {
+            *last = Some((source, Instant::now()));
+        }
+    }
+
+    pub fn malformed_total(&self) -> u64 {
+        self.malformed.load(Ordering::Relaxed)
+    }
+
+    pub fn malformed_last(&self) -> Option<(SocketAddr, Instant)> {
+        self.malformed_last.lock().ok().and_then(|last| *last)
     }
 }
 
@@ -504,10 +525,13 @@ fn listen(
                     continue;
                 }
                 let iface = ifnames.get(&ifindex).map(String::as_str).unwrap_or("");
-                if let Some(ev) = parse_packet(&raw, info.addr_src, iface, ifindex) {
-                    if tx.send(ev).is_err() {
-                        break;
+                match parse_packet(&raw, info.addr_src, iface, ifindex) {
+                    Some(ev) => {
+                        if tx.send(ev).is_err() {
+                            break;
+                        }
                     }
+                    None => drops.note_malformed(info.addr_src),
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1281,6 +1305,20 @@ mod tests {
             socket2::Socket::from(std6).multicast_hops_v6().unwrap(),
             255
         );
+    }
+
+    #[test]
+    fn malformed_packets_are_counted_with_source() {
+        let drops = DropStats::default();
+        assert_eq!(drops.malformed_total(), 0);
+        assert!(drops.malformed_last().is_none());
+        drops.note_malformed(test_source());
+        drops.note_malformed(test_source());
+        assert_eq!(drops.malformed_total(), 2);
+        assert_eq!(drops.malformed_last().unwrap().0, test_source());
+        // Off-link accounting is untouched by malformed traffic.
+        assert_eq!(drops.total(), 0);
+        assert!(drops.last().is_none());
     }
 
     #[test]
