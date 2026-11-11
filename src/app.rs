@@ -1747,8 +1747,10 @@ impl App {
         }
     }
 
-    /// Live TXT pairs for a service, deduped and sorted by key like the
-    /// sibling (expired and goodbye rows omitted).
+    /// Live TXT pairs, deduped and sorted by key (expired and goodbye
+    /// rows omitted). High-entropy values are redacted (keys kept) so
+    /// dumps are safe to share; dedup runs after redaction so identical
+    /// keys collapse to one `key=*REDACTED*` row.
     fn txt_records_for_dump(svc: &ServiceEntry) -> Vec<String> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
@@ -1763,8 +1765,9 @@ impl App {
                 if pair.is_empty() {
                     continue;
                 }
-                if seen.insert(pair.to_string()) {
-                    out.push(pair.to_string());
+                let redacted = dump::redact_txt_value(pair);
+                if seen.insert(redacted.clone()) {
+                    out.push(redacted);
                 }
             }
         }
@@ -1783,7 +1786,12 @@ impl App {
             rtype_str: rec.rtype_str.clone(),
             ttl: rec.ttl,
             ttl_remaining: Self::remaining_ttl(rec),
-            rdata: rec.rdata.clone(),
+            // High-entropy TXT values are redacted for safe sharing.
+            rdata: if rec.rtype == 16 {
+                dump::redact_txt_rdata(&rec.rdata)
+            } else {
+                rec.rdata.clone()
+            },
             source: rec.source.to_string(),
             iface: rec.iface.clone(),
             ifindex: rec.ifindex,
@@ -4601,6 +4609,28 @@ mod tests {
         }
         assert_eq!(v["metadata"]["application_name"], "mex");
         assert_eq!(v["services"][0]["service_type"], "_http._tcp.local");
+    }
+
+    #[test]
+    fn dump_redacts_high_entropy_txt_values() {
+        let mut app = App::new().unwrap();
+        service_with_txt(
+            &mut app,
+            "id=328FEBD442638273B38340E9AFE1E9CB; fn=Schreibtisch",
+        );
+        app.send_queries();
+        let dump = app.state_dump();
+        let svc = &dump.services[0];
+        assert_eq!(
+            svc.txt_records,
+            vec!["fn=Schreibtisch".to_string(), "id=*REDACTED*".to_string()]
+        );
+        let txt = svc
+            .answers
+            .iter()
+            .find(|r| r.rtype_str == "TXT")
+            .expect("TXT answer present");
+        assert_eq!(txt.rdata, "id=*REDACTED*; fn=Schreibtisch");
     }
 
     #[test]
