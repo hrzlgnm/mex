@@ -50,7 +50,7 @@ strip = true
 [dependencies]
 ratatui = "0.30"
 crossterm = "0.29"
-hickory-proto = { version = "0.26", features = ["mdns"] }
+hickory-proto = { version = "0.26", features = ["mdns"] } # DNS wire codec only (mex owns sockets/scheduling/suppression): the experimental `mdns` flag is just the RFC 6762 §5.4 QU bit + §10.2 flush bit, both pinned by browse tests; fallback if hickory rots: `domain` crate (#76)
 socket2 = { version = "0.6", features = ["all"] }
 socket-pktinfo = "0.4"
 log = "0.4"
