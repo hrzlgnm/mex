@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/hrzlgnm/mex/compare/v0.6.2...v0.7.0) (2026-11-11)
+
+
+### Features
+
+* experimental mex state dump (Ctrl+J) ([#70](https://github.com/hrzlgnm/mex/issues/70)) ([d46fd6a](https://github.com/hrzlgnm/mex/commit/d46fd6a5c3b9b5491bb3c56354f7011841777264))
+
 ## [0.6.2](https://github.com/hrzlgnm/mex/compare/v0.6.1...v0.6.2) (2026-11-11)
 
 
