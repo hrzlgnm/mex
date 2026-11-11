@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/hrzlgnm/mex/compare/v0.7.0...v0.8.0) (2026-11-11)
+
+
+### Features
+
+* add RFC anomaly detection ([#73](https://github.com/hrzlgnm/mex/issues/73)) ([b09a8e7](https://github.com/hrzlgnm/mex/commit/b09a8e7917acd88d758aa1820f69cc939f0b1046))
+
 ## [0.7.0](https://github.com/hrzlgnm/mex/compare/v0.6.2...v0.7.0) (2026-11-11)
 
 
