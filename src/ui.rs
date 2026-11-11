@@ -43,6 +43,28 @@ pub fn try_restore(initialized: bool) -> io::Result<()> {
     Ok(())
 }
 
+/// Leave the terminal, suspend the process, and re-enter on resume:
+/// Ctrl+Z arrives as a key event (raw mode disables ISIG), so the event
+/// loop calls this instead of relying on SIGTSTP. Returns false when the
+/// terminal is gone and the app should exit instead. Unix only.
+#[cfg(unix)]
+pub fn suspend(term: &mut Terminal) -> io::Result<bool> {
+    try_restore(true)?;
+    let stopped =
+        nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGSTOP);
+    // Execution resumes here after `fg` (or immediately if SIGSTOP failed).
+    if let Err(e) = stopped {
+        eprintln!("mex: failed to suspend: {e}");
+    }
+    let Some(restored) = try_init()? else {
+        return Ok(false);
+    };
+    *term = restored;
+    // Ratatui diffs frames: clear so the resumed screen repaints fully.
+    term.clear()?;
+    Ok(true)
+}
+
 pub fn draw(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
