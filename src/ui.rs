@@ -663,17 +663,17 @@ fn detail_table_rows<'a>(
             if pairs.len() > 1 {
                 for (n, pair) in pairs.iter().enumerate() {
                     let branch = if n + 1 == pairs.len() {
-                        "└─"
+                        "  └─"
                     } else {
-                        "├─"
+                        "  ├─"
                     };
                     rows.push(
                         Row::new(vec![
-                            Cell::from(format!("  {branch}")),
+                            Cell::from(branch),
                             Cell::from(""),
                             Cell::from(""),
                             Cell::from(""),
-                            Cell::from(pair.to_string()),
+                            Cell::from(*pair),
                         ])
                         .style(info_style),
                     );
