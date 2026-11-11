@@ -114,6 +114,29 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
             continue;
         }
         check_record("enumeration", rec, &mut out);
+        // Enumeration PTR targets name service types: a malformed target
+        // means the type itself violates DNS-SD naming, so flag the PTR row
+        // itself (with full record identity, so the Answers table marks it).
+        if rec.rtype == 12 {
+            let target = rec.rdata.trim_end_matches('.');
+            if target.to_ascii_lowercase().contains("._sub.") {
+                continue;
+            }
+            if let Some(reason) = service_type_problem(target) {
+                out.push(Anomaly {
+                    kind: "type-format",
+                    severity: Severity::Warning,
+                    service: "enumeration".to_string(),
+                    record_name: Some(rec.name.clone()),
+                    rtype: Some(rec.rtype),
+                    rtype_str: Some(rec.rtype_str.clone()),
+                    rdata: Some(rec.rdata.clone()),
+                    source: Some(rec.source.to_string()),
+                    message: format!("enumerated type {target} invalid: {reason}"),
+                    rfc: "RFC 6763 §7",
+                });
+            }
+        }
     }
 
     out.sort_by(|a, b| {
@@ -193,7 +216,7 @@ fn check_type_format(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>
     if st.eq_ignore_ascii_case("_services._dns-sd._udp.local") {
         return;
     }
-    if !is_valid_service_type(st) {
+    if let Some(reason) = service_type_problem(st) {
         out.push(Anomaly {
             kind: "type-format",
             severity: Severity::Warning,
@@ -203,32 +226,41 @@ fn check_type_format(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>
             rtype_str: None,
             rdata: None,
             source: None,
-            message: format!("service type {st} is not _service._tcp.local or _service._udp.local"),
+            message: format!("service type {st} invalid: {reason}"),
             rfc: "RFC 6763 §7",
         });
     }
 }
 
-fn is_valid_service_type(st: &str) -> bool {
+/// Why a service type string is invalid, if it is. `None` means valid.
+/// Split out so both confirmed services and enumeration PTR targets share
+/// one verdict and one message.
+fn service_type_problem(st: &str) -> Option<String> {
     let parts: Vec<&str> = st.split('.').collect();
     if parts.len() != 3 {
-        return false;
+        return Some("expected _service._tcp.local or _service._udp.local".to_string());
     }
     let (svc, proto, local) = (parts[0], parts[1], parts[2]);
     if svc.len() < 2 || !svc.starts_with('_') {
-        return false;
+        return Some("service label must start with '_'".to_string());
     }
     let label = &svc[1..];
-    if label.len() > 15 || label.is_empty() {
-        return false;
+    if label.is_empty() {
+        return Some("service label is empty".to_string());
+    }
+    if label.len() > 15 {
+        return Some(format!(
+            "service label '{label}' is {} characters, limit is 15",
+            label.len()
+        ));
     }
     if !proto.eq_ignore_ascii_case("_tcp") && !proto.eq_ignore_ascii_case("_udp") {
-        return false;
+        return Some("protocol must be _tcp or _udp".to_string());
     }
     if !local.eq_ignore_ascii_case("local") {
-        return false;
+        return Some("must end in .local".to_string());
     }
-    true
+    None
 }
 
 fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
@@ -720,6 +752,67 @@ mod tests {
                 "type {t} should be quiet"
             );
         }
+    }
+
+    #[test]
+    fn type_format_message_names_overlong_label() {
+        let found = analyze_service("SHIELD", "_nv_shield_remote._tcp.local", "", &[]);
+        let item = found
+            .iter()
+            .find(|a| a.kind == "type-format")
+            .expect("expected type-format");
+        assert!(
+            item.message.contains("16") && item.message.contains("15"),
+            "message should name the length problem, got: {}",
+            item.message
+        );
+    }
+
+    #[test]
+    fn enumeration_ptr_with_bad_type_flags_row() {
+        let enum_rec = rec(
+            "_services._dns-sd._udp.local.",
+            12,
+            "PTR",
+            "SHIELD._nv_shield_remote._tcp.local.",
+            4500,
+            false,
+        );
+        let snap = Snapshot {
+            services: Vec::new(),
+            enum_answers: vec![&enum_rec],
+            pending_hosts: HashSet::new(),
+        };
+        let found = analyze(&snap);
+        let item = found
+            .iter()
+            .find(|a| a.kind == "type-format" && a.service == "enumeration")
+            .expect("expected enumeration type-format");
+        // Full record identity so the Answers table can mark the PTR row.
+        assert_eq!(
+            item.record_name.as_deref(),
+            Some("_services._dns-sd._udp.local.")
+        );
+        assert_eq!(item.rtype, Some(12));
+        assert!(item.rdata.is_some());
+    }
+
+    #[test]
+    fn enumeration_ptr_with_good_type_stays_quiet() {
+        let enum_rec = rec(
+            "_services._dns-sd._udp.local.",
+            12,
+            "PTR",
+            "_http._tcp.local.",
+            4500,
+            false,
+        );
+        let snap = Snapshot {
+            services: Vec::new(),
+            enum_answers: vec![&enum_rec],
+            pending_hosts: HashSet::new(),
+        };
+        assert!(!analyze(&snap).iter().any(|a| a.kind == "type-format"));
     }
 
     #[test]
