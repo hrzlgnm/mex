@@ -366,6 +366,13 @@ fn check_subtypes(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>) {
     }
 }
 
+/// Whether a PTR owner name is a reverse-mapping name. Those PTRs are
+/// unique (one address, one owner), unlike service/enumeration PTRs.
+fn is_reverse_ptr(name: &str) -> bool {
+    let lower = name.trim_end_matches('.').to_ascii_lowercase();
+    lower.ends_with(".in-addr.arpa") || lower.ends_with(".ip6.arpa")
+}
+
 fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     let name = rec.name.clone();
     let rdata = rec.rdata.clone();
@@ -409,8 +416,10 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         });
     }
 
-    // Cache-flush bit misuse: shared records must not set it.
-    if rec.rtype == 12 && rec.flush_bit {
+    // Cache-flush bit misuse: shared records must not set it. Reverse
+    // mapping PTRs are the exception: the RFC treats them as unique (no
+    // other host may claim the same address), so the bit is correct there.
+    if rec.rtype == 12 && rec.flush_bit && !is_reverse_ptr(&rec.name) {
         out.push(Anomaly {
             kind: "shared-flush",
             severity: Severity::Error,
@@ -853,6 +862,23 @@ mod tests {
         assert!(found
             .iter()
             .any(|a| a.kind == "shared-flush" && a.severity == Severity::Error));
+    }
+
+    #[test]
+    fn reverse_ptr_flush_is_not_an_error() {
+        // Reverse-mapping PTRs are unique (one address, one owner), so the
+        // flush bit is correct there. Both v4 and v6 forms stay quiet.
+        for name in [
+            "Android.local.37.178.168.192.in-addr.arpa.",
+            "Android.local.8.A.8.E.A.F.E.F.F.F.0.A.D.B.8.3.0.0.0.0.0.0.0.0.0.0.0.0.0.0.D.F.ip6.arpa.",
+        ] {
+            let answers = vec![rec(name, 12, "PTR", "Android.local.", 120, true)];
+            let found = analyze_service("X", "_http._tcp.local", "", &answers);
+            assert!(
+                !found.iter().any(|a| a.kind == "shared-flush"),
+                "reverse PTR {name} should be quiet"
+            );
+        }
     }
 
     #[test]
