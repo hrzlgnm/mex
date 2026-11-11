@@ -12,7 +12,7 @@ pub struct Metadata {
 }
 
 #[derive(serde::Serialize)]
-pub struct DumpRecord {
+pub struct DumpAnswer {
     pub name: String,
     pub rtype: u16,
     pub rtype_str: String,
@@ -49,7 +49,7 @@ pub struct DumpService {
     pub txt_records: Vec<String>,
     pub is_active: bool,
     pub last_seen_age_secs: u64,
-    pub records: Vec<DumpRecord>,
+    pub answers: Vec<DumpAnswer>,
     pub questions: Vec<DumpQuestion>,
 }
 
@@ -57,7 +57,7 @@ pub struct DumpService {
 #[derive(serde::Serialize)]
 pub struct RawGroup {
     pub name: String,
-    pub records: Vec<DumpRecord>,
+    pub answers: Vec<DumpAnswer>,
     pub questions: Vec<DumpQuestion>,
 }
 

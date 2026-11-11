@@ -1776,8 +1776,8 @@ impl App {
         out
     }
 
-    fn dump_record_row(rec: &browse::RawRecord) -> dump::DumpRecord {
-        dump::DumpRecord {
+    fn dump_answer_row(rec: &browse::RawRecord) -> dump::DumpAnswer {
+        dump::DumpAnswer {
             name: rec.name.clone(),
             rtype: rec.rtype,
             rtype_str: rec.rtype_str.clone(),
@@ -1816,10 +1816,10 @@ impl App {
             is_active: svc.is_active,
             last_seen_age_secs: svc.last_seen.elapsed().as_secs(),
             subtypes,
-            records: svc
+            answers: svc
                 .ordered_records()
                 .into_iter()
-                .map(Self::dump_record_row)
+                .map(Self::dump_answer_row)
                 .collect(),
             questions: svc.questions.iter().map(Self::dump_question_row).collect(),
         }
@@ -1895,7 +1895,7 @@ impl App {
                 .iter()
                 .map(|e| dump::RawGroup {
                     name: e.name.clone(),
-                    records: e.records.iter().map(Self::dump_record_row).collect(),
+                    answers: e.records.iter().map(Self::dump_answer_row).collect(),
                     questions: e.questions.iter().map(Self::dump_question_row).collect(),
                 })
                 .collect(),
@@ -1904,7 +1904,7 @@ impl App {
                 .iter()
                 .map(|p| dump::RawGroup {
                     name: format!("{}.{}", p.instance, p.service_type),
-                    records: p.records.iter().map(Self::dump_record_row).collect(),
+                    answers: p.records.iter().map(Self::dump_answer_row).collect(),
                     questions: p.questions.iter().map(Self::dump_question_row).collect(),
                 })
                 .collect(),
@@ -4584,7 +4584,7 @@ mod tests {
         // TXT pairs sorted by key.
         assert_eq!(svc.txt_records, vec!["a=1".to_string(), "b=2".to_string()]);
         assert!(svc.is_active);
-        assert!(!svc.records.is_empty());
+        assert!(!svc.answers.is_empty());
         assert!(dump.service_types.contains(&"_http._tcp.local".to_string()));
         // Top-level keys are mex's own model.
         let v = serde_json::to_value(&dump).unwrap();
