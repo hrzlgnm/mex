@@ -13,6 +13,7 @@ use crossterm::event::{
 use hickory_proto::rr::RecordType;
 use ratatui::layout::Rect;
 
+use crate::anomalies;
 use crate::browse;
 use crate::dump;
 use crate::ui;
@@ -1546,6 +1547,42 @@ impl App {
             ),
         );
 
+        // Anomalies (read-only RFC checks, see anomalies module).
+        section(&mut rows, "Anomalies");
+        let found = self.anomalies();
+        let errors = found
+            .iter()
+            .filter(|a| matches!(a.severity, anomalies::Severity::Error))
+            .count();
+        let warnings = found
+            .iter()
+            .filter(|a| matches!(a.severity, anomalies::Severity::Warning))
+            .count();
+        let infos = found.len().saturating_sub(errors + warnings);
+        kv(
+            &mut rows,
+            "anomalies",
+            if found.is_empty() {
+                "none".to_string()
+            } else {
+                format!("{errors} error · {warnings} warning · {infos} info")
+            },
+        );
+        for a in found.iter().take(8) {
+            kv(
+                &mut rows,
+                &format!("! {} {}", a.kind, a.severity.as_str()),
+                format!("{}: {}", a.service, a.message),
+            );
+        }
+        if found.len() > 8 {
+            kv(
+                &mut rows,
+                "anomalies more",
+                format!("+{} more", found.len() - 8),
+            );
+        }
+
         // Links.
         section(&mut rows, "Links");
         kv(&mut rows, "local addrs", self.local_ips.len().to_string());
@@ -1747,6 +1784,56 @@ impl App {
         }
     }
 
+    /// Pure anomaly snapshot over live browser state. Read-only: never
+    /// touches query scheduling, ingest, or expiry. Cheap enough to rebuild
+    /// per overlay frame (tens of services, hundreds of records).
+    pub fn anomalies(&self) -> Vec<anomalies::Anomaly> {
+        let services: Vec<anomalies::ServiceView<'_>> = self
+            .services
+            .iter()
+            .map(|s| anomalies::ServiceView {
+                instance: &s.instance,
+                service_type: &s.service_type,
+                hostname: &s.hostname,
+                answers: &s.answers,
+            })
+            .collect();
+        let enum_answers: Vec<&browse::RawRecord> = self
+            .enum_entries
+            .iter()
+            .flat_map(|e| e.answers.iter())
+            .collect();
+        let pending_hosts: HashSet<String> =
+            self.pending_addrs.iter().map(|(h, _)| h.clone()).collect();
+        let snap = anomalies::Snapshot {
+            services,
+            enum_answers,
+            pending_hosts,
+        };
+        anomalies::analyze(&snap)
+    }
+
+    /// Per-service anomaly counts keyed by (service_type, instance),
+    /// matching the sticky detail key. Used for host-list markers and the
+    /// Answers table without recomputing per row.
+    pub fn anomaly_counts(&self) -> HashMap<(String, String), usize> {
+        let mut counts: HashMap<(String, String), usize> = HashMap::new();
+        for a in self.anomalies() {
+            // Service id is `instance.service_type`; enumeration is global.
+            if a.service == "enumeration" {
+                continue;
+            }
+            if let Some(dot) = a.service.find('.') {
+                let (inst, typ) = a.service.split_at(dot);
+                let typ = typ.trim_start_matches('.');
+                *counts
+                    .entry((typ.to_string(), inst.to_string()))
+                    .or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
     /// Live TXT pairs, deduped and sorted by key (expired and goodbye
     /// rows omitted). High-entropy values are redacted (keys kept) so
     /// dumps are safe to share; dedup runs after redaction so identical
@@ -1901,6 +1988,22 @@ impl App {
             "uptime_secs".to_string(),
             self.start_time.elapsed().as_secs(),
         );
+        let found = self.anomalies();
+        metrics.insert("anomalies_total".to_string(), found.len() as u64);
+        metrics.insert(
+            "anomalies_error".to_string(),
+            found
+                .iter()
+                .filter(|a| matches!(a.severity, anomalies::Severity::Error))
+                .count() as u64,
+        );
+        metrics.insert(
+            "anomalies_warning".to_string(),
+            found
+                .iter()
+                .filter(|a| matches!(a.severity, anomalies::Severity::Warning))
+                .count() as u64,
+        );
         dump::StateDump {
             metadata: dump::Metadata {
                 dump_timestamp: dump::dump_timestamp_iso(),
@@ -1927,6 +2030,27 @@ impl App {
                     name: format!("{}.{}", p.instance, p.service_type),
                     answers: p.answers.iter().map(Self::dump_answer_row).collect(),
                     questions: p.questions.iter().map(Self::dump_question_row).collect(),
+                })
+                .collect(),
+            anomalies: found
+                .iter()
+                .map(|a| dump::DumpAnomaly {
+                    kind: a.kind.to_string(),
+                    severity: a.severity.as_str().to_string(),
+                    service: a.service.clone(),
+                    record_name: a.record_name.clone(),
+                    rtype: a.rtype,
+                    rtype_str: a.rtype_str.clone(),
+                    // Reuse the safe-sharing redaction policy: TXT pairs
+                    // redacted, public IPv6 literals masked.
+                    rdata: a.rdata.clone().map(|d| match a.rtype {
+                        Some(16) => dump::redact_txt_rdata(&d),
+                        Some(28) => dump::redact_ip_literal(&d),
+                        _ => d,
+                    }),
+                    source: a.source.clone(),
+                    message: a.message.clone(),
+                    rfc: a.rfc.to_string(),
                 })
                 .collect(),
         }
@@ -6516,7 +6640,10 @@ mod tests {
             .filter(|(_, v)| v.is_empty())
             .map(|(k, _)| k.as_str())
             .collect();
-        assert_eq!(headers, vec!["Session", "Discovery", "Queries", "Links"]);
+        assert_eq!(
+            headers,
+            vec!["Session", "Discovery", "Queries", "Anomalies", "Links"]
+        );
         assert!(rows.iter().any(|(k, _)| k == "packets"));
         assert!(rows.iter().any(|(k, _)| k == "sent"));
         assert!(rows.iter().any(|(k, _)| k == "usable v4"));

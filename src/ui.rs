@@ -297,6 +297,7 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
     app.list_viewport
         .set(area.height.saturating_sub(2) as usize);
     let items = app.display_items();
+    let anomaly_counts = app.anomaly_counts();
 
     // An Instance is last in its group if the next row is not another
     // Instance (i.e. next is a Host header or end of list).
@@ -353,8 +354,17 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
                         format!("[{short}]")
                     };
                     let style = Style::default();
+                    let warn = anomaly_counts
+                        .get(&(svc.service_type.clone(), svc.instance.clone()))
+                        .copied()
+                        .unwrap_or(0);
+                    let suffix = if warn > 0 {
+                        format!(" [!{warn}]")
+                    } else {
+                        String::new()
+                    };
                     ListItem::new(Line::from(Span::styled(
-                        format!("{branch} {active} {} {badge}", svc.instance),
+                        format!("{branch} {active} {} {badge}{suffix}", svc.instance),
                         style,
                     )))
                 }
@@ -688,9 +698,27 @@ fn detail_table_rows<'a>(
     // Multi-pair TXT answers carry their key=value pairs as collapsible
     // child rows (collapsed by default, `Enter` expands); the cursor skips
     // child rows. raw_positions maps each raw record to its table row.
+    // Anomalous rows (error/warning only) get a `!` suffix on the type.
+    let anomaly_keys: HashSet<(String, u16, String)> = app
+        .anomalies()
+        .into_iter()
+        .filter(|a| !matches!(a.severity, crate::anomalies::Severity::Info))
+        .filter_map(|a| {
+            Some((
+                a.record_name?.trim_end_matches('.').to_lowercase(),
+                a.rtype?,
+                a.rdata?,
+            ))
+        })
+        .collect();
     let unique_recs = target.ordered_answers();
     let mut raw_positions = Vec::with_capacity(unique_recs.len());
     for rec in unique_recs {
+        let flagged = anomaly_keys.contains(&(
+            rec.name.trim_end_matches('.').to_lowercase(),
+            rec.rtype,
+            rec.rdata.clone(),
+        ));
         let flush = if rec.flush_bit { "flush" } else { "" };
         let rem = rec
             .ttl
@@ -715,7 +743,7 @@ fn detail_table_rows<'a>(
             None => Cell::from(ttl_str.clone()),
         };
         let expandable = crate::app::App::is_expandable_txt(rec);
-        let type_label = if expandable {
+        let base_label = if expandable {
             if app.is_txt_expanded(rec) {
                 "▾ TXT"
             } else {
@@ -723,6 +751,11 @@ fn detail_table_rows<'a>(
             }
         } else {
             rec.rtype_str.as_str()
+        };
+        let type_label = if flagged {
+            format!("{base_label}!")
+        } else {
+            base_label.to_string()
         };
         rows.push(
             Row::new(vec![
