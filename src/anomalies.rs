@@ -174,6 +174,17 @@ fn severity_rank(s: Severity) -> u8 {
     }
 }
 
+/// Display/dedup key for rdata: SOA serials churn constantly (one bump
+/// per announcement), so rows differing only in serial share one finding
+/// and one marker. All other types pass through untouched.
+pub(crate) fn anomaly_match_key(rtype: u16, rdata: &str) -> String {
+    if rtype == 6 {
+        normalize_soa_rdata(rdata.to_string())
+    } else {
+        rdata.to_string()
+    }
+}
+
 fn dedup(mut items: Vec<Anomaly>) -> Vec<Anomaly> {
     let mut seen = HashSet::new();
     let mut out = Vec::with_capacity(items.len());
@@ -182,7 +193,7 @@ fn dedup(mut items: Vec<Anomaly>) -> Vec<Anomaly> {
         // leaks differing only in serial are the same finding. Normalize
         // the serial away for the dedup key; the stored rdata keeps it.
         let rdata_key = match (a.kind, a.rtype) {
-            ("unicast-leak", Some(6)) => normalize_soa_rdata(a.rdata.clone().unwrap_or_default()),
+            ("unicast-leak", Some(6)) => anomaly_match_key(6, &a.rdata.clone().unwrap_or_default()),
             _ => a.rdata.clone().unwrap_or_default(),
         };
         let key = (
@@ -1289,6 +1300,18 @@ mod tests {
     }
 
     #[test]
+    fn soa_match_key_ignores_serial_for_display() {
+        // The Answers pane matches rows against findings by key: two live
+        // SOA rows differing only in serial must share one display key so
+        // both mark while counting as one finding.
+        let a = super::anomaly_match_key(6, "host.local. admin 1794425867 21600 1800 43200 10");
+        let b = super::anomaly_match_key(6, "host.local. admin 1794425874 21600 1800 43200 10");
+        assert_eq!(a, b);
+        // Non-SOA rdata passes through untouched.
+        assert_eq!(super::anomaly_match_key(1, "192.168.1.1"), "192.168.1.1");
+    }
+
+    #[test]
     fn soa_serial_churn_dedups_to_one_leak() {
         let answers = vec![
             rec(
@@ -1313,6 +1336,66 @@ mod tests {
             found.iter().filter(|a| a.kind == "unicast-leak").count(),
             1,
             "serial-only differences must not multiply findings"
+        );
+    }
+
+    #[test]
+    fn unicast_soa_expired_and_goodbye_never_flagged() {
+        let old = aged(
+            rec(
+                "host.local.",
+                6,
+                "SOA",
+                "host.local. admin 1794425867 21600 1800 43200 10",
+                120,
+                false,
+            ),
+            500,
+        );
+        let gone = rec(
+            "host.local.",
+            6,
+            "SOA",
+            "host.local. admin 1794425874 21600 1800 43200 10",
+            0,
+            false,
+        );
+        let answers = vec![old, gone];
+        let found = analyze_service("My", "_http._tcp.local", "host.local.", &answers);
+        assert!(
+            !found.iter().any(|a| a.kind == "unicast-leak"),
+            "expired and goodbye SOA must not leak-flag"
+        );
+    }
+
+    #[test]
+    fn multicast_types_and_cname_stay_quiet_for_leak() {
+        let answers = vec![
+            rec(
+                "_http._tcp.local.",
+                12,
+                "PTR",
+                "X._http._tcp.local.",
+                4500,
+                false,
+            ),
+            rec(
+                "X._http._tcp.local.",
+                33,
+                "SRV",
+                "0 0 80 h.local.",
+                120,
+                true,
+            ),
+            rec("X._http._tcp.local.", 16, "TXT", "k=v", 4500, true),
+            rec("h.local.", 1, "A", "192.168.1.1", 120, true),
+            rec("h.local.", 28, "AAAA", "fe80::1", 120, true),
+            rec("alias.local.", 5, "CNAME", "h.local.", 120, false),
+        ];
+        let found = analyze_service("X", "_http._tcp.local", "h.local.", &answers);
+        assert!(
+            !found.iter().any(|a| a.kind == "unicast-leak"),
+            "valid multicast types and CNAME must not leak-flag"
         );
     }
 
