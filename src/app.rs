@@ -13,6 +13,7 @@ use crossterm::event::{
 use hickory_proto::rr::RecordType;
 use ratatui::layout::Rect;
 
+use crate::anomalies;
 use crate::browse;
 use crate::dump;
 use crate::ui;
@@ -1604,6 +1605,7 @@ impl App {
             ),
         );
         kv(&mut rows, "refused off-link", self.offlink_row());
+        kv(&mut rows, "malformed packets", self.malformed_row());
         let mut iface_rows: Vec<(&String, &u64)> = self.metrics.iface_rx.iter().collect();
         iface_rows.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
         for (iface, count) in iface_rows.iter().take(8) {
@@ -1621,6 +1623,36 @@ impl App {
         talkers.sort_by(|a, b| b.1.cmp(a.1));
         for (src, count) in talkers.iter().take(5) {
             kv(&mut rows, &format!("talker {src}"), format!("{count} pkts"));
+        }
+
+        // Anomalies last: the list can be long, and the overlay scrolls
+        // (j/k, PgUp/PgDn), so every finding is listed instead of capped.
+        section(&mut rows, "Anomalies");
+        let found = self.anomalies();
+        let errors = found
+            .iter()
+            .filter(|a| matches!(a.severity, anomalies::Severity::Error))
+            .count();
+        let warnings = found
+            .iter()
+            .filter(|a| matches!(a.severity, anomalies::Severity::Warning))
+            .count();
+        let infos = found.len().saturating_sub(errors + warnings);
+        kv(
+            &mut rows,
+            "anomalies",
+            if found.is_empty() {
+                "none".to_string()
+            } else {
+                format!("{errors} error · {warnings} warning · {infos} info")
+            },
+        );
+        for a in found.iter() {
+            kv(
+                &mut rows,
+                &format!("! {} {}", a.kind, a.severity.as_str()),
+                format!("{}: {}", a.service, a.message),
+            );
         }
 
         rows
@@ -1745,6 +1777,79 @@ impl App {
             ),
             None => format!("{total} total"),
         }
+    }
+
+    /// Message-level decode failures: counted in the listener threads so
+    /// a garbage storm reads differently from a quiet network.
+    fn malformed_row(&self) -> String {
+        let total = self.drop_stats.malformed_total();
+        match self.drop_stats.malformed_last() {
+            Some((src, at)) => format!(
+                "{total} total · last {src} {} ago",
+                fmt_age(at.elapsed().as_secs())
+            ),
+            None => format!("{total} total"),
+        }
+    }
+
+    /// Pure anomaly snapshot over live browser state. Read-only: never
+    /// touches query scheduling, ingest, or expiry. Cheap enough to rebuild
+    /// per overlay frame (tens of services, hundreds of records).
+    pub fn anomalies(&self) -> Vec<anomalies::Anomaly> {
+        let mut services: Vec<anomalies::ServiceView<'_>> = self
+            .services
+            .iter()
+            .map(|s| anomalies::ServiceView {
+                instance: &s.instance,
+                service_type: &s.service_type,
+                hostname: &s.hostname,
+                answers: &s.answers,
+                subtypes: &s.subtypes,
+            })
+            .collect();
+        // Pending instances hold PTR/TXT rows that arrived before their
+        // SRV: they deserve the same checks. Dedup in the analyzer keeps
+        // rows already represented on a confirmed service to one finding;
+        // the identity format matches so shared findings collapse.
+        for p in &self.pending_instances {
+            services.push(anomalies::ServiceView {
+                instance: &p.instance,
+                service_type: &p.service_type,
+                hostname: "",
+                answers: &p.answers,
+                subtypes: &p.subtypes,
+            });
+        }
+        let enum_answers: Vec<&browse::RawRecord> = self
+            .enum_entries
+            .iter()
+            .flat_map(|e| e.answers.iter())
+            .collect();
+        let pending_hosts: HashSet<String> =
+            self.pending_addrs.iter().map(|(h, _)| h.clone()).collect();
+        let snap = anomalies::Snapshot {
+            services,
+            enum_answers,
+            pending_hosts,
+        };
+        anomalies::analyze(&snap)
+    }
+
+    /// Per-service anomaly counts keyed by `instance.service_type`
+    /// service id. Used for host-list markers and the Answers table
+    /// without recomputing per row. Informational notes never count.
+    pub fn anomaly_counts(&self) -> HashMap<String, usize> {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for a in self.anomalies() {
+            if matches!(a.severity, anomalies::Severity::Info) {
+                continue;
+            }
+            if a.service == "enumeration" {
+                continue;
+            }
+            *counts.entry(a.service.clone()).or_insert(0) += 1;
+        }
+        counts
     }
 
     /// Live TXT pairs, deduped and sorted by key (expired and goodbye
@@ -1901,6 +2006,26 @@ impl App {
             "uptime_secs".to_string(),
             self.start_time.elapsed().as_secs(),
         );
+        let found = self.anomalies();
+        metrics.insert("anomalies_total".to_string(), found.len() as u64);
+        metrics.insert(
+            "anomalies_error".to_string(),
+            found
+                .iter()
+                .filter(|a| matches!(a.severity, anomalies::Severity::Error))
+                .count() as u64,
+        );
+        metrics.insert(
+            "anomalies_warning".to_string(),
+            found
+                .iter()
+                .filter(|a| matches!(a.severity, anomalies::Severity::Warning))
+                .count() as u64,
+        );
+        metrics.insert(
+            "malformed_packets".to_string(),
+            self.drop_stats.malformed_total(),
+        );
         dump::StateDump {
             metadata: dump::Metadata {
                 dump_timestamp: dump::dump_timestamp_iso(),
@@ -1927,6 +2052,27 @@ impl App {
                     name: format!("{}.{}", p.instance, p.service_type),
                     answers: p.answers.iter().map(Self::dump_answer_row).collect(),
                     questions: p.questions.iter().map(Self::dump_question_row).collect(),
+                })
+                .collect(),
+            anomalies: found
+                .iter()
+                .map(|a| dump::DumpAnomaly {
+                    kind: a.kind.to_string(),
+                    severity: a.severity.as_str().to_string(),
+                    service: a.service.clone(),
+                    record_name: a.record_name.clone(),
+                    rtype: a.rtype,
+                    rtype_str: a.rtype_str.clone(),
+                    // Reuse the safe-sharing redaction policy: TXT pairs
+                    // redacted, public IPv6 literals masked.
+                    rdata: a.rdata.clone().map(|d| match a.rtype {
+                        Some(16) => dump::redact_txt_rdata(&d),
+                        Some(28) => dump::redact_ip_literal(&d),
+                        _ => d,
+                    }),
+                    source: a.source.clone(),
+                    message: a.message.clone(),
+                    rfc: a.rfc.to_string(),
                 })
                 .collect(),
         }
@@ -6516,10 +6662,26 @@ mod tests {
             .filter(|(_, v)| v.is_empty())
             .map(|(k, _)| k.as_str())
             .collect();
-        assert_eq!(headers, vec!["Session", "Discovery", "Queries", "Links"]);
+        assert_eq!(
+            headers,
+            vec!["Session", "Discovery", "Queries", "Links", "Anomalies"]
+        );
         assert!(rows.iter().any(|(k, _)| k == "packets"));
         assert!(rows.iter().any(|(k, _)| k == "sent"));
         assert!(rows.iter().any(|(k, _)| k == "usable v4"));
+    }
+
+    #[test]
+    fn pending_ptr_flush_is_analyzed() {
+        // PTR with flush bit but no SRV yet: the row lives in pending, and
+        // the analyzer must still see it.
+        let mut app = App::new().unwrap();
+        let mut bad = ptr_record(120);
+        bad.flush_bit = true;
+        ingest(&mut app, &bad);
+        assert!(app.services.is_empty());
+        assert!(!app.pending_instances.is_empty());
+        assert!(app.anomalies().iter().any(|a| a.kind == "shared-flush"));
     }
 
     #[test]

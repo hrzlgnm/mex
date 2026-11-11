@@ -1,3 +1,4 @@
+mod anomalies;
 mod app;
 mod browse;
 mod dump;

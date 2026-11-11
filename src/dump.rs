@@ -62,6 +62,20 @@ pub struct RawGroup {
 }
 
 #[derive(serde::Serialize)]
+pub struct DumpAnomaly {
+    pub kind: String,
+    pub severity: String,
+    pub service: String,
+    pub record_name: Option<String>,
+    pub rtype: Option<u16>,
+    pub rtype_str: Option<String>,
+    pub rdata: Option<String>,
+    pub source: Option<String>,
+    pub message: String,
+    pub rfc: String,
+}
+
+#[derive(serde::Serialize)]
 pub struct StateDump {
     pub metadata: Metadata,
     pub passive: bool,
@@ -71,6 +85,7 @@ pub struct StateDump {
     pub metrics: BTreeMap<String, u64>,
     pub enum_groups: Vec<RawGroup>,
     pub pending: Vec<RawGroup>,
+    pub anomalies: Vec<DumpAnomaly>,
 }
 
 /// Wall-clock ISO8601 (`%Y-%m-%dT%H:%M:%S%.6fZ`) for an `Instant` by
