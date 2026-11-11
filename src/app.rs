@@ -3841,16 +3841,18 @@ impl App {
                 rtype_str,
                 raw,
             } => {
-                // Own inferred sends carry no packet bytes; show the latest
-                // event bytes under the same QRY title so the title stays
-                // per-question instead of falling back to Raw Packet.
                 let title = format!(" QRY {rtype_str} {name} ");
                 if raw.is_empty() {
+                    // Own inferred sends carry no packet bytes: the latest
+                    // event bytes are fallback packet data, not the query
+                    // itself, so the title keeps the QRY identity but marks
+                    // the payload as a raw packet (as the old Raw Packet
+                    // fallback disclosed).
                     let fallback = self
                         .latest_event_for_selected()
                         .map(|ev| ev.raw_bytes.clone())
                         .unwrap_or_default();
-                    return Some((fallback, title));
+                    return Some((fallback, format!("{title}(raw packet) ")));
                 }
                 Some((raw.to_vec(), title))
             }
@@ -4441,6 +4443,20 @@ mod tests {
             ));
         }
         app.route_own_question("_ssh._tcp.local.", 12);
+        // Seed fallback packet bytes distinct from any question payload:
+        // the self row must surface these bytes, marked as fallback.
+        let fallback = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        {
+            let sel_idx = match app.display_items().get(app.selected_display) {
+                Some(DisplayItem::Instance { index }) => *index,
+                _ => panic!("expected instance selected"),
+            };
+            app.services[sel_idx]
+                .last_event
+                .as_mut()
+                .expect("last event")
+                .raw_bytes = fallback.clone();
+        }
         let (raws, self_pos, remote_pos) = {
             let target = app.display_detail().expect("detail target");
             let raws = target.ordered_records().len();
@@ -4456,15 +4472,18 @@ mod tests {
             (raws, self_pos, remote_pos)
         };
         app.detail_selected = raws + self_pos;
-        let (_bytes, title) = app
+        let (bytes, title) = app
             .selected_detail_bytes()
             .expect("self question has hex payload");
-        assert_eq!(title, " QRY PTR _ssh._tcp.local ");
-        // Remote row uses the identical title shape.
+        assert_eq!(bytes, fallback);
+        assert_eq!(title, " QRY PTR _ssh._tcp.local (raw packet) ");
+        // Remote row returns its own query packet bytes under the
+        // unmarked title.
         app.detail_selected = raws + remote_pos;
-        let (_, remote_title) = app
+        let (rbytes, remote_title) = app
             .selected_detail_bytes()
             .expect("remote question has hex payload");
+        assert_eq!(rbytes, pkt);
         assert_eq!(remote_title, " QRY PTR _ssh._tcp.local ");
     }
 
@@ -4498,10 +4517,12 @@ mod tests {
             (raws, self_pos)
         };
         app.detail_selected = raws + self_pos;
-        let (_, title) = app
+        let (bytes, title) = app
             .selected_detail_bytes()
             .expect("self enum question has hex payload");
-        assert_eq!(title, " QRY PTR _services._dns-sd._udp.local ");
+        // No packet observed on this target: empty payload, marked title.
+        assert!(bytes.is_empty());
+        assert_eq!(title, " QRY PTR _services._dns-sd._udp.local (raw packet) ");
     }
 
     #[test]
