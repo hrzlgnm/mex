@@ -428,11 +428,22 @@ fn is_reverse_ptr(name: &str) -> bool {
 
 /// Shared verdict for unicast-only types observed on multicast: definite
 /// violations (SOA/NS/ANY) are errors, the MX soft case is a warning, and
-/// everything else is `None` (quiet). Used by answer checks now and
-/// observed-question checks next, so both surfaces classify identically.
+/// everything else is `None` (quiet). Used by answer checks.
 pub(crate) fn unicast_severity(rtype: u16) -> Option<Severity> {
     match rtype {
         2 | 6 | 255 => Some(Severity::Error),
+        15 => Some(Severity::Warning),
+        _ => None,
+    }
+}
+
+/// Verdict for observed *questions*. Same as answers, except QTYPE ANY
+/// (255) is excluded: probes for unique ownership use QTYPE ANY
+/// (RFC 6762 §8.1, §6.1), so ANY questions are routine demand, while ANY
+/// *answers* are meaningless on the wire and stay flagged.
+pub(crate) fn question_unicast_severity(rtype: u16) -> Option<Severity> {
+    match rtype {
+        2 | 6 => Some(Severity::Error),
         15 => Some(Severity::Warning),
         _ => None,
     }
@@ -464,7 +475,7 @@ fn check_question(q: &QuestionView, out: &mut Vec<Anomaly>) {
     if q.source.port() == 0 {
         return;
     }
-    let Some(severity) = unicast_severity(q.rtype) else {
+    let Some(severity) = question_unicast_severity(q.rtype) else {
         return;
     };
     let name = q.name.to_string();
@@ -1131,21 +1142,31 @@ mod tests {
     }
 
     #[test]
-    fn unicast_question_ns_and_any_are_errors() {
-        for (rtype, label) in [(2, "NS"), (255, "ANY")] {
-            let found = analyze_questions(&[qview(
-                "My._http._tcp.local",
-                "host.local.",
-                rtype,
-                test_source(),
-            )]);
-            let item = found
-                .iter()
-                .find(|a| a.kind == "unicast-question")
-                .unwrap_or_else(|| panic!("expected {label} question leak"));
-            assert_eq!(item.severity, Severity::Error);
-            assert_eq!(item.rtype_str.as_deref(), Some(label));
-        }
+    fn unicast_question_ns_is_error_any_is_quiet_probe() {
+        // NS questions have no legitimate multicast use; ANY questions
+        // are ownership probes (RFC 6762 §8.1, §6.1) and must stay quiet.
+        let found = analyze_questions(&[qview(
+            "My._http._tcp.local",
+            "host.local.",
+            2,
+            test_source(),
+        )]);
+        let item = found
+            .iter()
+            .find(|a| a.kind == "unicast-question")
+            .expect("expected NS question leak");
+        assert_eq!(item.severity, Severity::Error);
+        assert_eq!(item.rtype_str.as_deref(), Some("NS"));
+        let found = analyze_questions(&[qview(
+            "My._http._tcp.local",
+            "host.local.",
+            255,
+            test_source(),
+        )]);
+        assert!(
+            !found.iter().any(|a| a.kind == "unicast-question"),
+            "ANY probe questions must stay quiet"
+        );
     }
 
     #[test]
