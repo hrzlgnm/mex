@@ -310,11 +310,11 @@ fn service_type_problem(st: &str) -> Option<String> {
 }
 
 /// Why an underscore-led service/subtype label is invalid, if it is.
-/// RFC 6763 §7 / Apple QA1198: leading underscore, then letters, digits,
-/// and hyphens, containing a letter and not starting or ending with a
-/// hyphen. There is intentionally no length cap: the RFC's 15-character
-/// limit is not enforced by real stacks (avahi publishes longer labels,
-/// Apple tolerates them on .local), so flagging it is noise, not signal.
+/// Structural only: leading underscore, non-empty, containing a letter,
+/// not starting or ending with a hyphen. Charset and length are
+/// deliberately loose: inner underscores and long labels ship in real
+/// devices (e.g. NVIDIA) and pass avahi/Apple responders on .local, so
+/// flagging them is noise, not signal.
 fn label_problem(label: &str) -> Option<String> {
     if label.len() < 2 || !label.starts_with('_') {
         return Some("service label must start with '_'".to_string());
@@ -323,9 +323,12 @@ fn label_problem(label: &str) -> Option<String> {
     if body.is_empty() {
         return Some("service label is empty".to_string());
     }
-    if !body.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+    if !body
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
         return Some(format!(
-            "service label '{body}' may only contain letters, digits, and hyphens"
+            "service label '{body}' may only contain letters, digits, hyphens, and underscores"
         ));
     }
     if !body.bytes().any(|b| b.is_ascii_alphabetic()) {
@@ -1033,7 +1036,6 @@ mod tests {
     fn type_format_rejects_bad_labels() {
         for t in [
             "_80._tcp.local",
-            "_bad_name._tcp.local",
             "_-bad._tcp.local",
             "_bad-._tcp.local",
             "_http._sctp.local",
@@ -1055,7 +1057,7 @@ mod tests {
 
     #[test]
     fn type_format_flags_bad_subtype_label() {
-        let subtypes = vec!["_bad_name".to_string()];
+        let subtypes = vec!["_80".to_string()];
         let found = analyze_service_sub("X", "_http._tcp.local", "", &[], &subtypes);
         assert!(found.iter().any(|a| a.kind == "type-format"));
     }
@@ -1112,11 +1114,10 @@ mod tests {
     }
 
     #[test]
-    fn type_format_ignores_label_length() {
-        // The RFC's 15-character limit is not enforced by real stacks, so
-        // a 16-character label (e.g. NVIDIA SHIELD) stays quiet. Underscore
-        // shape still applies: this label has none besides the leading one.
-        let found = analyze_service("SHIELD", "_nvshieldremote12._tcp.local", "", &[]);
+    fn type_format_ignores_label_length_and_underscores() {
+        // Neither the RFC's 15-character limit nor inner underscores are
+        // enforced by real stacks, so the SHIELD's real type stays quiet.
+        let found = analyze_service("SHIELD", "_nv_shield_remote._tcp.local", "", &[]);
         assert!(!found.iter().any(|a| a.kind == "type-format"));
     }
 
@@ -1126,7 +1127,7 @@ mod tests {
             "_services._dns-sd._udp.local.",
             12,
             "PTR",
-            "_nv_shield_remote._tcp.local.",
+            "_80._tcp.local.",
             4500,
             false,
         );
@@ -1191,7 +1192,7 @@ mod tests {
             "_services._dns-sd._udp.local.",
             12,
             "PTR",
-            "_bad_name._sub._http._tcp.local.",
+            "_-bad._sub._http._tcp.local.",
             4500,
             false,
         );
