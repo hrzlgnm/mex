@@ -136,7 +136,10 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
                     rtype_str: Some(rec.rtype_str.clone()),
                     rdata: Some(rec.rdata.clone()),
                     source: Some(rec.source.to_string()),
-                    message: format!("enumerated type {target} invalid: {reason}"),
+                    message: format!(
+                        "enumerated type {target} invalid: {reason} (announced by {})",
+                        rec.source
+                    ),
                     rfc: "RFC 6763 §7",
                 });
             }
@@ -474,6 +477,19 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     // stacks (e.g. avahi) publish TXT at 120s by default, so flagging it
     // would be noise, not signal.
     if rec.rtype == 12 && rec.ttl <= 120 {
+        // Enumeration rows all share the owner name, so name the
+        // enumerated type and the announcer: otherwise every finding
+        // reads identically.
+        let message = if service_id == "enumeration" {
+            format!(
+                "PTR for {} base TTL {}s far below the conventional 4500s (from {})",
+                rec.rdata.trim_end_matches('.'),
+                rec.ttl,
+                rec.source
+            )
+        } else {
+            format!("PTR base TTL {}s far below the conventional 4500s", rec.ttl)
+        };
         out.push(Anomaly {
             kind: "ttl-base-mismatch",
             severity: Severity::Warning,
@@ -483,7 +499,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             rtype_str: Some(rec.rtype_str.clone()),
             rdata: Some(rec.rdata.clone()),
             source: Some(rec.source.to_string()),
-            message: format!("PTR base TTL {}s far below the conventional 4500s", rec.ttl),
+            message,
             rfc: "RFC 6762 §10",
         });
     }
@@ -905,6 +921,38 @@ mod tests {
                 .unwrap_or_else(|| panic!("PTR@{ttl} should be flagged"));
             assert_eq!(item.severity, Severity::Warning);
         }
+    }
+
+    #[test]
+    fn enumeration_ttl_mismatch_names_type_and_source() {
+        let enum_rec = rec(
+            "_services._dns-sd._udp.local.",
+            12,
+            "PTR",
+            "_http._tcp.local.",
+            120,
+            false,
+        );
+        let snap = Snapshot {
+            services: Vec::new(),
+            enum_answers: vec![&enum_rec],
+            pending_hosts: HashSet::new(),
+        };
+        let item = analyze(&snap)
+            .iter()
+            .find(|a| a.kind == "ttl-base-mismatch")
+            .expect("expected enumeration ttl-base-mismatch")
+            .clone();
+        assert!(
+            item.message.contains("_http._tcp.local"),
+            "message should name the enumerated type, got: {}",
+            item.message
+        );
+        assert!(
+            item.message.contains("192.168.1.2"),
+            "message should name the announcer, got: {}",
+            item.message
+        );
     }
 
     #[test]
