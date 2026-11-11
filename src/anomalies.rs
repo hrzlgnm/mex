@@ -310,9 +310,11 @@ fn service_type_problem(st: &str) -> Option<String> {
 }
 
 /// Why an underscore-led service/subtype label is invalid, if it is.
-/// RFC 6763 §7 / Apple QA1198: leading underscore, then 1-15 characters
-/// of letters, digits, and hyphens, containing a letter and not starting
-/// or ending with a hyphen.
+/// RFC 6763 §7 / Apple QA1198: leading underscore, then letters, digits,
+/// and hyphens, containing a letter and not starting or ending with a
+/// hyphen. There is intentionally no length cap: the RFC's 15-character
+/// limit is not enforced by real stacks (avahi publishes longer labels,
+/// Apple tolerates them on .local), so flagging it is noise, not signal.
 fn label_problem(label: &str) -> Option<String> {
     if label.len() < 2 || !label.starts_with('_') {
         return Some("service label must start with '_'".to_string());
@@ -320,12 +322,6 @@ fn label_problem(label: &str) -> Option<String> {
     let body = &label[1..];
     if body.is_empty() {
         return Some("service label is empty".to_string());
-    }
-    if body.len() > 15 {
-        return Some(format!(
-            "service label '{body}' is {} characters, limit is 15",
-            body.len()
-        ));
     }
     if !body.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
         return Some(format!(
@@ -466,6 +462,26 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             source: Some(src),
             message: format!("TTL {}s is far above the expected base", rec.ttl),
             rfc: "RFC 6762 §5.2",
+        });
+    }
+
+    // PTR base TTL: service and enumeration PTRs conventionally use
+    // 4500s (75 min). A PTR arriving at 120s/60s was usually re-announced
+    // with the generic 120s default instead. TXT is deliberately excluded:
+    // stacks (e.g. avahi) publish TXT at 120s by default, so flagging it
+    // would be noise, not signal.
+    if rec.rtype == 12 && rec.ttl <= 120 {
+        out.push(Anomaly {
+            kind: "ttl-base-mismatch",
+            severity: Severity::Warning,
+            service: service_id.to_string(),
+            record_name: Some(rec.name.clone()),
+            rtype: Some(rec.rtype),
+            rtype_str: Some(rec.rtype_str.clone()),
+            rdata: Some(rec.rdata.clone()),
+            source: Some(rec.source.to_string()),
+            message: format!("PTR base TTL {}s far below the conventional 4500s", rec.ttl),
+            rfc: "RFC 6762 §10",
         });
     }
 
@@ -869,6 +885,55 @@ mod tests {
     }
 
     #[test]
+    fn ptr_with_short_base_ttl_is_flagged() {
+        for ttl in [60, 120] {
+            let answers = vec![rec(
+                "_http._tcp.local.",
+                12,
+                "PTR",
+                "X._http._tcp.local.",
+                ttl,
+                false,
+            )];
+            let found = analyze_service("X", "_http._tcp.local", "", &answers);
+            let item = found
+                .iter()
+                .find(|a| a.kind == "ttl-base-mismatch")
+                .unwrap_or_else(|| panic!("PTR@{ttl} should be flagged"));
+            assert_eq!(item.severity, Severity::Warning);
+        }
+    }
+
+    #[test]
+    fn ptr_with_4500_base_is_quiet() {
+        let answers = vec![rec(
+            "_http._tcp.local.",
+            12,
+            "PTR",
+            "X._http._tcp.local.",
+            4500,
+            false,
+        )];
+        let found = analyze_service("X", "_http._tcp.local", "", &answers);
+        assert!(!found.iter().any(|a| a.kind == "ttl-base-mismatch"));
+    }
+
+    #[test]
+    fn srv_with_120_base_is_quiet() {
+        // 120s is the normal SRV base; the 4500 expectation is PTR-only.
+        let answers = vec![rec(
+            "X._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 80 myhost.local.",
+            120,
+            true,
+        )];
+        let found = analyze_service("X", "_http._tcp.local", "myhost.local.", &answers);
+        assert!(!found.iter().any(|a| a.kind == "ttl-base-mismatch"));
+    }
+
+    #[test]
     fn ttl_band_keeps_120_and_4500_quiet() {
         let answers = vec![
             rec("a.local.", 1, "A", "192.168.1.1", 120, true),
@@ -1047,17 +1112,12 @@ mod tests {
     }
 
     #[test]
-    fn type_format_message_names_overlong_label() {
-        let found = analyze_service("SHIELD", "_nv_shield_remote._tcp.local", "", &[]);
-        let item = found
-            .iter()
-            .find(|a| a.kind == "type-format")
-            .expect("expected type-format");
-        assert!(
-            item.message.contains("16") && item.message.contains("15"),
-            "message should name the length problem, got: {}",
-            item.message
-        );
+    fn type_format_ignores_label_length() {
+        // The RFC's 15-character limit is not enforced by real stacks, so
+        // a 16-character label (e.g. NVIDIA SHIELD) stays quiet. Underscore
+        // shape still applies: this label has none besides the leading one.
+        let found = analyze_service("SHIELD", "_nvshieldremote12._tcp.local", "", &[]);
+        assert!(!found.iter().any(|a| a.kind == "type-format"));
     }
 
     #[test]
