@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/hrzlgnm/mex/compare/v0.6.0...v0.6.1) (2026-11-11)
+
+
+### Bug Fixes
+
+* fall back to self-stop without job-control separation ([#63](https://github.com/hrzlgnm/mex/issues/63)) ([5c7a51e](https://github.com/hrzlgnm/mex/commit/5c7a51e9cc842bd4940a485204f9983ab2a65270))
+
 ## [0.6.0](https://github.com/hrzlgnm/mex/compare/v0.5.1...v0.6.0) (2026-11-11)
 
 
