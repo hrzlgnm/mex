@@ -781,16 +781,26 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
                         || resize_active(app, DragMode::HorizLower),
                 )),
         )
-        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        // The hex pane follows the detail cursor whatever holds focus, so
+        // the cursor row stays marked even when unfocused — dimmed to stay
+        // distinct from the focused cursor.
+        .row_highlight_style(if app.focus == Focus::Questions {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::DIM)
+        });
 
-    // Highlight the record-cursor question row, if the cursor is on one.
+    // Highlight the detail-cursor question row, if the cursor is on one,
+    // so the hex source stays identifiable whatever holds focus.
     let selected_table_row = if cursor_in_questions {
         Some(app.detail_selected - raw_count)
     } else {
         None
     };
     let mut tstate = TableState::default();
-    tstate.select(if app.focus == Focus::Questions {
+    // The marker stays visible whatever holds focus; the focused cursor
+    // keeps the full highlight, other focuses get the dimmed style above.
+    tstate.select(if cursor_in_questions {
         selected_table_row
     } else {
         None

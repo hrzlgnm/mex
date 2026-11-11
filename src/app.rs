@@ -4525,6 +4525,114 @@ mod tests {
         assert_eq!(title, " QRY PTR _services._dns-sd._udp.local (raw packet) ");
     }
 
+    /// REVERSED-carrying cell styles inside the Questions pane body
+    /// (border and header rows excluded). No other style in that pane uses
+    /// REVERSED, so any hit is the cursor marker.
+    fn questions_reversed_modifiers(app: &App) -> Vec<ratatui::style::Modifier> {
+        use ratatui::backend::TestBackend;
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+        let area = app.questions_rect.get();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = Vec::new();
+        for y in (area.y + 2)..(area.y + area.height.saturating_sub(1)) {
+            for x in (area.x + 1)..(area.x + area.width.saturating_sub(1)) {
+                if let Some(cell) = buf.cell((x, y)) {
+                    if cell.modifier.contains(ratatui::style::Modifier::REVERSED) {
+                        out.push(cell.modifier);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Top border line text of the hex pane (carries the pane title).
+    fn hex_title_line(app: &App) -> String {
+        use ratatui::backend::TestBackend;
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+        let area = app.hex_rect.get();
+        let buf = terminal.backend().buffer().clone();
+        let mut s = String::new();
+        for x in area.x..(area.x + area.width) {
+            if let Some(cell) = buf.cell((x, area.y)) {
+                s.push_str(cell.symbol());
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn questions_table_marks_hex_source_when_hosts_focused() {
+        use ratatui::style::Modifier;
+        let mut app = two_group_app();
+        app.route_own_question("_ssh._tcp.local.", 12);
+        let (raws, self_pos) = {
+            let target = app.display_detail().expect("detail target");
+            let raws = target.ordered_records().len();
+            let pos = target
+                .ordered_questions()
+                .iter()
+                .position(|q| q.2 == SELF_SOURCE)
+                .expect("self question filed");
+            (raws, pos)
+        };
+        app.detail_selected = raws + self_pos;
+        // Hosts focus: dimmed marker, hex title names the question.
+        assert_eq!(app.focus, Focus::Services);
+        let marked = questions_reversed_modifiers(&app);
+        assert!(
+            !marked.is_empty(),
+            "hex source row must stay marked without Questions focus"
+        );
+        assert!(
+            marked.iter().all(|m| m.contains(Modifier::DIM)),
+            "unfocused marker must be dim, distinct from the focused cursor"
+        );
+        assert!(hex_title_line(&app).contains("QRY PTR _ssh._tcp.local"));
+        // Questions focus: full cursor, same title.
+        app.focus = Focus::Questions;
+        let marked = questions_reversed_modifiers(&app);
+        assert!(!marked.is_empty());
+        assert!(
+            marked.iter().all(|m| !m.contains(Modifier::DIM)),
+            "focused cursor must not be dimmed"
+        );
+        assert!(hex_title_line(&app).contains("QRY PTR _ssh._tcp.local"));
+        // Hex focus: dimmed marker, same title.
+        app.focus = Focus::Hex;
+        let marked = questions_reversed_modifiers(&app);
+        assert!(!marked.is_empty());
+        assert!(marked.iter().all(|m| m.contains(Modifier::DIM)));
+        assert!(hex_title_line(&app).contains("QRY PTR _ssh._tcp.local"));
+        // Moving the cursor across question rows updates marker and title.
+        {
+            let sel_idx = match app.display_items().get(app.selected_display) {
+                Some(DisplayItem::Instance { index }) => *index,
+                _ => panic!("expected instance selected"),
+            };
+            app.services[sel_idx].questions.push((
+                "shell.local".to_string(),
+                "A".to_string(),
+                "192.168.1.99:5353".parse().unwrap(),
+                Instant::now(),
+                vec![0x01, 0x02],
+            ));
+        }
+        let target = app.display_detail().expect("detail target");
+        let raws = target.ordered_records().len();
+        let remote_pos = target
+            .ordered_questions()
+            .iter()
+            .position(|q| q.1 == "A")
+            .expect("remote question filed");
+        app.detail_selected = raws + remote_pos;
+        let marked = questions_reversed_modifiers(&app);
+        assert!(!marked.is_empty());
+        assert!(hex_title_line(&app).contains("QRY A shell.local"));
+    }
+
     #[test]
     fn enum_answers_file_on_selectable_row() {
         let mut app = App::new().unwrap();
