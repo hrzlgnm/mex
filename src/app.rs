@@ -4616,6 +4616,64 @@ mod tests {
         assert!(app.known_types.contains("_dacp._tcp.local"));
     }
 
+    /// REVERSED-carrying cell styles inside the Answers pane body (border
+    /// and header rows excluded). Backs the unfocused-marker regression
+    /// test; no other style in that pane uses REVERSED, so any hit is the
+    /// cursor marker.
+    fn answers_reversed_modifiers(app: &App) -> Vec<ratatui::style::Modifier> {
+        use ratatui::backend::TestBackend;
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+        let area = app.answers_rect.get();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = Vec::new();
+        for y in (area.y + 2)..(area.y + area.height.saturating_sub(1)) {
+            for x in (area.x + 1)..(area.x + area.width.saturating_sub(1)) {
+                if let Some(cell) = buf.cell((x, y)) {
+                    if cell.modifier.contains(ratatui::style::Modifier::REVERSED) {
+                        out.push(cell.modifier);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn answers_table_marks_hex_source_when_hosts_focused() {
+        use ratatui::style::Modifier;
+        let mut app = two_group_app();
+        // Services focus is the Hosts pane.
+        assert_eq!(app.focus, Focus::Services);
+        // The detail cursor sits on a record, so the hex pane follows it.
+        assert!(app.selected_detail_entry().is_some());
+        let marked = answers_reversed_modifiers(&app);
+        assert!(
+            !marked.is_empty(),
+            "hex source row must stay marked without Answers focus"
+        );
+        assert!(
+            marked.iter().all(|m| m.contains(Modifier::DIM)),
+            "unfocused marker must be dim, distinct from the focused cursor"
+        );
+        // Focused behavior is unchanged: full cursor, no dimming.
+        app.focus = Focus::Answers;
+        let marked = answers_reversed_modifiers(&app);
+        assert!(!marked.is_empty());
+        assert!(
+            marked.iter().all(|m| !m.contains(Modifier::DIM)),
+            "focused cursor must not be dimmed"
+        );
+        // Moving the host selection keeps marker and hex dump in sync: the
+        // marker follows the detail cursor (test records carry no wire
+        // bytes, so the dump itself is covered by the title tests).
+        app.focus = Focus::Services;
+        select_instance(&mut app, "Test");
+        assert!(app.selected_detail_entry().is_some());
+        let marked = answers_reversed_modifiers(&app);
+        assert!(!marked.is_empty(), "marker must follow the host selection");
+    }
+
     #[test]
     fn enum_answers_coalesce_wire_case_variants() {
         let mut app = App::new().unwrap();
