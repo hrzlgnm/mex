@@ -660,6 +660,9 @@ fn detail_table_rows<'a>(
                     .then_with(|| a.cmp(b))
             });
             // A lone pair is already fully shown in the parent row.
+            // Children span the full row width so the pair text sits
+            // next to the tree glyph at the left instead of in RDATA
+            // (far right behind the SOURCE column).
             if pairs.len() > 1 {
                 for (n, pair) in pairs.iter().enumerate() {
                     let branch = if n + 1 == pairs.len() {
@@ -668,13 +671,12 @@ fn detail_table_rows<'a>(
                         "  ├─"
                     };
                     rows.push(
-                        Row::new(vec![
-                            Cell::from(branch),
-                            Cell::from(""),
-                            Cell::from(""),
-                            Cell::from(""),
-                            Cell::from(*pair),
-                        ])
+                        Row::new(vec![Cell::from(Line::from(vec![
+                            Span::raw(branch),
+                            Span::raw(" "),
+                            Span::raw(*pair),
+                        ]))
+                        .column_span(5)])
                         .style(info_style),
                     );
                 }
