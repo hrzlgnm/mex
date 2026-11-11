@@ -714,11 +714,15 @@ fn detail_table_rows<'a>(
     let unique_recs = target.ordered_answers();
     let mut raw_positions = Vec::with_capacity(unique_recs.len());
     for rec in unique_recs {
-        let flagged = anomaly_keys.contains(&(
-            rec.name.trim_end_matches('.').to_lowercase(),
-            rec.rtype,
-            rec.rdata.clone(),
-        ));
+        // Expired and goodbye rows share identity with live findings from
+        // other sources; only live rows earn the marker.
+        let live = rec.ttl > 0 && rec.received_at.elapsed().as_secs() as u32 <= rec.ttl;
+        let flagged = live
+            && anomaly_keys.contains(&(
+                rec.name.trim_end_matches('.').to_lowercase(),
+                rec.rtype,
+                rec.rdata.clone(),
+            ));
         let flush = if rec.flush_bit { "flush" } else { "" };
         let rem = rec
             .ttl

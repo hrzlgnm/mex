@@ -1782,7 +1782,7 @@ impl App {
     /// touches query scheduling, ingest, or expiry. Cheap enough to rebuild
     /// per overlay frame (tens of services, hundreds of records).
     pub fn anomalies(&self) -> Vec<anomalies::Anomaly> {
-        let services: Vec<anomalies::ServiceView<'_>> = self
+        let mut services: Vec<anomalies::ServiceView<'_>> = self
             .services
             .iter()
             .map(|s| anomalies::ServiceView {
@@ -1790,8 +1790,22 @@ impl App {
                 service_type: &s.service_type,
                 hostname: &s.hostname,
                 answers: &s.answers,
+                subtypes: &s.subtypes,
             })
             .collect();
+        // Pending instances hold PTR/TXT rows that arrived before their
+        // SRV: they deserve the same checks. Dedup in the analyzer keeps
+        // rows already represented on a confirmed service to one finding;
+        // the identity format matches so shared findings collapse.
+        for p in &self.pending_instances {
+            services.push(anomalies::ServiceView {
+                instance: &p.instance,
+                service_type: &p.service_type,
+                hostname: "",
+                answers: &p.answers,
+                subtypes: &p.subtypes,
+            });
+        }
         let enum_answers: Vec<&browse::RawRecord> = self
             .enum_entries
             .iter()
@@ -6637,6 +6651,19 @@ mod tests {
         assert!(rows.iter().any(|(k, _)| k == "packets"));
         assert!(rows.iter().any(|(k, _)| k == "sent"));
         assert!(rows.iter().any(|(k, _)| k == "usable v4"));
+    }
+
+    #[test]
+    fn pending_ptr_flush_is_analyzed() {
+        // PTR with flush bit but no SRV yet: the row lives in pending, and
+        // the analyzer must still see it.
+        let mut app = App::new().unwrap();
+        let mut bad = ptr_record(120);
+        bad.flush_bit = true;
+        ingest(&mut app, &bad);
+        assert!(app.services.is_empty());
+        assert!(!app.pending_instances.is_empty());
+        assert!(app.anomalies().iter().any(|a| a.kind == "shared-flush"));
     }
 
     #[test]

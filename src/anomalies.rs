@@ -48,6 +48,7 @@ pub struct ServiceView<'a> {
     pub service_type: &'a str,
     pub hostname: &'a str,
     pub answers: &'a [RawRecord],
+    pub subtypes: &'a [String],
 }
 
 /// Snapshot input for the analyzer. Built by the caller from live browser
@@ -92,14 +93,19 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
 
     for svc in &snap.services {
         let service_id = format!("{}.{}", svc.instance, svc.service_type);
+        // A retained hostname outlives its SRV (expiry, goodbye): only a
+        // live SRV proves the service still claims the host.
+        let has_live_srv = svc.answers.iter().any(|r| r.rtype == 33 && is_live(r, now));
         check_missing_addr(
             svc,
             &service_id,
             &host_has_addr,
             &snap.pending_hosts,
+            has_live_srv,
             &mut out,
         );
         check_type_format(svc, &service_id, &mut out);
+        check_subtypes(svc, &service_id, &mut out);
         for rec in svc.answers {
             if !is_live(rec, now) {
                 continue;
@@ -114,14 +120,12 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
             continue;
         }
         check_record("enumeration", rec, &mut out);
-        // Enumeration PTR targets name service types: a malformed target
-        // means the type itself violates DNS-SD naming, so flag the PTR row
-        // itself (with full record identity, so the Answers table marks it).
+        // Enumeration PTR targets name service types (or subtypes): a
+        // malformed target means the name itself violates DNS-SD naming,
+        // so flag the PTR row itself (with full record identity, so the
+        // Answers table marks it).
         if rec.rtype == 12 {
             let target = rec.rdata.trim_end_matches('.');
-            if target.to_ascii_lowercase().contains("._sub.") {
-                continue;
-            }
             if let Some(reason) = service_type_problem(target) {
                 out.push(Anomaly {
                     kind: "type-format",
@@ -207,8 +211,12 @@ fn check_missing_addr(
     service_id: &str,
     host_has_addr: &HashMap<String, bool>,
     pending_hosts: &HashSet<String>,
+    has_live_srv: bool,
     out: &mut Vec<Anomaly>,
 ) {
+    if !has_live_srv {
+        return;
+    }
     let host = svc.hostname.trim_end_matches('.');
     if host.is_empty() {
         return;
@@ -220,9 +228,9 @@ fn check_missing_addr(
     if pending_hosts.contains(&key) {
         return;
     }
-    // Only flag when the service actually has an SRV (a hostname with no
-    // SRV yet is still resolving, not broken). Hostname alone is set from
-    // SRV handling, so non-empty hostname implies SRV was seen.
+    // A retained hostname outlives its SRV (expiry, goodbye): the caller
+    // passes whether a live SRV still claims the host, and only then is a
+    // missing address meaningful.
     out.push(Anomaly {
         kind: "missing-addr",
         severity: Severity::Warning,
@@ -259,34 +267,101 @@ fn check_type_format(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>
 }
 
 /// Why a service type string is invalid, if it is. `None` means valid.
-/// Split out so both confirmed services and enumeration PTR targets share
-/// one verdict and one message.
+/// Split out so confirmed services and enumeration PTR targets share
+/// one verdict and one message. Accepts the `_subtype._sub._service._tcp`
+/// subtype form (RFC 6763 §7.1) as well as plain types.
 fn service_type_problem(st: &str) -> Option<String> {
     let parts: Vec<&str> = st.split('.').collect();
-    if parts.len() != 3 {
-        return Some("expected _service._tcp.local or _service._udp.local".to_string());
+    match parts.as_slice() {
+        [svc, proto, local] => {
+            if let Some(reason) = label_problem(svc) {
+                return Some(reason);
+            }
+            if !proto.eq_ignore_ascii_case("_tcp") && !proto.eq_ignore_ascii_case("_udp") {
+                return Some("protocol must be _tcp or _udp".to_string());
+            }
+            if !local.eq_ignore_ascii_case("local") {
+                return Some("must end in .local".to_string());
+            }
+            None
+        }
+        [sub, sub_kw, svc, proto, local] => {
+            if let Some(reason) = label_problem(sub) {
+                return Some(format!("subtype {reason}"));
+            }
+            if !sub_kw.eq_ignore_ascii_case("_sub") {
+                return Some(
+                    "expected _service._tcp.local or _subtype._sub._service._tcp.local".to_string(),
+                );
+            }
+            if let Some(reason) = label_problem(svc) {
+                return Some(reason);
+            }
+            if !proto.eq_ignore_ascii_case("_tcp") && !proto.eq_ignore_ascii_case("_udp") {
+                return Some("protocol must be _tcp or _udp".to_string());
+            }
+            if !local.eq_ignore_ascii_case("local") {
+                return Some("must end in .local".to_string());
+            }
+            None
+        }
+        _ => Some("expected _service._tcp.local or _subtype._sub._service._tcp.local".to_string()),
     }
-    let (svc, proto, local) = (parts[0], parts[1], parts[2]);
-    if svc.len() < 2 || !svc.starts_with('_') {
+}
+
+/// Why an underscore-led service/subtype label is invalid, if it is.
+/// RFC 6763 §7 / Apple QA1198: leading underscore, then 1-15 characters
+/// of letters, digits, and hyphens, containing a letter and not starting
+/// or ending with a hyphen.
+fn label_problem(label: &str) -> Option<String> {
+    if label.len() < 2 || !label.starts_with('_') {
         return Some("service label must start with '_'".to_string());
     }
-    let label = &svc[1..];
-    if label.is_empty() {
+    let body = &label[1..];
+    if body.is_empty() {
         return Some("service label is empty".to_string());
     }
-    if label.len() > 15 {
+    if body.len() > 15 {
         return Some(format!(
-            "service label '{label}' is {} characters, limit is 15",
-            label.len()
+            "service label '{body}' is {} characters, limit is 15",
+            body.len()
         ));
     }
-    if !proto.eq_ignore_ascii_case("_tcp") && !proto.eq_ignore_ascii_case("_udp") {
-        return Some("protocol must be _tcp or _udp".to_string());
+    if !body.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        return Some(format!(
+            "service label '{body}' may only contain letters, digits, and hyphens"
+        ));
     }
-    if !local.eq_ignore_ascii_case("local") {
-        return Some("must end in .local".to_string());
+    if !body.bytes().any(|b| b.is_ascii_alphabetic()) {
+        return Some(format!("service label '{body}' must contain a letter"));
+    }
+    if body.starts_with('-') || body.ends_with('-') {
+        return Some(format!(
+            "service label '{body}' must not start or end with '-'"
+        ));
     }
     None
+}
+
+/// Subtype labels registered on a confirmed service share the service
+/// naming rules; a malformed one is a service-level finding.
+fn check_subtypes(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>) {
+    for sub in svc.subtypes {
+        if let Some(reason) = label_problem(sub.trim_end_matches('.')) {
+            out.push(Anomaly {
+                kind: "type-format",
+                severity: Severity::Warning,
+                service: service_id.to_string(),
+                record_name: None,
+                rtype: None,
+                rtype_str: None,
+                rdata: None,
+                source: None,
+                message: format!("subtype {sub} invalid: {reason}"),
+                rfc: "RFC 6763 §7.1",
+            });
+        }
+    }
 }
 
 fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
@@ -294,8 +369,11 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     let rdata = rec.rdata.clone();
     let src = rec.source.to_string();
 
-    // Unicast-only types leaking onto multicast.
-    if matches!(rec.rtype, 2 | 6 | 15 | 255) {
+    // Unicast-only types leaking onto multicast. MX is the soft case:
+    // nothing in the RFCs legitimizes mail routing over mDNS, but unlike
+    // SOA/NS/ANY it is not an explicitly unicast-only type, so it stays
+    // a warning about a possible leak rather than a definite violation.
+    if matches!(rec.rtype, 2 | 6 | 255) {
         out.push(Anomaly {
             kind: "unicast-leak",
             severity: Severity::Error,
@@ -307,6 +385,22 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             source: Some(src.clone()),
             message: format!(
                 "{} record leaked onto multicast (unicast-only type)",
+                rec.rtype_str
+            ),
+            rfc: "RFC 6762 §3",
+        });
+    } else if rec.rtype == 15 {
+        out.push(Anomaly {
+            kind: "unicast-leak",
+            severity: Severity::Warning,
+            service: service_id.to_string(),
+            record_name: Some(name.clone()),
+            rtype: Some(rec.rtype),
+            rtype_str: Some(rec.rtype_str.clone()),
+            rdata: Some(rdata.clone()),
+            source: Some(src.clone()),
+            message: format!(
+                "{} record on multicast (possible unicast leak)",
                 rec.rtype_str
             ),
             rfc: "RFC 6762 §3",
@@ -328,8 +422,10 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             rfc: "RFC 6762 §10.2",
         });
     }
-    // Unique records SHOULD set it; missing is only informational.
-    if matches!(rec.rtype, 33 | 16 | 1 | 28) && !rec.flush_bit {
+    // Unique records SHOULD set it; missing is only informational. Scoped
+    // to SRV/TXT: omitting the bit on A/AAAA is universal practice across
+    // embedded stacks, so flagging it is pure noise (removed, not tuned).
+    if matches!(rec.rtype, 33 | 16) && !rec.flush_bit {
         out.push(Anomaly {
             kind: "unique-no-flush",
             severity: Severity::Info,
@@ -378,15 +474,14 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         check_srv_target(service_id, rec, out);
     }
 
-    // TXT size only. Valueless keys, keys without `=`, and empty payloads
-    // are all valid and never flagged.
+    // TXT size only: measure the decoded payload, not the full wire
+    // record (owner name + header). Valueless keys, keys without `=`,
+    // and empty payloads are all valid and never flagged.
     if rec.rtype == 16 {
-        let wire_len = if rec.wire.is_empty() {
-            rec.rdata.len()
-        } else {
-            rec.wire.len()
-        };
-        if wire_len > TXT_MAX || rec.rdata.len() > TXT_MAX {
+        // Encoded length is this plus ~1 length byte per TXT string;
+        // negligible against the threshold, so the decoded length rules.
+        let payload_len = rec.rdata.len();
+        if payload_len > TXT_MAX {
             out.push(Anomaly {
                 kind: "txt-oversize",
                 severity: Severity::Warning,
@@ -396,7 +491,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
                 rtype_str: Some(rec.rtype_str.clone()),
                 rdata: Some(rec.rdata.clone()),
                 source: Some(rec.source.to_string()),
-                message: format!("TXT payload ~{wire_len}B exceeds {TXT_MAX}B"),
+                message: format!("TXT payload ~{payload_len}B exceeds {TXT_MAX}B"),
                 rfc: "RFC 6762 §17",
             });
         }
@@ -406,51 +501,80 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
 fn check_srv_target(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     let parts: Vec<&str> = rec.rdata.split_whitespace().collect();
     if parts.len() < 4 {
-        out.push(Anomaly {
-            kind: "srv-target",
-            severity: Severity::Warning,
-            service: service_id.to_string(),
-            record_name: Some(rec.name.clone()),
-            rtype: Some(rec.rtype),
-            rtype_str: Some(rec.rtype_str.clone()),
-            rdata: Some(rec.rdata.clone()),
-            source: Some(rec.source.to_string()),
-            message: "SRV rdata is malformed".to_string(),
-            rfc: "RFC 6763 §12",
-        });
+        out.push(srv_anomaly(service_id, rec, "SRV rdata is malformed"));
         return;
+    }
+    // Priority, weight, and port are 16-bit fields; port 0 stays valid.
+    for (field, value) in [
+        ("priority", parts[0]),
+        ("weight", parts[1]),
+        ("port", parts[2]),
+    ] {
+        if value.parse::<u16>().is_err() {
+            out.push(srv_anomaly(
+                service_id,
+                rec,
+                &format!("SRV {field} '{value}' is not a 16-bit number"),
+            ));
+            return;
+        }
     }
     let target = parts[3..].join(" ");
     let trimmed = target.trim().trim_end_matches('.');
     if trimmed.is_empty() || trimmed == "." {
-        out.push(Anomaly {
-            kind: "srv-target",
-            severity: Severity::Warning,
-            service: service_id.to_string(),
-            record_name: Some(rec.name.clone()),
-            rtype: Some(rec.rtype),
-            rtype_str: Some(rec.rtype_str.clone()),
-            rdata: Some(rec.rdata.clone()),
-            source: Some(rec.source.to_string()),
-            message: "SRV target is empty".to_string(),
-            rfc: "RFC 6763 §12",
-        });
+        out.push(srv_anomaly(service_id, rec, "SRV target is empty"));
+        return;
+    }
+    if let Some(reason) = dns_name_problem(trimmed) {
+        out.push(srv_anomaly(
+            service_id,
+            rec,
+            &format!("SRV target {target} invalid: {reason}"),
+        ));
         return;
     }
     if !trimmed.to_ascii_lowercase().ends_with(".local") && !trimmed.eq_ignore_ascii_case("local") {
-        out.push(Anomaly {
-            kind: "srv-target",
-            severity: Severity::Warning,
-            service: service_id.to_string(),
-            record_name: Some(rec.name.clone()),
-            rtype: Some(rec.rtype),
-            rtype_str: Some(rec.rtype_str.clone()),
-            rdata: Some(rec.rdata.clone()),
-            source: Some(rec.source.to_string()),
-            message: format!("SRV target {target} is outside .local"),
-            rfc: "RFC 6763 §12",
-        });
+        out.push(srv_anomaly(
+            service_id,
+            rec,
+            &format!("SRV target {target} is outside .local"),
+        ));
     }
+}
+
+fn srv_anomaly(service_id: &str, rec: &RawRecord, message: &str) -> Anomaly {
+    Anomaly {
+        kind: "srv-target",
+        severity: Severity::Warning,
+        service: service_id.to_string(),
+        record_name: Some(rec.name.clone()),
+        rtype: Some(rec.rtype),
+        rtype_str: Some(rec.rtype_str.clone()),
+        rdata: Some(rec.rdata.clone()),
+        source: Some(rec.source.to_string()),
+        message: message.to_string(),
+        rfc: "RFC 6763 §12",
+    }
+}
+
+/// Basic DNS-name shape: dot-separated non-empty labels of at most 63
+/// bytes, 255 bytes overall. Internationalized names pass through.
+fn dns_name_problem(name: &str) -> Option<String> {
+    if name.len() > 255 {
+        return Some("name exceeds 255 bytes".to_string());
+    }
+    for label in name.split('.') {
+        if label.is_empty() {
+            return Some("name has an empty label".to_string());
+        }
+        if label.len() > 63 {
+            return Some(format!(
+                "label '{}' exceeds 63 bytes",
+                label.chars().take(12).collect::<String>()
+            ));
+        }
+    }
+    None
 }
 
 fn check_ttl_stable(svc: &ServiceView, service_id: &str, now: Instant, out: &mut Vec<Anomaly>) {
@@ -535,11 +659,22 @@ mod tests {
         hostname: &str,
         answers: &[RawRecord],
     ) -> Vec<Anomaly> {
+        analyze_service_sub(instance, service_type, hostname, answers, &[])
+    }
+
+    fn analyze_service_sub(
+        instance: &str,
+        service_type: &str,
+        hostname: &str,
+        answers: &[RawRecord],
+        subtypes: &[String],
+    ) -> Vec<Anomaly> {
         let services = vec![ServiceView {
             instance,
             service_type,
             hostname,
             answers,
+            subtypes,
         }];
         let snap = Snapshot {
             services,
@@ -605,6 +740,7 @@ mod tests {
             service_type: "_http._tcp.local",
             hostname: "myhost.local.",
             answers: &answers,
+            subtypes: &[],
         }];
         let snap = Snapshot {
             services,
@@ -612,6 +748,39 @@ mod tests {
             pending_hosts: HashSet::from(["myhost.local".to_string()]),
         };
         assert!(!analyze(&snap).iter().any(|a| a.kind == "missing-addr"));
+    }
+
+    #[test]
+    fn missing_addr_quiet_without_live_srv() {
+        // Retained hostname after the SRV expired: nothing claims the host
+        // anymore, so a missing address is not an anomaly.
+        let answers = vec![aged(
+            rec(
+                "My._http._tcp.local.",
+                33,
+                "SRV",
+                "0 0 80 myhost.local.",
+                120,
+                true,
+            ),
+            500,
+        )];
+        let found = analyze_service("My", "_http._tcp.local", "myhost.local.", &answers);
+        assert!(!found.iter().any(|a| a.kind == "missing-addr"));
+    }
+
+    #[test]
+    fn missing_addr_quiet_on_srv_goodbye() {
+        let answers = vec![rec(
+            "My._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 80 myhost.local.",
+            0,
+            false,
+        )];
+        let found = analyze_service("My", "_http._tcp.local", "myhost.local.", &answers);
+        assert!(!found.iter().any(|a| a.kind == "missing-addr"));
     }
 
     #[test]
@@ -667,6 +836,36 @@ mod tests {
             .find(|a| a.kind == "unique-no-flush")
             .expect("expected info");
         assert_eq!(item.severity, Severity::Info);
+    }
+
+    #[test]
+    fn addr_records_without_flush_are_quiet() {
+        // Omitting the bit on A/AAAA is universal practice, not signal.
+        let answers = vec![
+            rec(
+                "My._http._tcp.local.",
+                33,
+                "SRV",
+                "0 0 80 myhost.local.",
+                120,
+                true,
+            ),
+            rec("myhost.local.", 1, "A", "192.168.1.10", 120, false),
+            rec("myhost.local.", 28, "AAAA", "fe80::1", 120, false),
+        ];
+        let found = analyze_service("My", "_http._tcp.local", "myhost.local.", &answers);
+        assert!(!found.iter().any(|a| a.kind == "unique-no-flush"));
+    }
+
+    #[test]
+    fn mx_leak_is_warning_not_error() {
+        let answers = vec![rec("host.local.", 15, "MX", "10 host.local.", 120, false)];
+        let found = analyze_service("My", "_http._tcp.local", "host.local.", &answers);
+        let item = found
+            .iter()
+            .find(|a| a.kind == "unicast-leak")
+            .expect("expected leak");
+        assert_eq!(item.severity, Severity::Warning);
     }
 
     #[test]
@@ -766,6 +965,73 @@ mod tests {
     }
 
     #[test]
+    fn type_format_rejects_bad_labels() {
+        for t in [
+            "_80._tcp.local",
+            "_bad_name._tcp.local",
+            "_-bad._tcp.local",
+            "_bad-._tcp.local",
+            "_http._sctp.local",
+        ] {
+            let found = analyze_service("X", t, "", &[]);
+            assert!(
+                found.iter().any(|a| a.kind == "type-format"),
+                "type {t} should be flagged"
+            );
+        }
+    }
+
+    #[test]
+    fn type_format_accepts_valid_subtype_label() {
+        let subtypes = vec!["_printer".to_string()];
+        let found = analyze_service_sub("X", "_http._tcp.local", "", &[], &subtypes);
+        assert!(!found.iter().any(|a| a.kind == "type-format"));
+    }
+
+    #[test]
+    fn type_format_flags_bad_subtype_label() {
+        let subtypes = vec!["_bad_name".to_string()];
+        let found = analyze_service_sub("X", "_http._tcp.local", "", &[], &subtypes);
+        assert!(found.iter().any(|a| a.kind == "type-format"));
+    }
+
+    #[test]
+    fn srv_rejects_non_numeric_fields() {
+        let answers = vec![rec(
+            "My._http._tcp.local.",
+            33,
+            "SRV",
+            "fast quick 80 myhost.local.",
+            120,
+            true,
+        )];
+        let found = analyze_service("My", "_http._tcp.local", "myhost.local.", &answers);
+        assert!(found.iter().any(|a| a.kind == "srv-target"));
+    }
+
+    #[test]
+    fn srv_rejects_empty_dns_label_in_target() {
+        let answers = vec![rec(
+            "My._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 80 foo..local.",
+            120,
+            true,
+        )];
+        let found = analyze_service("My", "_http._tcp.local", "foo..local.", &answers);
+        assert!(found.iter().any(|a| a.kind == "srv-target"));
+    }
+
+    #[test]
+    fn txt_wire_overhead_alone_is_quiet() {
+        let mut r = rec("X._http._tcp.local.", 16, "TXT", "k=v", 120, true);
+        r.wire = vec![0u8; 1400];
+        let found = analyze_service("X", "_http._tcp.local", "", &[r]);
+        assert!(!found.iter().any(|a| a.kind == "txt-oversize"));
+    }
+
+    #[test]
     fn type_format_accepts_tcp_udp_and_enum() {
         for t in [
             "_http._tcp.local",
@@ -800,7 +1066,7 @@ mod tests {
             "_services._dns-sd._udp.local.",
             12,
             "PTR",
-            "SHIELD._nv_shield_remote._tcp.local.",
+            "_nv_shield_remote._tcp.local.",
             4500,
             false,
         );
@@ -839,6 +1105,44 @@ mod tests {
             pending_hosts: HashSet::new(),
         };
         assert!(!analyze(&snap).iter().any(|a| a.kind == "type-format"));
+    }
+
+    #[test]
+    fn enumeration_ptr_with_valid_subtype_stays_quiet() {
+        let enum_rec = rec(
+            "_services._dns-sd._udp.local.",
+            12,
+            "PTR",
+            "_printer._sub._http._tcp.local.",
+            4500,
+            false,
+        );
+        let snap = Snapshot {
+            services: Vec::new(),
+            enum_answers: vec![&enum_rec],
+            pending_hosts: HashSet::new(),
+        };
+        assert!(!analyze(&snap).iter().any(|a| a.kind == "type-format"));
+    }
+
+    #[test]
+    fn enumeration_ptr_with_bad_subtype_flags_row() {
+        let enum_rec = rec(
+            "_services._dns-sd._udp.local.",
+            12,
+            "PTR",
+            "_bad_name._sub._http._tcp.local.",
+            4500,
+            false,
+        );
+        let snap = Snapshot {
+            services: Vec::new(),
+            enum_answers: vec![&enum_rec],
+            pending_hosts: HashSet::new(),
+        };
+        assert!(analyze(&snap)
+            .iter()
+            .any(|a| a.kind == "type-format" && a.service == "enumeration"));
     }
 
     #[test]
