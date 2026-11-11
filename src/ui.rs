@@ -9,12 +9,12 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Cell, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Row,
-    Table, TableState,
+    Table, TableState, Wrap,
 };
 use ratatui::Frame;
 
@@ -105,6 +105,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_body(frame, chunks[1], app);
     if app.show_metrics {
         draw_metrics_overlay(frame, app);
+    }
+    if let Some(text) = app.status_popup() {
+        draw_status_popup(frame, text);
     }
 }
 
@@ -240,6 +243,31 @@ fn draw_metrics_overlay(frame: &mut Frame, app: &App) {
     *state.offset_mut() = offset;
     frame.render_stateful_widget(table, area, &mut state);
     app.metrics_scroll.set(state.offset());
+}
+
+/// Transient confirmation popup (state dump result): centered, 3 rows,
+/// auto-expires after 3s and dismissed by any key (see `App::status_popup`).
+fn draw_status_popup(frame: &mut Frame, text: String) {
+    let area = frame.area();
+    let width = (text.len() + 6)
+        .min(area.width.saturating_sub(4) as usize)
+        .max(1) as u16;
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(3) / 2,
+        width,
+        height: 3.min(area.height).max(1),
+    };
+    frame.render_widget(Clear, popup);
+    let para = Paragraph::new(text)
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Green)),
+        );
+    frame.render_widget(para, popup);
 }
 
 /// Short display form for a service type: `_http._tcp.local.` → `http.tcp`.
@@ -443,7 +471,7 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     // Size SOURCE to the longest socket addr so IPv6 fits, clamped to
     // keep RDATA usable on narrow terminals.
     let src_w = target
-        .all_records()
+        .all_answers()
         .iter()
         .map(|r| source_label(r).len())
         .max()
@@ -655,12 +683,12 @@ fn detail_table_rows<'a>(
         }
     }
 
-    // Raw records, deduped and sorted by type then TTL.
+    // Raw answers, deduped and sorted by type then TTL.
     // (Ordering lives on the target so the j/k cursor and hex lookup share it.)
-    // Multi-pair TXT records carry their key=value pairs as collapsible
+    // Multi-pair TXT answers carry their key=value pairs as collapsible
     // child rows (collapsed by default, `Enter` expands); the cursor skips
     // child rows. raw_positions maps each raw record to its table row.
-    let unique_recs = target.ordered_records();
+    let unique_recs = target.ordered_answers();
     let mut raw_positions = Vec::with_capacity(unique_recs.len());
     for rec in unique_recs {
         let flush = if rec.flush_bit { "flush" } else { "" };
@@ -774,7 +802,7 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
             format!("{age}s")
         };
         // Questions asked from this host's own addresses (including our
-        // own looped-back queries) get the same highlight as local records.
+        // own looped-back queries) get the same highlight as local answers.
         // Our own inferred sends render as `self`.
         let self_row = *source == crate::app::SELF_SOURCE;
         let style = if self_row || app.is_local_source(source) {
@@ -810,7 +838,7 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
 
     // The Questions table is its own focus stop: light its border when
     // focused.
-    let raw_count = target.ordered_records().len();
+    let raw_count = target.ordered_answers().len();
     let cursor_in_questions =
         app.selected_detail_entry().is_some() && app.detail_selected >= raw_count;
 

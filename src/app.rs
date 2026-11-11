@@ -14,6 +14,7 @@ use hickory_proto::rr::RecordType;
 use ratatui::layout::Rect;
 
 use crate::browse;
+use crate::dump;
 use crate::ui;
 
 /// Pane with keyboard focus: Tab cycles the service list, the two
@@ -76,7 +77,7 @@ enum DetailCursorKey {
 struct PendingService {
     instance: String,
     service_type: String,
-    records: Vec<browse::RawRecord>,
+    answers: Vec<browse::RawRecord>,
     subtypes: Vec<String>,
     questions: Vec<QuestionRow>,
     last_seen: Instant,
@@ -291,7 +292,7 @@ pub struct App {
     /// schedule via push_record.
     requeries: HashMap<(String, u16), (Instant, u8)>,
     /// Enumeration answers learned from `_services._dns-sd._udp.local`
-    /// PTR records: service type -> (original TTL, received_at, ingress
+    /// PTR answers: service type -> (original TTL, received_at, ingress
     /// interface). Used as known answers on enumeration requeries
     /// (RFC 6762 §7.1, shared), scoped to the link they came from.
     enum_known: HashMap<String, (u32, Instant, String)>,
@@ -324,6 +325,9 @@ pub struct App {
     pending_instances: Vec<PendingService>,
     pending_addrs: Vec<(String, browse::RawRecord)>,
     pub raw_events: Vec<browse::Event>,
+    /// Transient confirmation popup (e.g. state-dump result), shown for
+    /// a few seconds and dismissed by any key.
+    status_msg: Option<(String, Instant)>,
 }
 
 pub struct ServiceEntry {
@@ -332,7 +336,7 @@ pub struct ServiceEntry {
     pub hostname: String,
     pub port: u16,
     pub subtypes: Vec<String>,
-    pub records: Vec<browse::RawRecord>,
+    pub answers: Vec<browse::RawRecord>,
     /// Recently seen questions asking for this service:
     /// (name, type, querier, received_at, query packet bytes). Capped.
     pub questions: Vec<QuestionRow>,
@@ -344,14 +348,14 @@ pub struct ServiceEntry {
 }
 
 impl ServiceEntry {
-    /// Raw records deduped by name/type/rdata/source (latest wins), sorted by
+    /// Raw answers deduped by name/type/rdata/source (latest wins), sorted by
     /// type then source for display. Same record announced by different
     /// responders counts as distinct observations, grouped adjacently.
     /// Mirrors the replace identity used by `push_record`.
-    pub fn ordered_records(&self) -> Vec<&browse::RawRecord> {
+    pub fn ordered_answers(&self) -> Vec<&browse::RawRecord> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
-        for rec in self.records.iter().rev() {
+        for rec in self.answers.iter().rev() {
             if seen.insert((&rec.name, rec.rtype, &rec.rdata, rec.source)) {
                 out.push(rec);
             }
@@ -392,17 +396,17 @@ impl ServiceEntry {
 /// service counts, expiry, or SRV/TXT/A interests.
 pub struct EnumEntry {
     pub name: String,
-    pub records: Vec<browse::RawRecord>,
+    pub answers: Vec<browse::RawRecord>,
     pub questions: Vec<QuestionRow>,
     pub last_seen: Instant,
     pub last_event: Option<browse::Event>,
 }
 
 impl EnumEntry {
-    pub fn ordered_records(&self) -> Vec<&browse::RawRecord> {
+    pub fn ordered_answers(&self) -> Vec<&browse::RawRecord> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
-        for rec in self.records.iter().rev() {
+        for rec in self.answers.iter().rev() {
             if seen.insert((&rec.name, rec.rtype, &rec.rdata, rec.source)) {
                 out.push(rec);
             }
@@ -447,10 +451,10 @@ pub enum DetailTarget<'a> {
 }
 
 impl<'a> DetailTarget<'a> {
-    pub fn ordered_records(&self) -> Vec<&'a browse::RawRecord> {
+    pub fn ordered_answers(&self) -> Vec<&'a browse::RawRecord> {
         match self {
-            DetailTarget::Service(s) => s.ordered_records(),
-            DetailTarget::Enum(e) => e.ordered_records(),
+            DetailTarget::Service(s) => s.ordered_answers(),
+            DetailTarget::Enum(e) => e.ordered_answers(),
         }
     }
 
@@ -470,10 +474,10 @@ impl<'a> DetailTarget<'a> {
         }
     }
 
-    pub fn all_records(&self) -> &'a [browse::RawRecord] {
+    pub fn all_answers(&self) -> &'a [browse::RawRecord] {
         match self {
-            DetailTarget::Service(s) => &s.records,
-            DetailTarget::Enum(e) => &e.records,
+            DetailTarget::Service(s) => &s.answers,
+            DetailTarget::Enum(e) => &e.answers,
         }
     }
 
@@ -559,7 +563,7 @@ impl App {
             sticky_enum_key: None,
             enum_entries: vec![EnumEntry {
                 name: ENUM_SERVICE.to_string(),
-                records: Vec::new(),
+                answers: Vec::new(),
                 questions: Vec::new(),
                 last_seen: Instant::now(),
                 last_event: None,
@@ -567,6 +571,7 @@ impl App {
             pending_instances: Vec::new(),
             pending_addrs: Vec::new(),
             raw_events: Vec::new(),
+            status_msg: None,
             show_metrics: false,
             metrics_scroll: Cell::new(0),
             metrics_viewport: Cell::new(0),
@@ -728,8 +733,8 @@ impl App {
         m.bytes_total += ev.raw_bytes.len() as u64;
         m.packet_times.push_back(now);
         m.last_packet_at = Some(now);
-        m.records_total += ev.records.len() as u64;
-        for rec in &ev.records {
+        m.records_total += ev.answers.len() as u64;
+        for rec in &ev.answers {
             *m.records_by_type.entry(rec.rtype).or_insert(0) += 1;
             if rec.flush_bit {
                 m.flush_seen += 1;
@@ -752,7 +757,7 @@ impl App {
         // so unmapped traffic stays identifiable instead of piling up
         // under one opaque bucket.
         let (iface, ifindex) = ev
-            .records
+            .answers
             .first()
             .or(ev.questions.first())
             .or(ev.query_kas.first())
@@ -780,10 +785,10 @@ impl App {
     }
 
     /// Known PTR answers for a service type (or enumeration), RFC 6762 §7.1:
-    /// only records with at least half of the original TTL remaining, sent
+    /// only answers with at least half of the original TTL remaining, sent
     /// with their remaining TTL so responders can suppress duplicates.
     /// Unique types (SRV/TXT/A/AAAA) are intentionally omitted: §7.1 notes
-    /// known-answer suppression is for shared records. Each answer carries
+    /// known-answer suppression is for shared answers. Each answer carries
     /// the interface it was observed on; the transport only sends it back
     /// out that same link, where it can actually suppress something.
     fn known_ptrs(&self, owner: &str) -> Vec<browse::KnownAnswer> {
@@ -810,7 +815,7 @@ impl App {
             if !s.service_type.eq_ignore_ascii_case(owner) {
                 continue;
             }
-            for rec in &s.records {
+            for rec in &s.answers {
                 push_rec(rec, &mut out);
             }
         }
@@ -818,7 +823,7 @@ impl App {
             if !p.service_type.eq_ignore_ascii_case(owner) {
                 continue;
             }
-            for rec in &p.records {
+            for rec in &p.answers {
                 push_rec(rec, &mut out);
             }
         }
@@ -888,12 +893,12 @@ impl App {
             }
         };
         for svc in &self.services {
-            for rec in &svc.records {
+            for rec in &svc.answers {
                 scan(rec, &mut ttl_by_key, &mut triggered, &mut live_keys);
             }
         }
         for entry in &self.enum_entries {
-            for rec in &entry.records {
+            for rec in &entry.answers {
                 scan(rec, &mut ttl_by_key, &mut triggered, &mut live_keys);
             }
         }
@@ -1252,7 +1257,7 @@ impl App {
             if Self::host_key(&s.hostname) != key {
                 continue;
             }
-            for rec in &s.records {
+            for rec in &s.answers {
                 if rec.rtype != 1 && rec.rtype != 28 {
                     continue;
                 }
@@ -1379,7 +1384,7 @@ impl App {
         );
         for entry in &self.enum_entries {
             let live_answers = entry
-                .records
+                .answers
                 .iter()
                 .filter(|r| r.ttl > 0 && r.received_at.elapsed().as_secs() as u32 <= r.ttl)
                 .count();
@@ -1396,7 +1401,7 @@ impl App {
                     "{} Q current ({} queriers) · {} answers ({} live)",
                     entry.questions.len(),
                     eq.len(),
-                    entry.records.len(),
+                    entry.answers.len(),
                     live_answers,
                 ),
             );
@@ -1413,12 +1418,12 @@ impl App {
         let (live, expired, goodbye) = self.current_record_liveness();
         kv(
             &mut rows,
-            "records current",
+            "answers current",
             format!("{live} live, {expired} expired, {goodbye} goodbye"),
         );
         kv(
             &mut rows,
-            "records ever",
+            "answers ever",
             format!(
                 "{} (PTR {} · SRV {} · TXT {} · A {} · AAAA {} · other {})",
                 self.metrics.records_total,
@@ -1635,12 +1640,12 @@ impl App {
             }
         };
         for svc in &self.services {
-            for rec in &svc.records {
+            for rec in &svc.answers {
                 count(rec);
             }
         }
         for entry in &self.enum_entries {
-            for rec in &entry.records {
+            for rec in &entry.answers {
                 count(rec);
             }
         }
@@ -1742,6 +1747,214 @@ impl App {
         }
     }
 
+    /// Live TXT pairs, deduped and sorted by key (expired and goodbye
+    /// rows omitted). High-entropy values are redacted (keys kept) so
+    /// dumps are safe to share; dedup runs after redaction so identical
+    /// keys collapse to one `key=*REDACTED*` row.
+    fn txt_records_for_dump(svc: &ServiceEntry) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for rec in &svc.answers {
+            if rec.rtype != 16 || rec.ttl == 0 {
+                continue;
+            }
+            if rec.received_at.elapsed().as_secs() as u32 > rec.ttl {
+                continue;
+            }
+            for pair in rec.rdata.split("; ") {
+                if pair.is_empty() {
+                    continue;
+                }
+                let redacted = dump::redact_txt_value(pair);
+                if seen.insert(redacted.clone()) {
+                    out.push(redacted);
+                }
+            }
+        }
+        out.sort_by(|a, b| {
+            let ka = a.split('=').next().unwrap_or(a);
+            let kb = b.split('=').next().unwrap_or(b);
+            ka.cmp(kb)
+        });
+        out
+    }
+
+    fn dump_answer_row(rec: &browse::RawRecord) -> dump::DumpAnswer {
+        dump::DumpAnswer {
+            name: rec.name.clone(),
+            rtype: rec.rtype,
+            rtype_str: rec.rtype_str.clone(),
+            ttl: rec.ttl,
+            ttl_remaining: Self::remaining_ttl(rec),
+            // High-entropy TXT values and public IPv6 literals are
+            // redacted for safe sharing.
+            rdata: if rec.rtype == 16 {
+                dump::redact_txt_rdata(&rec.rdata)
+            } else if rec.rtype == 28 {
+                dump::redact_ip_literal(&rec.rdata)
+            } else {
+                rec.rdata.clone()
+            },
+            source: rec.source.to_string(),
+            iface: rec.iface.clone(),
+            ifindex: rec.ifindex,
+            flush: rec.flush_bit,
+            received_at: dump::instant_to_iso(rec.received_at),
+            age_secs: rec.received_at.elapsed().as_secs(),
+        }
+    }
+
+    fn dump_question_row(q: &QuestionRow) -> dump::DumpQuestion {
+        dump::DumpQuestion {
+            name: q.0.clone(),
+            rtype_str: q.1.clone(),
+            source: q.2.to_string(),
+            received_at: dump::instant_to_iso(q.3),
+            age_secs: q.3.elapsed().as_secs(),
+        }
+    }
+
+    fn dump_service(&self, svc: &ServiceEntry) -> dump::DumpService {
+        let mut subtypes = svc.subtypes.clone();
+        subtypes.sort();
+        // Public IPv6 literals keep first/last hextet only; identical
+        // markers dedup here.
+        let mut seen_addrs = HashSet::new();
+        let mut addresses = Vec::new();
+        for addr in self.host_addresses(&Self::host_key(&svc.hostname)) {
+            let redacted = dump::redact_ip_literal(&addr);
+            if seen_addrs.insert(redacted.clone()) {
+                addresses.push(redacted);
+            }
+        }
+        dump::DumpService {
+            instance: svc.instance.clone(),
+            service_type: svc.service_type.clone(),
+            hostname: svc.hostname.clone(),
+            port: svc.port,
+            addresses,
+            txt_records: Self::txt_records_for_dump(svc),
+            is_active: svc.is_active,
+            last_seen_age_secs: svc.last_seen.elapsed().as_secs(),
+            subtypes,
+            answers: svc
+                .ordered_answers()
+                .into_iter()
+                .map(Self::dump_answer_row)
+                .collect(),
+            questions: svc.questions.iter().map(Self::dump_question_row).collect(),
+        }
+    }
+
+    /// Snapshot of mex's own browse state.
+    fn state_dump(&self) -> dump::StateDump {
+        let mut service_types: Vec<String> = self.known_types.iter().cloned().collect();
+        service_types.sort();
+        let mut metrics = std::collections::BTreeMap::new();
+        let m = &self.metrics;
+        metrics.insert("packets".to_string(), self.packet_count);
+        metrics.insert("bytes_total".to_string(), m.bytes_total);
+        metrics.insert("records_total".to_string(), m.records_total);
+        for (t, label) in [
+            (12, "ptr"),
+            (33, "srv"),
+            (16, "txt"),
+            (1, "a"),
+            (28, "aaaa"),
+        ] {
+            metrics.insert(
+                format!("records_{label}"),
+                m.records_by_type.get(&t).copied().unwrap_or(0),
+            );
+        }
+        metrics.insert("records_other".to_string(), self.other_records_total());
+        metrics.insert("questions_total".to_string(), m.questions_total);
+        metrics.insert("questions_qu".to_string(), m.qu_questions_seen);
+        metrics.insert("questions_qm".to_string(), m.qm_questions_seen);
+        metrics.insert("kas_seen".to_string(), m.kas_seen);
+        metrics.insert("goodbyes_seen".to_string(), m.goodbyes_seen);
+        metrics.insert("flush_seen".to_string(), m.flush_seen);
+        metrics.insert("q_sent_continuous".to_string(), m.q_sent_continuous);
+        metrics.insert("q_sent_refresh".to_string(), m.q_sent_refresh);
+        metrics.insert("qu_sent".to_string(), m.qu_sent);
+        metrics.insert("ka_sent".to_string(), m.ka_sent);
+        metrics.insert("suppressed_continuous".to_string(), m.suppressed_continuous);
+        metrics.insert("suppressed_refresh".to_string(), m.suppressed_refresh);
+        metrics.insert("services_current".to_string(), self.services.len() as u64);
+        metrics.insert(
+            "services_active".to_string(),
+            self.services.iter().filter(|s| s.is_active).count() as u64,
+        );
+        metrics.insert("services_seen_total".to_string(), m.services_seen_total);
+        metrics.insert(
+            "services_expired_total".to_string(),
+            m.services_expired_total,
+        );
+        metrics.insert("service_types".to_string(), service_types.len() as u64);
+        metrics.insert("enum_known".to_string(), self.enum_known.len() as u64);
+        metrics.insert(
+            "continuous_interests".to_string(),
+            self.continuous.len() as u64,
+        );
+        metrics.insert("requery_pending".to_string(), self.requeries.len() as u64);
+        metrics.insert(
+            "uptime_secs".to_string(),
+            self.start_time.elapsed().as_secs(),
+        );
+        dump::StateDump {
+            metadata: dump::Metadata {
+                dump_timestamp: dump::dump_timestamp_iso(),
+                application_name: "mex".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+            services: self.services.iter().map(|s| self.dump_service(s)).collect(),
+            service_types,
+            metrics,
+            passive: self.passive,
+            enum_groups: self
+                .enum_entries
+                .iter()
+                .map(|e| dump::RawGroup {
+                    name: e.name.clone(),
+                    answers: e.answers.iter().map(Self::dump_answer_row).collect(),
+                    questions: e.questions.iter().map(Self::dump_question_row).collect(),
+                })
+                .collect(),
+            pending: self
+                .pending_instances
+                .iter()
+                .map(|p| dump::RawGroup {
+                    name: format!("{}.{}", p.instance, p.service_type),
+                    answers: p.answers.iter().map(Self::dump_answer_row).collect(),
+                    questions: p.questions.iter().map(Self::dump_question_row).collect(),
+                })
+                .collect(),
+        }
+    }
+
+    fn save_state_dump(&self) -> Result<String> {
+        let json_path = self.save_state_dump_to(std::path::Path::new(""))?;
+        Ok(json_path.to_string_lossy().into_owned())
+    }
+
+    fn save_state_dump_to(&self, dir: &std::path::Path) -> Result<std::path::PathBuf> {
+        let json = serde_json::to_string_pretty(&self.state_dump())?;
+        let stem = dump::file_stem_iso();
+        let json_path = dir.join(format!("{stem}-mex-dump.json"));
+        std::fs::write(&json_path, &json)?;
+        Ok(json_path)
+    }
+
+    /// Confirmation popup text while fresh (3s); `None` once expired.
+    pub fn status_popup(&self) -> Option<String> {
+        let (text, since) = self.status_msg.as_ref()?;
+        if since.elapsed() <= Duration::from_secs(3) {
+            Some(text.clone())
+        } else {
+            None
+        }
+    }
+
     fn unanswered_histogram(&self) -> String {
         if self.requeries.is_empty() {
             return "none unanswered".to_string();
@@ -1812,6 +2025,27 @@ impl App {
             self.running = false;
             return;
         }
+        // Experimental dump of mex's own browse state (Ctrl+J).
+        // This takes Ctrl+J away from detail scrolling (Ctrl+K still
+        // scrolls; the other scroll keys are unaffected).
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('j') | KeyCode::Char('J'))
+        {
+            let msg = match self.save_state_dump() {
+                Ok(json) => {
+                    log::info!("mex: state dump saved to {json}");
+                    format!("Dump saved: {json}")
+                }
+                Err(e) => {
+                    log::error!("mex: state dump failed: {e:#}");
+                    format!("Dump failed: {e:#}")
+                }
+            };
+            self.status_msg = Some((msg, Instant::now()));
+            return;
+        }
+        // Any other key dismisses a visible confirmation popup.
+        self.status_msg = None;
         let no_ctrl_alt = !key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
@@ -2186,7 +2420,7 @@ impl App {
             return None;
         }
         let mut row = info_rows;
-        for (idx, rec) in target.ordered_records().into_iter().enumerate() {
+        for (idx, rec) in target.ordered_answers().into_iter().enumerate() {
             if table_row == row {
                 return Some(idx);
             }
@@ -2248,7 +2482,7 @@ impl App {
         let Some(target) = self.display_detail() else {
             return;
         };
-        let raws = target.ordered_records().len();
+        let raws = target.ordered_answers().len();
         let table_row = self.questions_offset.get().saturating_add(rel);
         if table_row < target.questions_len() {
             self.detail_free_scroll = false;
@@ -2359,7 +2593,7 @@ impl App {
 
     /// Page the service selection by one viewport of stops
     /// (PageUp/PageDown/b/f/Space). Falls back to 10 stops before the
-    /// first draw records the real height.
+    /// first draw answers the real height.
     fn page_selection(&mut self, pages: isize) {
         let per_page = self.list_viewport.get().max(1) as isize;
         let steps = pages * per_page;
@@ -2487,7 +2721,7 @@ impl App {
     }
 
     /// Index range of the focused record table inside the combined
-    /// [records, questions] cursor order: Answers covers the raw records,
+    /// [answers, questions] cursor order: Answers covers the raw answers,
     /// Questions the question rows. Services focus is unused by the
     /// record cursor; it spans everything. Hex has no cursor rows.
     fn detail_range(&self) -> (usize, usize) {
@@ -2495,8 +2729,8 @@ impl App {
             .display_detail()
             .map(|d| {
                 (
-                    d.ordered_records().len(),
-                    d.ordered_records().len() + d.questions_len(),
+                    d.ordered_answers().len(),
+                    d.ordered_answers().len() + d.questions_len(),
                 )
             })
             .unwrap_or((0, 0));
@@ -2526,7 +2760,7 @@ impl App {
             .and_then(|d| Self::identity_at_detail(&d, self.detail_selected));
     }
 
-    /// Record cursor over the focused table: raw records for Answers,
+    /// Record cursor over the focused table: raw answers for Answers,
     /// question rows for Questions. The cursor tracks row identity, so
     /// TTL resorting and re-announcements don't yank the selection to
     /// another row.
@@ -2573,7 +2807,7 @@ impl App {
     }
 
     /// Page the record cursor by one Answers-table viewport. Falls back
-    /// to 10 rows before the first draw records the real height.
+    /// to 10 rows before the first draw answers the real height.
     fn page_detail(&mut self, pages: isize) {
         let per_page = self.record_viewport.get().max(1) as isize;
         let steps = pages * per_page;
@@ -2664,10 +2898,10 @@ impl App {
         self.scroll_metrics(steps);
     }
 
-    /// Identity of the table row at an index (raw records first, then
+    /// Identity of the table row at an index (raw answers first, then
     /// questions by type/newest-first, matching the rendered table).
     fn identity_at_detail(target: &DetailTarget<'_>, index: usize) -> Option<DetailCursorKey> {
-        let raws = target.ordered_records();
+        let raws = target.ordered_answers();
         if index < raws.len() {
             let r = raws[index];
             return Some(DetailCursorKey::Record {
@@ -2690,7 +2924,7 @@ impl App {
 
     /// Index of the row with an identity, if still present.
     fn position_of_detail(target: &DetailTarget<'_>, key: &DetailCursorKey) -> Option<usize> {
-        let raws = target.ordered_records();
+        let raws = target.ordered_answers();
         match key {
             DetailCursorKey::Record {
                 name,
@@ -2752,7 +2986,7 @@ impl App {
                 // the last raw record instead of pointing at shifted churn.
                 let parked = self
                     .display_detail()
-                    .map(|d| d.ordered_records().len().saturating_sub(1))
+                    .map(|d| d.ordered_answers().len().saturating_sub(1))
                     .unwrap_or(0);
                 self.detail_selected = parked;
                 self.detail_anchor = self
@@ -2764,7 +2998,7 @@ impl App {
         // Clamp against entries that aged away (capped question list).
         let max = self
             .display_detail()
-            .map(|d| (d.ordered_records().len() + d.questions_len()).saturating_sub(1))
+            .map(|d| (d.ordered_answers().len() + d.questions_len()).saturating_sub(1))
             .unwrap_or(0);
         if self.detail_selected > max {
             self.detail_selected = max;
@@ -2772,7 +3006,7 @@ impl App {
     }
 
     fn ingest_event(&mut self, ev: &browse::Event) {
-        for rec in &ev.records {
+        for rec in &ev.answers {
             if rec.ttl == 0 {
                 self.mark_goodbye(rec);
                 self.ingest_goodbye(rec, ev);
@@ -2890,15 +3124,15 @@ impl App {
                 // DNS names compare case-insensitively (RFC 6763 §7): a
                 // peer varying the wire case must refresh the row, not
                 // grow the list.
-                if let Some(pos) = entry.records.iter().position(|r| {
+                if let Some(pos) = entry.answers.iter().position(|r| {
                     r.name.eq_ignore_ascii_case(&rec.name)
                         && r.rtype == rec.rtype
                         && r.rdata.eq_ignore_ascii_case(&rec.rdata)
                         && r.source == rec.source
                 }) {
-                    entry.records[pos] = rec.clone();
+                    entry.answers[pos] = rec.clone();
                 } else {
-                    entry.records.push(rec.clone());
+                    entry.answers.push(rec.clone());
                 }
             }
             return;
@@ -3123,20 +3357,20 @@ impl App {
                 // DNS names compare case-insensitively (RFC 6763 §7): a
                 // peer varying the wire case must refresh the row, not
                 // grow the list.
-                if let Some(pos) = entry.records.iter().position(|r| {
+                if let Some(pos) = entry.answers.iter().position(|r| {
                     r.name.eq_ignore_ascii_case(&rec.name)
                         && r.rtype == rec.rtype
                         && r.rdata.eq_ignore_ascii_case(&rec.rdata)
                         && r.source == rec.source
                 }) {
-                    entry.records[pos] = rec.clone();
+                    entry.answers[pos] = rec.clone();
                 } else {
-                    entry.records.push(rec.clone());
+                    entry.answers.push(rec.clone());
                 }
                 // A fresh answer resets the requery schedule unless a
                 // sibling row is still inside its 80%-TTL window.
                 let key = (rec.name.trim_end_matches('.').to_string(), rec.rtype);
-                let still_expiring = entry.records.iter().any(|r| {
+                let still_expiring = entry.answers.iter().any(|r| {
                     if r.ttl == 0
                         || r.name.trim_end_matches('.') != key.0.as_str()
                         || r.rtype != key.1
@@ -3187,13 +3421,13 @@ impl App {
                     .subtypes
                     .push(subtype.to_string());
             }
-            self.pending_instances[pi].records.push(rec.clone());
+            self.pending_instances[pi].answers.push(rec.clone());
             return;
         }
 
         let instance = Self::strip_suffix_ci(target, st).unwrap_or(target);
         let pi = self.ensure_pending(instance, st);
-        self.pending_instances[pi].records.push(rec.clone());
+        self.pending_instances[pi].answers.push(rec.clone());
         // A live PTR for an already-confirmed service must reactivate it
         // here: after a goodbye the service is inactive, and without this
         // forward the PTR would sit in pending until (and unless) a fresh
@@ -3303,7 +3537,7 @@ impl App {
                 if svc.hostname.trim_end_matches('.').to_lowercase() != host_key {
                     continue;
                 }
-                for r in &svc.records {
+                for r in &svc.answers {
                     // Owner check, not just sibling check: a sibling that
                     // moved SRV targets keeps its old-host rows, and those
                     // must not leak onto this host. Names compare
@@ -3357,8 +3591,8 @@ impl App {
                 }
                 self.services[svc_idx].last_seen =
                     self.services[svc_idx].last_seen.max(p.last_seen);
-                let records = p.records;
-                for rec in &records {
+                let answers = p.answers;
+                for rec in &answers {
                     self.push_record(svc_idx, rec);
                 }
             } else {
@@ -3392,7 +3626,7 @@ impl App {
         }
         let pi = self.ensure_pending(&instance, &service_type);
 
-        self.pending_instances[pi].records.push(rec.clone());
+        self.pending_instances[pi].answers.push(rec.clone());
     }
 
     fn handle_addr(&mut self, rec: &browse::RawRecord, ev: &browse::Event) {
@@ -3455,7 +3689,7 @@ impl App {
         self.pending_instances.push(PendingService {
             instance: instance.to_string(),
             service_type: service_type.to_string(),
-            records: Vec::new(),
+            answers: Vec::new(),
             subtypes: Vec::new(),
             questions: Vec::new(),
             last_seen: Instant::now(),
@@ -3479,7 +3713,7 @@ impl App {
             hostname: String::new(),
             port: 0,
             subtypes: Vec::new(),
-            records: Vec::new(),
+            answers: Vec::new(),
             questions: Vec::new(),
             last_seen: now,
             is_active: true,
@@ -3507,15 +3741,15 @@ impl App {
             s.is_active = true;
         }
         // replace stale record with same name+rtype+rdata+source to keep list clean
-        if let Some(pos) = s.records.iter().position(|r| {
+        if let Some(pos) = s.answers.iter().position(|r| {
             r.name == rec.name
                 && r.rtype == rec.rtype
                 && r.rdata == rec.rdata
                 && r.source == rec.source
         }) {
-            s.records[pos] = rec.clone();
+            s.answers[pos] = rec.clone();
         } else {
-            s.records.push(rec.clone());
+            s.answers.push(rec.clone());
         }
         // Fresh answer resets the RFC 6762 §5.2 requery schedule, but only
         // if no row for this key is still inside the 80%-TTL window:
@@ -3524,7 +3758,7 @@ impl App {
         // trigger each loop iteration (reset-driven storm).
         if rec.ttl > 0 {
             let key = (rec.name.trim_end_matches('.').to_string(), rec.rtype);
-            let still_expiring = self.services[svc_idx].records.iter().any(|r| {
+            let still_expiring = self.services[svc_idx].answers.iter().any(|r| {
                 if r.ttl == 0 || r.name.trim_end_matches('.') != key.0.as_str() || r.rtype != key.1
                 {
                     return false;
@@ -3583,14 +3817,14 @@ impl App {
         let now = Instant::now();
         let is_live = |r: &browse::RawRecord| r.ttl > r.received_at.elapsed().as_secs() as u32;
         for svc in services.iter_mut() {
-            if !svc.is_active || svc.records.is_empty() {
+            if !svc.is_active || svc.answers.is_empty() {
                 continue;
             }
-            let has_ptr = svc.records.iter().any(|r| r.rtype == 12);
+            let has_ptr = svc.answers.iter().any(|r| r.rtype == 12);
             let gone = if has_ptr {
-                !svc.records.iter().any(|r| r.rtype == 12 && is_live(r))
+                !svc.answers.iter().any(|r| r.rtype == 12 && is_live(r))
             } else {
-                !svc.records.iter().any(is_live)
+                !svc.answers.iter().any(is_live)
             };
             if gone {
                 svc.is_active = false;
@@ -3618,7 +3852,7 @@ impl App {
         live.insert((ENUM_SERVICE.to_string(), 12));
         for entry in &self.enum_entries {
             live.insert((entry.name.to_lowercase(), 12));
-            for rec in &entry.records {
+            for rec in &entry.answers {
                 live.insert((rec.name.trim_end_matches('.').to_lowercase(), rec.rtype));
             }
         }
@@ -3632,7 +3866,7 @@ impl App {
                 live.insert((host.clone(), 1));
                 live.insert((host, 28));
             }
-            for rec in &svc.records {
+            for rec in &svc.answers {
                 live.insert((rec.name.trim_end_matches('.').to_lowercase(), rec.rtype));
             }
         }
@@ -3651,17 +3885,17 @@ impl App {
         // Overheard QM queries are single-use and short-lived (§7.3).
         self.overheard
             .retain(|_, (seen, _, _)| seen.elapsed() < OVERHEARD_WINDOW);
-        // Drop TXT expansion state for records that no longer exist.
+        // Drop TXT expansion state for answers that no longer exist.
         let mut live_txt = HashSet::new();
         for svc in &self.services {
-            for rec in &svc.records {
+            for rec in &svc.answers {
                 if rec.rtype == 16 {
                     live_txt.insert(Self::txt_key(rec));
                 }
             }
         }
         for entry in &self.enum_entries {
-            for rec in &entry.records {
+            for rec in &entry.answers {
                 if rec.rtype == 16 {
                     live_txt.insert(Self::txt_key(rec));
                 }
@@ -3672,7 +3906,7 @@ impl App {
         self.expanded_txt.retain(|k| live_txt.contains(k));
         for entry in &mut self.enum_entries {
             entry
-                .records
+                .answers
                 .retain(|r| r.received_at.elapsed().as_secs() as u32 <= r.ttl.saturating_add(120));
             entry.questions.retain(|_| true);
         }
@@ -3768,7 +4002,7 @@ impl App {
         (rec.name.clone(), rec.rdata.clone(), rec.source)
     }
 
-    /// Collapsed by default: only records explicitly expanded via `Enter`
+    /// Collapsed by default: only answers explicitly expanded via `Enter`
     /// show their child rows.
     pub fn is_txt_expanded(&self, rec: &browse::RawRecord) -> bool {
         self.expanded_txt.contains(&Self::txt_key(rec))
@@ -3821,9 +4055,9 @@ impl App {
     pub fn latest_event_for_selected(&self) -> Option<&browse::Event> {
         // Newest record first, then the target's last-seen packet: the
         // shared buffer ages with total traffic, so a quiet target's
-        // packets may all be gone while its records live on.
+        // packets may all be gone while its answers live on.
         let target = self.display_detail()?;
-        for rec in target.all_records().iter().rev() {
+        for rec in target.all_answers().iter().rev() {
             if let Some(ev) = self
                 .raw_events
                 .iter()
@@ -3877,7 +4111,7 @@ impl App {
     }
 
     /// Entry under the Tab cursor in the Records table: a raw record row or
-    /// a question row (table order is raw records first, then questions
+    /// a question row (table order is raw answers first, then questions
     /// by type/newest-first, matching the rendered table).
     pub fn selected_detail_entry(&self) -> Option<DetailEntry<'_>> {
         let target = self.display_detail()?;
@@ -3894,7 +4128,7 @@ impl App {
                 }
             }
         }
-        let raws = target.ordered_records();
+        let raws = target.ordered_answers();
         if self.detail_selected < raws.len() {
             return Some(DetailEntry::Record(raws[self.detail_selected]));
         }
@@ -4000,7 +4234,7 @@ mod tests {
 
     fn event_for(rec: &browse::RawRecord) -> browse::Event {
         browse::Event {
-            records: vec![rec.clone()],
+            answers: vec![rec.clone()],
             questions: Vec::new(),
             query_kas: Vec::new(),
             raw_bytes: Vec::new(),
@@ -4016,7 +4250,7 @@ mod tests {
     fn live_ptr_rows(app: &App) -> Vec<browse::RawRecord> {
         app.services
             .iter()
-            .flat_map(|s| s.ordered_records())
+            .flat_map(|s| s.ordered_answers())
             .filter(|r| r.rtype == 12)
             .cloned()
             .collect()
@@ -4126,7 +4360,7 @@ mod tests {
         assert!(app.selected_service().is_some());
         let idx = {
             let svc = app.display_service().expect("service displayed");
-            svc.ordered_records()
+            svc.ordered_answers()
                 .iter()
                 .position(|r| r.rtype == 16)
                 .expect("TXT record merged into service")
@@ -4144,7 +4378,7 @@ mod tests {
         let mut app = App::new().unwrap();
         service_with_txt(&mut app, "a=1; b=2; c=3");
         let rec = app.services[0]
-            .ordered_records()
+            .ordered_answers()
             .into_iter()
             .find(|r| r.rtype == 16)
             .cloned()
@@ -4162,7 +4396,7 @@ mod tests {
         let mut app = App::new().unwrap();
         service_with_txt(&mut app, "a=1");
         let rec = app.services[0]
-            .ordered_records()
+            .ordered_answers()
             .into_iter()
             .find(|r| r.rtype == 16)
             .cloned()
@@ -4179,12 +4413,12 @@ mod tests {
         ingest(&mut app, &ptr_record(120));
         ingest(&mut app, &srv_record(120));
         assert!(app.services[0]
-            .ordered_records()
+            .ordered_answers()
             .iter()
             .all(|r| r.rtype != 16));
         ingest(&mut app, &txt_record("a=1; b=2"));
         assert!(app.services[0]
-            .ordered_records()
+            .ordered_answers()
             .iter()
             .any(|r| r.rtype == 16));
     }
@@ -4209,7 +4443,7 @@ mod tests {
         );
         assert_eq!(app.services[0].subtypes, vec!["_printer".to_string()]);
         assert!(app.services[0]
-            .ordered_records()
+            .ordered_answers()
             .iter()
             .any(|r| r.rtype == 12 && r.name == "_printer._sub._http._tcp.local."));
         // No stranded pending entry for the confirmed instance.
@@ -4301,7 +4535,7 @@ mod tests {
         app.handle_key(&key(KeyCode::Tab));
         app.handle_key(&key(KeyCode::Enter));
         let rec = app.services[0]
-            .ordered_records()
+            .ordered_answers()
             .into_iter()
             .find(|r| r.rtype == 16)
             .cloned()
@@ -4313,7 +4547,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_j_pins_viewport_and_cursor_resumes_follow() {
+    fn scroll_pins_viewport_and_cursor_resumes_follow() {
         use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
         let mut app = App::new().unwrap();
         service_with_txt(&mut app, "a=1; b=2");
@@ -4330,7 +4564,9 @@ mod tests {
             state: KeyEventState::empty(),
         };
         assert!(!app.detail_free_scroll);
-        app.handle_key(&ctrl(KeyCode::Char('j')));
+        // Ctrl+J now dumps state (like the sibling); viewport scroll
+        // uses J instead.
+        app.handle_key(&plain(KeyCode::Char('J')));
         assert!(app.detail_free_scroll);
         assert_eq!(app.detail_offset.get(), 1);
         app.handle_key(&ctrl(KeyCode::Char('k')));
@@ -4350,6 +4586,138 @@ mod tests {
         assert_eq!(app.focus, Focus::Hex);
         app.handle_key(&plain(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Services);
+    }
+
+    #[test]
+    fn state_dump_models_mex_state() {
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "b=2; a=1");
+        // known_types (the browse set) is learned on the send tick.
+        app.send_queries();
+        let dump = app.state_dump();
+        assert!(!dump.passive);
+        assert_eq!(dump.services.len(), 1);
+        let svc = &dump.services[0];
+        assert_eq!(svc.instance, "Test");
+        assert_eq!(svc.service_type, "_http._tcp.local");
+        assert_eq!(svc.hostname, "test.local.");
+        assert_eq!(svc.port, 80);
+        // TXT pairs sorted by key.
+        assert_eq!(svc.txt_records, vec!["a=1".to_string(), "b=2".to_string()]);
+        assert!(svc.is_active);
+        assert!(!svc.answers.is_empty());
+        assert!(dump.service_types.contains(&"_http._tcp.local".to_string()));
+        // Top-level keys are mex's own model.
+        let v = serde_json::to_value(&dump).unwrap();
+        for key in [
+            "metadata",
+            "passive",
+            "services",
+            "service_types",
+            "metrics",
+            "enum_groups",
+            "pending",
+        ] {
+            assert!(v.get(key).is_some(), "missing {key}");
+        }
+        assert_eq!(v["metadata"]["application_name"], "mex");
+        assert_eq!(v["services"][0]["service_type"], "_http._tcp.local");
+    }
+
+    #[test]
+    fn dump_redacts_high_entropy_txt_values() {
+        let mut app = App::new().unwrap();
+        service_with_txt(
+            &mut app,
+            "id=328FEBD442638273B38340E9AFE1E9CB; external_url=https://ha.knulp.home64.de; fn=Schreibtisch",
+        );
+        app.send_queries();
+        let dump = app.state_dump();
+        let svc = &dump.services[0];
+        assert_eq!(
+            svc.txt_records,
+            vec![
+                "external_url=*REDACTED*".to_string(),
+                "fn=Schreibtisch".to_string(),
+                "id=*REDACTED*".to_string()
+            ]
+        );
+        let txt = svc
+            .answers
+            .iter()
+            .find(|r| r.rtype_str == "TXT")
+            .expect("TXT answer present");
+        assert_eq!(
+            txt.rdata,
+            "id=*REDACTED*; external_url=*REDACTED*; fn=Schreibtisch"
+        );
+    }
+
+    #[test]
+    fn save_state_dump_to_writes_json_file() {
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1");
+        let dir = std::env::temp_dir().join(format!(
+            "mex-dump-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let json_path = app.save_state_dump_to(&dir).unwrap();
+        let json = std::fs::read_to_string(&json_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["metadata"]["application_name"], "mex");
+        assert!(parsed.get("services").is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn status_popup_shows_while_fresh() {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = App::new().unwrap();
+        assert!(app.status_popup().is_none());
+        app.status_msg = Some(("hello".to_string(), Instant::now()));
+        assert_eq!(app.status_popup().as_deref(), Some("hello"));
+        // Any key dismisses it.
+        let plain = KeyEvent {
+            code: KeyCode::Char('x'),
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        app.handle_key(&plain);
+        assert!(app.status_popup().is_none());
+    }
+
+    #[test]
+    fn dump_redacts_public_ipv6_addresses() {
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1");
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 28, "AAAA", "2003:e8:bf10:9500::1", 120),
+        );
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 28, "AAAA", "fd00::1", 120),
+        );
+        app.send_queries();
+        let dump = app.state_dump();
+        let svc = &dump.services[0];
+        assert!(svc.addresses.contains(&"fd00::1".to_string()));
+        assert!(svc.addresses.contains(&"2003:*REDACTED*:1".to_string()));
+        assert!(!svc.addresses.iter().any(|a| a.contains("bf10")));
+        let aaaa: Vec<_> = svc
+            .answers
+            .iter()
+            .filter(|r| r.rtype_str == "AAAA")
+            .collect();
+        assert!(!aaaa.is_empty());
+        for r in aaaa {
+            assert!(!r.rdata.contains("bf10"), "global AAAA leaked: {}", r.rdata);
+        }
     }
 
     #[test]
@@ -4419,7 +4787,7 @@ mod tests {
         let raw_count = app
             .display_service()
             .expect("service displayed")
-            .ordered_records()
+            .ordered_answers()
             .len();
         // Tab twice to reach Questions; the cursor snaps to its first row.
         app.handle_key(&plain(KeyCode::Tab));
@@ -4545,7 +4913,7 @@ mod tests {
         }
         let (raws, self_pos, remote_pos) = {
             let target = app.display_detail().expect("detail target");
-            let raws = target.ordered_records().len();
+            let raws = target.ordered_answers().len();
             let ordered = target.ordered_questions();
             let self_pos = ordered
                 .iter()
@@ -4594,7 +4962,7 @@ mod tests {
         app.route_own_question("_services._dns-sd._udp.local.", 12);
         let (raws, self_pos) = {
             let target = app.display_detail().expect("enum detail target");
-            let raws = target.ordered_records().len();
+            let raws = target.ordered_answers().len();
             let ordered = target.ordered_questions();
             let self_pos = ordered
                 .iter()
@@ -4660,7 +5028,7 @@ mod tests {
         app.route_own_question("_ssh._tcp.local.", 12);
         let (raws, self_pos) = {
             let target = app.display_detail().expect("detail target");
-            let raws = target.ordered_records().len();
+            let raws = target.ordered_answers().len();
             let pos = target
                 .ordered_questions()
                 .iter()
@@ -4711,7 +5079,7 @@ mod tests {
             ));
         }
         let target = app.display_detail().expect("detail target");
-        let raws = target.ordered_records().len();
+        let raws = target.ordered_answers().len();
         let remote_pos = target
             .ordered_questions()
             .iter()
@@ -4822,7 +5190,7 @@ mod tests {
             ),
         );
         assert!(app.known_types.contains("_http._tcp.local"));
-        assert_eq!(app.enum_entries[0].records.len(), 1);
+        assert_eq!(app.enum_entries[0].answers.len(), 1);
         assert_eq!(app.group_labels()[0], "(enumeration)");
         // Metrics carry a per-name row for the enumeration name.
         let rows = app.metrics_rows();
@@ -4875,7 +5243,7 @@ mod tests {
         app.ingest_event(&ev);
         assert_eq!(app.enum_entries[0].questions.len(), 1);
         assert!(
-            app.enum_entries[0].records.is_empty(),
+            app.enum_entries[0].answers.is_empty(),
             "query KAs must not become enumeration answers"
         );
         assert!(
@@ -4893,7 +5261,7 @@ mod tests {
         );
         let ev = event_for(&ans);
         app.ingest_event(&ev);
-        assert_eq!(app.enum_entries[0].records.len(), 1);
+        assert_eq!(app.enum_entries[0].answers.len(), 1);
         assert!(app.enum_known.contains_key("_dacp._tcp.local"));
         assert!(app.known_types.contains("_dacp._tcp.local"));
     }
@@ -4944,7 +5312,7 @@ mod tests {
             "focused cursor must not be dimmed"
         );
         // Moving the host selection keeps marker and hex dump in sync: the
-        // marker follows the detail cursor (test records carry no wire
+        // marker follows the detail cursor (test answers carry no wire
         // bytes, so the dump itself is covered by the title tests).
         app.focus = Focus::Services;
         select_instance(&mut app, "Test");
@@ -4979,7 +5347,7 @@ mod tests {
                 120,
             ),
         );
-        assert_eq!(app.enum_entries[0].records.len(), 1);
+        assert_eq!(app.enum_entries[0].answers.len(), 1);
     }
 
     #[test]
@@ -5082,7 +5450,7 @@ mod tests {
             state: KeyEventState::empty(),
         };
         let rec = app.services[0]
-            .ordered_records()
+            .ordered_answers()
             .into_iter()
             .find(|r| r.rtype == 16)
             .cloned()
@@ -5231,7 +5599,7 @@ mod tests {
             hostname: String::new(),
             port: 0,
             subtypes: Vec::new(),
-            records: Vec::new(),
+            answers: Vec::new(),
             questions: Vec::new(),
             last_seen: Instant::now(),
             is_active: true,
@@ -5341,7 +5709,7 @@ mod tests {
             .iter()
             .find(|s| s.instance == instance)
             .expect("service present")
-            .records
+            .answers
             .iter()
             .any(|r| {
                 r.rtype == 1
@@ -5424,7 +5792,7 @@ mod tests {
                 .find(|s| s.instance == instance)
                 .expect("service present");
             assert!(
-                svc.records
+                svc.answers
                     .iter()
                     .any(|r| r.rtype == 1 && r.rdata == "192.168.1.10" && r.ttl == 0),
                 "goodbye row missing on {instance}"
@@ -5529,7 +5897,7 @@ mod tests {
             .find(|s| s.instance == "Two")
             .expect("Two present");
         assert!(
-            two.records.iter().all(|r| r.rtype != 1 && r.rtype != 28),
+            two.answers.iter().all(|r| r.rtype != 1 && r.rtype != 28),
             "old-host address leaked onto Two"
         );
         let one = app
@@ -5538,7 +5906,7 @@ mod tests {
             .find(|s| s.instance == "One")
             .expect("One present");
         assert!(one
-            .records
+            .answers
             .iter()
             .any(|r| r.rtype == 1 && r.rdata == "192.168.0.5"));
     }
@@ -5579,7 +5947,7 @@ mod tests {
             .find(|s| s.instance == "One")
             .expect("One present");
         assert!(one
-            .records
+            .answers
             .iter()
             .any(|r| r.rtype == 1 && r.rdata == "192.168.1.11"));
         // ...without extending the grace deadline; the sibling is unaffected.
@@ -5823,7 +6191,7 @@ mod tests {
         ingest(&mut app, &srv_record(120));
         // Age the PTR past 100% TTL: no live row remains for the key.
         for svc in &mut app.services {
-            for rec in &mut svc.records {
+            for rec in &mut svc.answers {
                 if rec.rtype == 12 {
                     rec.received_at = Instant::now() - Duration::from_secs(130);
                 }
@@ -5844,7 +6212,7 @@ mod tests {
         ingest(&mut app, &srv_record(120));
         // Age PTR into the 80-100% window so a refresh is due.
         for svc in &mut app.services {
-            for rec in &mut svc.records {
+            for rec in &mut svc.answers {
                 if rec.rtype == 12 {
                     rec.received_at = Instant::now() - Duration::from_secs(100);
                 }
@@ -5918,7 +6286,7 @@ mod tests {
             received_at: Instant::now(),
         };
         browse::Event {
-            records: Vec::new(),
+            answers: Vec::new(),
             questions: vec![q],
             query_kas: kas,
             raw_bytes: Vec::new(),
@@ -6043,7 +6411,7 @@ mod tests {
         rec.iface = "br0".to_string();
         rec.flush_bit = true;
         let ev = browse::Event {
-            records: vec![rec],
+            answers: vec![rec],
             questions: Vec::new(),
             query_kas: Vec::new(),
             raw_bytes: vec![0u8; 100],
@@ -6079,7 +6447,7 @@ mod tests {
     fn packet_metrics_counts_goodbyes_and_qu() {
         let mut app = App::new().unwrap();
         let ev = browse::Event {
-            records: vec![ptr_record(0)],
+            answers: vec![ptr_record(0)],
             questions: vec![browse::RawRecord {
                 name: "_http._tcp.local.".to_string(),
                 rtype: 12,
@@ -6226,7 +6594,7 @@ mod tests {
         ingest(&mut app, &ptr_record(120));
         ingest(&mut app, &srv_record(120));
         for svc in &mut app.services {
-            for rec in &mut svc.records {
+            for rec in &mut svc.answers {
                 if rec.rtype == 12 {
                     rec.received_at = Instant::now() - Duration::from_secs(100);
                 }
@@ -6550,7 +6918,7 @@ mod tests {
                 Instant::now(),
                 Vec::new(),
             ));
-            app.services[sel_idx].ordered_records().len()
+            app.services[sel_idx].ordered_answers().len()
         };
         // Park the cursor on a record, scroll the hex dump, then Tab across:
         // the snap moves the cursor and must restart the dump at the top.
@@ -6632,7 +7000,7 @@ mod tests {
             Some(DisplayItem::Instance { index }) => *index,
             _ => panic!("expected instance selected"),
         };
-        let raws = app.services[sel_idx].ordered_records().len();
+        let raws = app.services[sel_idx].ordered_answers().len();
         for _ in 0..2 {
             app.services[sel_idx].questions.push((
                 "_http._tcp.local".to_string(),
@@ -6711,7 +7079,7 @@ mod tests {
         let raws = app
             .display_detail()
             .expect("detail")
-            .ordered_records()
+            .ordered_answers()
             .len();
         assert!(raws >= 2);
         let row = 3 + 2 + (info + 1) as u16;
