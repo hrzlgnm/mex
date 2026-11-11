@@ -136,10 +136,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
                     rtype_str: Some(rec.rtype_str.clone()),
                     rdata: Some(rec.rdata.clone()),
                     source: Some(rec.source.to_string()),
-                    message: format!(
-                        "enumerated type {target} invalid: {reason} (announced by {})",
-                        rec.source
-                    ),
+                    message: format!("enumerated type {target} invalid: {reason}"),
                     rfc: "RFC 6763 §7",
                 });
             }
@@ -155,6 +152,18 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
             .then_with(|| a.rdata.cmp(&b.rdata))
     });
     dedup(out)
+        // Every finding with a known announcer names it, so overlay rows and
+        // dump messages read identically whether the finding is service- or
+        // enumeration-level. Findings without an announcer (missing-addr,
+        // service-level type-format, ttl-unstable) are untouched.
+        .into_iter()
+        .map(|mut a| {
+            if let Some(src) = a.source.clone() {
+                a.message.push_str(&format!(" (from {src})"));
+            }
+            a
+        })
+        .collect()
 }
 
 fn severity_rank(s: Severity) -> u8 {
@@ -487,14 +496,13 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     // would be noise, not signal.
     if rec.rtype == 12 && rec.ttl <= 120 {
         // Enumeration rows all share the owner name, so name the
-        // enumerated type and the announcer: otherwise every finding
-        // reads identically.
+        // enumerated type: otherwise every finding reads identically.
+        // The announcer is appended centrally below.
         let message = if service_id == "enumeration" {
             format!(
-                "PTR for {} base TTL {}s far below the conventional 4500s (from {})",
+                "PTR for {} base TTL {}s far below the conventional 4500s",
                 rec.rdata.trim_end_matches('.'),
-                rec.ttl,
-                rec.source
+                rec.ttl
             )
         } else {
             format!("PTR base TTL {}s far below the conventional 4500s", rec.ttl)
