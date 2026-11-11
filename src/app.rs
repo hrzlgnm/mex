@@ -609,7 +609,11 @@ impl App {
                                         self.running = false;
                                         return Ok(());
                                     }
-                                    continue;
+                                    // Break out to redraw immediately: the
+                                    // inner loop would block on `read()` until
+                                    // the next input event, leaving the
+                                    // freshly cleared screen blank.
+                                    break;
                                 }
                                 self.handle_key(&key);
                             }
