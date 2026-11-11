@@ -433,9 +433,18 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                         || resize_active(app, DragMode::HorizUpper),
                 )),
         )
-        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        // The hex pane follows the record cursor whatever holds focus, so
+        // the cursor row stays marked even when unfocused — dimmed to stay
+        // distinct from the focused cursor.
+        .row_highlight_style(if app.focus == Focus::Answers {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::DIM)
+        });
 
-    // Highlight the record-cursor row, if the cursor is on a record.
+    // Highlight the record-cursor row, if the cursor is on a record, so
+    // the hex source stays identifiable whatever holds focus (unfocused
+    // panes mark it dimmed via the highlight style above).
     // TXT child rows are display-only; questions live in their own pane.
     // In free-scroll mode the selection is withheld so ratatui (which
     // always snaps the viewport back to the selected row) does not undo
@@ -468,7 +477,11 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         offset = offset.min(total_rows.saturating_sub(1));
     }
     let mut tstate = TableState::default();
-    tstate.select(if app.detail_free_scroll || app.focus != Focus::Answers {
+    // In free-scroll mode the selection is withheld so ratatui (which
+    // always snaps the viewport back to the selected row) does not undo
+    // the manual offset; otherwise the marker stays visible whatever
+    // holds focus, so the hex source row is always identifiable.
+    tstate.select(if app.detail_free_scroll {
         None
     } else {
         selected_table_row
