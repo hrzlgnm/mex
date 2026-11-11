@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.10.0](https://github.com/hrzlgnm/mex/compare/v0.9.0...v0.10.0) (2026-11-11)
+
+
+### Features
+
+* distribute via Homebrew tap + cask ([#81](https://github.com/hrzlgnm/mex/issues/81)) ([45e84fd](https://github.com/hrzlgnm/mex/commit/45e84fda0bbb6d7581b4282783358e76238e7dd7))
+* flag observed questions for unicast-only types ([#88](https://github.com/hrzlgnm/mex/issues/88)) ([b42acdf](https://github.com/hrzlgnm/mex/commit/b42acdfaa98f1c2360d8b088fa3cf018fd5dbb5e))
+
+
+### Bug Fixes
+
+* mark all serial variants of live SOA unicast leaks ([#86](https://github.com/hrzlgnm/mex/issues/86)) ([ce3a01f](https://github.com/hrzlgnm/mex/commit/ce3a01f7779b5337b2e060b35c951e7341ea6775))
+
+
+### Code Refactoring
+
+* centralize unicast-only verdict for answers ([#87](https://github.com/hrzlgnm/mex/issues/87)) ([d49c2fb](https://github.com/hrzlgnm/mex/commit/d49c2fb3ffaa058cd35ed6857d83ef4ae24a21d4))
+
 ## [0.9.0](https://github.com/hrzlgnm/mex/compare/v0.8.0...v0.9.0) (2026-11-11)
 
 
