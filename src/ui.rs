@@ -49,6 +49,11 @@ pub fn try_restore(initialized: bool) -> io::Result<()> {
 /// terminal is gone and the app should exit instead. Unix only.
 #[cfg(unix)]
 pub fn suspend(term: &mut Terminal) -> io::Result<bool> {
+    // The draw loop hides the cursor and never shows it (mex sets no cursor
+    // position), so reveal it explicitly: the surviving shell needs a cursor
+    // while we're stopped. Ratatui hides it again on the next draw, and its
+    // Drop handler stays consistent via the tracked flag.
+    let _ = term.show_cursor();
     try_restore(true)?;
     let stopped =
         nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGSTOP);
