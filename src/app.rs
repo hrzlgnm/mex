@@ -4525,15 +4525,22 @@ mod tests {
         assert_eq!(title, " QRY PTR _services._dns-sd._udp.local (raw packet) ");
     }
 
+    /// Render the full UI into a test buffer at the given size. Shared
+    /// core for the render-based regression tests below.
+    fn render_to_buffer(app: &App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        use ratatui::backend::TestBackend;
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
     /// REVERSED-carrying cell styles inside the Questions pane body
     /// (border and header rows excluded). No other style in that pane uses
     /// REVERSED, so any hit is the cursor marker.
     fn questions_reversed_modifiers(app: &App) -> Vec<ratatui::style::Modifier> {
-        use ratatui::backend::TestBackend;
-        let mut terminal = ratatui::Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+        // Rects are recorded during draw, so render first.
+        let buf = render_to_buffer(app, 100, 30);
         let area = app.questions_rect.get();
-        let buf = terminal.backend().buffer().clone();
         let mut out = Vec::new();
         for y in (area.y + 2)..(area.y + area.height.saturating_sub(1)) {
             for x in (area.x + 1)..(area.x + area.width.saturating_sub(1)) {
@@ -4549,11 +4556,8 @@ mod tests {
 
     /// Top border line text of the hex pane (carries the pane title).
     fn hex_title_line(app: &App) -> String {
-        use ratatui::backend::TestBackend;
-        let mut terminal = ratatui::Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+        let buf = render_to_buffer(app, 100, 30);
         let area = app.hex_rect.get();
-        let buf = terminal.backend().buffer().clone();
         let mut s = String::new();
         for x in area.x..(area.x + area.width) {
             if let Some(cell) = buf.cell((x, area.y)) {
@@ -4631,6 +4635,90 @@ mod tests {
         let marked = questions_reversed_modifiers(&app);
         assert!(!marked.is_empty());
         assert!(hex_title_line(&app).contains("QRY A shell.local"));
+    }
+
+    /// Hex pane body cell modifiers (excluding the two dump header lines)
+    /// plus the hex pane title line, rendered at the given terminal size.
+    fn hex_body_marks(
+        app: &App,
+        width: u16,
+        height: u16,
+    ) -> (Vec<ratatui::style::Modifier>, String) {
+        let buf = render_to_buffer(app, width, height);
+        let area = app.hex_rect.get();
+        let empty =
+            app.selected_detail_bytes().is_none() && app.latest_event_for_selected().is_none();
+        let offset = app.hex_offset.get();
+        let mut mods = Vec::new();
+        for (i, y) in ((area.y + 1)..(area.y + area.height.saturating_sub(1))).enumerate() {
+            // Skip the "Hex dump" header + blank line; the empty message
+            // has no header lines.
+            if !empty && offset + i < 2 {
+                continue;
+            }
+            for x in (area.x + 1)..(area.x + area.width.saturating_sub(1)) {
+                if let Some(cell) = buf.cell((x, y)) {
+                    mods.push(cell.modifier);
+                }
+            }
+        }
+        let mut title = String::new();
+        for x in area.x..(area.x + area.width) {
+            if let Some(cell) = buf.cell((x, area.y)) {
+                title.push_str(cell.symbol());
+            }
+        }
+        (mods, title)
+    }
+
+    #[test]
+    fn hex_pane_shows_focus_cue() {
+        use ratatui::style::Modifier;
+        // Dump state: bold body iff focused.
+        let mut app = two_group_app();
+        app.focus = Focus::Hex;
+        let (mods, _) = hex_body_marks(&app, 100, 30);
+        assert!(!mods.is_empty());
+        assert!(
+            mods.iter().any(|m| m.contains(Modifier::BOLD)),
+            "focused hex body must be bold"
+        );
+        app.focus = Focus::Services;
+        let (mods, _) = hex_body_marks(&app, 100, 30);
+        assert!(!mods.is_empty());
+        assert!(
+            mods.iter().all(|m| !m.contains(Modifier::BOLD)),
+            "unfocused hex body must not be bold"
+        );
+        // Empty state: cue present, same rule.
+        let mut empty_app = App::new().unwrap();
+        empty_app.focus = Focus::Hex;
+        let (mods, _) = hex_body_marks(&empty_app, 100, 30);
+        assert!(mods.iter().any(|m| m.contains(Modifier::BOLD)));
+        empty_app.focus = Focus::Services;
+        let (mods, _) = hex_body_marks(&empty_app, 100, 30);
+        assert!(mods.iter().all(|m| !m.contains(Modifier::BOLD)));
+        // Scrolled state: tall dump, small pane, offset forced.
+        let mut app = two_group_app();
+        {
+            let sel_idx = match app.display_items().get(app.selected_display) {
+                Some(DisplayItem::Instance { index }) => *index,
+                _ => panic!("expected instance selected"),
+            };
+            app.services[sel_idx]
+                .last_event
+                .as_mut()
+                .expect("last event")
+                .raw_bytes = vec![0xAB; 256];
+        }
+        app.hex_offset.set(5);
+        app.focus = Focus::Hex;
+        let (mods, title) = hex_body_marks(&app, 100, 12);
+        assert!(title.contains('↕'), "dump must be scrolled, got: {title}");
+        assert!(mods.iter().any(|m| m.contains(Modifier::BOLD)));
+        app.focus = Focus::Services;
+        let (mods, _) = hex_body_marks(&app, 100, 12);
+        assert!(mods.iter().all(|m| !m.contains(Modifier::BOLD)));
     }
 
     #[test]
@@ -4729,11 +4817,8 @@ mod tests {
     /// test; no other style in that pane uses REVERSED, so any hit is the
     /// cursor marker.
     fn answers_reversed_modifiers(app: &App) -> Vec<ratatui::style::Modifier> {
-        use ratatui::backend::TestBackend;
-        let mut terminal = ratatui::Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+        let buf = render_to_buffer(app, 100, 30);
         let area = app.answers_rect.get();
-        let buf = terminal.backend().buffer().clone();
         let mut out = Vec::new();
         for y in (area.y + 2)..(area.y + area.height.saturating_sub(1)) {
             for x in (area.x + 1)..(area.x + area.width.saturating_sub(1)) {
