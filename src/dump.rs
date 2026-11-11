@@ -195,13 +195,33 @@ pub fn is_public_url(v: &str) -> bool {
     };
     is_public_host(host)
 }
+/// Whether a string is a public IPv6 literal. Global unicast device
+/// addresses are stable fingerprints; link-local, unique-local,
+/// loopback and multicast stay visible.
+fn is_public_ip_literal(v: &str) -> bool {
+    match v.trim().parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(ip)) => is_public_ip(&std::net::IpAddr::V6(ip)),
+        _ => false,
+    }
+}
+
+/// Redact a bare public IPv6 literal as `*REDACTED*`; anything else
+/// (including IPv4 and non-public IPv6) passes through.
+pub fn redact_ip_literal(rdata: &str) -> String {
+    if is_public_ip_literal(rdata) {
+        "*REDACTED*".to_string()
+    } else {
+        rdata.to_string()
+    }
+}
+
 /// Redact a `key=value` pair as `key=*REDACTED*` when the value is a
-/// high-entropy token or a publicly reachable URL, keeping the key so
-/// dumps stay comparable. Pairs without `=` or with ordinary values
-/// pass through.
+/// high-entropy token, a publicly reachable URL, or a public IPv6
+/// literal — keeping the key so dumps stay comparable. Pairs without
+/// `=` or with ordinary values pass through.
 pub fn redact_txt_value(pair: &str) -> String {
     match pair.split_once('=') {
-        Some((k, v)) if is_high_entropy_value(v) || is_public_url(v) => {
+        Some((k, v)) if is_high_entropy_value(v) || is_public_url(v) || is_public_ip_literal(v) => {
             format!("{k}=*REDACTED*")
         }
         _ => pair.to_string(),
@@ -310,5 +330,26 @@ mod tests {
             redact_txt_value("model=SHIELD Android TV"),
             "model=SHIELD Android TV"
         );
+    }
+
+    #[test]
+    fn redaction_redacts_public_ipv6_keeps_scope() {
+        // Global unicast: redacted (bare literal and TXT value alike).
+        assert_eq!(
+            redact_txt_value("ipv6=2003:e8:bf10:9500:38e1:a9ff:fe2c:7927"),
+            "ipv6=*REDACTED*"
+        );
+        assert_eq!(
+            redact_ip_literal("2003:e8:bf10:9500:38e1:a9ff:fe2c:7927"),
+            "*REDACTED*"
+        );
+        // Link-local, ULA, loopback, and IPv4 stay visible.
+        assert_eq!(
+            redact_txt_value("ipv6=fe80::38e1:a9ff:fe2c:7927"),
+            "ipv6=fe80::38e1:a9ff:fe2c:7927"
+        );
+        assert_eq!(redact_txt_value("ip6=fd00::1"), "ip6=fd00::1");
+        assert_eq!(redact_ip_literal("::1"), "::1");
+        assert_eq!(redact_ip_literal("192.168.178.30"), "192.168.178.30");
     }
 }

@@ -1786,9 +1786,12 @@ impl App {
             rtype_str: rec.rtype_str.clone(),
             ttl: rec.ttl,
             ttl_remaining: Self::remaining_ttl(rec),
-            // High-entropy TXT values are redacted for safe sharing.
+            // High-entropy TXT values and public IPv6 literals are
+            // redacted for safe sharing.
             rdata: if rec.rtype == 16 {
                 dump::redact_txt_rdata(&rec.rdata)
+            } else if rec.rtype == 28 {
+                dump::redact_ip_literal(&rec.rdata)
             } else {
                 rec.rdata.clone()
             },
@@ -1814,12 +1817,21 @@ impl App {
     fn dump_service(&self, svc: &ServiceEntry) -> dump::DumpService {
         let mut subtypes = svc.subtypes.clone();
         subtypes.sort();
+        // Public IPv6 literals collapse to one marker, like TXT keys do.
+        let mut seen_addrs = HashSet::new();
+        let mut addresses = Vec::new();
+        for addr in self.host_addresses(&Self::host_key(&svc.hostname)) {
+            let redacted = dump::redact_ip_literal(&addr);
+            if seen_addrs.insert(redacted.clone()) {
+                addresses.push(redacted);
+            }
+        }
         dump::DumpService {
             instance: svc.instance.clone(),
             service_type: svc.service_type.clone(),
             hostname: svc.hostname.clone(),
             port: svc.port,
-            addresses: self.host_addresses(&Self::host_key(&svc.hostname)),
+            addresses,
             txt_records: Self::txt_records_for_dump(svc),
             is_active: svc.is_active,
             last_seen_age_secs: svc.last_seen.elapsed().as_secs(),
@@ -4676,6 +4688,39 @@ mod tests {
         };
         app.handle_key(&plain);
         assert!(app.status_popup().is_none());
+    }
+
+    #[test]
+    fn dump_redacts_public_ipv6_addresses() {
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1");
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 28, "AAAA", "2003:e8:bf10:9500::1", 120),
+        );
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 28, "AAAA", "fd00::1", 120),
+        );
+        app.send_queries();
+        let dump = app.state_dump();
+        let svc = &dump.services[0];
+        assert!(svc.addresses.contains(&"fd00::1".to_string()));
+        assert!(svc.addresses.contains(&"*REDACTED*".to_string()));
+        assert!(!svc.addresses.iter().any(|a| a.starts_with("2003:")));
+        let aaaa: Vec<_> = svc
+            .answers
+            .iter()
+            .filter(|r| r.rtype_str == "AAAA")
+            .collect();
+        assert!(!aaaa.is_empty());
+        for r in aaaa {
+            assert!(
+                !r.rdata.starts_with("2003:"),
+                "global AAAA leaked: {}",
+                r.rdata
+            );
+        }
     }
 
     #[test]
