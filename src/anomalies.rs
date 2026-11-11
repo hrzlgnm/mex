@@ -162,18 +162,44 @@ fn dedup(mut items: Vec<Anomaly>) -> Vec<Anomaly> {
     let mut seen = HashSet::new();
     let mut out = Vec::with_capacity(items.len());
     for a in items.drain(..) {
+        // SOA serials churn constantly (one bump per announcement), so two
+        // leaks differing only in serial are the same finding. Normalize
+        // the serial away for the dedup key; the stored rdata keeps it.
+        let rdata_key = match (a.kind, a.rtype) {
+            ("unicast-leak", Some(6)) => normalize_soa_rdata(a.rdata.clone().unwrap_or_default()),
+            _ => a.rdata.clone().unwrap_or_default(),
+        };
         let key = (
             a.kind,
             a.service.clone(),
             a.record_name.clone().unwrap_or_default(),
             a.rtype.unwrap_or(0),
-            a.rdata.clone().unwrap_or_default(),
+            rdata_key,
         );
         if seen.insert(key) {
             out.push(a);
         }
     }
     out
+}
+
+/// Mask the serial (third field) of `mname rname serial refresh retry
+/// expire minimum` so serial bumps don't multiply findings.
+fn normalize_soa_rdata(rdata: String) -> String {
+    let mut parts = rdata.split_whitespace();
+    let (mname, rname) = (parts.next(), parts.next());
+    match (mname, rname, parts.next()) {
+        (Some(m), Some(r), Some(_)) => {
+            let rest: Vec<&str> = parts.collect();
+            let mut out = format!("{m} {r} *");
+            for p in rest {
+                out.push(' ');
+                out.push_str(p);
+            }
+            out
+        }
+        _ => rdata,
+    }
 }
 
 fn check_missing_addr(
@@ -813,6 +839,34 @@ mod tests {
             pending_hosts: HashSet::new(),
         };
         assert!(!analyze(&snap).iter().any(|a| a.kind == "type-format"));
+    }
+
+    #[test]
+    fn soa_serial_churn_dedups_to_one_leak() {
+        let answers = vec![
+            rec(
+                "host.local.",
+                6,
+                "SOA",
+                "host.local. admin 1794425867 21600 1800 43200 10",
+                4500,
+                false,
+            ),
+            rec(
+                "host.local.",
+                6,
+                "SOA",
+                "host.local. admin 1794425874 21600 1800 43200 10",
+                4500,
+                false,
+            ),
+        ];
+        let found = analyze_service("My", "_http._tcp.local", "host.local.", &answers);
+        assert_eq!(
+            found.iter().filter(|a| a.kind == "unicast-leak").count(),
+            1,
+            "serial-only differences must not multiply findings"
+        );
     }
 
     #[test]

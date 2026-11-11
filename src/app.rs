@@ -1568,18 +1568,14 @@ impl App {
                 format!("{errors} error · {warnings} warning · {infos} info")
             },
         );
-        for a in found.iter().take(8) {
+        // The overlay scrolls (j/k, PgUp/PgDn), so list every finding
+        // instead of capping: a cap hides findings behind an unexpandable
+        // "+N more" row.
+        for a in found.iter() {
             kv(
                 &mut rows,
                 &format!("! {} {}", a.kind, a.severity.as_str()),
                 format!("{}: {}", a.service, a.message),
-            );
-        }
-        if found.len() > 8 {
-            kv(
-                &mut rows,
-                "anomalies more",
-                format!("+{} more", found.len() - 8),
             );
         }
 
