@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.9.0](https://github.com/hrzlgnm/mex/compare/v0.8.0...v0.9.0) (2026-11-11)
+
+
+### Features
+
+* select specific network interfaces via -i/--interfaces ([#80](https://github.com/hrzlgnm/mex/issues/80)) ([527b2e7](https://github.com/hrzlgnm/mex/commit/527b2e7bfe1c21e0aaba992037cec0e544f8d0c8))
+
+
+### Documentation
+
+* document measured release profile gains ([#75](https://github.com/hrzlgnm/mex/issues/75)) ([394a7e0](https://github.com/hrzlgnm/mex/commit/394a7e01a2fc2c8850f77138fb0826ec39ba359e))
+* record hickory-proto codec decision ([#77](https://github.com/hrzlgnm/mex/issues/77)) ([b618797](https://github.com/hrzlgnm/mex/commit/b6187973f478769079f127d621cdead736bceb1f))
+
 ## [0.8.0](https://github.com/hrzlgnm/mex/compare/v0.7.0...v0.8.0) (2026-11-11)
 
 
