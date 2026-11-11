@@ -669,11 +669,11 @@ fn detail_table_rows<'a>(
                     };
                     rows.push(
                         Row::new(vec![
+                            Cell::from(format!("  {branch}")),
                             Cell::from(""),
                             Cell::from(""),
                             Cell::from(""),
-                            Cell::from(""),
-                            Cell::from(format!("  {branch} {pair}")),
+                            Cell::from(pair.to_string()),
                         ])
                         .style(info_style),
                     );
