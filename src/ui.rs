@@ -55,8 +55,16 @@ pub fn suspend(term: &mut Terminal) -> io::Result<bool> {
     // Drop handler stays consistent via the tracked flag.
     let _ = term.show_cursor();
     try_restore(true)?;
-    let stopped =
-        nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGSTOP);
+    // Stop the whole foreground job, not just ourselves: like the kernel's
+    // Ctrl+Z (SIGTSTP to the foreground group), this also suspends wrappers
+    // such as `sh -c 'mex; ...'`, so the shell gets its prompt back and `fg`
+    // resumes everything together. Alone in our group (the common case) this
+    // is identical to stopping ourselves.
+    let group = nix::unistd::getpgrp();
+    let stopped = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(-group.as_raw()),
+        nix::sys::signal::Signal::SIGSTOP,
+    );
     // Execution resumes here after `fg` (or immediately if SIGSTOP failed).
     if let Err(e) = stopped {
         eprintln!("mex: failed to suspend: {e}");
