@@ -179,7 +179,9 @@ impl DropStats {
     }
 }
 
-pub fn spawn() -> Result<(QueryTx, mpsc::Receiver<Event>, Arc<DropStats>)> {
+pub fn spawn(
+    selection: Option<HashSet<String>>,
+) -> Result<(QueryTx, mpsc::Receiver<Event>, Arc<DropStats>)> {
     let (tx, rx) = mpsc::channel();
     let (tx_v4, rx_v4) = mpsc::channel();
     let (tx_v6, rx_v6) = mpsc::channel();
@@ -187,6 +189,7 @@ pub fn spawn() -> Result<(QueryTx, mpsc::Receiver<Event>, Arc<DropStats>)> {
 
     let tx4 = tx.clone();
     let drops4 = drops.clone();
+    let sel4 = selection.clone();
     thread::spawn(move || {
         let socket = match create_v4_socket() {
             Ok(s) => s,
@@ -195,7 +198,7 @@ pub fn spawn() -> Result<(QueryTx, mpsc::Receiver<Event>, Arc<DropStats>)> {
                 return;
             }
         };
-        listen(&socket, tx4, rx_v4, drops4, Family::V4);
+        listen(&socket, tx4, rx_v4, drops4, Family::V4, sel4);
     });
 
     let drops6 = drops.clone();
@@ -207,7 +210,7 @@ pub fn spawn() -> Result<(QueryTx, mpsc::Receiver<Event>, Arc<DropStats>)> {
                 return;
             }
         };
-        listen(&socket, tx, rx_v6, drops6, Family::V6);
+        listen(&socket, tx, rx_v6, drops6, Family::V6, selection);
     });
 
     Ok((
@@ -237,27 +240,34 @@ pub struct LinkStats {
     pub v4: Vec<(String, Ipv4Addr)>,
     /// Usable v6 links: (interface name, index).
     pub v6: Vec<(String, u32)>,
-    /// Distinct names skipped by policy (`lo`/`docker`/`veth`).
+    /// Distinct names skipped by policy (`lo`/`docker`/`veth`), or
+    /// excluded by an explicit interface selection.
     pub skipped: Vec<String>,
     /// Distinct names that are down or point-to-point (no multicast).
     pub inactive: Vec<String>,
 }
 
-pub fn link_stats() -> LinkStats {
+/// Effective join set for the metrics view: usable links under the
+/// default skip policy, or the selected usable links under an explicit
+/// selection (which overrides the policy). Unselected usable links are
+/// reported as skipped so the snapshot still enumerates every link.
+pub fn link_stats(selection: Option<&HashSet<String>>) -> LinkStats {
     let mut stats = LinkStats::default();
     let mut seen_v4 = HashSet::new();
     let mut seen_v6 = HashSet::new();
     let mut seen_skipped = HashSet::new();
     let mut seen_inactive = HashSet::new();
     for iface in if_addrs::get_if_addrs().unwrap_or_default() {
-        if skipped_interface(&iface.name) {
-            if seen_skipped.insert(iface.name.clone()) {
-                stats.skipped.push(iface.name.clone());
-            }
-            continue;
-        }
-        if !usable_interface(&iface) {
-            if seen_inactive.insert(iface.name.clone()) {
+        let usable = usable_interface(&iface);
+        if !join_candidate(&iface.name, usable, selection) {
+            // Not joined: policy skip, selection exclusion (usable links
+            // only), or unusable. A selected-but-down link lands in
+            // inactive, visibly waiting for the rejoin refresh.
+            if skipped_interface(&iface.name) || (usable && selection.is_some()) {
+                if seen_skipped.insert(iface.name.clone()) {
+                    stats.skipped.push(iface.name.clone());
+                }
+            } else if seen_inactive.insert(iface.name.clone()) {
                 stats.inactive.push(iface.name.clone());
             }
             continue;
@@ -365,11 +375,67 @@ fn skipped_interface(name: &str) -> bool {
     name == "lo" || name.starts_with("docker") || name.starts_with("veth")
 }
 
-fn v4_interfaces() -> Vec<(String, Ipv4Addr)> {
+/// All OS interface names in any state (up, down, point-to-point): the
+/// validation universe for an explicit selection. Down links validate
+/// fine and are picked up by the periodic rejoin once they come up.
+pub fn available_interfaces() -> HashSet<String> {
+    if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .iter()
+        .map(|i| i.name.clone())
+        .collect()
+}
+
+/// Validate an explicit `-i/--interfaces` selection: every name must
+/// exist, otherwise abort listing the sorted available names (same
+/// shape as the sibling browser). Returns the deduped set.
+pub fn validate_selection(
+    requested: &[String],
+    available: &HashSet<String>,
+) -> Result<HashSet<String>> {
+    let mut sorted: Vec<&String> = available.iter().collect();
+    sorted.sort();
+    for name in requested {
+        if !available.contains(name) {
+            anyhow::bail!(
+                "Interface '{name}' not found. Available interfaces: {}",
+                sorted
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+    Ok(requested.iter().cloned().collect())
+}
+
+/// Whether ingress from `name` is kept under an explicit selection:
+/// unset keeps every link, set keeps only named ones. Unmapped ingress
+/// (empty name) fails closed under a selection.
+fn interface_selected(name: &str, selection: Option<&HashSet<String>>) -> bool {
+    selection.is_none_or(|sel| sel.contains(name))
+}
+
+/// Whether a link is a multicast-join candidate: an explicit selection
+/// overrides the loopback/container skip policy (user intent wins) but
+/// still requires the link to be usable; down links wait for the
+/// periodic refresh instead of erroring.
+fn join_candidate(name: &str, usable: bool, selection: Option<&HashSet<String>>) -> bool {
+    if !usable {
+        return false;
+    }
+    match selection {
+        Some(sel) => sel.contains(name),
+        None => !skipped_interface(name),
+    }
+}
+
+fn v4_interfaces(selection: Option<&HashSet<String>>) -> Vec<(String, Ipv4Addr)> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for iface in if_addrs::get_if_addrs().unwrap_or_default() {
-        if skipped_interface(&iface.name) || !usable_interface(&iface) {
+        if !join_candidate(&iface.name, usable_interface(&iface), selection) {
             continue;
         }
         if let if_addrs::IfAddr::V4(v4) = iface.addr {
@@ -382,11 +448,11 @@ fn v4_interfaces() -> Vec<(String, Ipv4Addr)> {
     out
 }
 
-fn v6_interfaces() -> Vec<(String, u32)> {
+fn v6_interfaces(selection: Option<&HashSet<String>>) -> Vec<(String, u32)> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for iface in if_addrs::get_if_addrs().unwrap_or_default() {
-        if skipped_interface(&iface.name) || !usable_interface(&iface) {
+        if !join_candidate(&iface.name, usable_interface(&iface), selection) {
             continue;
         }
         if let if_addrs::IfAddr::V6(v6) = iface.addr {
@@ -440,6 +506,7 @@ fn listen(
     query_rx: mpsc::Receiver<QueryRequest>,
     drops: Arc<DropStats>,
     family: Family,
+    selection: Option<HashSet<String>>,
 ) {
     let mut buf = vec![0u8; 65535];
     let mut ifaces_v4: Vec<(String, Ipv4Addr)> = Vec::new();
@@ -462,7 +529,7 @@ fn listen(
             // came back (same name, new incarnation).
             match family {
                 Family::V4 => {
-                    ifaces_v4 = v4_interfaces();
+                    ifaces_v4 = v4_interfaces(selection.as_ref());
                     for (name, ip) in &ifaces_v4 {
                         if let Err(e) = socket.join_multicast_v4(&MDNS_V4, ip) {
                             // Duplicate joins report AddrInUse; the membership
@@ -474,7 +541,7 @@ fn listen(
                     }
                 }
                 Family::V6 => {
-                    ifaces_v6 = v6_interfaces();
+                    ifaces_v6 = v6_interfaces(selection.as_ref());
                     for (name, idx) in &ifaces_v6 {
                         if let Err(e) = socket.join_multicast_v6(&MDNS_V6, *idx) {
                             if e.kind() != std::io::ErrorKind::AddrInUse {
@@ -525,6 +592,11 @@ fn listen(
                     continue;
                 }
                 let iface = ifnames.get(&ifindex).map(String::as_str).unwrap_or("");
+                // Explicit selection drops off-selection ingress, including
+                // unicast replies that bypass multicast group membership.
+                if !interface_selected(iface, selection.as_ref()) {
+                    continue;
+                }
                 match parse_packet(&raw, info.addr_src, iface, ifindex) {
                     Some(ev) => {
                         if tx.send(ev).is_err() {
@@ -1323,7 +1395,7 @@ mod tests {
 
     #[test]
     fn link_stats_lists_are_sorted_and_disjoint() {
-        let stats = link_stats();
+        let stats = link_stats(None);
         let mut v4 = stats.v4.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
         let mut sorted = v4.clone();
         sorted.sort();
@@ -1337,5 +1409,85 @@ mod tests {
         sorted = v4.clone();
         sorted.sort();
         assert_eq!(v4, sorted);
+    }
+
+    #[test]
+    fn link_stats_selection_confines_usable_to_selected() {
+        // Whatever this machine has, a selection must only ever report
+        // selected names as usable and never as skipped: display and
+        // transport join set cannot contradict each other.
+        let sel = HashSet::from(["br0".to_string(), "eth0".to_string(), "lo".to_string()]);
+        let stats = link_stats(Some(&sel));
+        for (name, _) in &stats.v4 {
+            assert!(sel.contains(name), "usable {name} not selected");
+        }
+        for (name, _) in &stats.v6 {
+            assert!(sel.contains(name), "usable {name} not selected");
+        }
+        for name in &stats.skipped {
+            assert!(!sel.contains(name), "selected {name} reported skipped");
+        }
+        let mut skipped = stats.skipped.clone();
+        skipped.sort();
+        assert_eq!(stats.skipped, skipped);
+        let mut inactive = stats.inactive.clone();
+        inactive.sort();
+        assert_eq!(stats.inactive, inactive);
+    }
+
+    #[test]
+    fn selection_unset_allows_every_link() {
+        assert!(interface_selected("br0", None));
+        assert!(interface_selected("eth0", None));
+        assert!(interface_selected("", None));
+    }
+
+    #[test]
+    fn selection_set_restricts_to_named_links() {
+        let sel = HashSet::from(["br0".to_string()]);
+        assert!(interface_selected("br0", Some(&sel)));
+        assert!(!interface_selected("eth0", Some(&sel)));
+        // Unmapped ingress never matches a selection: fail closed.
+        assert!(!interface_selected("", Some(&sel)));
+    }
+
+    #[test]
+    fn join_candidate_explicit_selection_overrides_skip_policy() {
+        let lo = HashSet::from(["lo".to_string()]);
+        // Explicitly selected loopback joins when usable ...
+        assert!(join_candidate("lo", true, Some(&lo)));
+        // ... while unselected usable links do not.
+        assert!(!join_candidate("eth0", true, Some(&lo)));
+        // Unfiltered behavior is unchanged.
+        assert!(!join_candidate("lo", true, None));
+        assert!(join_candidate("eth0", true, None));
+        // Down links never join: the periodic refresh picks them up when up.
+        let br0 = HashSet::from(["br0".to_string()]);
+        assert!(!join_candidate("br0", false, Some(&br0)));
+        assert!(!join_candidate("eth0", false, None));
+        // Container skips still apply without a filter.
+        assert!(!join_candidate("docker0", true, None));
+        assert!(!join_candidate("veth1234", true, None));
+    }
+
+    #[test]
+    fn validate_selection_accepts_known_names_deduped() {
+        let available = HashSet::from(["br0".to_string(), "eth0".to_string()]);
+        let got = validate_selection(
+            &["br0".to_string(), "eth0".to_string(), "br0".to_string()],
+            &available,
+        )
+        .unwrap();
+        assert_eq!(got, HashSet::from(["br0".to_string(), "eth0".to_string()]));
+    }
+
+    #[test]
+    fn validate_selection_rejects_unknown_with_available_list() {
+        let available = HashSet::from(["br0".to_string(), "eth0".to_string()]);
+        let err =
+            validate_selection(&["br0".to_string(), "nope".to_string()], &available).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("'nope'"), "got: {msg}");
+        assert!(msg.contains("br0, eth0"), "got: {msg}");
     }
 }

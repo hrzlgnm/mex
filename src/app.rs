@@ -262,6 +262,10 @@ pub struct App {
     pub running: bool,
     /// Listen-only mode (`--passive`): never transmit queries.
     pub passive: bool,
+    /// Explicit interface selection (`-i/--interfaces`): `None` browses
+    /// all usable links; `Some` restricts joins, queries, and ingress to
+    /// the named links. Local-address detection stays global.
+    pub interfaces: Option<HashSet<String>>,
     /// Metrics overlay popup (`m` toggles, `m`/`Esc` closes).
     pub show_metrics: bool,
     /// Scroll offset inside the metrics popup (viewport recorded at draw).
@@ -508,17 +512,21 @@ impl<'a> DetailTarget<'a> {
 
 impl App {
     pub fn new() -> Result<Self> {
-        Self::new_with(false)
+        Self::new_with(false, None)
     }
 
     /// `passive` listens only: no QU batch, no continuous stream, no
     /// TTL refreshes. Everything else (ingest, expiry, display) runs
     /// as usual, so the view shows recently heard traffic decaying by
     /// TTL instead of actively maintained state.
-    pub fn new_with(passive: bool) -> Result<Self> {
-        let (query_tx, rx, drop_stats) = browse::spawn()?;
+    /// `interfaces` restricts discovery to the named links (`None`
+    /// browses all usable links).
+    pub fn new_with(passive: bool, interfaces: Option<HashSet<String>>) -> Result<Self> {
+        let (query_tx, rx, drop_stats) = browse::spawn(interfaces.clone())?;
+        let link_stats = browse::link_stats(interfaces.as_ref());
         Ok(Self {
             passive,
+            interfaces,
             services: Vec::new(),
             selected_display: 0,
             list_offset: Cell::new(0),
@@ -577,7 +585,7 @@ impl App {
             metrics_scroll: Cell::new(0),
             metrics_viewport: Cell::new(0),
             metrics: MetricsCounters::default(),
-            link_stats: browse::link_stats(),
+            link_stats,
             drop_stats,
         })
     }
@@ -1148,7 +1156,7 @@ impl App {
         if self.last_ip_refresh.elapsed() >= LOCAL_IPS_REFRESH {
             self.last_ip_refresh = Instant::now();
             self.local_ips = browse::local_ips();
-            self.link_stats = browse::link_stats();
+            self.link_stats = browse::link_stats(self.interfaces.as_ref());
         }
     }
 
@@ -1550,32 +1558,29 @@ impl App {
         // Links.
         section(&mut rows, "Links");
         kv(&mut rows, "local addrs", self.local_ips.len().to_string());
+        let v4names: Vec<String> = self.link_stats.v4.iter().map(|(n, _)| n.clone()).collect();
+        let v6names: Vec<String> = self.link_stats.v6.iter().map(|(n, _)| n.clone()).collect();
+        if let Some(sel) = &self.interfaces {
+            let mut names: Vec<&str> = sel.iter().map(String::as_str).collect();
+            names.sort();
+            kv(&mut rows, "selected", names.join(", "));
+        }
         kv(
             &mut rows,
             "usable v4",
-            if self.link_stats.v4.is_empty() {
+            if v4names.is_empty() {
                 "—".to_string()
             } else {
-                self.link_stats
-                    .v4
-                    .iter()
-                    .map(|(n, _)| n.clone())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                v4names.join(", ")
             },
         );
         kv(
             &mut rows,
             "usable v6",
-            if self.link_stats.v6.is_empty() {
+            if v6names.is_empty() {
                 "—".to_string()
             } else {
-                self.link_stats
-                    .v6
-                    .iter()
-                    .map(|(n, _)| n.clone())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                v6names.join(", ")
             },
         );
         kv(
@@ -1600,8 +1605,8 @@ impl App {
             "fan-out per query",
             format!(
                 "{} v4 + {} v6 copies",
-                self.link_stats.v4.len().max(1),
-                self.link_stats.v6.len().max(1)
+                v4names.len().max(1),
+                v6names.len().max(1)
             ),
         );
         kv(&mut rows, "refused off-link", self.offlink_row());
@@ -6814,7 +6819,23 @@ mod tests {
     #[test]
     fn passive_constructor_sets_flag() {
         assert!(!App::new().unwrap().passive);
-        assert!(App::new_with(true).unwrap().passive);
+        assert!(App::new_with(true, None).unwrap().passive);
+    }
+
+    #[test]
+    fn interface_selection_is_stored_and_shown_in_metrics() {
+        use std::collections::HashSet;
+        let sel = HashSet::from(["br0".to_string()]);
+        let app = App::new_with(false, Some(sel)).unwrap();
+        let rows = app.metrics_rows();
+        let (_, value) = rows
+            .iter()
+            .find(|(k, _)| k == "selected")
+            .expect("selected row");
+        assert_eq!(value, "br0");
+        // No selection: no row, default behavior unchanged.
+        let app = App::new().unwrap();
+        assert!(app.metrics_rows().iter().all(|(k, _)| k != "selected"));
     }
 
     #[test]
