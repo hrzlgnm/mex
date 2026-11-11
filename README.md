@@ -101,7 +101,7 @@ decaying by TTL instead of actively maintained state.
 | `+` / `-` | fold / unfold host (Hosts) |
 | `*` | collapse all host groups / unfold all |
 | `Ctrl+↑/↓`, `Ctrl+k`, `Shift+↑/↓`, `J` / `K` | scroll Answers viewport freely (Hex viewport when Hex focused) |
-| `Ctrl+J` | dump mex state to JSON, `<timestamp>-mex-dump.json` (experimental; high-entropy TXT values redacted) |
+| `Ctrl+J` | dump mex state to JSON, `<timestamp>-mex-dump.json` (experimental; high-entropy TXT values and public URLs redacted) |
 | `m` | metrics overlay (traffic, discovery, queries, links) |
 | `q` / `Esc` / `Ctrl+C` | quit (`m` / `Esc` closes the overlay first) |
 | `Ctrl+Z` (unix) | suspend to shell (`fg` resumes) |

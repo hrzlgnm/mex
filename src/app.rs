@@ -4616,21 +4616,28 @@ mod tests {
         let mut app = App::new().unwrap();
         service_with_txt(
             &mut app,
-            "id=328FEBD442638273B38340E9AFE1E9CB; fn=Schreibtisch",
+            "id=328FEBD442638273B38340E9AFE1E9CB; external_url=https://ha.knulp.home64.de; fn=Schreibtisch",
         );
         app.send_queries();
         let dump = app.state_dump();
         let svc = &dump.services[0];
         assert_eq!(
             svc.txt_records,
-            vec!["fn=Schreibtisch".to_string(), "id=*REDACTED*".to_string()]
+            vec![
+                "external_url=*REDACTED*".to_string(),
+                "fn=Schreibtisch".to_string(),
+                "id=*REDACTED*".to_string()
+            ]
         );
         let txt = svc
             .answers
             .iter()
             .find(|r| r.rtype_str == "TXT")
             .expect("TXT answer present");
-        assert_eq!(txt.rdata, "id=*REDACTED*; fn=Schreibtisch");
+        assert_eq!(
+            txt.rdata,
+            "id=*REDACTED*; external_url=*REDACTED*; fn=Schreibtisch"
+        );
     }
 
     #[test]

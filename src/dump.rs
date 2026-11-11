@@ -123,12 +123,88 @@ pub fn is_high_entropy_value(v: &str) -> bool {
         && shannon_entropy(v) >= 3.2
 }
 
-/// Redact a high-entropy `key=value` pair as `key=*REDACTED*`, keeping
-/// the key so dumps stay comparable. Pairs without `=` or with ordinary
-/// values pass through.
+/// Whether an IP literal is publicly routable (i.e. not private,
+/// loopback, link-local, unique-local, or multicast).
+fn is_public_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v) => {
+            let o = v.octets();
+            !(o[0] == 10
+                || (o[0] == 172 && (16..32).contains(&o[1]))
+                || (o[0] == 192 && o[1] == 168)
+                || o[0] == 127
+                || (o[0] == 169 && o[1] == 254)
+                || o[0] == 0
+                || o[0] >= 224)
+        }
+        std::net::IpAddr::V6(v) => {
+            let s = v.segments();
+            !(v.is_loopback()
+                || v.is_unspecified()
+                || (s[0] & 0xffc0) == 0xfe80
+                || (s[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xff00) == 0xff00)
+        }
+    }
+}
+
+/// Whether a URL host is publicly reachable. Single-label names and
+/// home-network suffixes (mDNS, homenet, router pseudo-TLDs) count as
+/// private; anything else (e.g. a DynDNS hostname) counts as public.
+fn is_public_host(host: &str) -> bool {
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    if h.is_empty() {
+        return false;
+    }
+    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+        return is_public_ip(&ip);
+    }
+    if !h.contains('.') {
+        return false;
+    }
+    for suf in [
+        ".local",
+        ".localhost",
+        ".invalid",
+        ".internal",
+        ".lan",
+        ".home",
+        ".home.arpa",
+        ".box",
+        ".repeater",
+    ] {
+        if h.ends_with(suf) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether a TXT value is a URL (`scheme://...`) pointing at a publicly
+/// reachable host. LAN URLs (RFC 1918, link-local, `.local`, home-router
+/// names) stay visible since they are the debugging payload.
+pub fn is_public_url(v: &str) -> bool {
+    let Some(pos) = v.find("://") else {
+        return false;
+    };
+    let authority = v[pos + 3..].split('/').next().unwrap_or("");
+    let hostport = authority.rsplit('@').next().unwrap_or("");
+    let host = if let Some(rest) = hostport.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        hostport.split(':').next().unwrap_or("")
+    };
+    is_public_host(host)
+}
+/// Redact a `key=value` pair as `key=*REDACTED*` when the value is a
+/// high-entropy token or a publicly reachable URL, keeping the key so
+/// dumps stay comparable. Pairs without `=` or with ordinary values
+/// pass through.
 pub fn redact_txt_value(pair: &str) -> String {
     match pair.split_once('=') {
-        Some((k, v)) if is_high_entropy_value(v) => format!("{k}=*REDACTED*"),
+        Some((k, v)) if is_high_entropy_value(v) || is_public_url(v) => {
+            format!("{k}=*REDACTED*")
+        }
         _ => pair.to_string(),
     }
 }
@@ -190,6 +266,41 @@ mod tests {
         assert_eq!(
             redact_txt_rdata("id=328FEBD442638273B38340E9AFE1E9CB; fn=Schreibtisch"),
             "id=*REDACTED*; fn=Schreibtisch"
+        );
+    }
+
+    #[test]
+    fn redaction_redacts_public_urls_keeps_lan_urls() {
+        // Public DynDNS hostname: redacted.
+        assert_eq!(
+            redact_txt_value("external_url=https://ha.knulp.home64.de"),
+            "external_url=*REDACTED*"
+        );
+        assert_eq!(
+            redact_txt_value("base_url=https://example.com:443/a?b=c"),
+            "base_url=*REDACTED*"
+        );
+        // LAN literals, link-local, and home-router names stay visible.
+        assert_eq!(
+            redact_txt_value("internal_url=http://192.168.178.27:8095"),
+            "internal_url=http://192.168.178.27:8095"
+        );
+        assert_eq!(
+            redact_txt_value("path=http://fritz.box:49000/avmnexusdesc.xml"),
+            "path=http://fritz.box:49000/avmnexusdesc.xml"
+        );
+        assert_eq!(
+            redact_txt_value("x=http://[fe80::1]:8123/"),
+            "x=http://[fe80::1]:8123/"
+        );
+        assert_eq!(
+            redact_txt_value("path=http://printer.local.:9100/x"),
+            "path=http://printer.local.:9100/x"
+        );
+        // Not a URL at all: untouched.
+        assert_eq!(
+            redact_txt_value("model=SHIELD Android TV"),
+            "model=SHIELD Android TV"
         );
     }
 }
