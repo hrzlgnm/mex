@@ -704,10 +704,12 @@ fn detail_table_rows<'a>(
         .into_iter()
         .filter(|a| !matches!(a.severity, crate::anomalies::Severity::Info))
         .filter_map(|a| {
+            let rtype = a.rtype?;
+            let rdata = a.rdata?;
             Some((
                 a.record_name?.trim_end_matches('.').to_lowercase(),
-                a.rtype?,
-                a.rdata?,
+                rtype,
+                crate::anomalies::anomaly_match_key(rtype, &rdata),
             ))
         })
         .collect();
@@ -721,7 +723,7 @@ fn detail_table_rows<'a>(
             && anomaly_keys.contains(&(
                 rec.name.trim_end_matches('.').to_lowercase(),
                 rec.rtype,
-                rec.rdata.clone(),
+                crate::anomalies::anomaly_match_key(rec.rtype, &rec.rdata),
             ));
         let flush = if rec.flush_bit { "flush" } else { "" };
         let rem = rec
