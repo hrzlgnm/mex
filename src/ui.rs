@@ -831,8 +831,17 @@ fn draw_hex_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     } else if let Some(ev) = app.latest_event_for_selected() {
         (hex_dump(&ev.raw_bytes, 16), " Raw Packet ".to_string())
     } else {
-        let empty =
-            Paragraph::new("No raw packet data available").style(Style::default().fg(Color::Gray));
+        // In-pane focus cue (the hex pane has no cursor to highlight):
+        // the body text goes bold while focused. The border already
+        // brightens, but that alone is easy to miss when tabbing panes.
+        let empty_style = if app.focus == Focus::Hex {
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let empty = Paragraph::new("No raw packet data available").style(empty_style);
         frame.render_widget(empty, area);
         return;
     };
@@ -857,7 +866,13 @@ fn draw_hex_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                         || resize_active(app, DragMode::HorizLower),
                 )),
         )
-        .style(Style::default().fg(Color::Green));
+        .style(if app.focus == Focus::Hex {
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Green)
+        });
     frame.render_widget(para, area);
 }
 
