@@ -43,6 +43,30 @@ pub fn try_restore(initialized: bool) -> io::Result<()> {
     Ok(())
 }
 
+/// kill target for suspend: suspend_pid() applied to the live ids.
+#[cfg(unix)]
+fn suspend_target() -> nix::unistd::Pid {
+    use nix::unistd::{getpgrp, getsid};
+    suspend_pid(getpgrp(), getsid(None).ok())
+}
+
+/// Decide the kill target from the own process group and session id. A
+/// negative pid addresses a group for kill(2): stopping the whole job
+/// also suspends wrappers such as `sh -c 'mex; ...'`, so the shell gets
+/// its prompt back and `fg` resumes everything. No job-control separation
+/// (our group is the session leader's own group) means the interactive
+/// shell shares it: stopping the group would freeze the shell with nobody
+/// left to `fg`, so stop just ourselves instead (as does an unknown
+/// session, where safety wins over wrapper coverage).
+#[cfg(unix)]
+fn suspend_pid(group: nix::unistd::Pid, session: Option<nix::unistd::Pid>) -> nix::unistd::Pid {
+    use nix::unistd::Pid;
+    match session {
+        Some(sid) if group != sid => Pid::from_raw(-group.as_raw()),
+        _ => Pid::this(),
+    }
+}
+
 /// Leave the terminal, suspend the process, and re-enter on resume:
 /// Ctrl+Z arrives as a key event (raw mode disables ISIG), so the event
 /// loop calls this instead of relying on SIGTSTP. Returns false when the
@@ -55,16 +79,9 @@ pub fn suspend(term: &mut Terminal) -> io::Result<bool> {
     // Drop handler stays consistent via the tracked flag.
     let _ = term.show_cursor();
     try_restore(true)?;
-    // Stop the whole foreground job, not just ourselves: like the kernel's
-    // Ctrl+Z (SIGTSTP to the foreground group), this also suspends wrappers
-    // such as `sh -c 'mex; ...'`, so the shell gets its prompt back and `fg`
-    // resumes everything together. Alone in our group (the common case) this
-    // is identical to stopping ourselves.
-    let group = nix::unistd::getpgrp();
-    let stopped = nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(-group.as_raw()),
-        nix::sys::signal::Signal::SIGSTOP,
-    );
+    // Stop the whole foreground job (see suspend_target), not just
+    // ourselves. Use SIGSTOP, which cannot be caught, ignored, or blocked.
+    let stopped = nix::sys::signal::kill(suspend_target(), nix::sys::signal::Signal::SIGSTOP);
     // Execution resumes here after `fg` (or immediately if SIGSTOP failed).
     if let Err(e) = stopped {
         eprintln!("mex: failed to suspend: {e}");
@@ -1003,6 +1020,30 @@ mod tests {
         assert_eq!(question_source_label(&crate::app::SELF_SOURCE), "self");
         let addr: SocketAddr = "192.168.1.5:5353".parse().unwrap();
         assert_eq!(question_source_label(&addr), "192.168.1.5:5353");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn suspend_targets_foreground_process_group_not_just_self() {
+        use nix::unistd::Pid;
+        assert_eq!(
+            suspend_pid(Pid::from_raw(100), Some(Pid::from_raw(50))),
+            Pid::from_raw(-100)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn suspend_falls_back_to_self_in_session_leaders_group() {
+        use nix::unistd::Pid;
+        // No job-control separation: the interactive shell shares our
+        // group, so stopping it would freeze the shell. Unknown session:
+        // same safe fallback.
+        assert_eq!(
+            suspend_pid(Pid::from_raw(50), Some(Pid::from_raw(50))),
+            Pid::this()
+        );
+        assert_eq!(suspend_pid(Pid::from_raw(100), None), Pid::this());
     }
 
     #[test]
