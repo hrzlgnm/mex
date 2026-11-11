@@ -1776,8 +1776,8 @@ impl App {
         out
     }
 
-    fn mex_record_row(rec: &browse::RawRecord) -> dump::MexRecord {
-        dump::MexRecord {
+    fn dump_record_row(rec: &browse::RawRecord) -> dump::DumpRecord {
+        dump::DumpRecord {
             name: rec.name.clone(),
             rtype: rec.rtype,
             rtype_str: rec.rtype_str.clone(),
@@ -1793,8 +1793,8 @@ impl App {
         }
     }
 
-    fn mex_question_row(q: &QuestionRow) -> dump::MexQuestion {
-        dump::MexQuestion {
+    fn dump_question_row(q: &QuestionRow) -> dump::DumpQuestion {
+        dump::DumpQuestion {
             name: q.0.clone(),
             rtype_str: q.1.clone(),
             source: q.2.to_string(),
@@ -1804,73 +1804,30 @@ impl App {
     }
 
     fn dump_service(&self, svc: &ServiceEntry) -> dump::DumpService {
-        // Sibling dumps use trailing dots (`_http._tcp.local.`); mex
-        // strips them internally, so re-add for comparison.
-        let stype = if svc.service_type.ends_with('.') {
-            svc.service_type.clone()
-        } else {
-            format!("{}.", svc.service_type)
-        };
-        let host = if svc.hostname.ends_with('.') {
-            svc.hostname.clone()
-        } else {
-            format!("{}.", svc.hostname)
-        };
-        let fullname = format!("{}.{}", svc.instance, stype);
-        let created_at = svc
-            .records
-            .iter()
-            .map(|r| r.received_at)
-            .min()
-            .map(dump::instant_to_iso)
-            .unwrap_or_else(|| dump::instant_to_iso(svc.last_seen));
-        let seen_iso = dump::instant_to_iso(svc.last_seen);
         let mut subtypes = svc.subtypes.clone();
         subtypes.sort();
         dump::DumpService {
-            fullname,
-            host,
-            service_type: stype,
-            subtype: subtypes.first().cloned(),
-            addresses: self.host_addresses(&Self::host_key(&svc.hostname)),
+            instance: svc.instance.clone(),
+            service_type: svc.service_type.clone(),
+            hostname: svc.hostname.clone(),
             port: svc.port,
+            addresses: self.host_addresses(&Self::host_key(&svc.hostname)),
             txt_records: Self::txt_records_for_dump(svc),
-            is_online: svc.is_active,
-            is_flapping: false,
-            created_at,
-            updated_at: Some(seen_iso.clone()),
-            last_online_at: if svc.is_active {
-                Some(seen_iso.clone())
-            } else {
-                None
-            },
-            last_offline_at: if svc.is_active { None } else { Some(seen_iso) },
-            session_history: Vec::new(),
+            is_active: svc.is_active,
+            last_seen_age_secs: svc.last_seen.elapsed().as_secs(),
             subtypes,
-            mex_records: svc
+            records: svc
                 .ordered_records()
                 .into_iter()
-                .map(Self::mex_record_row)
+                .map(Self::dump_record_row)
                 .collect(),
-            mex_questions: svc.questions.iter().map(Self::mex_question_row).collect(),
+            questions: svc.questions.iter().map(Self::dump_question_row).collect(),
         }
     }
 
-    /// Sibling-shaped snapshot plus mex raw rows, for cross-tool diffing.
+    /// Snapshot of mex's own browse state.
     fn state_dump(&self) -> dump::StateDump {
-        // Sibling `serviceTypes` carry trailing dots; mex tracks them
-        // dotless, so normalize here (comparison-only).
-        let mut service_types: Vec<String> = self
-            .known_types
-            .iter()
-            .map(|t| {
-                if t.ends_with('.') {
-                    t.clone()
-                } else {
-                    format!("{t}.")
-                }
-            })
-            .collect();
+        let mut service_types: Vec<String> = self.known_types.iter().cloned().collect();
         service_types.sort();
         let mut metrics = std::collections::BTreeMap::new();
         let m = &self.metrics;
@@ -1930,132 +1887,41 @@ impl App {
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
             services: self.services.iter().map(|s| self.dump_service(s)).collect(),
-            service_types: service_types.clone(),
+            service_types,
             metrics,
-            options: dump::DumpOptions {
-                passive: self.passive,
-                service_types,
-            },
-            filters: dump::DumpFilters {
-                query: String::new(),
-            },
-            sorting: dump::DumpSorting {
-                field: "Host".to_string(),
-                direction: "Ascending".to_string(),
-            },
-            mex_enum: self
+            passive: self.passive,
+            enum_groups: self
                 .enum_entries
                 .iter()
-                .map(|e| dump::MexRawGroup {
+                .map(|e| dump::RawGroup {
                     name: e.name.clone(),
-                    records: e.records.iter().map(Self::mex_record_row).collect(),
-                    questions: e.questions.iter().map(Self::mex_question_row).collect(),
+                    records: e.records.iter().map(Self::dump_record_row).collect(),
+                    questions: e.questions.iter().map(Self::dump_question_row).collect(),
                 })
                 .collect(),
-            mex_pending: self
+            pending: self
                 .pending_instances
                 .iter()
-                .map(|p| dump::MexRawGroup {
+                .map(|p| dump::RawGroup {
                     name: format!("{}.{}", p.instance, p.service_type),
-                    records: p.records.iter().map(Self::mex_record_row).collect(),
-                    questions: p.questions.iter().map(Self::mex_question_row).collect(),
+                    records: p.records.iter().map(Self::dump_record_row).collect(),
+                    questions: p.questions.iter().map(Self::dump_question_row).collect(),
                 })
                 .collect(),
         }
     }
 
-    /// Avahi type field is the service type without the `local` domain.
-    fn avahi_type(service_type: &str) -> String {
-        let t = service_type.trim_end_matches('.');
-        if t.len() > ".local".len() {
-            let off = t.len() - ".local".len();
-            if t.is_char_boundary(off) && t[off..].eq_ignore_ascii_case(".local") {
-                return t[..off].to_string();
-            }
-        }
-        t.to_string()
+    fn save_state_dump(&self) -> Result<String> {
+        let json_path = self.save_state_dump_to(std::path::Path::new(""))?;
+        Ok(json_path.to_string_lossy().into_owned())
     }
 
-    /// One `=` line per (service, address, ingress interface), mirroring
-    /// `avahi-browse -aprt` resolved rows. Services without a live
-    /// address have no `=` row (avahi only shows them as `+`).
-    fn avahi_text(&self) -> String {
-        let mut lines = Vec::new();
-        for svc in &self.services {
-            let key = Self::host_key(&svc.hostname);
-            let addrs = self.host_addresses(&key);
-            if addrs.is_empty() {
-                continue;
-            }
-            let stype = Self::avahi_type(&svc.service_type);
-            let txt = Self::txt_records_for_dump(svc);
-            for addr in &addrs {
-                let mut ifaces: Vec<String> = Vec::new();
-                for s in &self.services {
-                    if Self::host_key(&s.hostname) != key {
-                        continue;
-                    }
-                    for r in &s.records {
-                        if r.rtype != 1 && r.rtype != 28 {
-                            continue;
-                        }
-                        if r.ttl == 0 || r.received_at.elapsed().as_secs() as u32 > r.ttl {
-                            continue;
-                        }
-                        if r.rdata.trim() != *addr {
-                            continue;
-                        }
-                        if !r.iface.is_empty() && !ifaces.contains(&r.iface) {
-                            ifaces.push(r.iface.clone());
-                        }
-                    }
-                }
-                ifaces.sort();
-                if ifaces.is_empty() {
-                    ifaces.push("unknown".to_string());
-                }
-                for iface in &ifaces {
-                    lines.push(dump::avahi_line(
-                        iface,
-                        dump::proto_for_addr(addr),
-                        &svc.instance,
-                        &stype,
-                        &svc.hostname,
-                        addr,
-                        svc.port,
-                        &txt,
-                    ));
-                }
-            }
-        }
-        lines.sort();
-        let mut out = lines.join("\n");
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out
-    }
-
-    fn save_state_dump(&self) -> Result<(String, String)> {
-        let (json_path, avahi_path) = self.save_state_dump_to(std::path::Path::new(""))?;
-        Ok((
-            json_path.to_string_lossy().into_owned(),
-            avahi_path.to_string_lossy().into_owned(),
-        ))
-    }
-
-    fn save_state_dump_to(
-        &self,
-        dir: &std::path::Path,
-    ) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
+    fn save_state_dump_to(&self, dir: &std::path::Path) -> Result<std::path::PathBuf> {
         let json = serde_json::to_string_pretty(&self.state_dump())?;
-        let avahi = self.avahi_text();
         let stem = dump::file_stem_iso();
         let json_path = dir.join(format!("{stem}-mex-dump.json"));
-        let avahi_path = dir.join(format!("{stem}-mex-avahi.txt"));
         std::fs::write(&json_path, &json)?;
-        std::fs::write(&avahi_path, &avahi)?;
-        Ok((json_path, avahi_path))
+        Ok(json_path)
     }
 
     /// Confirmation popup text while fresh (3s); `None` once expired.
@@ -2138,16 +2004,16 @@ impl App {
             self.running = false;
             return;
         }
-        // Experimental dump (Ctrl+J, like the sibling): JSON + avahi text.
+        // Experimental dump of mex's own browse state (Ctrl+J).
         // This takes Ctrl+J away from detail scrolling (Ctrl+K still
         // scrolls; the other scroll keys are unaffected).
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('j') | KeyCode::Char('J'))
         {
             let msg = match self.save_state_dump() {
-                Ok((json, avahi)) => {
-                    log::info!("mex: state dump saved to {json} and {avahi}");
-                    format!("Dump saved: {json} + {avahi}")
+                Ok(json) => {
+                    log::info!("mex: state dump saved to {json}");
+                    format!("Dump saved: {json}")
                 }
                 Err(e) => {
                     log::error!("mex: state dump failed: {e:#}");
@@ -4702,61 +4568,43 @@ mod tests {
     }
 
     #[test]
-    fn state_dump_mirrors_sibling_shape() {
+    fn state_dump_models_mex_state() {
         let mut app = App::new().unwrap();
         service_with_txt(&mut app, "b=2; a=1");
         // known_types (the browse set) is learned on the send tick.
         app.send_queries();
         let dump = app.state_dump();
+        assert!(!dump.passive);
         assert_eq!(dump.services.len(), 1);
         let svc = &dump.services[0];
-        assert_eq!(svc.fullname, "Test._http._tcp.local.");
-        assert_eq!(svc.service_type, "_http._tcp.local.");
+        assert_eq!(svc.instance, "Test");
+        assert_eq!(svc.service_type, "_http._tcp.local");
+        assert_eq!(svc.hostname, "test.local.");
         assert_eq!(svc.port, 80);
-        // TXT pairs sorted by key like the sibling.
+        // TXT pairs sorted by key.
         assert_eq!(svc.txt_records, vec!["a=1".to_string(), "b=2".to_string()]);
-        assert!(svc.is_online);
-        assert!(!svc.mex_records.is_empty());
-        assert!(dump
-            .service_types
-            .contains(&"_http._tcp.local.".to_string()));
-        // Sibling-required top-level keys exist.
+        assert!(svc.is_active);
+        assert!(!svc.records.is_empty());
+        assert!(dump.service_types.contains(&"_http._tcp.local".to_string()));
+        // Top-level keys are mex's own model.
         let v = serde_json::to_value(&dump).unwrap();
         for key in [
             "metadata",
+            "passive",
             "services",
-            "serviceTypes",
+            "service_types",
             "metrics",
-            "options",
-            "filters",
-            "sorting",
+            "enum_groups",
+            "pending",
         ] {
             assert!(v.get(key).is_some(), "missing {key}");
         }
-        assert_eq!(v["metadata"]["applicationName"], "mex");
-        assert_eq!(v["services"][0]["serviceType"], "_http._tcp.local.");
+        assert_eq!(v["metadata"]["application_name"], "mex");
+        assert_eq!(v["services"][0]["service_type"], "_http._tcp.local");
     }
 
     #[test]
-    fn avahi_text_emits_resolved_lines() {
-        let mut app = App::new().unwrap();
-        service_with_txt(&mut app, "a=1");
-        ingest(
-            &mut app,
-            &raw_record("test.local.", 1, "A", "192.168.1.10", 120),
-        );
-        app.evict_expired();
-        let text = app.avahi_text();
-        assert!(!text.is_empty(), "service with an address must emit a line");
-        let line = text.lines().next().unwrap();
-        assert!(line.starts_with('='), "got: {line}");
-        assert!(line.contains(";IPv4;"), "got: {line}");
-        assert!(line.contains("Test;_http._tcp;local;"), "got: {line}");
-        assert!(line.contains(";192.168.1.10;80"), "got: {line}");
-    }
-
-    #[test]
-    fn save_state_dump_to_writes_both_files() {
+    fn save_state_dump_to_writes_json_file() {
         let mut app = App::new().unwrap();
         service_with_txt(&mut app, "a=1");
         let dir = std::env::temp_dir().join(format!(
@@ -4767,12 +4615,11 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let (json_path, avahi_path) = app.save_state_dump_to(&dir).unwrap();
+        let json_path = app.save_state_dump_to(&dir).unwrap();
         let json = std::fs::read_to_string(&json_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["metadata"]["applicationName"], "mex");
+        assert_eq!(parsed["metadata"]["application_name"], "mex");
         assert!(parsed.get("services").is_some());
-        assert!(std::fs::metadata(&avahi_path).is_ok());
         std::fs::remove_dir_all(&dir).ok();
     }
 
