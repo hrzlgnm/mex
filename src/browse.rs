@@ -86,7 +86,7 @@ pub struct RawRecord {
 
 #[derive(Debug, Clone)]
 pub struct Event {
-    pub records: Vec<RawRecord>,
+    pub answers: Vec<RawRecord>,
     pub questions: Vec<RawRecord>,
     /// Known answers carried in query packets (RFC 6762 §7.1). Never filed
     /// as sightings (queries are beliefs, not facts); used only for
@@ -109,8 +109,8 @@ pub struct KnownAnswer {
 pub struct QueryRequest {
     pub name: String,
     pub record_type: RecordType,
-    /// PTR target names to include as known-answer records (owner name = self.name).
-    /// Each TTL must be the *remaining* TTL, and callers must omit records
+    /// PTR target names to include as known-answer answers (owner name = self.name).
+    /// Each TTL must be the *remaining* TTL, and callers must omit answers
     /// with less than half of the original TTL left (RFC 6762 §7.1).
     pub known_answers: Vec<KnownAnswer>,
     /// mDNS unicast-response (QU) bit. Only set on the first query of the
@@ -608,10 +608,10 @@ fn send_query(socket: &PktInfoUdpSocket, req: &QueryRequest, dest: SocketAddr, e
 fn parse_packet(raw: &[u8], source: SocketAddr, iface: &str, ifindex: u32) -> Option<Event> {
     let msg = Message::from_bytes(raw).ok()?;
 
-    let mut records = Vec::new();
+    let mut answers = Vec::new();
 
-    // Only responses carry authoritative records. Queries may carry the
-    // same records as known answers (RFC 6762 §7.1 suppression), which
+    // Only responses carry authoritative answers. Queries may carry the
+    // same answers as known answers (RFC 6762 §7.1 suppression), which
     // are beliefs, not facts: the querier (e.g. another browser on the
     // link; multicast loop is disabled so never ourselves) is not their
     // source. Filing them would conjure phantom sightings on links the
@@ -623,7 +623,7 @@ fn parse_packet(raw: &[u8], source: SocketAddr, iface: &str, ifindex: u32) -> Op
             .chain(&msg.authorities)
             .chain(&msg.additionals)
         {
-            records.push(RawRecord {
+            answers.push(RawRecord {
                 name: unescape(&rec.name.to_string()),
                 rtype: u16::from(rec.record_type()),
                 rtype_str: rtype_label(rec.record_type()),
@@ -644,7 +644,7 @@ fn parse_packet(raw: &[u8], source: SocketAddr, iface: &str, ifindex: u32) -> Op
     }
 
     // Known answers in queries are parsed separately for duplicate
-    // question suppression (§7.3) and never filed as records.
+    // question suppression (§7.3) and never filed as answers.
     let mut query_kas = Vec::new();
     if msg.metadata.message_type == MessageType::Query {
         for rec in msg.answers.iter() {
@@ -684,7 +684,7 @@ fn parse_packet(raw: &[u8], source: SocketAddr, iface: &str, ifindex: u32) -> Op
     }
 
     Some(Event {
-        records,
+        answers,
         questions,
         query_kas,
         raw_bytes: raw.to_vec(),
@@ -943,7 +943,7 @@ mod tests {
         ));
         let ev = parse_packet(&q.to_vec().unwrap(), test_source(), "enx", 2).unwrap();
         // The known answer must not become a sighting; the question stays.
-        assert!(ev.records.is_empty());
+        assert!(ev.answers.is_empty());
         assert_eq!(ev.questions.len(), 1);
         assert_eq!(ev.questions[0].name, "svc._http._tcp.local.");
         assert!(!ev.questions[0].qu);
@@ -959,9 +959,9 @@ mod tests {
             120,
         ));
         let ev = parse_packet(&r.to_vec().unwrap(), test_source(), "enx", 2).unwrap();
-        assert_eq!(ev.records.len(), 1);
-        assert_eq!(ev.records[0].rdata, "Inst.svc._http._tcp.local.");
-        assert_eq!(ev.records[0].iface, "enx");
+        assert_eq!(ev.answers.len(), 1);
+        assert_eq!(ev.answers[0].rdata, "Inst.svc._http._tcp.local.");
+        assert_eq!(ev.answers[0].iface, "enx");
         assert!(ev.questions.is_empty());
         assert!(ev.query_kas.is_empty());
     }
@@ -997,17 +997,17 @@ mod tests {
         // hickory-proto strips the top CLASS bit at decode into
         // the mdns_cache_flush field; reading dns_class directly always
         // yields a clear bit (RFC 6762 §10.2).
-        assert!(flush_response(true).records[0].flush_bit);
-        assert!(!flush_response(false).records[0].flush_bit);
+        assert!(flush_response(true).answers[0].flush_bit);
+        assert!(!flush_response(false).answers[0].flush_bit);
     }
 
     #[test]
     fn packet_index_survives_parse_without_name() {
         // flush_response parses with ("", 7): no name, index kept.
         let ev = flush_response(false);
-        assert_eq!(ev.records.len(), 1);
-        assert!(ev.records[0].iface.is_empty());
-        assert_eq!(ev.records[0].ifindex, 7);
+        assert_eq!(ev.answers.len(), 1);
+        assert!(ev.answers[0].iface.is_empty());
+        assert_eq!(ev.answers[0].ifindex, 7);
     }
 
     #[test]
@@ -1025,7 +1025,7 @@ mod tests {
         ka.mdns_cache_flush = true;
         q.add_answer(ka);
         let ev = parse_packet(&q.to_vec().unwrap(), test_source(), "", 7).unwrap();
-        assert!(ev.records.is_empty());
+        assert!(ev.answers.is_empty());
         assert_eq!(ev.query_kas.len(), 1);
         assert!(ev.query_kas[0].flush_bit);
     }
@@ -1148,9 +1148,9 @@ mod tests {
         let raw = msg.to_vec().unwrap();
         let addr: SocketAddr = "192.168.178.5:5353".parse().unwrap();
         let ev = parse_packet(&raw, addr, "br0", 3).unwrap();
-        assert_eq!(ev.records.len(), 1);
-        assert_eq!(ev.records[0].rdata, "host.local. A");
-        assert_eq!(ev.records[0].iface, "br0");
+        assert_eq!(ev.answers.len(), 1);
+        assert_eq!(ev.answers[0].rdata, "host.local. A");
+        assert_eq!(ev.answers[0].iface, "br0");
         assert!(ev.questions.is_empty());
     }
 

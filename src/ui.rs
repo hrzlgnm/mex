@@ -471,7 +471,7 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     // Size SOURCE to the longest socket addr so IPv6 fits, clamped to
     // keep RDATA usable on narrow terminals.
     let src_w = target
-        .all_records()
+        .all_answers()
         .iter()
         .map(|r| source_label(r).len())
         .max()
@@ -683,12 +683,12 @@ fn detail_table_rows<'a>(
         }
     }
 
-    // Raw records, deduped and sorted by type then TTL.
+    // Raw answers, deduped and sorted by type then TTL.
     // (Ordering lives on the target so the j/k cursor and hex lookup share it.)
-    // Multi-pair TXT records carry their key=value pairs as collapsible
+    // Multi-pair TXT answers carry their key=value pairs as collapsible
     // child rows (collapsed by default, `Enter` expands); the cursor skips
     // child rows. raw_positions maps each raw record to its table row.
-    let unique_recs = target.ordered_records();
+    let unique_recs = target.ordered_answers();
     let mut raw_positions = Vec::with_capacity(unique_recs.len());
     for rec in unique_recs {
         let flush = if rec.flush_bit { "flush" } else { "" };
@@ -802,7 +802,7 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
             format!("{age}s")
         };
         // Questions asked from this host's own addresses (including our
-        // own looped-back queries) get the same highlight as local records.
+        // own looped-back queries) get the same highlight as local answers.
         // Our own inferred sends render as `self`.
         let self_row = *source == crate::app::SELF_SOURCE;
         let style = if self_row || app.is_local_source(source) {
@@ -838,7 +838,7 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
 
     // The Questions table is its own focus stop: light its border when
     // focused.
-    let raw_count = target.ordered_records().len();
+    let raw_count = target.ordered_answers().len();
     let cursor_in_questions =
         app.selected_detail_entry().is_some() && app.detail_selected >= raw_count;
 
