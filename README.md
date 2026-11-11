@@ -32,12 +32,27 @@ standard browse queries (service enumeration, PTR/SRV/TXT/A/AAAA).
 
 ## Install
 
-Prebuilt Linux binaries (x86_64 glibc + musl static) are attached to
-[GitHub releases](https://github.com/hrzlgnm/mex/releases). On Arch Linux,
-install from the [AUR](https://aur.archlinux.org/packages/mex) instead:
+Prebuilt binaries are attached to
+[GitHub releases](https://github.com/hrzlgnm/mex/releases): Linux
+binaries (x86_64 glibc + musl static) and macOS DMGs (Apple Silicon +
+Intel). On Arch Linux, install from the
+[AUR](https://aur.archlinux.org/packages/mex) instead:
 
 ```sh
 yay -S mex
+```
+
+On macOS, install via [Homebrew](https://brew.sh/):
+
+```sh
+brew tap hrzlgnm/tap
+brew install --cask mex
+```
+
+Or directly without tapping:
+
+```sh
+brew install --cask hrzlgnm/tap/mex
 ```
 
 ## Usage

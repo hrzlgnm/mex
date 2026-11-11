@@ -1,0 +1,103 @@
+# Copyright 2026 hrzlgnm
+# SPDX-License-Identifier: MIT
+
+name: Publish Release to Homebrew Tap
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  release:
+    types: [released]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🔄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: 🏷️ Get latest release info
+        id: release-info
+        uses: ./.github/actions/latest-release-info
+
+      - name: 🛠️ Determine download URLs and fetch SHA256 digests
+        uses: hrzlgnm/actions/.github/actions/retry@a2e70543f16acf3105219e0e944c323afe88b269 # v2.14.13
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ steps.release-info.outputs.tagName }}
+          VERSION: ${{ steps.release-info.outputs.version }}
+        with:
+          command: |
+            set -o errexit
+            INTEL_URL="https://github.com/hrzlgnm/mex/releases/download/${TAG_NAME}/mex-${TAG_NAME}-macOS-x86_64.dmg"
+            ARM64_URL="https://github.com/hrzlgnm/mex/releases/download/${TAG_NAME}/mex-${TAG_NAME}-macOS-aarch64.dmg"
+
+            ASSETS=$(gh api "repos/hrzlgnm/mex/releases/tags/${TAG_NAME}")
+
+            INTEL_SHA=$(jq -er --arg name "mex-${TAG_NAME}-macOS-x86_64.dmg" \
+              '.assets[] | select(.name == $name) | .digest | sub("^sha256:"; "")' <<< "$ASSETS")
+            ARM64_SHA=$(jq -er --arg name "mex-${TAG_NAME}-macOS-aarch64.dmg" \
+              '.assets[] | select(.name == $name) | .digest | sub("^sha256:"; "")' <<< "$ASSETS")
+
+            {
+              echo "INTEL_SHA=$INTEL_SHA"
+              echo "ARM64_SHA=$ARM64_SHA"
+              echo "VERSION=${VERSION#v}"
+            } >> "$GITHUB_ENV"
+
+            echo "Detected latest tag name: $TAG_NAME"
+            echo "Version: $VERSION"
+            echo "Intel URL: $INTEL_URL"
+            echo "Intel SHA256: $INTEL_SHA"
+            echo "Apple Silicon URL: $ARM64_URL"
+            echo "Apple Silicon SHA256: $ARM64_SHA"
+
+      - name: 🔄 Checkout Homebrew Tap
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: hrzlgnm/homebrew-tap
+          path: homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          # Full history so the rebase below never hits a shallow boundary.
+          fetch-depth: 0
+
+      - name: 🔧 Update cask
+        shell: bash
+        env:
+          VERSION: ${{ env.VERSION }}
+          INTEL_SHA: ${{ env.INTEL_SHA }}
+          ARM64_SHA: ${{ env.ARM64_SHA }}
+        run: |
+          CASK_PATH="homebrew-tap/Casks/mex.rb"
+          sed -i "s|^  version \".*\"|  version \"$VERSION\"|" "$CASK_PATH"
+          sed -i "s|^  sha256 arm:.*|  sha256 arm:   \"$ARM64_SHA\",|" "$CASK_PATH"
+          sed -i "s|^         intel: \".*\"|         intel: \"$INTEL_SHA\"|" "$CASK_PATH"
+          cat "$CASK_PATH"
+
+      - name: 🚀 Commit and push to tap repo
+        uses: hrzlgnm/actions/.github/actions/retry@a2e70543f16acf3105219e0e944c323afe88b269 # v2.14.13
+        env:
+          VERSION: ${{ env.VERSION }}
+        with:
+          command: |
+            cd homebrew-tap
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Casks/mex.rb
+            if ! git diff --cached --quiet; then
+              git commit -m "chore: update mex to $VERSION"
+            else
+              echo "No staged changes (already committed on previous retry or no update needed)"
+            fi
+            # Sibling repos push to the same tap repo concurrently, so a
+            # plain push can be rejected. Rebase onto the latest remote
+            # state first; each repo touches only its own cask file, so
+            # the rebase is conflict-free and a retried push converges.
+            # Always push: a retry after commit-but-push-failed would see
+            # a clean tree and must not skip the push.
+            git fetch origin
+            git rebase origin/main
+            git push origin HEAD:main
