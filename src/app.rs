@@ -1800,6 +1800,27 @@ impl App {
     /// Pure anomaly snapshot over live browser state. Read-only: never
     /// touches query scheduling, ingest, or expiry. Cheap enough to rebuild
     /// per overlay frame (tens of services, hundreds of records).
+    /// Flatten one question list into analyzer views, resolving the
+    /// displayed type label back to its numeric type. Labels the parser
+    /// never emits stay quiet.
+    fn push_question_views<'a>(
+        out: &mut Vec<anomalies::QuestionView<'a>>,
+        service: String,
+        rows: &'a [QuestionRow],
+    ) {
+        for (name, rtype_str, source, _, _) in rows {
+            if let Some(rtype) = anomalies::rtype_from_str(rtype_str) {
+                out.push(anomalies::QuestionView {
+                    service: service.clone(),
+                    name,
+                    rtype,
+                    rtype_str,
+                    source: *source,
+                });
+            }
+        }
+    }
+
     pub fn anomalies(&self) -> Vec<anomalies::Anomaly> {
         let mut services: Vec<anomalies::ServiceView<'_>> = self
             .services
@@ -1832,10 +1853,32 @@ impl App {
             .collect();
         let pending_hosts: HashSet<String> =
             self.pending_addrs.iter().map(|(h, _)| h.clone()).collect();
+        // Observed questions flattened with their owning service id, so the
+        // analyzer can attribute demand-side leaks the same way it does
+        // answer sightings. Unrecognised type labels stay quiet.
+        let mut questions: Vec<anomalies::QuestionView<'_>> = Vec::new();
+        for s in &self.services {
+            Self::push_question_views(
+                &mut questions,
+                format!("{}.{}", s.instance, s.service_type),
+                &s.questions,
+            );
+        }
+        for p in &self.pending_instances {
+            Self::push_question_views(
+                &mut questions,
+                format!("{}.{}", p.instance, p.service_type),
+                &p.questions,
+            );
+        }
+        for e in &self.enum_entries {
+            Self::push_question_views(&mut questions, "enumeration".to_string(), &e.questions);
+        }
         let snap = anomalies::Snapshot {
             services,
             enum_answers,
             pending_hosts,
+            questions,
         };
         anomalies::analyze(&snap)
     }
@@ -5170,6 +5213,54 @@ mod tests {
             }
         }
         s
+    }
+
+    #[test]
+    fn unicast_question_reaches_badge_and_display_key() {
+        // End-to-end through the real routing path: an observed SOA
+        // question lands on the service, surfaces as a unicast-question
+        // finding, bumps the service badge, and carries exactly the
+        // (name, type, querier) triple the Questions pane looks up.
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        let querier: SocketAddr = "192.168.1.9:5353".parse().unwrap();
+        let mut q = raw_record("test.local.", 6, "SOA", "", 120);
+        q.source = querier;
+        app.ingest_event(&browse::Event {
+            answers: Vec::new(),
+            questions: vec![q],
+            query_kas: Vec::new(),
+            raw_bytes: vec![0x01, 0x02],
+            source: querier,
+        });
+        let item = app
+            .anomalies()
+            .into_iter()
+            .find(|a| a.kind == "unicast-question")
+            .expect("expected routed SOA question leak");
+        assert_eq!(item.service, "Test._http._tcp.local");
+        assert_eq!(item.severity, crate::anomalies::Severity::Error);
+        assert!(
+            app.anomaly_counts()
+                .get("Test._http._tcp.local")
+                .copied()
+                .unwrap_or(0)
+                >= 1,
+            "service badge must count the question-side finding"
+        );
+        assert_eq!(
+            (
+                item.record_name
+                    .unwrap()
+                    .trim_end_matches('.')
+                    .to_lowercase(),
+                item.rtype.unwrap(),
+                item.source.unwrap(),
+            ),
+            ("test.local".to_string(), 6, querier.to_string()),
+            "finding must carry the exact display lookup triple"
+        );
     }
 
     #[test]

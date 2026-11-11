@@ -833,6 +833,23 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
         .add_modifier(Modifier::BOLD);
 
     // By type, newest first — same grouping as the Answers table.
+    // Anomalous question rows (error/warning only) get a `!` suffix on the
+    // type, mirroring the Answers table. Keys are (name, type, querier):
+    // each leaking querier keeps its own finding, so every row can mark.
+    let question_keys: HashSet<(String, u16, String)> = app
+        .anomalies()
+        .into_iter()
+        .filter(|a| a.kind == "unicast-question")
+        .filter(|a| !matches!(a.severity, crate::anomalies::Severity::Info))
+        .filter_map(|a| {
+            let rtype = a.rtype?;
+            Some((
+                a.record_name?.trim_end_matches('.').to_lowercase(),
+                rtype,
+                a.source?,
+            ))
+        })
+        .collect();
     for (name, rtype, source, received, _) in target.ordered_questions() {
         let age = received.elapsed().as_secs();
         let age_str = if age >= 60 {
@@ -849,9 +866,24 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
         } else {
             dim
         };
+        // Port 0 is never a real querier, so inferred self sends never
+        // match a finding; unparsable type labels stay quiet.
+        let flagged = !self_row
+            && crate::anomalies::rtype_from_str(rtype).is_some_and(|t| {
+                question_keys.contains(&(
+                    name.trim_end_matches('.').to_lowercase(),
+                    t,
+                    source.to_string(),
+                ))
+            });
+        let type_label = if flagged {
+            format!("{rtype}!")
+        } else {
+            rtype.clone()
+        };
         rows.push(
             Row::new(vec![
-                Cell::from(rtype.clone()),
+                Cell::from(type_label),
                 Cell::from(age_str),
                 Cell::from(question_source_label(source)),
                 Cell::from(name.clone()),
