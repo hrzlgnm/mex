@@ -14,6 +14,7 @@ use hickory_proto::rr::RecordType;
 use ratatui::layout::Rect;
 
 use crate::browse;
+use crate::dump;
 use crate::ui;
 
 /// Pane with keyboard focus: Tab cycles the service list, the two
@@ -324,6 +325,9 @@ pub struct App {
     pending_instances: Vec<PendingService>,
     pending_addrs: Vec<(String, browse::RawRecord)>,
     pub raw_events: Vec<browse::Event>,
+    /// Transient confirmation popup (e.g. state-dump result), shown for
+    /// a few seconds and dismissed by any key.
+    status_msg: Option<(String, Instant)>,
 }
 
 pub struct ServiceEntry {
@@ -567,6 +571,7 @@ impl App {
             pending_instances: Vec::new(),
             pending_addrs: Vec::new(),
             raw_events: Vec::new(),
+            status_msg: None,
             show_metrics: false,
             metrics_scroll: Cell::new(0),
             metrics_viewport: Cell::new(0),
@@ -1742,6 +1747,327 @@ impl App {
         }
     }
 
+    /// Live TXT pairs for a service, deduped and sorted by key like the
+    /// sibling (expired and goodbye rows omitted).
+    fn txt_records_for_dump(svc: &ServiceEntry) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for rec in &svc.records {
+            if rec.rtype != 16 || rec.ttl == 0 {
+                continue;
+            }
+            if rec.received_at.elapsed().as_secs() as u32 > rec.ttl {
+                continue;
+            }
+            for pair in rec.rdata.split("; ") {
+                if pair.is_empty() {
+                    continue;
+                }
+                if seen.insert(pair.to_string()) {
+                    out.push(pair.to_string());
+                }
+            }
+        }
+        out.sort_by(|a, b| {
+            let ka = a.split('=').next().unwrap_or(a);
+            let kb = b.split('=').next().unwrap_or(b);
+            ka.cmp(kb)
+        });
+        out
+    }
+
+    fn mex_record_row(rec: &browse::RawRecord) -> dump::MexRecord {
+        dump::MexRecord {
+            name: rec.name.clone(),
+            rtype: rec.rtype,
+            rtype_str: rec.rtype_str.clone(),
+            ttl: rec.ttl,
+            ttl_remaining: Self::remaining_ttl(rec),
+            rdata: rec.rdata.clone(),
+            source: rec.source.to_string(),
+            iface: rec.iface.clone(),
+            ifindex: rec.ifindex,
+            flush: rec.flush_bit,
+            received_at: dump::instant_to_iso(rec.received_at),
+            age_secs: rec.received_at.elapsed().as_secs(),
+        }
+    }
+
+    fn mex_question_row(q: &QuestionRow) -> dump::MexQuestion {
+        dump::MexQuestion {
+            name: q.0.clone(),
+            rtype_str: q.1.clone(),
+            source: q.2.to_string(),
+            received_at: dump::instant_to_iso(q.3),
+            age_secs: q.3.elapsed().as_secs(),
+        }
+    }
+
+    fn dump_service(&self, svc: &ServiceEntry) -> dump::DumpService {
+        // Sibling dumps use trailing dots (`_http._tcp.local.`); mex
+        // strips them internally, so re-add for comparison.
+        let stype = if svc.service_type.ends_with('.') {
+            svc.service_type.clone()
+        } else {
+            format!("{}.", svc.service_type)
+        };
+        let host = if svc.hostname.ends_with('.') {
+            svc.hostname.clone()
+        } else {
+            format!("{}.", svc.hostname)
+        };
+        let fullname = format!("{}.{}", svc.instance, stype);
+        let created_at = svc
+            .records
+            .iter()
+            .map(|r| r.received_at)
+            .min()
+            .map(dump::instant_to_iso)
+            .unwrap_or_else(|| dump::instant_to_iso(svc.last_seen));
+        let seen_iso = dump::instant_to_iso(svc.last_seen);
+        let mut subtypes = svc.subtypes.clone();
+        subtypes.sort();
+        dump::DumpService {
+            fullname,
+            host,
+            service_type: stype,
+            subtype: subtypes.first().cloned(),
+            addresses: self.host_addresses(&Self::host_key(&svc.hostname)),
+            port: svc.port,
+            txt_records: Self::txt_records_for_dump(svc),
+            is_online: svc.is_active,
+            is_flapping: false,
+            created_at,
+            updated_at: Some(seen_iso.clone()),
+            last_online_at: if svc.is_active {
+                Some(seen_iso.clone())
+            } else {
+                None
+            },
+            last_offline_at: if svc.is_active { None } else { Some(seen_iso) },
+            session_history: Vec::new(),
+            subtypes,
+            mex_records: svc
+                .ordered_records()
+                .into_iter()
+                .map(Self::mex_record_row)
+                .collect(),
+            mex_questions: svc.questions.iter().map(Self::mex_question_row).collect(),
+        }
+    }
+
+    /// Sibling-shaped snapshot plus mex raw rows, for cross-tool diffing.
+    fn state_dump(&self) -> dump::StateDump {
+        // Sibling `serviceTypes` carry trailing dots; mex tracks them
+        // dotless, so normalize here (comparison-only).
+        let mut service_types: Vec<String> = self
+            .known_types
+            .iter()
+            .map(|t| {
+                if t.ends_with('.') {
+                    t.clone()
+                } else {
+                    format!("{t}.")
+                }
+            })
+            .collect();
+        service_types.sort();
+        let mut metrics = std::collections::BTreeMap::new();
+        let m = &self.metrics;
+        metrics.insert("packets".to_string(), self.packet_count);
+        metrics.insert("bytes_total".to_string(), m.bytes_total);
+        metrics.insert("records_total".to_string(), m.records_total);
+        for (t, label) in [
+            (12, "ptr"),
+            (33, "srv"),
+            (16, "txt"),
+            (1, "a"),
+            (28, "aaaa"),
+        ] {
+            metrics.insert(
+                format!("records_{label}"),
+                m.records_by_type.get(&t).copied().unwrap_or(0),
+            );
+        }
+        metrics.insert("records_other".to_string(), self.other_records_total());
+        metrics.insert("questions_total".to_string(), m.questions_total);
+        metrics.insert("questions_qu".to_string(), m.qu_questions_seen);
+        metrics.insert("questions_qm".to_string(), m.qm_questions_seen);
+        metrics.insert("kas_seen".to_string(), m.kas_seen);
+        metrics.insert("goodbyes_seen".to_string(), m.goodbyes_seen);
+        metrics.insert("flush_seen".to_string(), m.flush_seen);
+        metrics.insert("q_sent_continuous".to_string(), m.q_sent_continuous);
+        metrics.insert("q_sent_refresh".to_string(), m.q_sent_refresh);
+        metrics.insert("qu_sent".to_string(), m.qu_sent);
+        metrics.insert("ka_sent".to_string(), m.ka_sent);
+        metrics.insert("suppressed_continuous".to_string(), m.suppressed_continuous);
+        metrics.insert("suppressed_refresh".to_string(), m.suppressed_refresh);
+        metrics.insert("services_current".to_string(), self.services.len() as u64);
+        metrics.insert(
+            "services_active".to_string(),
+            self.services.iter().filter(|s| s.is_active).count() as u64,
+        );
+        metrics.insert("services_seen_total".to_string(), m.services_seen_total);
+        metrics.insert(
+            "services_expired_total".to_string(),
+            m.services_expired_total,
+        );
+        metrics.insert("service_types".to_string(), service_types.len() as u64);
+        metrics.insert("enum_known".to_string(), self.enum_known.len() as u64);
+        metrics.insert(
+            "continuous_interests".to_string(),
+            self.continuous.len() as u64,
+        );
+        metrics.insert("requery_pending".to_string(), self.requeries.len() as u64);
+        metrics.insert(
+            "uptime_secs".to_string(),
+            self.start_time.elapsed().as_secs(),
+        );
+        dump::StateDump {
+            metadata: dump::Metadata {
+                dump_timestamp: dump::dump_timestamp_iso(),
+                application_name: "mex".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+            services: self.services.iter().map(|s| self.dump_service(s)).collect(),
+            service_types: service_types.clone(),
+            metrics,
+            options: dump::DumpOptions {
+                passive: self.passive,
+                service_types,
+            },
+            filters: dump::DumpFilters {
+                query: String::new(),
+            },
+            sorting: dump::DumpSorting {
+                field: "Host".to_string(),
+                direction: "Ascending".to_string(),
+            },
+            mex_enum: self
+                .enum_entries
+                .iter()
+                .map(|e| dump::MexRawGroup {
+                    name: e.name.clone(),
+                    records: e.records.iter().map(Self::mex_record_row).collect(),
+                    questions: e.questions.iter().map(Self::mex_question_row).collect(),
+                })
+                .collect(),
+            mex_pending: self
+                .pending_instances
+                .iter()
+                .map(|p| dump::MexRawGroup {
+                    name: format!("{}.{}", p.instance, p.service_type),
+                    records: p.records.iter().map(Self::mex_record_row).collect(),
+                    questions: p.questions.iter().map(Self::mex_question_row).collect(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Avahi type field is the service type without the `local` domain.
+    fn avahi_type(service_type: &str) -> String {
+        let t = service_type.trim_end_matches('.');
+        if t.len() > ".local".len() {
+            let off = t.len() - ".local".len();
+            if t.is_char_boundary(off) && t[off..].eq_ignore_ascii_case(".local") {
+                return t[..off].to_string();
+            }
+        }
+        t.to_string()
+    }
+
+    /// One `=` line per (service, address, ingress interface), mirroring
+    /// `avahi-browse -aprt` resolved rows. Services without a live
+    /// address have no `=` row (avahi only shows them as `+`).
+    fn avahi_text(&self) -> String {
+        let mut lines = Vec::new();
+        for svc in &self.services {
+            let key = Self::host_key(&svc.hostname);
+            let addrs = self.host_addresses(&key);
+            if addrs.is_empty() {
+                continue;
+            }
+            let stype = Self::avahi_type(&svc.service_type);
+            let txt = Self::txt_records_for_dump(svc);
+            for addr in &addrs {
+                let mut ifaces: Vec<String> = Vec::new();
+                for s in &self.services {
+                    if Self::host_key(&s.hostname) != key {
+                        continue;
+                    }
+                    for r in &s.records {
+                        if r.rtype != 1 && r.rtype != 28 {
+                            continue;
+                        }
+                        if r.ttl == 0 || r.received_at.elapsed().as_secs() as u32 > r.ttl {
+                            continue;
+                        }
+                        if r.rdata.trim() != *addr {
+                            continue;
+                        }
+                        if !r.iface.is_empty() && !ifaces.contains(&r.iface) {
+                            ifaces.push(r.iface.clone());
+                        }
+                    }
+                }
+                ifaces.sort();
+                if ifaces.is_empty() {
+                    ifaces.push("unknown".to_string());
+                }
+                for iface in &ifaces {
+                    lines.push(dump::avahi_line(
+                        iface,
+                        dump::proto_for_addr(addr),
+                        &svc.instance,
+                        &stype,
+                        &svc.hostname,
+                        addr,
+                        svc.port,
+                        &txt,
+                    ));
+                }
+            }
+        }
+        lines.sort();
+        let mut out = lines.join("\n");
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out
+    }
+
+    fn save_state_dump(&self) -> Result<(String, String)> {
+        let (json_path, avahi_path) = self.save_state_dump_to(std::path::Path::new(""))?;
+        Ok((
+            json_path.to_string_lossy().into_owned(),
+            avahi_path.to_string_lossy().into_owned(),
+        ))
+    }
+
+    fn save_state_dump_to(
+        &self,
+        dir: &std::path::Path,
+    ) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
+        let json = serde_json::to_string_pretty(&self.state_dump())?;
+        let avahi = self.avahi_text();
+        let stem = dump::file_stem_iso();
+        let json_path = dir.join(format!("{stem}-mex-dump.json"));
+        let avahi_path = dir.join(format!("{stem}-mex-avahi.txt"));
+        std::fs::write(&json_path, &json)?;
+        std::fs::write(&avahi_path, &avahi)?;
+        Ok((json_path, avahi_path))
+    }
+
+    /// Confirmation popup text while fresh (3s); `None` once expired.
+    pub fn status_popup(&self) -> Option<String> {
+        let (text, since) = self.status_msg.as_ref()?;
+        if since.elapsed() <= Duration::from_secs(3) {
+            Some(text.clone())
+        } else {
+            None
+        }
+    }
+
     fn unanswered_histogram(&self) -> String {
         if self.requeries.is_empty() {
             return "none unanswered".to_string();
@@ -1812,6 +2138,27 @@ impl App {
             self.running = false;
             return;
         }
+        // Experimental dump (Ctrl+J, like the sibling): JSON + avahi text.
+        // This takes Ctrl+J away from detail scrolling (Ctrl+K still
+        // scrolls; the other scroll keys are unaffected).
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('j') | KeyCode::Char('J'))
+        {
+            let msg = match self.save_state_dump() {
+                Ok((json, avahi)) => {
+                    log::info!("mex: state dump saved to {json} and {avahi}");
+                    format!("Dump saved: {json} + {avahi}")
+                }
+                Err(e) => {
+                    log::error!("mex: state dump failed: {e:#}");
+                    format!("Dump failed: {e:#}")
+                }
+            };
+            self.status_msg = Some((msg, Instant::now()));
+            return;
+        }
+        // Any other key dismisses a visible confirmation popup.
+        self.status_msg = None;
         let no_ctrl_alt = !key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
@@ -4313,7 +4660,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_j_pins_viewport_and_cursor_resumes_follow() {
+    fn scroll_pins_viewport_and_cursor_resumes_follow() {
         use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
         let mut app = App::new().unwrap();
         service_with_txt(&mut app, "a=1; b=2");
@@ -4330,7 +4677,9 @@ mod tests {
             state: KeyEventState::empty(),
         };
         assert!(!app.detail_free_scroll);
-        app.handle_key(&ctrl(KeyCode::Char('j')));
+        // Ctrl+J now dumps state (like the sibling); viewport scroll
+        // uses J instead.
+        app.handle_key(&plain(KeyCode::Char('J')));
         assert!(app.detail_free_scroll);
         assert_eq!(app.detail_offset.get(), 1);
         app.handle_key(&ctrl(KeyCode::Char('k')));
@@ -4350,6 +4699,99 @@ mod tests {
         assert_eq!(app.focus, Focus::Hex);
         app.handle_key(&plain(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Services);
+    }
+
+    #[test]
+    fn state_dump_mirrors_sibling_shape() {
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "b=2; a=1");
+        // known_types (the browse set) is learned on the send tick.
+        app.send_queries();
+        let dump = app.state_dump();
+        assert_eq!(dump.services.len(), 1);
+        let svc = &dump.services[0];
+        assert_eq!(svc.fullname, "Test._http._tcp.local.");
+        assert_eq!(svc.service_type, "_http._tcp.local.");
+        assert_eq!(svc.port, 80);
+        // TXT pairs sorted by key like the sibling.
+        assert_eq!(svc.txt_records, vec!["a=1".to_string(), "b=2".to_string()]);
+        assert!(svc.is_online);
+        assert!(!svc.mex_records.is_empty());
+        assert!(dump
+            .service_types
+            .contains(&"_http._tcp.local.".to_string()));
+        // Sibling-required top-level keys exist.
+        let v = serde_json::to_value(&dump).unwrap();
+        for key in [
+            "metadata",
+            "services",
+            "serviceTypes",
+            "metrics",
+            "options",
+            "filters",
+            "sorting",
+        ] {
+            assert!(v.get(key).is_some(), "missing {key}");
+        }
+        assert_eq!(v["metadata"]["applicationName"], "mex");
+        assert_eq!(v["services"][0]["serviceType"], "_http._tcp.local.");
+    }
+
+    #[test]
+    fn avahi_text_emits_resolved_lines() {
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1");
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 1, "A", "192.168.1.10", 120),
+        );
+        app.evict_expired();
+        let text = app.avahi_text();
+        assert!(!text.is_empty(), "service with an address must emit a line");
+        let line = text.lines().next().unwrap();
+        assert!(line.starts_with('='), "got: {line}");
+        assert!(line.contains(";IPv4;"), "got: {line}");
+        assert!(line.contains("Test;_http._tcp;local;"), "got: {line}");
+        assert!(line.contains(";192.168.1.10;80"), "got: {line}");
+    }
+
+    #[test]
+    fn save_state_dump_to_writes_both_files() {
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1");
+        let dir = std::env::temp_dir().join(format!(
+            "mex-dump-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (json_path, avahi_path) = app.save_state_dump_to(&dir).unwrap();
+        let json = std::fs::read_to_string(&json_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["metadata"]["applicationName"], "mex");
+        assert!(parsed.get("services").is_some());
+        assert!(std::fs::metadata(&avahi_path).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn status_popup_shows_while_fresh() {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = App::new().unwrap();
+        assert!(app.status_popup().is_none());
+        app.status_msg = Some(("hello".to_string(), Instant::now()));
+        assert_eq!(app.status_popup().as_deref(), Some("hello"));
+        // Any key dismisses it.
+        let plain = KeyEvent {
+            code: KeyCode::Char('x'),
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        app.handle_key(&plain);
+        assert!(app.status_popup().is_none());
     }
 
     #[test]

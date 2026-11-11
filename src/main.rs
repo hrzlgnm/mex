@@ -1,5 +1,6 @@
 mod app;
 mod browse;
+mod dump;
 mod ui;
 
 use anyhow::Result;

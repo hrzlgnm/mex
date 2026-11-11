@@ -9,12 +9,12 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Cell, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Row,
-    Table, TableState,
+    Table, TableState, Wrap,
 };
 use ratatui::Frame;
 
@@ -105,6 +105,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_body(frame, chunks[1], app);
     if app.show_metrics {
         draw_metrics_overlay(frame, app);
+    }
+    if let Some(text) = app.status_popup() {
+        draw_status_popup(frame, text);
     }
 }
 
@@ -240,6 +243,31 @@ fn draw_metrics_overlay(frame: &mut Frame, app: &App) {
     *state.offset_mut() = offset;
     frame.render_stateful_widget(table, area, &mut state);
     app.metrics_scroll.set(state.offset());
+}
+
+/// Transient confirmation popup (state dump result): centered, 3 rows,
+// auto-expires after 3s and dismissed by any key (see `App::status_popup`).
+fn draw_status_popup(frame: &mut Frame, text: String) {
+    let area = frame.area();
+    let width = (text.len() + 6)
+        .min(area.width.saturating_sub(4) as usize)
+        .max(1) as u16;
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(3) / 2,
+        width,
+        height: 3.min(area.height).max(1),
+    };
+    frame.render_widget(Clear, popup);
+    let para = Paragraph::new(text)
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Green)),
+        );
+    frame.render_widget(para, popup);
 }
 
 /// Short display form for a service type: `_http._tcp.local.` → `http.tcp`.

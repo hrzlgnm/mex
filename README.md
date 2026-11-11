@@ -100,7 +100,8 @@ decaying by TTL instead of actively maintained state.
 | `Enter` | fold / unfold host (Hosts) or TXT record (Answers) |
 | `+` / `-` | fold / unfold host (Hosts) |
 | `*` | collapse all host groups / unfold all |
-| `Ctrl+↑/↓`, `Ctrl+j/k`, `Shift+↑/↓`, `J` / `K` | scroll Answers viewport freely (Hex viewport when Hex focused) |
+| `Ctrl+↑/↓`, `Ctrl+k`, `Shift+↑/↓`, `J` / `K` | scroll Answers viewport freely (Hex viewport when Hex focused) |
+| `Ctrl+J` | dump state to JSON + avahi text, `<timestamp>-mex-dump.json` / `-mex-avahi.txt` (experimental, for cross-tool comparison) |
 | `m` | metrics overlay (traffic, discovery, queries, links) |
 | `q` / `Esc` / `Ctrl+C` | quit (`m` / `Esc` closes the overlay first) |
 | `Ctrl+Z` (unix) | suspend to shell (`fg` resumes) |
