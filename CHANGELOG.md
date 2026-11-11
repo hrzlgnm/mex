@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.6.0](https://github.com/hrzlgnm/mex/compare/v0.5.1...v0.6.0) (2026-11-11)
+
+
+### Features
+
+* suspend to shell with Ctrl+Z on unix ([#62](https://github.com/hrzlgnm/mex/issues/62)) ([0c36e03](https://github.com/hrzlgnm/mex/commit/0c36e03654330a026ec0dfb7ffb64b772db9e0da))
+
+
+### Bug Fixes
+
+* bold hex body while hex pane focused ([#61](https://github.com/hrzlgnm/mex/issues/61)) ([69025e5](https://github.com/hrzlgnm/mex/commit/69025e55ac7cc4242c455f65b88c510c98807065))
+* keep Answers marker visible when Hosts pane focused ([#56](https://github.com/hrzlgnm/mex/issues/56)) ([6f06a27](https://github.com/hrzlgnm/mex/commit/6f06a27b59bb6d04b99b88cf1286a44ebed17ff5))
+* keep Questions marker visible when Hosts pane focused ([#59](https://github.com/hrzlgnm/mex/issues/59)) ([f4b97cf](https://github.com/hrzlgnm/mex/commit/f4b97cf0cb52641dab35e1bdfb23a035e91c37ac))
+* self question hex title matches remote QRY format ([#55](https://github.com/hrzlgnm/mex/issues/55)) ([951398b](https://github.com/hrzlgnm/mex/commit/951398bb8e614adbab4fd0645647bb75b231a974))
+
 ## [0.5.1](https://github.com/hrzlgnm/mex/compare/v0.5.0...v0.5.1) (2026-11-11)
 
 
