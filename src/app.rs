@@ -1547,38 +1547,6 @@ impl App {
             ),
         );
 
-        // Anomalies (read-only RFC checks, see anomalies module).
-        section(&mut rows, "Anomalies");
-        let found = self.anomalies();
-        let errors = found
-            .iter()
-            .filter(|a| matches!(a.severity, anomalies::Severity::Error))
-            .count();
-        let warnings = found
-            .iter()
-            .filter(|a| matches!(a.severity, anomalies::Severity::Warning))
-            .count();
-        let infos = found.len().saturating_sub(errors + warnings);
-        kv(
-            &mut rows,
-            "anomalies",
-            if found.is_empty() {
-                "none".to_string()
-            } else {
-                format!("{errors} error · {warnings} warning · {infos} info")
-            },
-        );
-        // The overlay scrolls (j/k, PgUp/PgDn), so list every finding
-        // instead of capping: a cap hides findings behind an unexpandable
-        // "+N more" row.
-        for a in found.iter() {
-            kv(
-                &mut rows,
-                &format!("! {} {}", a.kind, a.severity.as_str()),
-                format!("{}: {}", a.service, a.message),
-            );
-        }
-
         // Links.
         section(&mut rows, "Links");
         kv(&mut rows, "local addrs", self.local_ips.len().to_string());
@@ -1654,6 +1622,36 @@ impl App {
         talkers.sort_by(|a, b| b.1.cmp(a.1));
         for (src, count) in talkers.iter().take(5) {
             kv(&mut rows, &format!("talker {src}"), format!("{count} pkts"));
+        }
+
+        // Anomalies last: the list can be long, and the overlay scrolls
+        // (j/k, PgUp/PgDn), so every finding is listed instead of capped.
+        section(&mut rows, "Anomalies");
+        let found = self.anomalies();
+        let errors = found
+            .iter()
+            .filter(|a| matches!(a.severity, anomalies::Severity::Error))
+            .count();
+        let warnings = found
+            .iter()
+            .filter(|a| matches!(a.severity, anomalies::Severity::Warning))
+            .count();
+        let infos = found.len().saturating_sub(errors + warnings);
+        kv(
+            &mut rows,
+            "anomalies",
+            if found.is_empty() {
+                "none".to_string()
+            } else {
+                format!("{errors} error · {warnings} warning · {infos} info")
+            },
+        );
+        for a in found.iter() {
+            kv(
+                &mut rows,
+                &format!("! {} {}", a.kind, a.severity.as_str()),
+                format!("{}: {}", a.service, a.message),
+            );
         }
 
         rows
@@ -6634,7 +6632,7 @@ mod tests {
             .collect();
         assert_eq!(
             headers,
-            vec!["Session", "Discovery", "Queries", "Anomalies", "Links"]
+            vec!["Session", "Discovery", "Queries", "Links", "Anomalies"]
         );
         assert!(rows.iter().any(|(k, _)| k == "packets"));
         assert!(rows.iter().any(|(k, _)| k == "sent"));
