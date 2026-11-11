@@ -205,24 +205,33 @@ fn is_public_ip_literal(v: &str) -> bool {
     }
 }
 
-/// Redact a bare public IPv6 literal as `*REDACTED*`; anything else
-/// (including IPv4 and non-public IPv6) passes through.
+/// Redact a bare public IPv6 literal, keeping the first and last
+/// hextet (`2003:*REDACTED*:7927`) so prefix and host tail stay useful
+/// for debugging. Anything else (including IPv4 and non-public IPv6)
+/// passes through.
 pub fn redact_ip_literal(rdata: &str) -> String {
-    if is_public_ip_literal(rdata) {
-        "*REDACTED*".to_string()
-    } else {
-        rdata.to_string()
+    let trimmed = rdata.trim().split('%').next().unwrap_or("");
+    match trimmed.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(ip)) if is_public_ip(&std::net::IpAddr::V6(ip)) => {
+            let s = ip.segments();
+            format!("{:x}:*REDACTED*:{:x}", s[0], s[7])
+        }
+        _ => rdata.to_string(),
     }
 }
 
-/// Redact a `key=value` pair as `key=*REDACTED*` when the value is a
-/// high-entropy token, a publicly reachable URL, or a public IPv6
-/// literal — keeping the key so dumps stay comparable. Pairs without
-/// `=` or with ordinary values pass through.
+/// Redact a `key=value` pair, keeping the key so dumps stay comparable:
+/// high-entropy tokens and publicly reachable URLs become `key=*REDACTED*`,
+/// public IPv6 literals keep their first and last hextet
+/// (`key=2003:*REDACTED*:7927`). Pairs without `=` or with ordinary
+/// values pass through.
 pub fn redact_txt_value(pair: &str) -> String {
     match pair.split_once('=') {
-        Some((k, v)) if is_high_entropy_value(v) || is_public_url(v) || is_public_ip_literal(v) => {
+        Some((k, v)) if is_high_entropy_value(v) || is_public_url(v) => {
             format!("{k}=*REDACTED*")
+        }
+        Some((k, v)) if is_public_ip_literal(v) => {
+            format!("{k}={}", redact_ip_literal(v))
         }
         _ => pair.to_string(),
     }
@@ -334,14 +343,14 @@ mod tests {
 
     #[test]
     fn redaction_redacts_public_ipv6_keeps_scope() {
-        // Global unicast: redacted (bare literal and TXT value alike).
+        // Global unicast keeps first and last hextet only.
         assert_eq!(
             redact_txt_value("ipv6=2003:e8:bf10:9500:38e1:a9ff:fe2c:7927"),
-            "ipv6=*REDACTED*"
+            "ipv6=2003:*REDACTED*:7927"
         );
         assert_eq!(
             redact_ip_literal("2003:e8:bf10:9500:38e1:a9ff:fe2c:7927"),
-            "*REDACTED*"
+            "2003:*REDACTED*:7927"
         );
         // Link-local, ULA, loopback, and IPv4 stay visible.
         assert_eq!(

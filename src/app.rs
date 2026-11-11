@@ -1817,7 +1817,8 @@ impl App {
     fn dump_service(&self, svc: &ServiceEntry) -> dump::DumpService {
         let mut subtypes = svc.subtypes.clone();
         subtypes.sort();
-        // Public IPv6 literals collapse to one marker, like TXT keys do.
+        // Public IPv6 literals keep first/last hextet only; identical
+        // markers dedup here.
         let mut seen_addrs = HashSet::new();
         let mut addresses = Vec::new();
         for addr in self.host_addresses(&Self::host_key(&svc.hostname)) {
@@ -4706,8 +4707,8 @@ mod tests {
         let dump = app.state_dump();
         let svc = &dump.services[0];
         assert!(svc.addresses.contains(&"fd00::1".to_string()));
-        assert!(svc.addresses.contains(&"*REDACTED*".to_string()));
-        assert!(!svc.addresses.iter().any(|a| a.starts_with("2003:")));
+        assert!(svc.addresses.contains(&"2003:*REDACTED*:1".to_string()));
+        assert!(!svc.addresses.iter().any(|a| a.contains("bf10")));
         let aaaa: Vec<_> = svc
             .answers
             .iter()
@@ -4715,11 +4716,7 @@ mod tests {
             .collect();
         assert!(!aaaa.is_empty());
         for r in aaaa {
-            assert!(
-                !r.rdata.starts_with("2003:"),
-                "global AAAA leaked: {}",
-                r.rdata
-            );
+            assert!(!r.rdata.contains("bf10"), "global AAAA leaked: {}", r.rdata);
         }
     }
 
