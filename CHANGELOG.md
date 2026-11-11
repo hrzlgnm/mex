@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.2](https://github.com/hrzlgnm/mex/compare/v0.6.1...v0.6.2) (2026-11-11)
+
+
+### Bug Fixes
+
+* fan out A/AAAA answers to every service sharing a hostname ([#68](https://github.com/hrzlgnm/mex/issues/68)) ([ec31507](https://github.com/hrzlgnm/mex/commit/ec31507f2a58ec06f223963d984313ca5a6d37d9))
+
 ## [0.6.1](https://github.com/hrzlgnm/mex/compare/v0.6.0...v0.6.1) (2026-11-11)
 
 
