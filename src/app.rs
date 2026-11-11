@@ -2986,8 +2986,8 @@ impl App {
     /// File a question we sent ourselves, inferred from the send path:
     /// multicast loop is disabled so our transmissions never arrive as
     /// events. Same matching as observed questions, marked with the
-    /// `SELF_SOURCE` sentinel; no packet bytes, so the hex pane falls
-    /// back to the latest event. Filed for real sends and §7.3
+    /// `SELF_SOURCE` sentinel; no packet bytes, so the hex pane shows the
+    /// latest event bytes under the same QRY title. Filed for real sends and §7.3
     /// suppressions alike: both are browse demand. Discovery sends
     /// precede the service, so matching pending instances park them
     /// until `handle_srv` moves them over on promotion. Passive mode
@@ -3841,12 +3841,18 @@ impl App {
                 rtype_str,
                 raw,
             } => {
-                // Own inferred sends carry no packet bytes; fall back to
-                // the latest event instead of an empty dump.
+                // Own inferred sends carry no packet bytes; show the latest
+                // event bytes under the same QRY title so the title stays
+                // per-question instead of falling back to Raw Packet.
+                let title = format!(" QRY {rtype_str} {name} ");
                 if raw.is_empty() {
-                    return None;
+                    let fallback = self
+                        .latest_event_for_selected()
+                        .map(|ev| ev.raw_bytes.clone())
+                        .unwrap_or_default();
+                    return Some((fallback, title));
                 }
-                Some((raw.to_vec(), format!(" QRY {rtype_str} {name} ")))
+                Some((raw.to_vec(), title))
             }
         }
     }
@@ -4413,6 +4419,89 @@ mod tests {
             .collect();
         assert_eq!(filed.len(), 1);
         assert_eq!(filed[0].1, "PTR");
+    }
+
+    #[test]
+    fn self_question_hex_title_matches_remote() {
+        let mut app = two_group_app();
+        // Remote question with packet bytes on the selected service.
+        let remote: std::net::SocketAddr = "192.168.1.99:5353".parse().unwrap();
+        let pkt = vec![0x12, 0x34, 0x01, 0x00];
+        {
+            let sel_idx = match app.display_items().get(app.selected_display) {
+                Some(DisplayItem::Instance { index }) => *index,
+                _ => panic!("expected instance selected"),
+            };
+            app.services[sel_idx].questions.push((
+                "_ssh._tcp.local".to_string(),
+                "PTR".to_string(),
+                remote,
+                Instant::now(),
+                pkt.clone(),
+            ));
+        }
+        app.route_own_question("_ssh._tcp.local.", 12);
+        let (raws, self_pos, remote_pos) = {
+            let target = app.display_detail().expect("detail target");
+            let raws = target.ordered_records().len();
+            let ordered = target.ordered_questions();
+            let self_pos = ordered
+                .iter()
+                .position(|q| q.2 == SELF_SOURCE)
+                .expect("self question filed");
+            let remote_pos = ordered
+                .iter()
+                .position(|q| q.2 == remote)
+                .expect("remote question filed");
+            (raws, self_pos, remote_pos)
+        };
+        app.detail_selected = raws + self_pos;
+        let (_bytes, title) = app
+            .selected_detail_bytes()
+            .expect("self question has hex payload");
+        assert_eq!(title, " QRY PTR _ssh._tcp.local ");
+        // Remote row uses the identical title shape.
+        app.detail_selected = raws + remote_pos;
+        let (_, remote_title) = app
+            .selected_detail_bytes()
+            .expect("remote question has hex payload");
+        assert_eq!(remote_title, " QRY PTR _ssh._tcp.local ");
+    }
+
+    #[test]
+    fn enum_self_question_hex_title_matches_remote() {
+        let mut app = App::new().unwrap();
+        let enum_pos = app
+            .display_items()
+            .iter()
+            .position(|it| matches!(it, DisplayItem::Enum { .. }))
+            .expect("enum row");
+        app.selected_display = enum_pos;
+        app.clamp_selection();
+        let remote: std::net::SocketAddr = "192.168.1.99:5353".parse().unwrap();
+        app.enum_entries[0].questions.push((
+            "_services._dns-sd._udp.local".to_string(),
+            "PTR".to_string(),
+            remote,
+            Instant::now(),
+            vec![0xAA, 0xBB],
+        ));
+        app.route_own_question("_services._dns-sd._udp.local.", 12);
+        let (raws, self_pos) = {
+            let target = app.display_detail().expect("enum detail target");
+            let raws = target.ordered_records().len();
+            let ordered = target.ordered_questions();
+            let self_pos = ordered
+                .iter()
+                .position(|q| q.2 == SELF_SOURCE)
+                .expect("self enum question filed");
+            (raws, self_pos)
+        };
+        app.detail_selected = raws + self_pos;
+        let (_, title) = app
+            .selected_detail_bytes()
+            .expect("self enum question has hex payload");
+        assert_eq!(title, " QRY PTR _services._dns-sd._udp.local ");
     }
 
     #[test]
