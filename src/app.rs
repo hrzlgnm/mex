@@ -3304,7 +3304,12 @@ impl App {
                     continue;
                 }
                 for r in &svc.records {
+                    // Owner check, not just sibling check: a sibling that
+                    // moved SRV targets keeps its old-host rows, and those
+                    // must not leak onto this host. Names compare
+                    // case-insensitively (RFC 6763 §7).
                     if (r.rtype == 1 || r.rtype == 28)
+                        && r.name.trim_end_matches('.').to_lowercase() == host_key
                         && r.ttl > r.received_at.elapsed().as_secs() as u32
                     {
                         backfill.push(r.clone());
@@ -3486,6 +3491,11 @@ impl App {
 
     fn push_record(&mut self, svc_idx: usize, rec: &browse::RawRecord) {
         let s = &mut self.services[svc_idx];
+        // Host addresses are not signs of service life: filing one on an
+        // already-withdrawn service must not extend its grace deadline.
+        // Only live PTRs reactivate, so an address never clears `withdrawn`.
+        let withdrawn = !s.is_active;
+        let prev_seen = s.last_seen;
         s.last_seen = Instant::now();
         if rec.ttl > 0 && rec.rtype == 12 {
             // Only a live PTR (re)announcement puts the service back on
@@ -3535,6 +3545,11 @@ impl App {
                     entry.next_due = Instant::now() + MAX_CONTINUOUS_INTERVAL;
                 }
             }
+        }
+        if withdrawn && (rec.rtype == 1 || rec.rtype == 28) {
+            // Addresses never reactivate, so a withdrawn service is still
+            // withdrawn here: keep its original grace deadline.
+            self.services[svc_idx].last_seen = prev_seen;
         }
     }
 
@@ -5417,6 +5432,159 @@ mod tests {
             assert!(!has_live_a(&app, instance), "live A stranded on {instance}");
             assert!(svc.is_active, "{instance} deactivated by an A goodbye");
         }
+    }
+
+    #[test]
+    fn pending_address_flush_reaches_every_service() {
+        let mut app = App::new().unwrap();
+        // Address arrives before either SRV: no hostname matches, so it
+        // parks in pending_addrs. The ingest helper never flushes, which
+        // is exactly what this exercises.
+        ingest(
+            &mut app,
+            &raw_record("shared.local.", 1, "A", "192.168.1.10", 120),
+        );
+        assert!(app.services.is_empty());
+        assert_eq!(app.pending_addrs.len(), 1);
+        ingest(
+            &mut app,
+            &raw_record("_http._tcp.local.", 12, "PTR", "One._http._tcp.local.", 120),
+        );
+        ingest(
+            &mut app,
+            &raw_record("_http._tcp.local.", 12, "PTR", "Two._http._tcp.local.", 120),
+        );
+        ingest(
+            &mut app,
+            &raw_record(
+                "One._http._tcp.local.",
+                33,
+                "SRV",
+                "0 0 80 shared.local.",
+                120,
+            ),
+        );
+        ingest(
+            &mut app,
+            &raw_record(
+                "Two._http._tcp.local.",
+                33,
+                "SRV",
+                "0 0 8080 shared.local.",
+                120,
+            ),
+        );
+        // Backfill finds no sibling rows (nothing flushed yet), so the
+        // parked address is still pending until the drain-time flush.
+        app.flush_pending_addrs();
+        assert!(app.pending_addrs.is_empty());
+        assert!(has_live_a(&app, "One"), "pending A missing on One");
+        assert!(has_live_a(&app, "Two"), "pending A missing on Two");
+    }
+
+    #[test]
+    fn backfill_ignores_sibling_rows_from_old_hostname() {
+        let mut app = App::new().unwrap();
+        ingest(
+            &mut app,
+            &raw_record("_http._tcp.local.", 12, "PTR", "One._http._tcp.local.", 120),
+        );
+        ingest(
+            &mut app,
+            &raw_record("_http._tcp.local.", 12, "PTR", "Two._http._tcp.local.", 120),
+        );
+        ingest(
+            &mut app,
+            &raw_record("One._http._tcp.local.", 33, "SRV", "0 0 80 old.local.", 120),
+        );
+        ingest(
+            &mut app,
+            &raw_record("old.local.", 1, "A", "192.168.0.5", 120),
+        );
+        // One moves to the shared host; its old-host rows stay put.
+        ingest(
+            &mut app,
+            &raw_record(
+                "One._http._tcp.local.",
+                33,
+                "SRV",
+                "0 0 80 shared.local.",
+                120,
+            ),
+        );
+        // Promoting Two must not inherit One's old-host address.
+        ingest(
+            &mut app,
+            &raw_record(
+                "Two._http._tcp.local.",
+                33,
+                "SRV",
+                "0 0 8080 shared.local.",
+                120,
+            ),
+        );
+        let two = app
+            .services
+            .iter()
+            .find(|s| s.instance == "Two")
+            .expect("Two present");
+        assert!(
+            two.records.iter().all(|r| r.rtype != 1 && r.rtype != 28),
+            "old-host address leaked onto Two"
+        );
+        let one = app
+            .services
+            .iter()
+            .find(|s| s.instance == "One")
+            .expect("One present");
+        assert!(one
+            .records
+            .iter()
+            .any(|r| r.rtype == 1 && r.rdata == "192.168.0.5"));
+    }
+
+    #[test]
+    fn addr_on_withdrawn_service_keeps_grace_deadline() {
+        let mut app = two_on_shared_host_app();
+        ingest(
+            &mut app,
+            &raw_record("shared.local.", 1, "A", "192.168.1.10", 120),
+        );
+        // Withdraw One; it lingers inactive through the grace period.
+        ingest(
+            &mut app,
+            &raw_record("_http._tcp.local.", 12, "PTR", "One._http._tcp.local.", 0),
+        );
+        let deadline = app
+            .services
+            .iter()
+            .find(|s| s.instance == "One")
+            .expect("One present")
+            .last_seen;
+        assert!(
+            !app.services
+                .iter()
+                .find(|s| s.instance == "One")
+                .expect("One present")
+                .is_active
+        );
+        // A subsequent shared-host announcement still files its row...
+        ingest(
+            &mut app,
+            &raw_record("shared.local.", 1, "A", "192.168.1.11", 120),
+        );
+        let one = app
+            .services
+            .iter()
+            .find(|s| s.instance == "One")
+            .expect("One present");
+        assert!(one
+            .records
+            .iter()
+            .any(|r| r.rtype == 1 && r.rdata == "192.168.1.11"));
+        // ...without extending the grace deadline; the sibling is unaffected.
+        assert_eq!(one.last_seen, deadline);
+        assert!(has_live_a(&app, "Two"));
     }
 
     #[test]
