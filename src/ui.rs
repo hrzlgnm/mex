@@ -43,6 +43,41 @@ pub fn try_restore(initialized: bool) -> io::Result<()> {
     Ok(())
 }
 
+/// Leave the terminal, suspend the process, and re-enter on resume:
+/// Ctrl+Z arrives as a key event (raw mode disables ISIG), so the event
+/// loop calls this instead of relying on SIGTSTP. Returns false when the
+/// terminal is gone and the app should exit instead. Unix only.
+#[cfg(unix)]
+pub fn suspend(term: &mut Terminal) -> io::Result<bool> {
+    // The draw loop hides the cursor and never shows it (mex sets no cursor
+    // position), so reveal it explicitly: the surviving shell needs a cursor
+    // while we're stopped. Ratatui hides it again on the next draw, and its
+    // Drop handler stays consistent via the tracked flag.
+    let _ = term.show_cursor();
+    try_restore(true)?;
+    // Stop the whole foreground job, not just ourselves: like the kernel's
+    // Ctrl+Z (SIGTSTP to the foreground group), this also suspends wrappers
+    // such as `sh -c 'mex; ...'`, so the shell gets its prompt back and `fg`
+    // resumes everything together. Alone in our group (the common case) this
+    // is identical to stopping ourselves.
+    let group = nix::unistd::getpgrp();
+    let stopped = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(-group.as_raw()),
+        nix::sys::signal::Signal::SIGSTOP,
+    );
+    // Execution resumes here after `fg` (or immediately if SIGSTOP failed).
+    if let Err(e) = stopped {
+        eprintln!("mex: failed to suspend: {e}");
+    }
+    let Some(restored) = try_init()? else {
+        return Ok(false);
+    };
+    *term = restored;
+    // Ratatui diffs frames: clear so the resumed screen repaints fully.
+    term.clear()?;
+    Ok(true)
+}
+
 pub fn draw(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)

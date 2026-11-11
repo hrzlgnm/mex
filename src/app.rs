@@ -600,6 +600,21 @@ impl App {
                     match event::read()? {
                         Event::Key(key) => {
                             if key.kind == KeyEventKind::Press {
+                                // Unix suspend precedes all key handling (even
+                                // the metrics overlay): raw mode delivers
+                                // Ctrl+Z as a key event, not SIGTSTP.
+                                #[cfg(unix)]
+                                if Self::is_suspend_key(&key) {
+                                    if !ui::suspend(terminal)? {
+                                        self.running = false;
+                                        return Ok(());
+                                    }
+                                    // Break out to redraw immediately: the
+                                    // inner loop would block on `read()` until
+                                    // the next input event, leaving the
+                                    // freshly cleared screen blank.
+                                    break;
+                                }
                                 self.handle_key(&key);
                             }
                         }
@@ -1776,6 +1791,14 @@ impl App {
             self.collapsed_hosts.extend(labels);
         }
         self.clamp_selection();
+    }
+
+    /// Ctrl+Z suspends the process on unix: raw mode disables ISIG, so the
+    /// terminal stop key arrives as a key event instead of SIGTSTP.
+    /// Lowercase only, mirroring the sibling mdns-tui-browser binding.
+    #[cfg(unix)]
+    fn is_suspend_key(key: &KeyEvent) -> bool {
+        key.code == KeyCode::Char('z') && key.modifiers.contains(KeyModifiers::CONTROL)
     }
 
     fn handle_key(&mut self, key: &KeyEvent) {
@@ -5102,6 +5125,34 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::empty(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ctrl_z_is_suspend_key() {
+        use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
+        let ctrl = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        assert!(App::is_suspend_key(&ctrl(KeyCode::Char('z'))));
+        assert!(!App::is_suspend_key(&plain_key(KeyCode::Char('z'))));
+        assert!(!App::is_suspend_key(&ctrl(KeyCode::Char('c'))));
+        assert!(!App::is_suspend_key(&ctrl(KeyCode::Char('Z'))));
+        // Bare Alt is not enough; Ctrl combinations suspend, matching the
+        // Ctrl+C quit binding and the sibling's `contains(CONTROL)` check.
+        let alt_z = KeyEvent {
+            modifiers: KeyModifiers::ALT,
+            ..ctrl(KeyCode::Char('z'))
+        };
+        assert!(!App::is_suspend_key(&alt_z));
+        let ctrl_alt_z = KeyEvent {
+            modifiers: KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ..ctrl(KeyCode::Char('z'))
+        };
+        assert!(App::is_suspend_key(&ctrl_alt_z));
     }
 
     #[test]

@@ -103,6 +103,7 @@ decaying by TTL instead of actively maintained state.
 | `Ctrl+↑/↓`, `Ctrl+j/k`, `Shift+↑/↓`, `J` / `K` | scroll Answers viewport freely (Hex viewport when Hex focused) |
 | `m` | metrics overlay (traffic, discovery, queries, links) |
 | `q` / `Esc` / `Ctrl+C` | quit (`m` / `Esc` closes the overlay first) |
+| `Ctrl+Z` (unix) | suspend to shell (`fg` resumes) |
 | mouse drag on pane borders | resize panes |
 | mouse click | focus pane + move cursor (host header folds) |
 | mouse wheel | move cursor one row / scroll one line (focused pane; overlay when open) |

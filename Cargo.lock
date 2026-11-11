@@ -1089,6 +1089,7 @@ dependencies = [
  "hickory-proto",
  "if-addrs",
  "log",
+ "nix 0.31.3",
  "ratatui",
  "socket-pktinfo",
  "socket2",
