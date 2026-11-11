@@ -181,18 +181,17 @@ fn is_public_host(host: &str) -> bool {
 }
 
 /// Whether a TXT value is a URL (`scheme://...`) pointing at a publicly
-/// reachable host. LAN URLs (RFC 1918, link-local, `.local`, home-router
-/// names) stay visible since they are the debugging payload.
+/// reachable host. Parsing follows the WHATWG URL standard via the `url`
+/// crate (userinfo, ports, bracketed IPv6 handled there); the
+/// public/private verdict stays local policy below. LAN URLs (RFC 1918,
+/// link-local, `.local`, home-router names) stay visible since they are
+/// the debugging payload.
 pub fn is_public_url(v: &str) -> bool {
-    let Some(pos) = v.find("://") else {
+    let Ok(url) = url::Url::parse(v) else {
         return false;
     };
-    let authority = v[pos + 3..].split('/').next().unwrap_or("");
-    let hostport = authority.rsplit('@').next().unwrap_or("");
-    let host = if let Some(rest) = hostport.strip_prefix('[') {
-        rest.split(']').next().unwrap_or("")
-    } else {
-        hostport.split(':').next().unwrap_or("")
+    let Some(host) = url.host_str() else {
+        return false;
     };
     is_public_host(host)
 }
@@ -292,6 +291,15 @@ mod tests {
         assert_eq!(
             redact_txt_value("x=http://[fe80::1]:8123/"),
             "x=http://[fe80::1]:8123/"
+        );
+        // Userinfo and odd ports are the parser's problem, not ours.
+        assert_eq!(
+            redact_txt_value("x=http://user:pass@public.example.com:8080/a"),
+            "x=*REDACTED*"
+        );
+        assert_eq!(
+            redact_txt_value("x=rtsp://camera.example.com/stream"),
+            "x=*REDACTED*"
         );
         assert_eq!(
             redact_txt_value("path=http://printer.local.:9100/x"),
