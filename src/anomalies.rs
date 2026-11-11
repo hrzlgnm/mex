@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::time::Instant;
 
 use crate::browse::RawRecord;
@@ -59,6 +60,21 @@ pub struct Snapshot<'a> {
     /// Lowercased hostnames with a queued address (suppresses
     /// `missing-addr` false positives while the address is in flight).
     pub pending_hosts: HashSet<String>,
+    /// Observed questions flattened across services, pending instances,
+    /// and enumeration rows. The owning service id rides along
+    /// (`instance.service_type`, or `enumeration`).
+    pub questions: Vec<QuestionView<'a>>,
+}
+
+/// One observed question for analysis: borrows the row, owns the small
+/// service id string.
+#[derive(Clone, Debug)]
+pub struct QuestionView<'a> {
+    pub service: String,
+    pub name: &'a str,
+    pub rtype: u16,
+    pub rtype_str: &'a str,
+    pub source: SocketAddr,
 }
 
 /// TTLs below this are churn risks; above this are stale-cache risks.
@@ -143,6 +159,14 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
         }
     }
 
+    // Observed questions for unicast-only types: a querier asking
+    // multicast for what can only live in unicast is the same leak from
+    // the demand side. Stored rows are already capped and refreshed on
+    // re-ask, so every row on file is worth marking.
+    for q in &snap.questions {
+        check_question(q, &mut out);
+    }
+
     out.sort_by(|a, b| {
         severity_rank(b.severity)
             .cmp(&severity_rank(a.severity))
@@ -196,12 +220,21 @@ fn dedup(mut items: Vec<Anomaly>) -> Vec<Anomaly> {
             ("unicast-leak", Some(6)) => anomaly_match_key(6, &a.rdata.clone().unwrap_or_default()),
             _ => a.rdata.clone().unwrap_or_default(),
         };
+        // Questions carry no rdata: tell queriers apart by source, so each
+        // leaking querier keeps its own finding and every row can mark.
+        // Answers keep the established behavior (one finding no matter how
+        // many sources announce it).
+        let source_key = match a.kind {
+            "unicast-question" => a.source.clone().unwrap_or_default(),
+            _ => String::new(),
+        };
         let key = (
             a.kind,
             a.service.clone(),
             a.record_name.clone().unwrap_or_default(),
             a.rtype.unwrap_or(0),
             rdata_key,
+            source_key,
         );
         if seen.insert(key) {
             out.push(a);
@@ -403,6 +436,53 @@ pub(crate) fn unicast_severity(rtype: u16) -> Option<Severity> {
         15 => Some(Severity::Warning),
         _ => None,
     }
+}
+
+/// Numeric type for a displayed `rtype_str` (`A` → 1, …, `TYPE47` → 47).
+/// `None` means unrecognised: the row stays quiet rather than guessing.
+pub(crate) fn rtype_from_str(s: &str) -> Option<u16> {
+    match s {
+        "A" => Some(1),
+        "NS" => Some(2),
+        "CNAME" => Some(5),
+        "SOA" => Some(6),
+        "MX" => Some(15),
+        "TXT" => Some(16),
+        "AAAA" => Some(28),
+        "SRV" => Some(33),
+        "PTR" => Some(12),
+        "NSEC" => Some(47),
+        "ANY" => Some(255),
+        _ => s.strip_prefix("TYPE").and_then(|n| n.parse().ok()),
+    }
+}
+
+/// One observed question asking multicast for a unicast-only type: the
+/// demand-side twin of `unicast-leak`. Port 0 can never be a real querier,
+/// so our own inferred sends stay quiet here, not just in the UI.
+fn check_question(q: &QuestionView, out: &mut Vec<Anomaly>) {
+    if q.source.port() == 0 {
+        return;
+    }
+    let Some(severity) = unicast_severity(q.rtype) else {
+        return;
+    };
+    let name = q.name.to_string();
+    out.push(Anomaly {
+        kind: "unicast-question",
+        severity,
+        service: q.service.clone(),
+        record_name: Some(name.clone()),
+        rtype: Some(q.rtype),
+        rtype_str: Some(q.rtype_str.to_string()),
+        rdata: None,
+        source: Some(q.source.to_string()),
+        message: format!(
+            "{} question for {name} on multicast (unicast-only type)",
+            q.rtype_str,
+        ),
+        rfc: "RFC 6762 §3",
+    });
 }
 
 fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
@@ -749,6 +829,7 @@ mod tests {
             services,
             enum_answers: Vec::new(),
             pending_hosts: HashSet::new(),
+            questions: Vec::new(),
         };
         analyze(&snap)
     }
@@ -815,6 +896,7 @@ mod tests {
             services,
             enum_answers: Vec::new(),
             pending_hosts: HashSet::from(["myhost.local".to_string()]),
+            questions: Vec::new(),
         };
         assert!(!analyze(&snap).iter().any(|a| a.kind == "missing-addr"));
     }
@@ -893,6 +975,7 @@ mod tests {
             services: Vec::new(),
             enum_answers: vec![&enum_rec],
             pending_hosts: HashSet::new(),
+            questions: Vec::new(),
         };
         let item = analyze(&snap)
             .iter()
@@ -905,6 +988,182 @@ mod tests {
             item.message.contains("192.168.1.2"),
             "message should name the announcer, got: {}",
             item.message
+        );
+    }
+
+    fn qview(service: &str, name: &str, rtype: u16, source: SocketAddr) -> QuestionView<'static> {
+        // Leak the service id for the snapshot lifetime: tests only.
+        let service: &'static str = Box::leak(service.to_string().into_boxed_str());
+        let rtype_str: &'static str = Box::leak(
+            match rtype {
+                2 => "NS",
+                6 => "SOA",
+                15 => "MX",
+                255 => "ANY",
+                _ => "PTR",
+            }
+            .to_string()
+            .into_boxed_str(),
+        );
+        let name: &'static str = Box::leak(name.to_string().into_boxed_str());
+        QuestionView {
+            service: service.to_string(),
+            name,
+            rtype,
+            rtype_str,
+            source,
+        }
+    }
+
+    fn analyze_questions(questions: &[QuestionView]) -> Vec<Anomaly> {
+        let snap = Snapshot {
+            services: Vec::new(),
+            enum_answers: Vec::new(),
+            pending_hosts: HashSet::new(),
+            questions: questions.to_vec(),
+        };
+        analyze(&snap)
+    }
+
+    #[test]
+    fn rtype_from_str_round_trips() {
+        use super::rtype_from_str;
+        assert_eq!(rtype_from_str("A"), Some(1));
+        assert_eq!(rtype_from_str("SOA"), Some(6));
+        assert_eq!(rtype_from_str("ANY"), Some(255));
+        assert_eq!(rtype_from_str("TYPE47"), Some(47));
+        assert_eq!(rtype_from_str("bogus"), None);
+    }
+
+    #[test]
+    fn unicast_question_flags_soa_with_querier() {
+        let querier: SocketAddr = "192.168.1.9:5353".parse().unwrap();
+        let found = analyze_questions(&[qview("My._http._tcp.local", "fritz.box.", 6, querier)]);
+        let item = found
+            .iter()
+            .find(|a| a.kind == "unicast-question")
+            .expect("expected SOA question leak");
+        assert_eq!(item.severity, Severity::Error);
+        assert_eq!(item.service, "My._http._tcp.local");
+        assert_eq!(item.record_name.as_deref(), Some("fritz.box."));
+        assert_eq!(item.rtype, Some(6));
+        assert!(
+            item.message.contains("192.168.1.9"),
+            "message should name the querier, got: {}",
+            item.message
+        );
+        assert!(
+            item.message.contains("fritz.box"),
+            "message should name the queried name, got: {}",
+            item.message
+        );
+    }
+
+    #[test]
+    fn unicast_question_mx_is_warning() {
+        let found = analyze_questions(&[qview(
+            "My._http._tcp.local",
+            "mail.local.",
+            15,
+            test_source(),
+        )]);
+        let item = found
+            .iter()
+            .find(|a| a.kind == "unicast-question")
+            .expect("expected MX question leak");
+        assert_eq!(item.severity, Severity::Warning);
+    }
+
+    #[test]
+    fn unicast_question_self_port_zero_excluded() {
+        // Port 0 can never be a real mDNS querier: our own inferred sends
+        // (SELF_SOURCE) must never flag.
+        let zelf: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let found = analyze_questions(&[qview("My._http._tcp.local", "fritz.box.", 6, zelf)]);
+        assert!(
+            !found.iter().any(|a| a.kind == "unicast-question"),
+            "self sends must stay quiet"
+        );
+    }
+
+    #[test]
+    fn unicast_question_quiet_for_multicast_types() {
+        let found = analyze_questions(&[qview(
+            "My._http._tcp.local",
+            "_http._tcp.local.",
+            12,
+            test_source(),
+        )]);
+        assert!(
+            !found.iter().any(|a| a.kind == "unicast-question"),
+            "multicast-type questions must stay quiet"
+        );
+    }
+
+    #[test]
+    fn unicast_question_dedups_per_querier() {
+        let a: SocketAddr = "192.168.1.9:5353".parse().unwrap();
+        let b: SocketAddr = "192.168.1.10:5353".parse().unwrap();
+        // Same querier asking twice: one finding.
+        let found = analyze_questions(&[
+            qview("My._http._tcp.local", "fritz.box.", 6, a),
+            qview("My._http._tcp.local", "fritz.box.", 6, a),
+        ]);
+        assert_eq!(
+            found
+                .iter()
+                .filter(|a| a.kind == "unicast-question")
+                .count(),
+            1
+        );
+        // Two queriers: one finding each, so every row can mark.
+        let found = analyze_questions(&[
+            qview("My._http._tcp.local", "fritz.box.", 6, a),
+            qview("My._http._tcp.local", "fritz.box.", 6, b),
+        ]);
+        assert_eq!(
+            found
+                .iter()
+                .filter(|a| a.kind == "unicast-question")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn unicast_question_ns_and_any_are_errors() {
+        for (rtype, label) in [(2, "NS"), (255, "ANY")] {
+            let found = analyze_questions(&[qview(
+                "My._http._tcp.local",
+                "host.local.",
+                rtype,
+                test_source(),
+            )]);
+            let item = found
+                .iter()
+                .find(|a| a.kind == "unicast-question")
+                .unwrap_or_else(|| panic!("expected {label} question leak"));
+            assert_eq!(item.severity, Severity::Error);
+            assert_eq!(item.rtype_str.as_deref(), Some(label));
+        }
+    }
+
+    #[test]
+    fn unicast_leak_same_answer_from_two_sources_is_one_finding() {
+        // Demand-side findings split per querier, but answer sightings
+        // keep the established behavior: one finding no matter how many
+        // sources announce it.
+        let mut second = rec("host.local.", 2, "NS", "host.local.", 120, false);
+        second.source = "192.168.1.9:5353".parse().unwrap();
+        let answers = vec![
+            rec("host.local.", 2, "NS", "host.local.", 120, false),
+            second,
+        ];
+        let found = analyze_service("My", "_http._tcp.local", "host.local.", &answers);
+        assert_eq!(
+            found.iter().filter(|a| a.kind == "unicast-leak").count(),
+            1,
+            "same answer from two sources must stay one finding"
         );
     }
 
@@ -1044,6 +1303,7 @@ mod tests {
             services: Vec::new(),
             enum_answers: vec![&enum_rec],
             pending_hosts: HashSet::new(),
+            questions: Vec::new(),
         };
         let item = analyze(&snap)
             .iter()
@@ -1290,6 +1550,7 @@ mod tests {
             services: Vec::new(),
             enum_answers: vec![&enum_rec],
             pending_hosts: HashSet::new(),
+            questions: Vec::new(),
         };
         let found = analyze(&snap);
         let item = found
@@ -1319,6 +1580,7 @@ mod tests {
             services: Vec::new(),
             enum_answers: vec![&enum_rec],
             pending_hosts: HashSet::new(),
+            questions: Vec::new(),
         };
         assert!(!analyze(&snap).iter().any(|a| a.kind == "type-format"));
     }
@@ -1337,6 +1599,7 @@ mod tests {
             services: Vec::new(),
             enum_answers: vec![&enum_rec],
             pending_hosts: HashSet::new(),
+            questions: Vec::new(),
         };
         assert!(!analyze(&snap).iter().any(|a| a.kind == "type-format"));
     }
@@ -1355,6 +1618,7 @@ mod tests {
             services: Vec::new(),
             enum_answers: vec![&enum_rec],
             pending_hosts: HashSet::new(),
+            questions: Vec::new(),
         };
         assert!(analyze(&snap)
             .iter()
