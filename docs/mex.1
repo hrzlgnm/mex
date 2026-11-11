@@ -21,6 +21,13 @@ With this flag mex transmits nothing: no startup QU batch, no continuous
 queries, no TTL refreshes \(em the view shows recently heard traffic
 decaying by TTL instead of actively maintained state.
 .TP
+.B \-i, \-\-interfaces \fIIFACES\fR
+Network interfaces to use for mDNS discovery (e.g., br0, eth0).
+Repeatable and comma-separated. Only the named links are joined, queried,
+and ingested; unknown names abort at startup with the available list.
+An explicit selection overrides the default loopback/container skip.
+Without the flag, all usable links are browsed.
+.TP
 .B \-h, \-\-help
 Display help message and exit.
 .TP
@@ -112,6 +119,10 @@ Browse mDNS traffic:
 Listen only, never transmit:
 .br
 .B mex \-\-passive
+.IP \(bu
+Browse only one link:
+.br
+.B mex \-i br0
 .RE
 
 .SH AUTHOR

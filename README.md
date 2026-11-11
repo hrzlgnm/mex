@@ -46,14 +46,21 @@ yay -S mex
 mex [OPTIONS]
 
 Options:
-      --passive  Listen only: never transmit queries, just observe announcements
-  -h, --help     Print help
-  -V, --version  Print version
+      --passive            Listen only: never transmit queries, just observe announcements
+  -i, --interfaces <IFACES>  Network interfaces to use for mDNS discovery (e.g., br0, eth0)
+  -h, --help               Print help
+  -V, --version            Print version
 ```
 
 With `--passive`, mex transmits nothing: no startup QU batch, no continuous
 queries, no TTL refreshes — the view shows recently heard traffic
 decaying by TTL instead of actively maintained state.
+
+With `-i/--interfaces`, mex joins, queries, and ingests only the named
+links (repeatable and comma-separated: `-i br0,eth0`). Unknown names abort
+at startup with the available list; an explicit selection overrides the
+default loopback/container skip. Without the flag, all usable links are
+browsed as before.
 
 ## Layout
 
