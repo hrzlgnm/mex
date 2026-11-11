@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.1](https://github.com/hrzlgnm/mex/compare/v0.5.0...v0.5.1) (2026-11-11)
+
+
+### Bug Fixes
+
+* left-align TXT child rows in Answers table ([#50](https://github.com/hrzlgnm/mex/issues/50)) ([53e8298](https://github.com/hrzlgnm/mex/commit/53e8298d38fbb1a754fdd386b613721edf680009))
+* match AUR pkgdesc to repo description ([#48](https://github.com/hrzlgnm/mex/issues/48)) ([227d3e2](https://github.com/hrzlgnm/mex/commit/227d3e263238c14b9a06ff7717d3d93265e69af4))
+
+
+### Dependencies
+
+* lock file maintenance ([#51](https://github.com/hrzlgnm/mex/issues/51)) ([280ac60](https://github.com/hrzlgnm/mex/commit/280ac6015e6f6940f91fff23cf702aa333db4898))
+
 ## [0.5.0](https://github.com/hrzlgnm/mex/compare/v0.4.2...v0.5.0) (2026-11-10)
 
 
