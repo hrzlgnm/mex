@@ -109,8 +109,8 @@ pub struct KnownAnswer {
 pub struct QueryRequest {
     pub name: String,
     pub record_type: RecordType,
-    /// PTR target names to include as known-answer answers (owner name = self.name).
-    /// Each TTL must be the *remaining* TTL, and callers must omit answers
+    /// PTR target names to include as known answers (owner name = self.name).
+    /// Each TTL must be the *remaining* TTL, and callers must omit targets
     /// with less than half of the original TTL left (RFC 6762 §7.1).
     pub known_answers: Vec<KnownAnswer>,
     /// mDNS unicast-response (QU) bit. Only set on the first query of the

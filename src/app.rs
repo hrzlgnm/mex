@@ -301,7 +301,7 @@ pub struct App {
     startup_qu_sent: bool,
     last_ip_refresh: Instant,
     collapsed_hosts: HashSet<String>,
-    /// Expanded TXT answers in the Answers table, keyed by
+    /// Expanded TXT records in the Answers table, keyed by
     /// (name, rdata, source). Absent = collapsed (the default), so
     /// multi-pair TXT rows render as a single `▸ TXT` line until
     /// `Enter` expands them into `▾ TXT` plus child rows.

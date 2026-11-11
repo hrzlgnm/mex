@@ -246,7 +246,7 @@ fn draw_metrics_overlay(frame: &mut Frame, app: &App) {
 }
 
 /// Transient confirmation popup (state dump result): centered, 3 rows,
-// auto-expires after 3s and dismissed by any key (see `App::status_popup`).
+/// auto-expires after 3s and dismissed by any key (see `App::status_popup`).
 fn draw_status_popup(frame: &mut Frame, text: String) {
     let area = frame.area();
     let width = (text.len() + 6)
