@@ -755,6 +755,9 @@ fn detail_table_rows<'a>(
     let info_style = Style::default()
         .fg(Color::Green)
         .add_modifier(Modifier::ITALIC);
+    // TXT pair children show verbatim wire content, so they stay
+    // upright: only the constructed header rows are italic.
+    let pair_style = Style::default().fg(Color::Green);
     let dim = Style::default().fg(Color::Gray);
     let local_style = Style::default()
         .fg(Color::Green)
@@ -920,7 +923,7 @@ fn detail_table_rows<'a>(
                             Span::raw(*pair),
                         ]))
                         .column_span(5)])
-                        .style(info_style),
+                        .style(pair_style),
                     );
                 }
             }

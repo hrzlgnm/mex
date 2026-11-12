@@ -7895,6 +7895,49 @@ mod tests {
     }
 
     #[test]
+    fn txt_children_render_upright() {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
+        use ratatui::style::Modifier;
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1; b=2");
+        let key = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        app.handle_key(&key(KeyCode::Tab));
+        app.handle_key(&key(KeyCode::Enter));
+        let buf = render_to_buffer(&app, 100, 30);
+        let area = app.answers_rect.get();
+        // Expanded TXT pair rows show verbatim wire content: green like
+        // the header rows, but never italic.
+        let mut pair = None;
+        for y in (area.y + 1)..(area.y + area.height.saturating_sub(1)) {
+            let mut row = String::new();
+            for x in (area.x + 1)..(area.x + area.width.saturating_sub(1)) {
+                row.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or_default());
+            }
+            if (row.contains("├─") || row.contains("└─")) && row.contains("a=1") {
+                pair = Some((y, row));
+                break;
+            }
+        }
+        let (y, _) = pair.expect("expanded TXT pair row");
+        let cell = buf.cell((area.x + 1, y)).expect("pair cell");
+        assert!(
+            !cell.modifier.contains(Modifier::ITALIC),
+            "wire content stays upright"
+        );
+        assert_eq!(
+            cell.fg,
+            ratatui::style::Color::Green,
+            "pair rows keep the info color, got: {:?}",
+            cell.fg
+        );
+    }
+
+    #[test]
     fn mouse_border_hit_test_prefers_seams() {
         use ratatui::layout::Rect;
         let app = App::new().unwrap();

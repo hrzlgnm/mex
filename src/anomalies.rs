@@ -545,11 +545,13 @@ pub(crate) fn question_unicast_severity(rtype: u16) -> Option<Severity> {
     }
 }
 
-/// One-shot (stub) resolver per RFC 6762 §5.1: queries from port 5353
-/// signal a compliant continuous querier (§5.2); anything else comes
-/// from a stub resolver, which asks from an ephemeral port. Port 0 is
-/// our own inferred send path, never a real querier; ports below 1024
-/// are left untagged (no defined mDNS querier lives there).
+/// One-shot (stub) resolver per RFC 6762 §5.1: port 5353 signals a
+/// compliant continuous querier (§5.2), so any other source port is a
+/// stub asking from an ephemeral port — anything at or above 1024
+/// reads as one-shot, i.e. "not a full 5353 querier" (this deliberately
+/// includes registered-range ports). Port 0 is our own inferred send
+/// path, never a real querier; well-known ports stay untagged since no
+/// defined mDNS querier lives there.
 pub(crate) fn is_one_shot_querier(source: &SocketAddr) -> bool {
     source.port() != 5353 && source.port() >= 1024
 }
@@ -1378,6 +1380,19 @@ mod tests {
         assert!(
             !item.message.contains("one-shot"),
             "well-known port stays untagged, got: {}",
+            item.message
+        );
+        // Registered-range ports are not full 5353 queriers either, so
+        // they read as one-shot by design.
+        let other: SocketAddr = "192.168.1.9:5354".parse().unwrap();
+        let found = analyze_questions(&[qview("My._http._tcp.local", "fritz.box.", 6, other)]);
+        let item = found
+            .iter()
+            .find(|a| a.kind == "unicast-question")
+            .expect("expected SOA question leak");
+        assert!(
+            item.message.contains("one-shot"),
+            "non-5353 port reads as one-shot, got: {}",
             item.message
         );
     }
