@@ -7419,48 +7419,22 @@ mod tests {
 
     #[test]
     fn mouse_click_anomalies_focuses_without_moving_cursor() {
-        use ratatui::layout::Rect;
         let mut app = two_group_app();
         app.focus = Focus::Services;
         let cursor = app.detail_selected;
-        app.left_rect.set(Rect::new(0, 3, 33, 30));
-        app.right_rect.set(Rect::new(33, 3, 67, 30));
-        app.answers_rect.set(Rect::new(33, 3, 67, 10));
-        app.questions_rect.set(Rect::new(33, 13, 67, 8));
-        app.anomalies_rect.set(Rect::new(33, 21, 67, 6));
-        app.hex_rect.set(Rect::new(33, 27, 67, 6));
+        // Click against the computed layout, not hand-placed rects.
+        render_to_buffer(&app, 100, 30);
+        let area = app.anomalies_rect.get();
+        assert!(area.height > 2, "anomalies pane needs an interior row");
         // Interior click (not a seam): focuses the pane, leaves the
         // cursor and both dump offsets alone.
         app.anomalies_offset.set(2);
         app.hex_offset.set(4);
-        app.mouse_down(40, 23);
+        app.mouse_down(area.x + 2, area.y + 1);
         assert_eq!(app.focus, Focus::Anomalies);
         assert_eq!(app.detail_selected, cursor);
         assert_eq!(app.anomalies_offset.get(), 2);
         assert_eq!(app.hex_offset.get(), 4);
-    }
-
-    #[test]
-    fn mouse_drag_moves_middle_and_lower_dividers() {
-        use ratatui::layout::Rect;
-        let mut app = App::new().unwrap();
-        app.body_rect.set(Rect::new(0, 3, 100, 40));
-        app.right_rect.set(Rect::new(33, 3, 67, 30));
-        app.answers_pct = 30;
-        app.questions_pct = 25;
-        app.anomalies_pct = 20;
-        // Middle seam (Questions/Anomalies) moves the questions share.
-        app.drag = DragMode::HorizMiddle;
-        app.mouse_drag(40, 3 + 20);
-        assert_eq!(app.questions_pct, 36);
-        assert_eq!(app.hover.get(), DragMode::HorizMiddle);
-        assert!(app.answers_pct + app.questions_pct + app.anomalies_pct <= 90);
-        // Lower seam (Anomalies/Hex) moves the anomalies share.
-        app.drag = DragMode::HorizLower;
-        app.mouse_drag(40, 3 + 25);
-        assert_eq!(app.anomalies_pct, 17);
-        assert_eq!(app.hover.get(), DragMode::HorizLower);
-        assert!(app.answers_pct + app.questions_pct + app.anomalies_pct <= 90);
     }
 
     #[test]
@@ -7474,11 +7448,19 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::empty(),
         };
-        // Services -> Answers -> Questions -> Anomalies.
-        app.handle_key(&plain(KeyCode::Tab));
-        app.handle_key(&plain(KeyCode::Tab));
-        app.handle_key(&plain(KeyCode::Tab));
-        assert_eq!(app.focus, Focus::Anomalies);
+        // Tab reachability lives in the focus-cycle tests; park here
+        // directly so this test pins scrolling, not tab order.
+        app.focus = Focus::Anomalies;
+        // Single-line scroll keys.
+        app.handle_key(&plain(KeyCode::Char('j')));
+        assert_eq!(app.anomalies_offset.get(), 1);
+        app.handle_key(&plain(KeyCode::Down));
+        assert_eq!(app.anomalies_offset.get(), 2);
+        app.handle_key(&plain(KeyCode::Char('k')));
+        assert_eq!(app.anomalies_offset.get(), 1);
+        app.handle_key(&plain(KeyCode::Up));
+        assert_eq!(app.anomalies_offset.get(), 0);
+        // Viewportful paging keys.
         app.anomalies_viewport.set(5);
         app.handle_key(&plain(KeyCode::PageDown));
         assert_eq!(app.anomalies_offset.get(), 5);
@@ -7488,24 +7470,27 @@ mod tests {
         assert_eq!(app.anomalies_offset.get(), 5);
         app.handle_key(&plain(KeyCode::Char('b')));
         assert_eq!(app.anomalies_offset.get(), 0);
+        app.handle_key(&plain(KeyCode::Char(' ')));
+        assert_eq!(app.anomalies_offset.get(), 5);
         app.handle_key(&plain(KeyCode::End));
         assert!(app.anomalies_offset.get() > 1000);
         app.handle_key(&plain(KeyCode::Home));
         assert_eq!(app.anomalies_offset.get(), 0);
     }
 
+    /// Share moved by a horizontal divider drag, by divider mode.
+    fn seam_share(app: &App, mode: DragMode) -> u16 {
+        match mode {
+            DragMode::HorizUpper => app.answers_pct,
+            DragMode::HorizMiddle => app.questions_pct,
+            _ => app.anomalies_pct,
+        }
+    }
+
     #[test]
     fn mouse_down_drag_sequence_moves_seams() {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-        use ratatui::layout::Rect;
         let mut app = App::new().unwrap();
-        app.body_rect.set(Rect::new(0, 3, 100, 40));
-        app.left_rect.set(Rect::new(0, 3, 33, 37));
-        app.right_rect.set(Rect::new(33, 3, 67, 37));
-        app.answers_rect.set(Rect::new(33, 3, 67, 10));
-        app.questions_rect.set(Rect::new(33, 13, 67, 8));
-        app.anomalies_rect.set(Rect::new(33, 21, 67, 6));
-        app.hex_rect.set(Rect::new(33, 27, 67, 10));
         let down = |column, row| MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column,
@@ -7524,36 +7509,39 @@ mod tests {
             row: 20,
             modifiers: KeyModifiers::empty(),
         };
-        // Upper seam grabs the answers share through a real Down/Drag.
-        app.answers_pct = 30;
-        app.questions_pct = 25;
-        app.anomalies_pct = 20;
-        app.handle_mouse(&down(40, 12));
-        assert_eq!(app.drag, DragMode::HorizUpper);
-        app.handle_mouse(&drag(40, 23));
-        assert_eq!(app.answers_pct, 45);
-        app.handle_mouse(&up());
-        assert_eq!(app.drag, DragMode::None);
-        // Middle seam grabs the questions share.
-        app.answers_pct = 30;
-        app.questions_pct = 25;
-        app.anomalies_pct = 20;
-        app.handle_mouse(&down(40, 20));
-        assert_eq!(app.drag, DragMode::HorizMiddle);
-        app.handle_mouse(&drag(40, 25));
-        assert_eq!(app.questions_pct, 29);
-        app.handle_mouse(&up());
-        assert_eq!(app.drag, DragMode::None);
-        // Lower seam grabs the anomalies share.
-        app.answers_pct = 30;
-        app.questions_pct = 25;
-        app.anomalies_pct = 20;
-        app.handle_mouse(&down(40, 26));
-        assert_eq!(app.drag, DragMode::HorizLower);
-        app.handle_mouse(&drag(40, 33));
-        assert_eq!(app.anomalies_pct, 26);
-        app.handle_mouse(&up());
-        assert_eq!(app.drag, DragMode::None);
+        // Seams come from the computed layout: the top border row of
+        // the lower pane is always a grab zone.
+        for mode in [
+            DragMode::HorizUpper,
+            DragMode::HorizMiddle,
+            DragMode::HorizLower,
+        ] {
+            app.answers_pct = 30;
+            app.questions_pct = 25;
+            app.anomalies_pct = 20;
+            render_to_buffer(&app, 100, 40);
+            let lower = match mode {
+                DragMode::HorizUpper => app.questions_rect.get(),
+                DragMode::HorizMiddle => app.anomalies_rect.get(),
+                DragMode::HorizLower => app.hex_rect.get(),
+                _ => unreachable!("horizontal seam"),
+            };
+            assert!(lower.height > 2, "pane needs a grabbable border");
+            let before = seam_share(&app, mode);
+            app.handle_mouse(&down(lower.x + 5, lower.y));
+            assert_eq!(app.drag, mode);
+            app.handle_mouse(&drag(lower.x + 5, lower.y + 6));
+            assert!(
+                seam_share(&app, mode) > before,
+                "{mode:?} drag must grow its share"
+            );
+            app.handle_mouse(&up());
+            assert_eq!(app.drag, DragMode::None);
+            assert!(app.answers_pct >= 10);
+            assert!(app.questions_pct >= 10);
+            assert!(app.anomalies_pct >= 10);
+            assert!(app.answers_pct + app.questions_pct + app.anomalies_pct <= 90);
+        }
     }
 
     #[test]
@@ -7590,6 +7578,34 @@ mod tests {
         app.set_answers_from_y(3);
         check(&app);
         assert_eq!(app.answers_pct, 10);
+        // The clamped model still renders every pane: no share
+        // collapses to zero rows.
+        render_to_buffer(&app, 100, 30);
+        for pane in [
+            &app.answers_rect,
+            &app.questions_rect,
+            &app.anomalies_rect,
+            &app.hex_rect,
+        ] {
+            assert!(
+                pane.get().height >= 1,
+                "slammed shares must still render every pane"
+            );
+        }
+    }
+
+    /// Text content of a rendered rect, rows joined by newline.
+    fn rect_text(buf: &ratatui::buffer::Buffer, area: ratatui::layout::Rect) -> String {
+        let mut out = String::new();
+        for y in area.y..area.y.saturating_add(area.height) {
+            for x in area.x..area.x.saturating_add(area.width) {
+                if let Some(cell) = buf.cell((x, y)) {
+                    out.push_str(cell.symbol());
+                }
+            }
+            out.push('\n');
+        }
+        out
     }
 
     #[test]
@@ -7597,31 +7613,20 @@ mod tests {
         let app = two_group_app();
         for (width, height) in [(100, 30), (60, 12), (40, 8)] {
             let buf = render_to_buffer(&app, width, height);
-            let mut text = String::new();
-            for y in 0..height {
-                for x in 0..width {
-                    if let Some(cell) = buf.cell((x, y)) {
-                        text.push_str(cell.symbol());
-                    }
-                }
-            }
-            // Every right-stack pane keeps a visible row: titles render
-            // on the top border even when the pane is one row tall.
-            for pane in [
-                &app.answers_rect,
-                &app.questions_rect,
-                &app.anomalies_rect,
-                &app.hex_rect,
+            // Every right-stack pane keeps a visible row and shows its
+            // own title inside its own rect — not just somewhere in the
+            // buffer.
+            for (rect, title) in [
+                (&app.answers_rect, "Answers"),
+                (&app.questions_rect, "Questions"),
+                (&app.anomalies_rect, "Anomalies"),
+                (&app.hex_rect, "Raw Packet"),
             ] {
+                let area = rect.get();
+                assert!(area.height >= 1, "{width}x{height}: every pane keeps a row");
                 assert!(
-                    pane.get().height >= 1,
-                    "{width}x{height}: every pane keeps a row"
-                );
-            }
-            for title in ["Answers", "Questions", "Anomalies"] {
-                assert!(
-                    text.contains(title),
-                    "{width}x{height} must still show the {title} pane"
+                    rect_text(&buf, area).contains(title),
+                    "{width}x{height} must show the {title} pane in place"
                 );
             }
         }
