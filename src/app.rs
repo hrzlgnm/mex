@@ -289,6 +289,11 @@ pub struct App {
     /// cursor and has no cursor of its own. Reset when the cursor or
     /// target changes; upper clamping happens at render time.
     pub anomalies_offset: Cell<usize>,
+    /// Whether the Anomalies pane tracks the cursor's finding: set on
+    /// cursor moves, cleared by any manual scroll. While set, a changed
+    /// finding list re-anchors the viewport instead of leaving the
+    /// marker behind.
+    pub anomalies_follow: Cell<bool>,
     /// Visible rows of the Anomalies pane (minus borders), recorded
     /// during draw so paging matches the viewport.
     pub anomalies_viewport: Cell<usize>,
@@ -620,6 +625,7 @@ impl App {
             detail_free_scroll: false,
             questions_offset: Cell::new(0),
             anomalies_offset: Cell::new(0),
+            anomalies_follow: Cell::new(false),
             anomalies_viewport: Cell::new(0),
             hex_offset: Cell::new(0),
             hex_viewport: Cell::new(0),
@@ -3233,9 +3239,11 @@ impl App {
     }
 
     /// Nudge the Anomalies viewport; the findings follow the record
-    /// cursor, so there is no cursor to resume and no pin flag.
+    /// cursor, so there is no cursor to resume and no pin flag. Any
+    /// manual scroll pauses tracking until the cursor moves again.
     fn scroll_anomalies(&mut self, delta: isize) {
         Self::bump_offset(&self.anomalies_offset, delta);
+        self.anomalies_follow.set(false);
     }
 
     /// New detail row: restart the hex dump at the top and scroll the
@@ -3245,10 +3253,33 @@ impl App {
         self.follow_anomalies_cursor();
     }
 
+    /// Offset the Anomalies pane should take before viewport clamping:
+    /// the cursor's finding while tracking, 0 when tracking a list
+    /// that lost its match, or the untouched manual offset otherwise.
+    /// Pure so the follow/no-follow decision is unit-testable; draw
+    /// clamps the result to the viewport.
+    pub(crate) fn tracked_anomalies_offset(
+        follow: bool,
+        current: usize,
+        match_idx: Option<usize>,
+        total: usize,
+    ) -> usize {
+        if !follow {
+            return current;
+        }
+        match match_idx {
+            Some(at) => at,
+            None if current >= total => 0,
+            None => current,
+        }
+    }
+
     /// Scroll the Anomalies pane to the finding that belongs to the
-    /// highlighted row, or to the top when nothing matches. Called on
-    /// cursor moves so the marker stays in view; manual scrolling in
-    /// between is untouched until the cursor moves again.
+    /// highlighted row, or to the top when nothing matches, and resume
+    /// tracking it: while tracking, a changed finding list re-anchors
+    /// the viewport instead of leaving the marker behind. Called on
+    /// cursor moves; any manual scroll pauses tracking until the cursor
+    /// moves again.
     fn follow_anomalies_cursor(&mut self) {
         let at = self
             .anomalies_for_selected()
@@ -3256,9 +3287,11 @@ impl App {
             .position(|p| p.cursor_match)
             .unwrap_or(0);
         self.anomalies_offset.set(at);
+        self.anomalies_follow.set(true);
     }
 
     fn scroll_anomalies_edge(&mut self, first: bool) {
+        self.anomalies_follow.set(false);
         if first {
             self.anomalies_offset.set(0);
         } else {
@@ -3353,6 +3386,10 @@ impl App {
             .map(|s| (s.service_type.clone(), s.instance.clone()));
         let enum_key = self.selected_enum().map(|e| e.name.clone());
         if svc_key.is_none() && enum_key.is_none() {
+            // Headers show the full unmarked list from the top: no row
+            // to track, so a stale manual offset must not linger.
+            self.anomalies_offset.set(0);
+            self.anomalies_follow.set(false);
             return;
         }
         if self.detail_svc_key != svc_key || self.detail_enum_key != enum_key {
@@ -7880,6 +7917,11 @@ mod tests {
                 ["ttl-unstable"],
                 "A row {idx} must mark the spanning finding"
             );
+            assert_eq!(
+                found[0].anomaly.rtype_str.as_deref(),
+                Some("A"),
+                "spanning finding keeps its type label, got: {found:?}"
+            );
         }
     }
 
@@ -8238,9 +8280,92 @@ mod tests {
         app.move_detail_cursor(1);
         assert_eq!(app.detail_selected, 2);
         assert_eq!(app.anomalies_offset.get(), 0);
-        // Header: nothing marked, back to the top.
+        // Header: a manual scroll resets on selection instead of
+        // lingering mid-list with nothing marked.
+        app.scroll_anomalies(3);
         select_host_header(&mut app, "test.local");
-        app.follow_anomalies_cursor();
+        assert_eq!(app.anomalies_offset.get(), 0);
+    }
+
+    #[test]
+    fn tracked_offset_follows_match_and_yields_to_manual() {
+        assert_eq!(App::tracked_anomalies_offset(true, 0, Some(2), 5), 2);
+        assert_eq!(App::tracked_anomalies_offset(true, 5, Some(5), 6), 5);
+        assert_eq!(App::tracked_anomalies_offset(true, 5, None, 3), 0);
+        assert_eq!(App::tracked_anomalies_offset(true, 0, None, 1), 0);
+        assert_eq!(App::tracked_anomalies_offset(false, 4, Some(1), 5), 4);
+        assert_eq!(App::tracked_anomalies_offset(false, 0, None, 1), 0);
+    }
+
+    #[test]
+    fn anomalies_pane_tracks_list_changes_until_manual_scroll() {
+        let mut app = App::new().unwrap();
+        let mut ptr = ptr_record(4500);
+        ptr.flush_bit = true;
+        ingest(&mut app, &ptr);
+        ingest(&mut app, &srv_record(120));
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 1, "A", "192.168.1.10", 120),
+        );
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 1, "A", "192.168.1.11", 4500),
+        );
+        app.evict_expired();
+        select_instance(&mut app, "Test");
+        // Cursor on an A row, marked second: [shared-flush, ttl-unstable].
+        park_on_answer(&mut app, 1, "192.168.1.10");
+        // Match index and visible viewport, whatever the layout gives.
+        let visible_match = |app: &App| {
+            let area = app.anomalies_rect.get();
+            let viewport = (area.height.saturating_sub(2) as usize).max(1);
+            let offset = app.anomalies_offset.get();
+            let found = app.anomalies_for_selected();
+            let at = found.iter().position(|p| p.cursor_match);
+            (offset, viewport, at)
+        };
+        render_to_buffer(&app, 100, 30);
+        assert!(app.anomalies_follow.get());
+        let (offset, viewport, at) = visible_match(&app);
+        assert_eq!(at, Some(1));
+        assert!(
+            (offset..offset + viewport).contains(&1),
+            "match must be visible after follow"
+        );
+        // A new error finding sorts in front without any cursor move:
+        // tracking re-anchors to the match instead of hiding it.
+        let querier: SocketAddr = "192.168.1.9:5353".parse().unwrap();
+        app.ingest_event(&query_event(
+            "test.local.",
+            2,
+            "NS",
+            false,
+            Vec::new(),
+            querier,
+        ));
+        render_to_buffer(&app, 100, 30);
+        let (offset, viewport, at) = visible_match(&app);
+        assert_eq!(at, Some(2));
+        assert!(
+            (offset..offset + viewport).contains(&2),
+            "match must stay visible as the list grows, offset {offset} viewport {viewport}"
+        );
+        // Manual scroll pauses tracking: the next arrival leaves the
+        // viewport where the user put it.
+        app.scroll_anomalies(-(offset as isize) - 10);
+        assert_eq!(app.anomalies_offset.get(), 0);
+        assert!(!app.anomalies_follow.get());
+        let querier2: SocketAddr = "192.168.1.100:5353".parse().unwrap();
+        app.ingest_event(&query_event(
+            "test.local.",
+            2,
+            "NS",
+            false,
+            Vec::new(),
+            querier2,
+        ));
+        render_to_buffer(&app, 100, 30);
         assert_eq!(app.anomalies_offset.get(), 0);
     }
 

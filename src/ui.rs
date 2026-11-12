@@ -1181,6 +1181,18 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
     };
 
     let total = lines.len();
+    // While tracking, a changed finding list re-anchors the viewport
+    // to the cursor's finding instead of leaving the marker behind.
+    // Manual scrolling clears tracking, so user offsets are untouched.
+    // The pure decision is unit-tested; draw only clamps to viewport.
+    let at = findings.iter().position(|p| p.cursor_match);
+    app.anomalies_offset
+        .set(crate::app::App::tracked_anomalies_offset(
+            app.anomalies_follow.get(),
+            app.anomalies_offset.get(),
+            at,
+            total,
+        ));
     let offset = clamp_scroll(
         app.anomalies_offset.get(),
         total,

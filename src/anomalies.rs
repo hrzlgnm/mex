@@ -792,13 +792,20 @@ fn check_ttl_stable(svc: &ServiceView, service_id: &str, now: Instant, out: &mut
         if ttls.len() > 1 {
             let mut sorted: Vec<u32> = ttls.into_iter().collect();
             sorted.sort_unstable();
+            // Type label from a live row of the same type, so the
+            // finding carries the same row identity the tables mark.
+            let rtype_str = svc
+                .answers
+                .iter()
+                .find(|r| r.rtype == rtype)
+                .map(|r| r.rtype_str.clone());
             out.push(Anomaly {
                 kind: "ttl-unstable",
                 severity: Severity::Warning,
                 service: service_id.to_string(),
                 record_name: Some(name),
                 rtype: Some(rtype),
-                rtype_str: None,
+                rtype_str,
                 rdata: None,
                 source: None,
                 message: format!("unstable TTL bases {sorted:?} for same name/type"),
