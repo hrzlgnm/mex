@@ -61,6 +61,26 @@ pub enum DetailEntry<'a> {
     },
 }
 
+/// Identity of one observed question row, shared by the finding lookup
+/// and the pane title so the three fields travel as one.
+#[derive(Clone, Copy)]
+pub struct QuestionKey<'a> {
+    pub name: &'a str,
+    pub rtype_str: &'a str,
+    pub source: &'a std::net::SocketAddr,
+}
+
+/// What the Anomalies pane shows findings for: the highlighted record
+/// or question row, the displayed target while resting on a header, or
+/// nothing at all. Single discriminant shared by the finding filter and
+/// the pane title, so a new detail kind touches one place.
+pub enum AnomalyScope<'a> {
+    ServiceLevel(DetailTarget<'a>),
+    Record(&'a browse::RawRecord),
+    Question(QuestionKey<'a>),
+    None,
+}
+
 /// Identity of the cursor row, so the selection survives resorting of the
 /// table (TTL countdowns and re-announcements constantly reshuffle rows).
 /// Matches the dedup identities used at ingest.
@@ -1893,19 +1913,23 @@ impl App {
         for s in &self.services {
             Self::push_question_views(
                 &mut questions,
-                format!("{}.{}", s.instance, s.service_type),
+                anomalies::service_id(&s.instance, &s.service_type),
                 &s.questions,
             );
         }
         for p in &self.pending_instances {
             Self::push_question_views(
                 &mut questions,
-                format!("{}.{}", p.instance, p.service_type),
+                anomalies::service_id(&p.instance, &p.service_type),
                 &p.questions,
             );
         }
         for e in &self.enum_entries {
-            Self::push_question_views(&mut questions, "enumeration".to_string(), &e.questions);
+            Self::push_question_views(
+                &mut questions,
+                anomalies::ENUMERATION_SERVICE.to_string(),
+                &e.questions,
+            );
         }
         let snap = anomalies::Snapshot {
             services,
@@ -1922,10 +1946,10 @@ impl App {
     pub fn anomaly_counts(&self) -> HashMap<String, usize> {
         let mut counts: HashMap<String, usize> = HashMap::new();
         for a in self.anomalies() {
-            if matches!(a.severity, anomalies::Severity::Info) {
+            if !a.is_surfaced() {
                 continue;
             }
-            if a.service == "enumeration" {
+            if a.service == anomalies::ENUMERATION_SERVICE {
                 continue;
             }
             *counts.entry(a.service.clone()).or_insert(0) += 1;
@@ -4475,29 +4499,6 @@ impl App {
             })
     }
 
-    /// Anomalies for the highlighted detail row, or for the displayed
-    /// service while the left selection rests on a header: record rows
-    /// match by (name, type, rdata) including spanning `ttl-unstable`,
-    /// question rows match their leaking querier, and headers show
-    /// service-level findings. Only Warning/Error findings; expired and
-    /// goodbye rows report nothing (mirroring the table markers, which
-    /// only flag live rows).
-    pub fn anomalies_for_selected(&self) -> Vec<anomalies::Anomaly> {
-        if self.anomalies_show_service_level() {
-            return self.service_level_anomalies();
-        }
-        match self.selected_detail_entry() {
-            Some(DetailEntry::Record(rec)) => self.record_anomalies(rec),
-            Some(DetailEntry::Question {
-                name,
-                rtype_str,
-                source,
-                ..
-            }) => self.question_anomalies(name, rtype_str, source),
-            None => Vec::new(),
-        }
-    }
-
     /// Whether the left selection rests on a header instead of a service
     /// row, so the Anomalies pane shows service-level findings for the
     /// sticky target rather than row findings.
@@ -4507,43 +4508,93 @@ impl App {
             && self.selected_enum().is_none()
     }
 
+    /// Current scope of the Anomalies pane: the highlighted record or
+    /// question row, the displayed target while resting on a header, or
+    /// nothing at all.
+    pub fn anomaly_scope(&self) -> AnomalyScope<'_> {
+        if self.anomalies_show_service_level() {
+            if let Some(target) = self.display_detail() {
+                return AnomalyScope::ServiceLevel(target);
+            }
+            return AnomalyScope::None;
+        }
+        match self.selected_detail_entry() {
+            Some(DetailEntry::Record(rec)) => AnomalyScope::Record(rec),
+            Some(DetailEntry::Question {
+                name,
+                rtype_str,
+                source,
+                ..
+            }) => AnomalyScope::Question(QuestionKey {
+                name,
+                rtype_str,
+                source,
+            }),
+            None => AnomalyScope::None,
+        }
+    }
+
+    /// Findings for the pane scope: row findings for records and
+    /// questions, service-level findings for headers.
+    pub fn anomalies_for_selected(&self) -> Vec<anomalies::Anomaly> {
+        match self.anomaly_scope() {
+            AnomalyScope::ServiceLevel(target) => self.service_level_anomalies(&target),
+            AnomalyScope::Record(rec) => self.record_anomalies(rec),
+            AnomalyScope::Question(key) => self.question_anomalies(key),
+            AnomalyScope::None => Vec::new(),
+        }
+    }
+
+    /// Service id owning a detail target, matching `Anomaly.service`.
+    fn detail_service_id(target: &DetailTarget<'_>) -> String {
+        match target {
+            DetailTarget::Service(s) => anomalies::service_id(&s.instance, &s.service_type),
+            DetailTarget::Enum(_) => anomalies::ENUMERATION_SERVICE.to_string(),
+        }
+    }
+
     /// Service-level findings for the displayed target: findings with no
     /// record identity (`missing-addr`, `type-format`) plus spanning
-    /// `ttl-unstable` findings, which belong to the service as a whole.
-    fn service_level_anomalies(&self) -> Vec<anomalies::Anomaly> {
-        let Some(target) = self.display_detail() else {
-            return Vec::new();
-        };
-        let id = match &target {
-            DetailTarget::Service(s) => format!("{}.{}", s.instance, s.service_type),
-            DetailTarget::Enum(_) => "enumeration".to_string(),
-        };
+    /// `ttl-unstable` findings and enumeration `type-format` findings,
+    /// which describe the target as a whole.
+    fn service_level_anomalies(&self, target: &DetailTarget<'_>) -> Vec<anomalies::Anomaly> {
+        let id = Self::detail_service_id(target);
+        let is_enum = matches!(target, DetailTarget::Enum(_));
         self.anomalies()
             .into_iter()
             .filter(|a| a.service == id)
-            .filter(|a| !matches!(a.severity, anomalies::Severity::Info))
-            .filter(|a| a.record_name.is_none() || a.kind == "ttl-unstable")
+            .filter(|a| a.is_surfaced())
+            .filter(|a| {
+                a.record_name.is_none()
+                    || a.kind == "ttl-unstable"
+                    // Enumeration `type-format` carries the PTR row's
+                    // identity so the row marks, but it describes the
+                    // enumerated type as a whole: it belongs on the
+                    // enumeration header too.
+                    || (is_enum && a.kind == "type-format")
+            })
             .collect()
     }
 
     /// Findings for one observed question row: the demand-side leak
-    /// attributed to its querier. Own inferred sends (`SELF_SOURCE`, port
-    /// 0) never match a finding, and unrecognised type labels stay quiet.
-    fn question_anomalies(
-        &self,
-        name: &str,
-        rtype_str: &str,
-        source: &std::net::SocketAddr,
-    ) -> Vec<anomalies::Anomaly> {
-        let Some(rtype) = anomalies::rtype_from_str(rtype_str) else {
+    /// attributed to its querier, scoped to the row's own service. Own
+    /// inferred sends (`SELF_SOURCE`, port 0) never match a finding, and
+    /// unrecognised type labels stay quiet.
+    fn question_anomalies(&self, key: QuestionKey<'_>) -> Vec<anomalies::Anomaly> {
+        let Some(rtype) = anomalies::rtype_from_str(key.rtype_str) else {
             return Vec::new();
         };
-        let name = name.trim_end_matches('.').to_lowercase();
-        let src = source.to_string();
+        let Some(target) = self.display_detail() else {
+            return Vec::new();
+        };
+        let id = Self::detail_service_id(&target);
+        let name = key.name.trim_end_matches('.').to_lowercase();
+        let src = key.source.to_string();
         self.anomalies()
             .into_iter()
             .filter(|a| a.kind == "unicast-question")
-            .filter(|a| !matches!(a.severity, anomalies::Severity::Info))
+            .filter(|a| a.is_surfaced())
+            .filter(|a| a.service == id)
             .filter(|a| a.rtype == Some(rtype))
             .filter(|a| {
                 a.record_name
@@ -4554,19 +4605,24 @@ impl App {
             .collect()
     }
 
-    /// Anomalies for the highlighted record row: Warning/Error findings
-    /// whose (name, type, rdata) identity matches the selected
-    /// `DetailEntry::Record`, including spanning `ttl-unstable` findings
-    /// matched by (name, type).
+    /// Anomalies for the highlighted record row: findings whose (name,
+    /// type, rdata) identity matches the selected `DetailEntry::Record`
+    /// and whose service owns the displayed target, including spanning
+    /// `ttl-unstable` findings matched by (name, type).
     fn record_anomalies(&self, rec: &browse::RawRecord) -> Vec<anomalies::Anomaly> {
         if rec.ttl == 0 || rec.received_at.elapsed().as_secs() as u32 > rec.ttl {
             return Vec::new();
         }
+        let Some(target) = self.display_detail() else {
+            return Vec::new();
+        };
+        let id = Self::detail_service_id(&target);
         let name = rec.name.trim_end_matches('.').to_lowercase();
         let rdata_key = anomalies::anomaly_match_key(rec.rtype, &rec.rdata);
         self.anomalies()
             .into_iter()
-            .filter(|a| !matches!(a.severity, anomalies::Severity::Info))
+            .filter(|a| a.service == id)
+            .filter(|a| a.is_surfaced())
             .filter(|a| a.rtype == Some(rec.rtype))
             .filter(|a| {
                 a.record_name
@@ -7669,6 +7725,49 @@ mod tests {
             "header must show exactly the spanning finding, got: {found:?}"
         );
         assert_eq!(found[0].kind, "ttl-unstable");
+    }
+
+    #[test]
+    fn anomalies_for_header_shows_enum_type_format() {
+        let mut app = App::new().unwrap();
+        // Malformed enumerated type: the finding carries the PTR row's
+        // identity (so the row marks) but describes the enumeration.
+        ingest(
+            &mut app,
+            &raw_record(
+                "_services._dns-sd._udp.local.",
+                12,
+                "PTR",
+                "badtype.local.",
+                4500,
+            ),
+        );
+        app.evict_expired();
+        // Select the enumeration row to make it sticky, then rest on its
+        // header: the header is the finding's service-level home.
+        let enum_pos = app
+            .display_items()
+            .iter()
+            .position(|it| matches!(it, DisplayItem::Enum { .. }))
+            .expect("enum row");
+        app.selected_display = enum_pos;
+        app.clamp_selection();
+        assert!(app.selected_enum().is_some());
+        select_host_header(&mut app, ENUM_HOST);
+        let found = app.anomalies_for_selected();
+        assert!(
+            found.iter().any(|a| a.kind == "type-format"),
+            "enum header must surface the bad-type finding, got: {found:?}"
+        );
+        // The row itself still shows it via the record path.
+        app.selected_display = enum_pos;
+        app.clamp_selection();
+        assert!(
+            app.anomalies_for_selected()
+                .iter()
+                .any(|a| a.kind == "type-format"),
+            "enum row must keep its own finding"
+        );
     }
 
     #[test]

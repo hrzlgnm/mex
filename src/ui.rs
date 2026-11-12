@@ -18,7 +18,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::app::{App, DisplayItem, DragMode, Focus};
+use crate::app::{AnomalyScope, App, DisplayItem, DragMode, Focus};
 
 pub type Terminal = ratatui::Terminal<CrosstermBackend<io::Stdout>>;
 
@@ -313,7 +313,7 @@ fn partition_anomaly_keys(found: &[crate::anomalies::Anomaly]) -> AnomalyMarks {
     let mut ttl = HashSet::new();
     let mut unstable = HashSet::new();
     for a in found {
-        if matches!(a.severity, crate::anomalies::Severity::Info) {
+        if !a.is_surfaced() {
             continue;
         }
         let (Some(name), Some(rtype)) = (a.record_name.as_ref(), a.rtype) else {
@@ -944,7 +944,7 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
         .anomalies()
         .into_iter()
         .filter(|a| a.kind == "unicast-question")
-        .filter(|a| !matches!(a.severity, crate::anomalies::Severity::Info))
+        .filter(|a| a.is_surfaced())
         .filter_map(|a| {
             let rtype = a.rtype?;
             Some((
@@ -1083,28 +1083,27 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
     app.anomalies_viewport
         .set(area.height.saturating_sub(2) as usize);
     let findings = app.anomalies_for_selected();
-    let title = if app.anomalies_show_service_level() {
-        match app.display_detail() {
-            Some(target) => format!(" Anomalies: {} ({}) ", target.pane_ident(), findings.len()),
-            None => format!(" Anomalies ({}) ", findings.len()),
+    let title = match app.anomaly_scope() {
+        AnomalyScope::ServiceLevel(target) => {
+            format!(" Anomalies: {} ({}) ", target.pane_ident(), findings.len())
         }
-    } else {
-        match app.selected_detail_entry() {
-            Some(crate::app::DetailEntry::Record(rec)) => {
-                format!(
-                    " Anomalies: {} {} ({}) ",
-                    rec.rtype_str,
-                    rec.name,
-                    findings.len()
-                )
-            }
-            Some(crate::app::DetailEntry::Question {
-                name, rtype_str, ..
-            }) => {
-                format!(" Anomalies: QRY {rtype_str} {name} ({}) ", findings.len())
-            }
-            None => format!(" Anomalies ({}) ", findings.len()),
+        AnomalyScope::Record(rec) => {
+            format!(
+                " Anomalies: {} {} ({}) ",
+                rec.rtype_str,
+                rec.name,
+                findings.len()
+            )
         }
+        AnomalyScope::Question(key) => {
+            format!(
+                " Anomalies: QRY {} {} ({}) ",
+                key.rtype_str,
+                key.name,
+                findings.len()
+            )
+        }
+        AnomalyScope::None => format!(" Anomalies ({}) ", findings.len()),
     };
     let lines: Vec<Line<'_>> = if findings.is_empty() {
         vec![Line::from(Span::styled(
