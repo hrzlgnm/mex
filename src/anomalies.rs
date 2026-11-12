@@ -190,7 +190,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
                     rtype_str: Some(rec.rtype_str.clone()),
                     rdata: Some(rec.rdata.clone()),
                     source: Some(rec.source.to_string()),
-                    message: format!("bad enumerated type {target}: {reason}"),
+                    message: format!("bad enumerated type: {reason}"),
                     rfc: "RFC 6763 §7",
                     requirement: "MUST",
                 });
@@ -207,7 +207,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
                     rtype_str: Some(rec.rtype_str.clone()),
                     rdata: Some(rec.rdata.clone()),
                     source: Some(rec.source.to_string()),
-                    message: format!("{target} is a subtype; want base type"),
+                    message: "is a subtype; want base type".to_string(),
                     rfc: "RFC 6763 §9",
                     requirement: "SHOULD",
                 });
@@ -355,7 +355,7 @@ fn check_missing_addr(
         rtype_str: None,
         rdata: None,
         source: None,
-        message: format!("no A/AAAA for {host}"),
+        message: "no A/AAAA".to_string(),
         rfc: "RFC 6763 §12",
         requirement: "SHOULD",
     });
@@ -376,7 +376,7 @@ fn check_type_format(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>
             rtype_str: None,
             rdata: None,
             source: None,
-            message: format!("bad type {st}: {reason}"),
+            message: format!("bad type: {reason}"),
             rfc: "RFC 6763 §7",
             requirement: "MUST",
         });
@@ -481,7 +481,7 @@ fn check_subtypes(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>) {
                 rtype_str: None,
                 rdata: None,
                 source: None,
-                message: format!("bad subtype {sub}: {reason}"),
+                message: format!("bad subtype: {reason}"),
                 rfc: "RFC 6763 §7.1",
                 requirement: "MUST",
             });
@@ -683,7 +683,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             rtype_str: Some(rec.rtype_str.clone()),
             rdata: Some(rdata.clone()),
             source: Some(src.clone()),
-            message: format!("TTL {}s, want ~{}s", rec.ttl, expected_base(rec.rtype)),
+            message: format!("want ~{}s", expected_base(rec.rtype)),
             rfc: "RFC 6762 §5.2",
             requirement: "SHOULD",
         });
@@ -697,7 +697,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             rtype_str: Some(rec.rtype_str.clone()),
             rdata: Some(rdata),
             source: Some(src),
-            message: format!("TTL {}s, want ~{}s", rec.ttl, expected_base(rec.rtype)),
+            message: format!("want ~{}s", expected_base(rec.rtype)),
             rfc: "RFC 6762 §5.2",
             requirement: "SHOULD",
         });
@@ -716,15 +716,9 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         // Enumeration rows all share the owner name, so name the
         // enumerated type: otherwise every finding reads identically.
         // The announcer is appended centrally below.
-        let message = if service_id == ENUMERATION_SERVICE {
-            format!(
-                "PTR TTL {}s for {}; want 4500s",
-                rec.ttl,
-                rec.rdata.trim_end_matches('.')
-            )
-        } else {
-            format!("PTR base TTL {}s; want 4500s", rec.ttl)
-        };
+        // The row shows the observed TTL and target; the message only
+        // carries the verdict.
+        let message = "PTR base TTL; want 4500s".to_string();
         out.push(Anomaly {
             kind: "ttl-base-mismatch",
             severity: Severity::Info,
@@ -751,8 +745,8 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     if rec.rtype == 16 {
         // Encoded length is this plus ~1 length byte per TXT string;
         // negligible against the threshold, so the decoded length rules.
-        let payload_len = rec.rdata.len();
-        if payload_len > TXT_MAX {
+        // The row shows the payload; the message only carries the verdict.
+        if rec.rdata.len() > TXT_MAX {
             out.push(Anomaly {
                 kind: "txt-oversize",
                 severity: Severity::Warning,
@@ -762,7 +756,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
                 rtype_str: Some(rec.rtype_str.clone()),
                 rdata: Some(rec.rdata.clone()),
                 source: Some(rec.source.to_string()),
-                message: format!("TXT ~{payload_len}B > {TXT_MAX}B"),
+                message: format!("TXT oversize; max {TXT_MAX}B"),
                 rfc: "RFC 6762 §17",
                 requirement: "SHOULD",
             });
@@ -786,7 +780,7 @@ fn check_srv_target(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             out.push(srv_anomaly(
                 service_id,
                 rec,
-                &format!("bad {field} '{value}': want 16-bit"),
+                &format!("bad {field}: want 16-bit"),
             ));
             return;
         }
@@ -801,7 +795,7 @@ fn check_srv_target(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         out.push(srv_anomaly(
             service_id,
             rec,
-            &format!("bad target {target}: {reason}"),
+            &format!("bad target: {reason}"),
         ));
         return;
     }
@@ -809,11 +803,7 @@ fn check_srv_target(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         // A target outside .local is not inherently invalid: DNS-SD may
         // reference hostnames resolved via unicast DNS. Info, worded as a
         // resolution note rather than a violation.
-        out.push(srv_anomaly_info(
-            service_id,
-            rec,
-            &format!("target {target} outside mDNS"),
-        ));
+        out.push(srv_anomaly_info(service_id, rec, "outside mDNS"));
     }
 }
 
@@ -896,8 +886,6 @@ fn check_ttl_stable(svc: &ServiceView, service_id: &str, now: Instant, out: &mut
     }
     for ((name, rtype), ttls) in bases {
         if ttls.len() > 1 {
-            let mut sorted: Vec<u32> = ttls.into_iter().collect();
-            sorted.sort_unstable();
             // Type label from a live row of the same type, so the
             // finding carries the same row identity the tables mark.
             let rtype_str = svc
@@ -914,7 +902,7 @@ fn check_ttl_stable(svc: &ServiceView, service_id: &str, now: Instant, out: &mut
                 rtype_str,
                 rdata: None,
                 source: None,
-                message: format!("mixed TTL bases {sorted:?}"),
+                message: "mixed TTL bases".to_string(),
                 rfc: "RFC 6762 §5.2",
                 requirement: "SHOULD",
             });
@@ -1592,10 +1580,11 @@ mod tests {
             .find(|a| a.kind == "ttl-base-mismatch")
             .expect("expected enumeration ttl-base-mismatch")
             .clone();
-        assert!(
-            item.message.contains("_http._tcp.local"),
-            "message should name the enumerated type, got: {}",
-            item.message
+        assert_eq!(
+            item.rdata.as_deref(),
+            Some("_http._tcp.local."),
+            "finding should point at the enumerated type, got: {:?}",
+            item.rdata
         );
         assert_eq!(
             item.source.as_deref(),
