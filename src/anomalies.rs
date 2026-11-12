@@ -90,8 +90,17 @@ pub struct ServiceView<'a> {
     pub subtypes: &'a [String],
 }
 
+/// Status of unicast DNS resolution for external hostnames.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UnicastStatus {
+    Pending,
+    Resolved(Vec<String>),
+    Failed,
+}
+
 /// Snapshot input for the analyzer. Built by the caller from live browser
 /// state; the analyzer never touches query scheduling, ingest, or expiry.
+#[derive(Default)]
 pub struct Snapshot<'a> {
     pub services: Vec<ServiceView<'a>>,
     pub enum_answers: Vec<&'a RawRecord>,
@@ -102,6 +111,7 @@ pub struct Snapshot<'a> {
     /// and enumeration rows. The owning service id rides along
     /// (`instance.service_type`, or `enumeration`).
     pub questions: Vec<QuestionView<'a>>,
+    pub unicast_cache: Option<&'a HashMap<String, UnicastStatus>>,
 }
 
 /// One observed question for analysis: borrows the row, owns the small
@@ -133,6 +143,8 @@ fn is_live(rec: &RawRecord, now: Instant) -> bool {
 pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
     let now = Instant::now();
     let mut out: Vec<Anomaly> = Vec::new();
+    let empty_cache = HashMap::new();
+    let unicast_cache = snap.unicast_cache.unwrap_or(&empty_cache);
 
     // Host -> has any live A/AAAA, across all services (one hostname backs
     // many services, so siblings share fate).
@@ -156,6 +168,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
             &host_has_addr,
             &snap.pending_hosts,
             has_live_srv,
+            unicast_cache,
             &mut out,
         );
         check_type_format(svc, &service_id, &mut out);
@@ -164,7 +177,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
             if !is_live(rec, now) {
                 continue;
             }
-            check_record(&service_id, rec, &mut out);
+            check_record(&service_id, rec, unicast_cache, &mut out);
         }
         check_ttl_stable(svc, &service_id, now, &mut out);
     }
@@ -173,7 +186,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
         if !is_live(rec, now) {
             continue;
         }
-        check_record(ENUMERATION_SERVICE, rec, &mut out);
+        check_record(ENUMERATION_SERVICE, rec, unicast_cache, &mut out);
         // Enumeration PTR targets name service types (or subtypes): a
         // malformed target means the name itself violates DNS-SD naming,
         // so flag the PTR row itself (with full record identity, so the
@@ -319,6 +332,7 @@ fn check_missing_addr(
     host_has_addr: &HashMap<String, bool>,
     pending_hosts: &HashSet<String>,
     has_live_srv: bool,
+    unicast_cache: &HashMap<String, UnicastStatus>,
     out: &mut Vec<Anomaly>,
 ) {
     if !has_live_srv {
@@ -342,6 +356,21 @@ fn check_missing_addr(
     // unicast DNS, so the same observation is only Info (RFC 6763 §12
     // recommends, not requires, additional address records).
     let local = host.eq_ignore_ascii_case("local") || host.to_ascii_lowercase().ends_with(".local");
+    let message = if local {
+        format!("no A/AAAA for {host}")
+    } else {
+        match unicast_cache.get(&key) {
+            Some(UnicastStatus::Resolved(ips)) => {
+                format!("no A/AAAA for {host} (resolved: {})", ips.join(", "))
+            }
+            Some(UnicastStatus::Pending) => {
+                format!("no A/AAAA for {host} (resolving…)")
+            }
+            Some(UnicastStatus::Failed) | None => {
+                format!("no A/AAAA for {host} (unresolved)")
+            }
+        }
+    };
     out.push(Anomaly {
         kind: "missing-addr",
         severity: if local {
@@ -355,7 +384,7 @@ fn check_missing_addr(
         rtype_str: None,
         rdata: None,
         source: None,
-        message: format!("no A/AAAA for {host}"),
+        message,
         rfc: "RFC 6763 §12",
         requirement: "SHOULD",
     });
@@ -672,7 +701,12 @@ fn check_question(q: &QuestionView, out: &mut Vec<Anomaly>) {
     });
 }
 
-fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
+fn check_record(
+    service_id: &str,
+    rec: &RawRecord,
+    unicast_cache: &HashMap<String, UnicastStatus>,
+    out: &mut Vec<Anomaly>,
+) {
     let name = rec.name.clone();
     let rdata = rec.rdata.clone();
     let src = rec.source.to_string();
@@ -865,7 +899,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
 
     // SRV target shape. Port is never checked: port 0 is valid.
     if rec.rtype == 33 {
-        check_srv_target(service_id, rec, out);
+        check_srv_target(service_id, rec, unicast_cache, out);
     }
 
     // TXT size only: measure the decoded payload, not the full wire
@@ -895,7 +929,12 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     }
 }
 
-fn check_srv_target(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
+fn check_srv_target(
+    service_id: &str,
+    rec: &RawRecord,
+    unicast_cache: &HashMap<String, UnicastStatus>,
+    out: &mut Vec<Anomaly>,
+) {
     let parts: Vec<&str> = rec.rdata.split_whitespace().collect();
     if parts.len() < 4 {
         out.push(srv_anomaly(service_id, rec, "malformed rdata"));
@@ -931,14 +970,20 @@ fn check_srv_target(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         return;
     }
     if !trimmed.to_ascii_lowercase().ends_with(".local") && !trimmed.eq_ignore_ascii_case("local") {
+        let key = trimmed.to_lowercase();
+        let message = match unicast_cache.get(&key) {
+            Some(UnicastStatus::Resolved(ips)) => {
+                format!("target needs unicast DNS (resolved: {})", ips.join(", "))
+            }
+            Some(UnicastStatus::Pending) => "target needs unicast DNS (resolving…)".to_string(),
+            Some(UnicastStatus::Failed) | None => {
+                "target needs unicast DNS (unresolved)".to_string()
+            }
+        };
         // A target outside .local is not inherently invalid: DNS-SD may
         // reference hostnames resolved via unicast DNS. Info, worded as a
         // resolution note rather than a violation.
-        out.push(srv_anomaly_info(
-            service_id,
-            rec,
-            "target needs unicast DNS",
-        ));
+        out.push(srv_anomaly_info(service_id, rec, &message));
     }
 }
 
@@ -1144,9 +1189,7 @@ mod tests {
         }];
         let snap = Snapshot {
             services,
-            enum_answers: Vec::new(),
-            pending_hosts: HashSet::new(),
-            questions: Vec::new(),
+            ..Snapshot::default()
         };
         analyze(&snap)
     }
@@ -1241,9 +1284,8 @@ mod tests {
         }];
         let snap = Snapshot {
             services,
-            enum_answers: Vec::new(),
             pending_hosts: HashSet::from(["myhost.local".to_string()]),
-            questions: Vec::new(),
+            ..Snapshot::default()
         };
         assert!(!analyze(&snap).iter().any(|a| a.kind == "missing-addr"));
     }
@@ -1323,6 +1365,7 @@ mod tests {
             enum_answers: vec![&enum_rec],
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
+            unicast_cache: None,
         };
         let item = analyze(&snap)
             .iter()
@@ -1369,6 +1412,7 @@ mod tests {
             enum_answers: Vec::new(),
             pending_hosts: HashSet::new(),
             questions: questions.to_vec(),
+            unicast_cache: None,
         };
         analyze(&snap)
     }
@@ -1663,6 +1707,7 @@ mod tests {
             enum_answers: vec![&flushed],
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
+            unicast_cache: None,
         };
         let item = analyze(&snap)
             .iter()
@@ -1843,6 +1888,7 @@ mod tests {
             enum_answers: vec![&enum_rec],
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
+            unicast_cache: None,
         };
         let item = analyze(&snap)
             .iter()
@@ -2130,6 +2176,7 @@ mod tests {
             enum_answers: vec![&subtype],
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
+            unicast_cache: None,
         };
         let found = analyze(&snap);
         let item = found
@@ -2159,6 +2206,7 @@ mod tests {
             enum_answers: vec![&base],
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
+            unicast_cache: None,
         };
         assert!(
             !analyze(&snap).iter().any(|a| a.kind == "enum-subtype"),
@@ -2181,6 +2229,7 @@ mod tests {
             enum_answers: vec![&enum_rec],
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
+            unicast_cache: None,
         };
         let found = analyze(&snap);
         let item = found
@@ -2211,6 +2260,7 @@ mod tests {
             enum_answers: vec![&enum_rec],
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
+            unicast_cache: None,
         };
         assert!(!analyze(&snap).iter().any(|a| a.kind == "type-format"));
     }
@@ -2230,6 +2280,7 @@ mod tests {
             enum_answers: vec![&enum_rec],
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
+            unicast_cache: None,
         };
         assert!(!analyze(&snap).iter().any(|a| a.kind == "type-format"));
     }
@@ -2249,6 +2300,7 @@ mod tests {
             enum_answers: vec![&enum_rec],
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
+            unicast_cache: None,
         };
         assert!(analyze(&snap)
             .iter()

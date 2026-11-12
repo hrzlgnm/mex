@@ -405,6 +405,9 @@ pub struct App {
     /// Transient confirmation popup (e.g. state-dump result), shown for
     /// a few seconds and dismissed by any key.
     status_msg: Option<(String, Instant)>,
+    unicast_cache: HashMap<String, anomalies::UnicastStatus>,
+    unicast_tx: std::sync::mpsc::Sender<(String, Result<Vec<std::net::IpAddr>, std::io::Error>)>,
+    unicast_rx: std::sync::mpsc::Receiver<(String, Result<Vec<std::net::IpAddr>, std::io::Error>)>,
 }
 
 pub struct ServiceEntry {
@@ -595,6 +598,7 @@ impl App {
     /// browses all usable links).
     pub fn new_with(passive: bool, interfaces: Option<HashSet<String>>) -> Result<Self> {
         let (query_tx, rx, drop_stats) = browse::spawn(interfaces.clone())?;
+        let (unicast_tx, unicast_rx) = std::sync::mpsc::channel();
         let link_stats = browse::link_stats(interfaces.as_ref());
         Ok(Self {
             passive,
@@ -658,6 +662,9 @@ impl App {
             pending_addrs: Vec::new(),
             raw_events: Vec::new(),
             status_msg: None,
+            unicast_cache: HashMap::new(),
+            unicast_tx,
+            unicast_rx,
             show_metrics: false,
             metrics_scroll: Cell::new(0),
             metrics_viewport: Cell::new(0),
@@ -770,6 +777,21 @@ impl App {
     }
 
     fn drain_events(&mut self) {
+        while let Ok((host, res)) = self.unicast_rx.try_recv() {
+            match res {
+                Ok(ips) if !ips.is_empty() => {
+                    let ip_strs = ips.iter().map(|ip| ip.to_string()).collect();
+                    self.unicast_cache
+                        .insert(host, anomalies::UnicastStatus::Resolved(ip_strs));
+                }
+                _ => {
+                    self.unicast_cache
+                        .insert(host, anomalies::UnicastStatus::Failed);
+                }
+            }
+        }
+        self.check_external_hosts();
+
         let mut batch: Vec<browse::Event> = Vec::new();
         while let Ok(ev) = self.rx.try_recv() {
             self.packet_count += 1;
@@ -1650,6 +1672,32 @@ impl App {
                 self.unanswered_histogram()
             ),
         );
+        let resolved_count = self
+            .unicast_cache
+            .values()
+            .filter(|v| matches!(v, anomalies::UnicastStatus::Resolved(_)))
+            .count();
+        let pending_count = self
+            .unicast_cache
+            .values()
+            .filter(|v| matches!(v, anomalies::UnicastStatus::Pending))
+            .count();
+        let failed_count = self
+            .unicast_cache
+            .values()
+            .filter(|v| matches!(v, anomalies::UnicastStatus::Failed))
+            .count();
+        kv(
+            &mut rows,
+            "unicast resolution",
+            format!(
+                "{} cached ({} resolved · {} pending · {} failed)",
+                self.unicast_cache.len(),
+                resolved_count,
+                pending_count,
+                failed_count
+            ),
+        );
 
         // Links.
         section(&mut rows, "Links");
@@ -1998,8 +2046,69 @@ impl App {
             enum_answers,
             pending_hosts,
             questions,
+            unicast_cache: Some(&self.unicast_cache),
         };
         anomalies::analyze(&snap)
+    }
+
+    fn check_external_hosts(&mut self) {
+        let mut hosts = HashSet::new();
+        for s in &self.services {
+            if !s.hostname.is_empty() {
+                let h = s.hostname.trim_end_matches('.');
+                if !h.eq_ignore_ascii_case("local") && !h.to_ascii_lowercase().ends_with(".local") {
+                    hosts.insert(h.to_lowercase());
+                }
+            }
+            for r in &s.answers {
+                if r.rtype == 33 {
+                    let parts: Vec<&str> = r.rdata.split_whitespace().collect();
+                    if parts.len() >= 4 {
+                        let target = parts[3..].join(" ");
+                        let t = target.trim().trim_end_matches('.');
+                        if !t.is_empty()
+                            && !t.eq_ignore_ascii_case("local")
+                            && !t.to_ascii_lowercase().ends_with(".local")
+                        {
+                            hosts.insert(t.to_lowercase());
+                        }
+                    }
+                }
+            }
+        }
+        for p in &self.pending_instances {
+            for r in &p.answers {
+                if r.rtype == 33 {
+                    let parts: Vec<&str> = r.rdata.split_whitespace().collect();
+                    if parts.len() >= 4 {
+                        let target = parts[3..].join(" ");
+                        let t = target.trim().trim_end_matches('.');
+                        if !t.is_empty()
+                            && !t.eq_ignore_ascii_case("local")
+                            && !t.to_ascii_lowercase().ends_with(".local")
+                        {
+                            hosts.insert(t.to_lowercase());
+                        }
+                    }
+                }
+            }
+        }
+
+        for h in hosts {
+            if !self.unicast_cache.contains_key(&h) {
+                self.unicast_cache
+                    .insert(h.clone(), anomalies::UnicastStatus::Pending);
+                let host = h;
+                let tx = self.unicast_tx.clone();
+                std::thread::spawn(move || {
+                    use std::net::ToSocketAddrs;
+                    let res = (host.as_str(), 0)
+                        .to_socket_addrs()
+                        .map(|iter| iter.map(|s| s.ip()).collect());
+                    let _ = tx.send((host, res));
+                });
+            }
+        }
     }
 
     /// Per-service anomaly counts keyed by `instance.service_type`
