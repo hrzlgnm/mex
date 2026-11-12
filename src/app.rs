@@ -4810,13 +4810,17 @@ mod tests {
     }
 
     fn srv_record(ttl: u32) -> browse::RawRecord {
-        raw_record(
+        let mut r = raw_record(
             "Test._http._tcp.local.",
             33,
             "SRV",
             "0 0 80 test.local.",
             ttl,
-        )
+        );
+        // Unique records SHOULD set the bit; the helper models the
+        // well-behaved case so pane tests only see their intended finding.
+        r.flush_bit = true;
+        r
     }
 
     fn event_for(rec: &browse::RawRecord) -> browse::Event {
@@ -8721,6 +8725,7 @@ mod tests {
         assert_eq!(app.hex_offset.get(), 0);
         // Anomalies: one notch scrolls the findings one line.
         app.focus = Focus::Anomalies;
+        app.anomalies_offset.set(0);
         app.handle_mouse(&wheel(MouseEventKind::ScrollDown));
         assert_eq!(app.anomalies_offset.get(), 1);
         app.handle_mouse(&wheel(MouseEventKind::ScrollUp));
