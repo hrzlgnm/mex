@@ -2417,7 +2417,7 @@ impl App {
                         _ => d,
                     }),
                     source: a.source.clone(),
-                    message: a.message.clone(),
+                    message: dump::redact_anomaly_message(&a.message),
                     rfc: a.rfc.to_string(),
                     requirement: a.requirement.to_string(),
                 })

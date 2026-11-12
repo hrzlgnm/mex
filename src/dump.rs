@@ -264,6 +264,18 @@ pub fn redact_txt_rdata(rdata: &str) -> String {
         .join("; ")
 }
 
+/// Redact any public IP literals embedded within an anomaly message.
+pub fn redact_anomaly_message(msg: &str) -> String {
+    let mut out_words = Vec::new();
+    for word in msg.split_whitespace() {
+        let trimmed = word.trim_end_matches([',', '.']);
+        let suffix = &word[trimmed.len()..];
+        let redacted = redact_ip_literal(trimmed);
+        out_words.push(format!("{redacted}{suffix}"));
+    }
+    out_words.join(" ")
+}
+
 /// File stem (`20260207T120102.089898`).
 pub fn file_stem_iso() -> String {
     let now: chrono::DateTime<chrono::Utc> = SystemTime::now().into();
@@ -378,5 +390,13 @@ mod tests {
         assert_eq!(redact_txt_value("ip6=fd00::1"), "ip6=fd00::1");
         assert_eq!(redact_ip_literal("::1"), "::1");
         assert_eq!(redact_ip_literal("192.168.178.30"), "192.168.178.30");
+    }
+
+    #[test]
+    fn redact_anomaly_message_redacts_public_ipv6() {
+        let msg = "target needs unicast DNS (resolved: 2003:e8:bf10:9500:38e1:a9ff:fe2c:7927, 192.168.1.1)";
+        let redacted = redact_anomaly_message(msg);
+        assert!(redacted.contains("2003:*REDACTED*:7927"));
+        assert!(redacted.contains("192.168.1.1"));
     }
 }
