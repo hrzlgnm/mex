@@ -2286,7 +2286,7 @@ impl App {
                 KeyCode::PageUp | KeyCode::Char('b') => self.page_metrics(-1),
                 KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => self.page_metrics(1),
                 // Horizontal pan over long values (key column stays
-                // frozen): Ctrl quadruples the step, `0` jumps back.
+                // frozen): Ctrl jumps ten chars, `0` jumps back.
                 KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('H') => {
                     self.scroll_metrics_h(if key.modifiers.contains(KeyModifiers::CONTROL) {
                         -10
