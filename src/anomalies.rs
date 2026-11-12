@@ -321,10 +321,18 @@ fn check_missing_addr(
     }
     // A retained hostname outlives its SRV (expiry, goodbye): the caller
     // passes whether a live SRV still claims the host, and only then is a
-    // missing address meaningful.
+    // missing address meaningful. `.local` names must resolve via mDNS, so
+    // a missing address is a Warning; non-`.local` names may resolve via
+    // unicast DNS, so the same observation is only Info (RFC 6763 §12
+    // recommends, not requires, additional address records).
+    let local = host.eq_ignore_ascii_case("local") || host.to_ascii_lowercase().ends_with(".local");
     out.push(Anomaly {
         kind: "missing-addr",
-        severity: Severity::Warning,
+        severity: if local {
+            Severity::Warning
+        } else {
+            Severity::Info
+        },
         service: service_id.to_string(),
         record_name: None,
         rtype: None,
@@ -638,6 +646,9 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     // stacks (e.g. avahi) publish TXT at 120s by default, so flagging it
     // would be noise, not signal. Reverse-mapping PTRs are excluded too:
     // they are unique with a 120s base, not the 4500s shared convention.
+    // This is a SHOULD-level deviation (RFC 6762 §10), not a violation:
+    // Info, since 60/120s values are common in real implementations and
+    // only increase cache-refresh traffic.
     if rec.rtype == 12 && rec.ttl <= 120 && !is_reverse_ptr(&rec.name) {
         // Enumeration rows all share the owner name, so name the
         // enumerated type: otherwise every finding reads identically.
@@ -653,7 +664,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         };
         out.push(Anomaly {
             kind: "ttl-base-mismatch",
-            severity: Severity::Warning,
+            severity: Severity::Info,
             service: service_id.to_string(),
             record_name: Some(rec.name.clone()),
             rtype: Some(rec.rtype),
@@ -730,11 +741,29 @@ fn check_srv_target(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         return;
     }
     if !trimmed.to_ascii_lowercase().ends_with(".local") && !trimmed.eq_ignore_ascii_case("local") {
-        out.push(srv_anomaly(
+        // A target outside .local is not inherently invalid: DNS-SD may
+        // reference hostnames resolved via unicast DNS. Info, worded as a
+        // resolution note rather than a violation.
+        out.push(srv_anomaly_info(
             service_id,
             rec,
-            &format!("SRV target {target} is outside .local"),
+            &format!("SRV target {target} requires resolution outside mDNS"),
         ));
+    }
+}
+
+fn srv_anomaly_info(service_id: &str, rec: &RawRecord, message: &str) -> Anomaly {
+    Anomaly {
+        kind: "srv-target",
+        severity: Severity::Info,
+        service: service_id.to_string(),
+        record_name: Some(rec.name.clone()),
+        rtype: Some(rec.rtype),
+        rtype_str: Some(rec.rtype_str.clone()),
+        rdata: Some(rec.rdata.clone()),
+        source: Some(rec.source.to_string()),
+        message: message.to_string(),
+        rfc: "RFC 6763 §12",
     }
 }
 
@@ -886,6 +915,36 @@ mod tests {
             questions: Vec::new(),
         };
         analyze(&snap)
+    }
+
+    #[test]
+    fn missing_addr_local_is_warning_remote_is_info() {
+        let local = vec![rec(
+            "My._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 80 myhost.local.",
+            120,
+            true,
+        )];
+        let item = analyze_service("My", "_http._tcp.local", "myhost.local.", &local)
+            .into_iter()
+            .find(|a| a.kind == "missing-addr")
+            .expect("expected missing-addr");
+        assert_eq!(item.severity, Severity::Warning);
+        let remote = vec![rec(
+            "My._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 80 fritz.box.",
+            120,
+            true,
+        )];
+        let item = analyze_service("My", "_http._tcp.local", "fritz.box.", &remote)
+            .into_iter()
+            .find(|a| a.kind == "missing-addr")
+            .expect("expected missing-addr");
+        assert_eq!(item.severity, Severity::Info);
     }
 
     #[test]
@@ -1349,7 +1408,7 @@ mod tests {
                 .iter()
                 .find(|a| a.kind == "ttl-base-mismatch")
                 .unwrap_or_else(|| panic!("PTR@{ttl} should be flagged"));
-            assert_eq!(item.severity, Severity::Warning);
+            assert_eq!(item.severity, Severity::Info);
         }
     }
 
@@ -1489,7 +1548,7 @@ mod tests {
     }
 
     #[test]
-    fn srv_target_outside_local_flagged() {
+    fn srv_target_outside_local_is_info() {
         let answers = vec![rec(
             "My._http._tcp.local.",
             33,
@@ -1499,7 +1558,16 @@ mod tests {
             true,
         )];
         let found = analyze_service("My", "_http._tcp.local", "example.com.", &answers);
-        assert!(found.iter().any(|a| a.kind == "srv-target"));
+        let item = found
+            .iter()
+            .find(|a| a.kind == "srv-target")
+            .expect("expected srv-target");
+        assert_eq!(item.severity, Severity::Info);
+        assert!(
+            item.message.contains("outside mDNS"),
+            "got: {}",
+            item.message
+        );
     }
 
     #[test]

@@ -7820,8 +7820,9 @@ mod tests {
     #[test]
     fn anomalies_pane_marks_ttl_base_mismatch_in_list() {
         let mut app = App::new().unwrap();
-        // Short PTR base with the flush bit clear: only the base TTL is
-        // remarkable — the spec's second example finding.
+        // Short PTR base is a SHOULD-level note (Info, overlay-only), so
+        // the pane lists only the surfaced missing-addr while the full
+        // set still holds the informational base-mismatch.
         ingest(&mut app, &ptr_record(120));
         ingest(&mut app, &srv_record(120));
         app.evict_expired();
@@ -7840,10 +7841,19 @@ mod tests {
         let found = app.anomalies_for_selected();
         assert_eq!(
             kinds(&found),
-            ["missing-addr", "ttl-base-mismatch"],
-            "pane lists the full service, got: {found:?}"
+            ["missing-addr"],
+            "pane lists only surfaced findings, got: {found:?}"
         );
-        assert_eq!(matched(&found), ["ttl-base-mismatch"]);
+        let all = app.anomalies();
+        let base = all
+            .iter()
+            .find(|a| a.kind == "ttl-base-mismatch")
+            .expect("base mismatch still analyzed");
+        assert_eq!(
+            base.severity,
+            crate::anomalies::Severity::Info,
+            "base mismatch is Info, got: {base:?}"
+        );
         assert!(
             found.iter().all(|p| p.anomaly.is_surfaced()),
             "pane never shows informational notes"
