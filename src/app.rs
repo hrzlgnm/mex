@@ -3846,6 +3846,13 @@ impl App {
             return;
         }
 
+        // Reverse-mapping PTRs (in-addr.arpa / ip6.arpa) map addresses to
+        // hostnames; they are not service enumeration and must not seed
+        // pending services (which check_type_format would then flag).
+        if crate::anomalies::is_reverse_ptr(st) {
+            return;
+        }
+
         if let Some(sub_pos) = st.to_ascii_lowercase().find("._sub.") {
             let subtype = &st[..sub_pos];
             let svc_type = &st[sub_pos + 6..];
@@ -6080,6 +6087,34 @@ mod tests {
         app.passive = true;
         app.send_queries();
         assert!(app.services.iter().all(|s| s.questions.is_empty()));
+    }
+
+    #[test]
+    fn reverse_ptr_creates_no_pending_service() {
+        // Reverse-mapping PTRs map addresses to hostnames; they are not
+        // service enumeration and must not seed (phantom) services.
+        let mut app = App::new().unwrap();
+        let rec = raw_record(
+            "Android.local.37.178.168.192.in-addr.arpa.",
+            12,
+            "PTR",
+            "Android.local.",
+            120,
+        );
+        let ev = browse::Event {
+            answers: vec![rec],
+            questions: vec![],
+            query_kas: vec![],
+            raw_bytes: vec![],
+            source: test_source(),
+        };
+        app.ingest_event(&ev);
+        assert!(app.services.is_empty());
+        assert!(app.pending_instances.is_empty());
+        assert!(
+            app.anomalies().iter().all(|a| a.kind != "type-format"),
+            "reverse name must not flag"
+        );
     }
 
     #[test]
