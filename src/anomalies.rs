@@ -587,10 +587,12 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             format!("{:?} section", rec.section).to_lowercase()
         };
         let (severity, message, requirement) = if confirmed {
+            // The overlay has no record columns, so the message keeps the
+            // rtype: it names what is not defined for mDNS.
             let message = if base == Severity::Error {
-                "not defined for mDNS".to_string()
+                format!("{} not defined for mDNS", rec.rtype_str)
             } else {
-                "possible unicast leak".to_string()
+                format!("{} possible unicast leak", rec.rtype_str)
             };
             let requirement = match base {
                 Severity::Error => "MUST NOT",
@@ -600,7 +602,10 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         } else {
             (
                 Severity::Warning,
-                format!("outside multicast answer ({context}); verify"),
+                format!(
+                    "{} outside multicast answer ({context}); verify",
+                    rec.rtype_str
+                ),
                 "SHOULD NOT",
             )
         };
@@ -683,7 +688,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             rtype_str: Some(rec.rtype_str.clone()),
             rdata: Some(rdata.clone()),
             source: Some(src.clone()),
-            message: format!("want ~{}s", expected_base(rec.rtype)),
+            message: format!("TTL {}s, want ~{}s", rec.ttl, expected_base(rec.rtype)),
             rfc: "RFC 6762 §5.2",
             requirement: "SHOULD",
         });
@@ -697,7 +702,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             rtype_str: Some(rec.rtype_str.clone()),
             rdata: Some(rdata),
             source: Some(src),
-            message: format!("want ~{}s", expected_base(rec.rtype)),
+            message: format!("TTL {}s, want ~{}s", rec.ttl, expected_base(rec.rtype)),
             rfc: "RFC 6762 §5.2",
             requirement: "SHOULD",
         });
@@ -716,9 +721,18 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         // Enumeration rows all share the owner name, so name the
         // enumerated type: otherwise every finding reads identically.
         // The announcer is appended centrally below.
-        // The row shows the observed TTL and target; the message only
-        // carries the verdict.
-        let message = "PTR base TTL; want 4500s".to_string();
+        // The row shows the TTL and target; the message repeats the
+        // observed TTL (the overlay has no record columns) and, for
+        // enumeration rows, the target that tells identical rows apart.
+        let message = if service_id == ENUMERATION_SERVICE {
+            format!(
+                "PTR {} TTL {}s; want 4500s",
+                rec.rdata.trim_end_matches('.'),
+                rec.ttl
+            )
+        } else {
+            format!("PTR base TTL {}s; want 4500s", rec.ttl)
+        };
         out.push(Anomaly {
             kind: "ttl-base-mismatch",
             severity: Severity::Info,
@@ -745,8 +759,10 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     if rec.rtype == 16 {
         // Encoded length is this plus ~1 length byte per TXT string;
         // negligible against the threshold, so the decoded length rules.
-        // The row shows the payload; the message only carries the verdict.
-        if rec.rdata.len() > TXT_MAX {
+        // The row shows the payload; the overlay has no record columns,
+        // so the message repeats the observed length.
+        let payload_len = rec.rdata.len();
+        if payload_len > TXT_MAX {
             out.push(Anomaly {
                 kind: "txt-oversize",
                 severity: Severity::Warning,
@@ -756,7 +772,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
                 rtype_str: Some(rec.rtype_str.clone()),
                 rdata: Some(rec.rdata.clone()),
                 source: Some(rec.source.to_string()),
-                message: format!("TXT oversize; max {TXT_MAX}B"),
+                message: format!("TXT ~{payload_len}B, max {TXT_MAX}B"),
                 rfc: "RFC 6762 §17",
                 requirement: "SHOULD",
             });
@@ -803,7 +819,11 @@ fn check_srv_target(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         // A target outside .local is not inherently invalid: DNS-SD may
         // reference hostnames resolved via unicast DNS. Info, worded as a
         // resolution note rather than a violation.
-        out.push(srv_anomaly_info(service_id, rec, "outside mDNS"));
+        out.push(srv_anomaly_info(
+            service_id,
+            rec,
+            "target needs unicast DNS",
+        ));
     }
 }
 
@@ -886,6 +906,8 @@ fn check_ttl_stable(svc: &ServiceView, service_id: &str, now: Instant, out: &mut
     }
     for ((name, rtype), ttls) in bases {
         if ttls.len() > 1 {
+            let mut sorted: Vec<u32> = ttls.into_iter().collect();
+            sorted.sort_unstable();
             // Type label from a live row of the same type, so the
             // finding carries the same row identity the tables mark.
             let rtype_str = svc
@@ -902,7 +924,7 @@ fn check_ttl_stable(svc: &ServiceView, service_id: &str, now: Instant, out: &mut
                 rtype_str,
                 rdata: None,
                 source: None,
-                message: "mixed TTL bases".to_string(),
+                message: format!("mixed TTL bases {sorted:?}"),
                 rfc: "RFC 6762 §5.2",
                 requirement: "SHOULD",
             });
@@ -1713,7 +1735,7 @@ mod tests {
             .expect("expected srv-target");
         assert_eq!(item.severity, Severity::Info);
         assert!(
-            item.message.contains("outside mDNS"),
+            item.message.contains("needs unicast DNS"),
             "got: {}",
             item.message
         );
