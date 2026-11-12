@@ -7406,15 +7406,15 @@ mod tests {
         app.questions_pct = 25;
         app.anomalies_pct = 20;
         app.set_answers_from_y(3 + 27);
-        assert!(app.answers_pct + app.questions_pct + app.anomalies_pct <= 90);
+        assert_shares(&app);
         app.answers_pct = 30;
         app.anomalies_pct = 20;
         app.set_middle_from_y(3 + 27);
-        assert!(app.answers_pct + app.questions_pct + app.anomalies_pct <= 90);
+        assert_shares(&app);
         app.answers_pct = 30;
         app.questions_pct = 25;
         app.set_lower_from_y(3 + 27);
-        assert!(app.answers_pct + app.questions_pct + app.anomalies_pct <= 90);
+        assert_shares(&app);
     }
 
     #[test]
@@ -7478,12 +7478,28 @@ mod tests {
         assert_eq!(app.anomalies_offset.get(), 0);
     }
 
-    /// Share moved by a horizontal divider drag, by divider mode.
-    fn seam_share(app: &App, mode: DragMode) -> u16 {
+    /// Layout budget for the right stack: every pane keeps at least 10%
+    /// and leaves at least 10% for the hex pane.
+    fn assert_shares(app: &App) {
+        assert!(app.answers_pct >= 10, "answers: {}", app.answers_pct);
+        assert!(app.questions_pct >= 10, "questions: {}", app.questions_pct);
+        assert!(app.anomalies_pct >= 10, "anomalies: {}", app.anomalies_pct);
+        assert!(
+            app.answers_pct + app.questions_pct + app.anomalies_pct <= 90,
+            "hex keeps >= 10: {}+{}+{}",
+            app.answers_pct,
+            app.questions_pct,
+            app.anomalies_pct
+        );
+    }
+
+    /// Lower-pane rect and moved share for a horizontal divider, by
+    /// mode: one dispatch shared by seam lookup and share reads.
+    fn seam_target(app: &App, mode: DragMode) -> (ratatui::layout::Rect, u16) {
         match mode {
-            DragMode::HorizUpper => app.answers_pct,
-            DragMode::HorizMiddle => app.questions_pct,
-            _ => app.anomalies_pct,
+            DragMode::HorizUpper => (app.questions_rect.get(), app.answers_pct),
+            DragMode::HorizMiddle => (app.anomalies_rect.get(), app.questions_pct),
+            _ => (app.hex_rect.get(), app.anomalies_pct),
         }
     }
 
@@ -7520,28 +7536,42 @@ mod tests {
             app.questions_pct = 25;
             app.anomalies_pct = 20;
             render_to_buffer(&app, 100, 40);
-            let lower = match mode {
-                DragMode::HorizUpper => app.questions_rect.get(),
-                DragMode::HorizMiddle => app.anomalies_rect.get(),
-                DragMode::HorizLower => app.hex_rect.get(),
-                _ => unreachable!("horizontal seam"),
-            };
+            let (lower, before) = seam_target(&app, mode);
             assert!(lower.height > 2, "pane needs a grabbable border");
-            let before = seam_share(&app, mode);
             app.handle_mouse(&down(lower.x + 5, lower.y));
             assert_eq!(app.drag, mode);
             app.handle_mouse(&drag(lower.x + 5, lower.y + 6));
             assert!(
-                seam_share(&app, mode) > before,
+                seam_target(&app, mode).1 > before,
                 "{mode:?} drag must grow its share"
             );
             app.handle_mouse(&up());
             assert_eq!(app.drag, DragMode::None);
-            assert!(app.answers_pct >= 10);
-            assert!(app.questions_pct >= 10);
-            assert!(app.anomalies_pct >= 10);
-            assert!(app.answers_pct + app.questions_pct + app.anomalies_pct <= 90);
+            assert_shares(&app);
         }
+        // Extremes through the mouse path: clamps hold and neighbors
+        // keep their minimums.
+        app.answers_pct = 30;
+        app.questions_pct = 25;
+        app.anomalies_pct = 20;
+        render_to_buffer(&app, 100, 40);
+        let right = app.right_rect.get();
+        let bottom = right.y + right.height - 1;
+        // Lower seam slammed to the bottom: anomalies pins at its max.
+        let (hex_top, _) = seam_target(&app, DragMode::HorizLower);
+        app.handle_mouse(&down(hex_top.x + 5, hex_top.y));
+        assert_eq!(app.drag, DragMode::HorizLower);
+        app.handle_mouse(&drag(hex_top.x + 5, bottom));
+        assert_eq!(app.drag, DragMode::HorizLower);
+        assert_eq!(app.anomalies_pct, 35);
+        assert_eq!((app.answers_pct, app.questions_pct), (30, 25));
+        // Upper seam slammed to the top: answers pins at 10%.
+        let (questions_top, _) = seam_target(&app, DragMode::HorizUpper);
+        app.handle_mouse(&down(questions_top.x + 5, questions_top.y));
+        assert_eq!(app.drag, DragMode::HorizUpper);
+        app.handle_mouse(&drag(questions_top.x + 5, right.y));
+        assert_eq!(app.answers_pct, 10);
+        assert_shares(&app);
     }
 
     #[test]
@@ -7550,47 +7580,37 @@ mod tests {
         let mut app = App::new().unwrap();
         app.body_rect.set(Rect::new(0, 3, 100, 40));
         app.right_rect.set(Rect::new(33, 3, 67, 30));
-        let check = |app: &App| {
-            assert!(app.answers_pct >= 10, "answers: {}", app.answers_pct);
-            assert!(app.questions_pct >= 10, "questions: {}", app.questions_pct);
-            assert!(app.anomalies_pct >= 10, "anomalies: {}", app.anomalies_pct);
-            assert!(
-                app.answers_pct + app.questions_pct + app.anomalies_pct <= 90,
-                "hex keeps >= 10: {}+{}+{}",
-                app.answers_pct,
-                app.questions_pct,
-                app.anomalies_pct
-            );
-        };
         // Slam every divider against the bottom, then the top.
         app.questions_pct = 25;
         app.anomalies_pct = 20;
         app.set_answers_from_y(3 + 30);
-        check(&app);
+        assert_shares(&app);
         app.answers_pct = 30;
         app.anomalies_pct = 20;
         app.set_middle_from_y(3 + 30);
-        check(&app);
+        assert_shares(&app);
         app.answers_pct = 30;
         app.questions_pct = 25;
         app.set_lower_from_y(3 + 30);
-        check(&app);
+        assert_shares(&app);
         app.set_answers_from_y(3);
-        check(&app);
+        assert_shares(&app);
         assert_eq!(app.answers_pct, 10);
-        // The clamped model still renders every pane: no share
-        // collapses to zero rows.
-        render_to_buffer(&app, 100, 30);
-        for pane in [
-            &app.answers_rect,
-            &app.questions_rect,
-            &app.anomalies_rect,
-            &app.hex_rect,
-        ] {
-            assert!(
-                pane.get().height >= 1,
-                "slammed shares must still render every pane"
-            );
+        // The clamped model still renders every pane at normal and
+        // small sizes: no share collapses to zero rows.
+        for (width, height) in [(100, 30), (60, 12)] {
+            render_to_buffer(&app, width, height);
+            for pane in [
+                &app.answers_rect,
+                &app.questions_rect,
+                &app.anomalies_rect,
+                &app.hex_rect,
+            ] {
+                assert!(
+                    pane.get().height >= 1,
+                    "{width}x{height}: slammed shares must still render every pane"
+                );
+            }
         }
     }
 
