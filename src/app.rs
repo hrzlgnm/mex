@@ -1755,8 +1755,9 @@ impl App {
             // `<source> <service> <scope> <text>`; unsourced findings omit
             // the source slot, and the key's icon carries the level. The
             // scope helper omits constant/absent row identities and names
-            // rdata where siblings share the identity. The RFC rides
-            // along for info-level rows.
+            // rdata where siblings share the identity. Every row carries
+            // its RFC reference: the key shows no requirement level, and
+            // info-level findings surface nowhere else.
             let scope = anomalies::visible_scope(a, &identity_count);
             let scoped = if scope.is_empty() {
                 a.message.clone()
