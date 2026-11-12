@@ -601,8 +601,9 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     // 4500s (75 min). A PTR arriving at 120s/60s was usually re-announced
     // with the generic 120s default instead. TXT is deliberately excluded:
     // stacks (e.g. avahi) publish TXT at 120s by default, so flagging it
-    // would be noise, not signal.
-    if rec.rtype == 12 && rec.ttl <= 120 {
+    // would be noise, not signal. Reverse-mapping PTRs are excluded too:
+    // they are unique with a 120s base, not the 4500s shared convention.
+    if rec.rtype == 12 && rec.ttl <= 120 && !is_reverse_ptr(&rec.name) {
         // Enumeration rows all share the owner name, so name the
         // enumerated type: otherwise every finding reads identically.
         // The announcer is appended centrally below.
@@ -1355,6 +1356,23 @@ mod tests {
         )];
         let found = analyze_service("X", "_http._tcp.local", "", &answers);
         assert!(!found.iter().any(|a| a.kind == "ttl-base-mismatch"));
+    }
+
+    #[test]
+    fn reverse_ptr_with_120_base_is_quiet() {
+        // Reverse-mapping PTRs are unique with a 120s base, not the 4500s
+        // service PTR convention, so they must not flag ttl-base-mismatch.
+        for name in [
+            "1.0.0.127.in-addr.arpa.",
+            "2.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa.",
+        ] {
+            let answers = vec![rec(name, 12, "PTR", "myhost.local.", 120, true)];
+            let found = analyze_service("X", "_http._tcp.local", "", &answers);
+            assert!(
+                !found.iter().any(|a| a.kind == "ttl-base-mismatch"),
+                "reverse PTR {name} at 120s should be quiet"
+            );
+        }
     }
 
     #[test]
