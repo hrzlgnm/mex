@@ -2399,17 +2399,7 @@ impl App {
     /// Answers/Questions/Anomalies shares keep at least 10% each and leave
     /// at least 10% for the hex pane (`answers + questions + anomalies <=
     /// 90`). The second argument is the sum of the other two shares.
-    fn clamp_answers_pct(pct: u16, others: u16) -> u16 {
-        let max = 90u16.saturating_sub(others).max(10);
-        pct.clamp(10, 70).min(max)
-    }
-
-    fn clamp_questions_pct(pct: u16, others: u16) -> u16 {
-        let max = 90u16.saturating_sub(others).max(10);
-        pct.clamp(10, 70).min(max)
-    }
-
-    fn clamp_anomalies_pct(pct: u16, others: u16) -> u16 {
+    fn clamp_pane_pct(pct: u16, others: u16) -> u16 {
         let max = 90u16.saturating_sub(others).max(10);
         pct.clamp(10, 70).min(max)
     }
@@ -2500,19 +2490,19 @@ impl App {
 
     fn set_answers_from_y(&mut self, row: u16) {
         let pct = Self::pct_from_y(row, self.right_rect.get());
-        self.answers_pct = Self::clamp_answers_pct(pct, self.questions_pct + self.anomalies_pct);
+        self.answers_pct = Self::clamp_pane_pct(pct, self.questions_pct + self.anomalies_pct);
     }
 
     fn set_middle_from_y(&mut self, row: u16) {
         let combined = Self::pct_from_y(row, self.right_rect.get());
         let want = combined.saturating_sub(self.answers_pct);
-        self.questions_pct = Self::clamp_questions_pct(want, self.answers_pct + self.anomalies_pct);
+        self.questions_pct = Self::clamp_pane_pct(want, self.answers_pct + self.anomalies_pct);
     }
 
     fn set_lower_from_y(&mut self, row: u16) {
         let combined = Self::pct_from_y(row, self.right_rect.get());
         let want = combined.saturating_sub(self.answers_pct + self.questions_pct);
-        self.anomalies_pct = Self::clamp_anomalies_pct(want, self.answers_pct + self.questions_pct);
+        self.anomalies_pct = Self::clamp_pane_pct(want, self.answers_pct + self.questions_pct);
     }
 
     fn handle_mouse(&mut self, mouse: &MouseEvent) {
@@ -3157,17 +3147,28 @@ impl App {
         }
     }
 
-    /// Nudge the Hex viewport; the dump follows the record cursor, so
-    /// there is no cursor to resume and no pin flag. Upper clamping
-    /// happens at render time, where the line count is known.
-    fn scroll_hex(&mut self, delta: isize) {
-        let cur = self.hex_offset.get();
+    /// Nudge a cursorless viewport offset, saturating at zero. Upper
+    /// clamping happens at render time, where the line count is known.
+    /// Shared by the Hex, Anomalies, and metrics panes.
+    fn bump_offset(offset: &Cell<usize>, delta: isize) {
+        let cur = offset.get();
         let next = if delta < 0 {
             cur.saturating_sub(delta.unsigned_abs())
         } else {
             cur.saturating_add(delta.unsigned_abs())
         };
-        self.hex_offset.set(next);
+        offset.set(next);
+    }
+
+    /// Page a cursorless viewport by viewportfuls.
+    fn page_offset(viewport: &Cell<usize>, pages: isize) -> isize {
+        viewport.get().max(1) as isize * pages
+    }
+
+    /// Nudge the Hex viewport; the dump follows the record cursor, so
+    /// there is no cursor to resume and no pin flag.
+    fn scroll_hex(&mut self, delta: isize) {
+        Self::bump_offset(&self.hex_offset, delta);
     }
 
     fn scroll_hex_edge(&mut self, first: bool) {
@@ -3179,22 +3180,14 @@ impl App {
     }
 
     fn page_hex(&mut self, pages: isize) {
-        let per_page = self.hex_viewport.get().max(1) as isize;
-        let steps = pages * per_page;
+        let steps = Self::page_offset(&self.hex_viewport, pages);
         self.scroll_hex(steps);
     }
 
     /// Nudge the Anomalies viewport; the findings follow the record
-    /// cursor, so there is no cursor to resume and no pin flag. Upper
-    /// clamping happens at render time, where the line count is known.
+    /// cursor, so there is no cursor to resume and no pin flag.
     fn scroll_anomalies(&mut self, delta: isize) {
-        let cur = self.anomalies_offset.get();
-        let next = if delta < 0 {
-            cur.saturating_sub(delta.unsigned_abs())
-        } else {
-            cur.saturating_add(delta.unsigned_abs())
-        };
-        self.anomalies_offset.set(next);
+        Self::bump_offset(&self.anomalies_offset, delta);
     }
 
     fn scroll_anomalies_edge(&mut self, first: bool) {
@@ -3206,20 +3199,13 @@ impl App {
     }
 
     fn page_anomalies(&mut self, pages: isize) {
-        let per_page = self.anomalies_viewport.get().max(1) as isize;
-        let steps = pages * per_page;
+        let steps = Self::page_offset(&self.anomalies_viewport, pages);
         self.scroll_anomalies(steps);
     }
 
     /// Scroll the metrics overlay; upper clamping happens at render time.
     fn scroll_metrics(&mut self, delta: isize) {
-        let cur = self.metrics_scroll.get();
-        let next = if delta < 0 {
-            cur.saturating_sub(delta.unsigned_abs())
-        } else {
-            cur.saturating_add(delta.unsigned_abs())
-        };
-        self.metrics_scroll.set(next);
+        Self::bump_offset(&self.metrics_scroll, delta);
     }
 
     fn scroll_metrics_edge(&mut self, first: bool) {
@@ -3231,21 +3217,14 @@ impl App {
     }
 
     fn page_metrics(&mut self, pages: isize) {
-        let per_page = self.metrics_viewport.get().max(1) as isize;
-        let steps = pages * per_page;
+        let steps = Self::page_offset(&self.metrics_viewport, pages);
         self.scroll_metrics(steps);
     }
 
     /// Pan the metrics overlay horizontally (chars); upper clamping
     /// happens at render time against the longest value.
     fn scroll_metrics_h(&mut self, delta: isize) {
-        let cur = self.metrics_hscroll.get();
-        let next = if delta < 0 {
-            cur.saturating_sub(delta.unsigned_abs())
-        } else {
-            cur.saturating_add(delta.unsigned_abs())
-        };
-        self.metrics_hscroll.set(next);
+        Self::bump_offset(&self.metrics_hscroll, delta);
     }
 
     /// Identity of the table row at an index (raw answers first, then
@@ -4520,9 +4499,11 @@ impl App {
             })
             .filter(|a| match a.rdata.as_ref() {
                 Some(rdata) => anomalies::anomaly_match_key(rec.rtype, rdata) == rdata_key,
-                // Record-scoped TTL findings without rdata span every row
-                // of the same name and type (`ttl-unstable`).
-                None => anomalies::is_ttl_kind(a.kind),
+                // Spanning `ttl-unstable` findings carry no rdata: they
+                // match every row of the same name and type. Narrowed to
+                // that kind on purpose — a future rdata-less finding of
+                // another kind must not silently span rows.
+                None => a.kind == "ttl-unstable",
             })
             .collect()
     }
@@ -7273,10 +7254,10 @@ mod tests {
         assert_eq!(App::pct_from_y(3 + 15, right), 50);
         // Hex keeps at least 10%: answers + questions + anomalies <= 90.
         // The second argument is the sum of the other two shares.
-        assert_eq!(App::clamp_answers_pct(80, 45), 45);
-        assert_eq!(App::clamp_questions_pct(80, 50), 40);
-        assert_eq!(App::clamp_anomalies_pct(80, 55), 35);
-        assert_eq!(App::clamp_answers_pct(30, 45), 30);
+        assert_eq!(App::clamp_pane_pct(80, 45), 45);
+        assert_eq!(App::clamp_pane_pct(80, 50), 40);
+        assert_eq!(App::clamp_pane_pct(80, 55), 35);
+        assert_eq!(App::clamp_pane_pct(30, 45), 30);
     }
 
     #[test]
@@ -7375,6 +7356,39 @@ mod tests {
         assert!(
             app.anomalies_for_selected().is_empty(),
             "healthy SRV row must be quiet"
+        );
+    }
+
+    #[test]
+    fn anomalies_for_selected_matches_ttl_base_mismatch() {
+        let mut app = App::new().unwrap();
+        // Short PTR base with the flush bit clear: only the base TTL is
+        // remarkable — the spec's second example finding.
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        app.evict_expired();
+        select_instance(&mut app, "Test");
+        let ptr_idx = app
+            .display_detail()
+            .expect("service displayed")
+            .ordered_answers()
+            .iter()
+            .position(|r| r.rtype == 12)
+            .expect("PTR row");
+        app.detail_selected = ptr_idx;
+        app.detail_anchor = app
+            .display_detail()
+            .and_then(|d| App::identity_at_detail(&d, ptr_idx));
+        let found = app.anomalies_for_selected();
+        assert!(
+            found.iter().any(|a| a.kind == "ttl-base-mismatch"),
+            "PTR row must surface ttl-base-mismatch, got: {found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .all(|a| !matches!(a.severity, crate::anomalies::Severity::Info)),
+            "pane never shows informational notes"
         );
     }
 
