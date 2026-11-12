@@ -271,6 +271,9 @@ pub struct App {
     /// Scroll offset inside the metrics popup (viewport recorded at draw).
     pub metrics_scroll: Cell<usize>,
     pub metrics_viewport: Cell<usize>,
+    /// Horizontal scroll offset inside the metrics popup, in chars: the
+    /// key column stays frozen while long values pan left.
+    pub metrics_hscroll: Cell<usize>,
     /// Cumulative v2 counters (traffic, queries, suppressions).
     pub metrics: MetricsCounters,
     /// Cached usable/skipped link snapshot, refreshed on the 10s tick.
@@ -584,6 +587,7 @@ impl App {
             show_metrics: false,
             metrics_scroll: Cell::new(0),
             metrics_viewport: Cell::new(0),
+            metrics_hscroll: Cell::new(0),
             metrics: MetricsCounters::default(),
             link_stats,
             drop_stats,
@@ -1306,6 +1310,18 @@ impl App {
             .count()
     }
 
+    /// Nerd Font level icon for an anomaly severity, shown in place of the
+    /// severity word in metrics keys. FontAwesome subset (single cell in
+    /// every Nerd Font): U+F057 times-circle (error), U+F071 warning
+    /// (warning), U+F05A info-circle (info).
+    pub(crate) fn anomaly_level_icon(severity: anomalies::Severity) -> char {
+        match severity {
+            anomalies::Severity::Error => '\u{f057}',
+            anomalies::Severity::Warning => '\u{f071}',
+            anomalies::Severity::Info => '\u{f05a}',
+        }
+    }
+
     /// Rows for the metrics overlay: `(key, value)` with an empty value
     /// marking a section header. Pure snapshot of cumulative counters plus
     /// live state; cheap enough to rebuild every frame.
@@ -1655,7 +1671,7 @@ impl App {
         for a in found.iter() {
             kv(
                 &mut rows,
-                &format!("! {} {}", a.kind, a.severity.as_str()),
+                &format!("{} {}", Self::anomaly_level_icon(a.severity), a.kind),
                 format!("{}: {}", a.service, a.message),
             );
         }
@@ -2248,6 +2264,7 @@ impl App {
             self.show_metrics = !self.show_metrics;
             if self.show_metrics {
                 self.metrics_scroll.set(0);
+                self.metrics_hscroll.set(0);
                 // The overlay owns all input while open: drop any active
                 // resize so borders behind it never glow.
                 self.drag = DragMode::None;
@@ -2268,6 +2285,23 @@ impl App {
                 KeyCode::End => self.scroll_metrics_edge(false),
                 KeyCode::PageUp | KeyCode::Char('b') => self.page_metrics(-1),
                 KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => self.page_metrics(1),
+                // Horizontal pan over long values (key column stays
+                // frozen): Ctrl quadruples the step, `0` jumps back.
+                KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('H') => {
+                    self.scroll_metrics_h(if key.modifiers.contains(KeyModifiers::CONTROL) {
+                        -10
+                    } else {
+                        -1
+                    })
+                }
+                KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L') => {
+                    self.scroll_metrics_h(if key.modifiers.contains(KeyModifiers::CONTROL) {
+                        10
+                    } else {
+                        1
+                    })
+                }
+                KeyCode::Char('0') => self.metrics_hscroll.set(0),
                 _ => {}
             }
             return;
@@ -2454,6 +2488,8 @@ impl App {
             }
             MouseEventKind::ScrollDown => self.mouse_wheel(1),
             MouseEventKind::ScrollUp => self.mouse_wheel(-1),
+            MouseEventKind::ScrollLeft => self.mouse_hwheel(-1),
+            MouseEventKind::ScrollRight => self.mouse_hwheel(1),
             _ => {}
         }
     }
@@ -2470,6 +2506,14 @@ impl App {
             Focus::Services => self.move_selection(delta),
             Focus::Answers | Focus::Questions => self.move_detail_cursor(delta),
             Focus::Hex => self.scroll_hex(delta),
+        }
+    }
+
+    /// Horizontal wheel notch: pans metrics values while the overlay is
+    /// open, ignored everywhere else.
+    fn mouse_hwheel(&mut self, delta: isize) {
+        if self.show_metrics {
+            self.scroll_metrics_h(delta);
         }
     }
 
@@ -3090,6 +3134,18 @@ impl App {
         let per_page = self.metrics_viewport.get().max(1) as isize;
         let steps = pages * per_page;
         self.scroll_metrics(steps);
+    }
+
+    /// Pan the metrics overlay horizontally (chars); upper clamping
+    /// happens at render time against the longest value.
+    fn scroll_metrics_h(&mut self, delta: isize) {
+        let cur = self.metrics_hscroll.get();
+        let next = if delta < 0 {
+            cur.saturating_sub(delta.unsigned_abs())
+        } else {
+            cur.saturating_add(delta.unsigned_abs())
+        };
+        self.metrics_hscroll.set(next);
     }
 
     /// Identity of the table row at an index (raw answers first, then
@@ -6730,6 +6786,7 @@ mod tests {
         app.handle_key(&key(KeyCode::Char('m')));
         assert!(app.show_metrics);
         assert_eq!(app.metrics_scroll.get(), 0);
+        assert_eq!(app.metrics_hscroll.get(), 0);
         app.handle_key(&key(KeyCode::Char('j')));
         assert_eq!(app.metrics_scroll.get(), 1);
         app.handle_key(&key(KeyCode::Char('k')));
@@ -6738,6 +6795,33 @@ mod tests {
         app.handle_key(&key(KeyCode::Char('J')));
         assert_eq!(app.metrics_scroll.get(), 1);
         app.handle_key(&key(KeyCode::Char('K')));
+        assert_eq!(app.metrics_scroll.get(), 0);
+        // Horizontal pan: h/l and arrows move one char, Ctrl jumps ten,
+        // `0` jumps back. The key column stays frozen (no vertical move).
+        app.handle_key(&key(KeyCode::Char('l')));
+        assert_eq!(app.metrics_hscroll.get(), 1);
+        app.handle_key(&key(KeyCode::Right));
+        assert_eq!(app.metrics_hscroll.get(), 2);
+        app.handle_key(&key(KeyCode::Char('h')));
+        assert_eq!(app.metrics_hscroll.get(), 1);
+        app.handle_key(&key(KeyCode::Left));
+        assert_eq!(app.metrics_hscroll.get(), 0);
+        app.handle_key(&key(KeyCode::Char('h')));
+        assert_eq!(app.metrics_hscroll.get(), 0);
+        let ctrl = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        app.handle_key(&ctrl(KeyCode::Char('l')));
+        assert_eq!(app.metrics_hscroll.get(), 10);
+        app.handle_key(&ctrl(KeyCode::Right));
+        assert_eq!(app.metrics_hscroll.get(), 20);
+        app.handle_key(&key(KeyCode::Char('0')));
+        assert_eq!(app.metrics_hscroll.get(), 0);
+        assert_eq!(app.metrics_scroll.get(), 0);
+        app.handle_key(&key(KeyCode::Char('k')));
         assert_eq!(app.metrics_scroll.get(), 0);
         // Tab must not escape the overlay.
         app.handle_key(&key(KeyCode::Tab));
@@ -6778,6 +6862,37 @@ mod tests {
         assert!(app.services.is_empty());
         assert!(!app.pending_instances.is_empty());
         assert!(app.anomalies().iter().any(|a| a.kind == "shared-flush"));
+    }
+
+    #[test]
+    fn metrics_anomaly_rows_use_level_icons() {
+        // Same fixture as above: a unique PTR with the flush bit is a
+        // shared-record violation, so the metrics overlay lists it with
+        // a Nerd Font level icon instead of the severity word.
+        let mut app = App::new().unwrap();
+        let mut bad = ptr_record(120);
+        bad.flush_bit = true;
+        ingest(&mut app, &bad);
+        let found = app.anomalies();
+        let a = found
+            .iter()
+            .find(|a| a.kind == "shared-flush")
+            .expect("finding");
+        let icon = App::anomaly_level_icon(a.severity);
+        let rows = app.metrics_rows();
+        let (k, v) = rows
+            .iter()
+            .find(|(k, _)| k.starts_with(icon))
+            .expect("anomaly row");
+        assert_eq!(k, &format!("{icon} shared-flush"));
+        assert!(
+            v.starts_with(&a.service),
+            "value names the service, got: {v}"
+        );
+        assert!(
+            !k.contains(a.severity.as_str()),
+            "no severity word left, got: {k}"
+        );
     }
 
     #[test]
