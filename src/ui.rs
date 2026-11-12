@@ -523,29 +523,37 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
 }
 
 fn draw_detail_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    // Right side: Answers table on top, its questions in the middle with
-    // their own captions (age, not TTL), hex dump of the selected entry
-    // at the bottom. The abutting pane borders are the drag handles.
+    // Right side: Answers table on top, its questions below with their
+    // own captions (age, not TTL), anomalies for the highlighted record
+    // next, hex dump of the selected entry at the bottom. The abutting
+    // pane borders are the drag handles.
     let answers = app.answers_pct.clamp(10, 70);
     let questions = app
         .questions_pct
         .clamp(10, 70)
         .min(90u16.saturating_sub(answers));
+    let anomalies = app
+        .anomalies_pct
+        .clamp(10, 70)
+        .min(90u16.saturating_sub(answers.saturating_add(questions)));
     let panes = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Percentage(answers),
             Constraint::Percentage(questions),
+            Constraint::Percentage(anomalies),
             Constraint::Min(0),
         ])
         .split(area);
 
     app.answers_rect.set(panes[0]);
     app.questions_rect.set(panes[1]);
-    app.hex_rect.set(panes[2]);
+    app.anomalies_rect.set(panes[2]);
+    app.hex_rect.set(panes[3]);
     draw_records_tab(frame, panes[0], app);
     draw_questions_tab(frame, panes[1], app);
-    draw_hex_tab(frame, panes[2], app);
+    draw_anomalies_tab(frame, panes[2], app);
+    draw_hex_tab(frame, panes[3], app);
 }
 
 /// Border color: resize hover/drag wins (subtle cyan seam) over focus white.
@@ -1025,7 +1033,7 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
                     app.focus == Focus::Questions,
                     resize_active(app, DragMode::Vertical)
                         || resize_active(app, DragMode::HorizUpper)
-                        || resize_active(app, DragMode::HorizLower),
+                        || resize_active(app, DragMode::HorizMiddle),
                 )),
         )
         // The hex pane follows the detail cursor whatever holds focus, so
@@ -1065,6 +1073,75 @@ fn question_source_label(source: &SocketAddr) -> String {
     } else {
         source.to_string()
     }
+}
+
+fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    // Findings for the highlighted record row: severity icon, kind,
+    // message, and RFC reference per row. Follows the record cursor and
+    // has no cursor of its own; j/k and paging keys scroll.
+    app.anomalies_viewport
+        .set(area.height.saturating_sub(2) as usize);
+    let findings = app.anomalies_for_selected();
+    let title = match app.selected_detail_entry() {
+        Some(crate::app::DetailEntry::Record(rec)) => {
+            format!(
+                " Anomalies: {} {} ({}) ",
+                rec.rtype_str,
+                rec.name,
+                findings.len()
+            )
+        }
+        _ => format!(" Anomalies ({}) ", findings.len()),
+    };
+    let lines: Vec<Line<'_>> = if findings.is_empty() {
+        vec![Line::from(Span::styled(
+            "No anomalies for this record",
+            Style::default().fg(Color::Gray),
+        ))]
+    } else {
+        findings
+            .iter()
+            .map(|a| {
+                let color = match a.severity {
+                    crate::anomalies::Severity::Error => Color::Red,
+                    crate::anomalies::Severity::Warning => Color::Yellow,
+                    crate::anomalies::Severity::Info => Color::Blue,
+                };
+                Line::from(vec![
+                    Span::styled(
+                        crate::app::App::anomaly_level_icon(a.severity).to_string(),
+                        Style::default().fg(color),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        format!("{} {}: {}", a.severity.as_str(), a.kind, a.message),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::styled(format!(" ({})", a.rfc), Style::default().fg(Color::Gray)),
+                ])
+            })
+            .collect()
+    };
+
+    let total = lines.len();
+    let offset = clamp_scroll(
+        app.anomalies_offset.get(),
+        total,
+        app.anomalies_viewport.get(),
+    );
+    app.anomalies_offset.set(offset);
+    let para = Paragraph::new(lines).scroll((offset as u16, 0)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(border_color(
+                app.focus == Focus::Anomalies,
+                resize_active(app, DragMode::Vertical)
+                    || resize_active(app, DragMode::HorizMiddle)
+                    || resize_active(app, DragMode::HorizLower),
+            )),
+    );
+    frame.render_widget(para, area);
 }
 
 fn draw_hex_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
