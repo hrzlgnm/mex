@@ -203,6 +203,35 @@ fn draw_metrics_overlay(frame: &mut Frame, app: &App) {
     let offset = clamp_scroll(app.metrics_scroll.get(), total, viewport);
     app.metrics_scroll.set(offset);
 
+    // Compact key column: size to the longest key (single-space indent
+    // plus one cell of padding) instead of a fixed 38% split, so values
+    // start further left. Capped so one pathological key cannot eat the
+    // popup, and to the popup width on tiny terminals.
+    let key_cap = area.width.saturating_sub(12).clamp(10, 32) as usize;
+    let key_w = rows
+        .iter()
+        .filter(|(_, v)| !v.is_empty())
+        .map(|(k, _)| k.chars().count() + 2)
+        .max()
+        .unwrap_or(10)
+        .clamp(10, 32)
+        .min(key_cap) as u16;
+
+    // Horizontal pan: the key column stays frozen while values shift left
+    // by `hscroll` chars. Clamp against the longest value minus the
+    // visible value width so panning stops at the end of the text.
+    let value_w = (area.width as usize).saturating_sub(key_w as usize + 5);
+    let longest = rows
+        .iter()
+        .map(|(_, v)| v.chars().count())
+        .max()
+        .unwrap_or(0);
+    let hscroll = app
+        .metrics_hscroll
+        .get()
+        .min(longest.saturating_sub(value_w.max(1)));
+    app.metrics_hscroll.set(hscroll);
+
     let section_style = Style::default()
         .add_modifier(Modifier::BOLD)
         .fg(Color::Cyan);
@@ -216,14 +245,14 @@ fn draw_metrics_overlay(frame: &mut Frame, app: &App) {
                 Row::new(vec![Cell::from(k).style(section_style), Cell::from("")])
             } else {
                 Row::new(vec![
-                    Cell::from(format!("  {k}")).style(key_style),
-                    Cell::from(v).style(val_style),
+                    Cell::from(format!(" {k}")).style(metrics_key_style(&k, key_style)),
+                    Cell::from(shift_str(&v, hscroll)).style(val_style),
                 ])
             }
         })
         .collect();
 
-    let widths = [Constraint::Percentage(38), Constraint::Percentage(62)];
+    let widths = [Constraint::Length(key_w), Constraint::Min(0)];
     let table = Table::new(body, widths)
         .header(
             Row::new(vec!["METRIC", "VALUE"]).style(
@@ -235,7 +264,7 @@ fn draw_metrics_overlay(frame: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Metrics (m/Esc close · j/k scroll) ")
+                .title(" Metrics (m/Esc close · j/k ↕ · h/l ↔) ")
                 .border_style(Style::default().fg(Color::White)),
         );
 
@@ -243,6 +272,73 @@ fn draw_metrics_overlay(frame: &mut Frame, app: &App) {
     *state.offset_mut() = offset;
     frame.render_stateful_widget(table, area, &mut state);
     app.metrics_scroll.set(state.offset());
+}
+
+/// Skip `skip` chars of `s` for horizontal panning. Char-boundary safe;
+/// the table truncates the tail to the visible width itself.
+fn shift_str(s: &str, skip: usize) -> String {
+    if skip == 0 {
+        return s.to_string();
+    }
+    s.chars().skip(skip).collect()
+}
+
+/// Key color for metrics rows: anomaly rows carry a Nerd Font level icon
+/// (see `App::anomaly_level_icon`) and take its severity color, so the
+/// level reads without the old severity word.
+fn metrics_key_style(key: &str, base: Style) -> Style {
+    match key.chars().next() {
+        Some('\u{f057}') => Style::default().fg(Color::Red),
+        Some('\u{f071}') => Style::default().fg(Color::Yellow),
+        Some('\u{f05a}') => Style::default().fg(Color::Blue),
+        _ => base,
+    }
+}
+
+/// Marker sets for Answers rows: content findings by (name, type,
+/// rdata), record-scoped TTL findings by (name, type, rdata), spanning
+/// TTL findings (`ttl-unstable`) by (name, type).
+type AnomalyMarks = (
+    HashSet<(String, u16, String)>,
+    HashSet<(String, u16, String)>,
+    HashSet<(String, u16)>,
+);
+
+/// Partition error/warning findings into content findings (mark the type
+/// cell) vs TTL findings (mark the TTL cell). Record-scoped TTL findings
+/// match by (name, type, rdata); `ttl-unstable` spans rows so it matches
+/// by (name, type). Informational notes never mark. Pure helper.
+fn partition_anomaly_keys(found: &[crate::anomalies::Anomaly]) -> AnomalyMarks {
+    let mut content = HashSet::new();
+    let mut ttl = HashSet::new();
+    let mut unstable = HashSet::new();
+    for a in found {
+        if matches!(a.severity, crate::anomalies::Severity::Info) {
+            continue;
+        }
+        let (Some(name), Some(rtype)) = (a.record_name.as_ref(), a.rtype) else {
+            continue;
+        };
+        let name = name.trim_end_matches('.').to_lowercase();
+        if !crate::anomalies::is_ttl_kind(a.kind) {
+            if let Some(rdata) = a.rdata.as_ref() {
+                content.insert((
+                    name,
+                    rtype,
+                    crate::anomalies::anomaly_match_key(rtype, rdata),
+                ));
+            }
+        } else if let Some(rdata) = a.rdata.as_ref() {
+            ttl.insert((
+                name,
+                rtype,
+                crate::anomalies::anomaly_match_key(rtype, rdata),
+            ));
+        } else {
+            unstable.insert((name, rtype));
+        }
+    }
+    (content, ttl, unstable)
 }
 
 /// Transient confirmation popup (state dump result): centered, 3 rows,
@@ -698,33 +794,28 @@ fn detail_table_rows<'a>(
     // Multi-pair TXT answers carry their key=value pairs as collapsible
     // child rows (collapsed by default, `Enter` expands); the cursor skips
     // child rows. raw_positions maps each raw record to its table row.
-    // Anomalous rows (error/warning only) get a `!` suffix on the type.
-    let anomaly_keys: HashSet<(String, u16, String)> = app
-        .anomalies()
-        .into_iter()
-        .filter(|a| !matches!(a.severity, crate::anomalies::Severity::Info))
-        .filter_map(|a| {
-            let rtype = a.rtype?;
-            let rdata = a.rdata?;
-            Some((
-                a.record_name?.trim_end_matches('.').to_lowercase(),
-                rtype,
-                crate::anomalies::anomaly_match_key(rtype, &rdata),
-            ))
-        })
-        .collect();
+    // Anomalous rows (error/warning only) get a `!` suffix: on the TTL
+    // cell when the TTL itself is the problem, otherwise on the type.
+    let (content_keys, ttl_keys, ttl_unstable) = partition_anomaly_keys(&app.anomalies());
     let unique_recs = target.ordered_answers();
     let mut raw_positions = Vec::with_capacity(unique_recs.len());
     for rec in unique_recs {
         // Expired and goodbye rows share identity with live findings from
         // other sources; only live rows earn the marker.
         let live = rec.ttl > 0 && rec.received_at.elapsed().as_secs() as u32 <= rec.ttl;
-        let flagged = live
-            && anomaly_keys.contains(&(
-                rec.name.trim_end_matches('.').to_lowercase(),
+        let name = rec.name.trim_end_matches('.').to_lowercase();
+        let content_flagged = live
+            && content_keys.contains(&(
+                name.clone(),
                 rec.rtype,
                 crate::anomalies::anomaly_match_key(rec.rtype, &rec.rdata),
             ));
+        let ttl_flagged = live
+            && (ttl_keys.contains(&(
+                name.clone(),
+                rec.rtype,
+                crate::anomalies::anomaly_match_key(rec.rtype, &rec.rdata),
+            )) || ttl_unstable.contains(&(name, rec.rtype)));
         let flush = if rec.flush_bit { "flush" } else { "" };
         let rem = rec
             .ttl
@@ -735,6 +826,11 @@ fn detail_table_rows<'a>(
             format!("{}m{:02}s", rem / 60, rem % 60)
         } else {
             format!("{rem}s")
+        };
+        let ttl_str = if ttl_flagged {
+            format!("{ttl_str}!")
+        } else {
+            ttl_str
         };
         // Records announced by this host (source is a local interface
         // address) get a brighter style so own publications stand out.
@@ -758,7 +854,7 @@ fn detail_table_rows<'a>(
         } else {
             rec.rtype_str.as_str()
         };
-        let type_label = if flagged {
+        let type_label = if content_flagged {
             format!("{base_label}!")
         } else {
             base_label.to_string()
@@ -1205,5 +1301,71 @@ mod tests {
         assert_eq!(clamp_scroll(100, 50, 10), 40);
         assert_eq!(clamp_scroll(7, 5, 10), 0);
         assert_eq!(clamp_scroll(3, 50, 0), 0);
+    }
+
+    #[test]
+    fn shift_str_pans_by_chars() {
+        assert_eq!(shift_str("hello", 0), "hello");
+        assert_eq!(shift_str("hello", 2), "llo");
+        assert_eq!(shift_str("hello", 5), "");
+        assert_eq!(shift_str("hello", 99), "");
+        // Level icons are single chars, not bytes: skipping one reveals
+        // the text behind the icon.
+        assert_eq!(
+            shift_str("\u{f057} missing-addr", 0),
+            "\u{f057} missing-addr"
+        );
+        assert_eq!(shift_str("\u{f057} missing-addr", 1), " missing-addr");
+        assert_eq!(shift_str("\u{f057} missing-addr", 2), "missing-addr");
+    }
+
+    #[test]
+    fn anomaly_keys_take_severity_colors() {
+        use crate::anomalies::Severity;
+        let base = Style::default().fg(Color::Gray);
+        // Every level icon maps to a distinct color, and plain keys keep
+        // the base style. Built from the shared helper so icon and color
+        // cannot drift apart.
+        let mut seen = std::collections::HashSet::new();
+        for sev in [Severity::Error, Severity::Warning, Severity::Info] {
+            let key = format!("{} some-kind", App::anomaly_level_icon(sev));
+            let styled = metrics_key_style(&key, base);
+            assert_ne!(styled, base, "{key:?} must not use the base style");
+            assert!(seen.insert(format!("{styled:?}")), "colors must differ");
+        }
+        assert_eq!(metrics_key_style("uptime", base), base);
+        assert_eq!(metrics_key_style("Anomalies", base), base);
+    }
+
+    #[test]
+    fn partition_anomaly_keys_splits_ttl_from_content() {
+        use crate::anomalies::{Anomaly, Severity};
+        let finding = |kind: &'static str, severity: Severity, rdata: Option<&str>| -> Anomaly {
+            Anomaly {
+                kind,
+                severity,
+                service: "svc._http._tcp.local.".to_string(),
+                record_name: Some("Host.local.".to_string()),
+                rtype: Some(1),
+                rtype_str: Some("A".to_string()),
+                rdata: rdata.map(str::to_string),
+                source: Some("192.168.1.2:5353".to_string()),
+                message: "test".to_string(),
+                rfc: "RFC 6762 §5.2",
+            }
+        };
+        let found = vec![
+            finding("shared-flush", Severity::Warning, Some("192.168.1.2")),
+            finding("ttl-low", Severity::Warning, Some("192.168.1.2")),
+            finding("ttl-unstable", Severity::Warning, None),
+            finding("ttl-high", Severity::Info, Some("192.168.1.2")),
+        ];
+        let (content, ttl, unstable) = partition_anomaly_keys(&found);
+        assert_eq!(content.len(), 1);
+        assert!(content.contains(&("host.local".to_string(), 1, "192.168.1.2".to_string())));
+        assert_eq!(ttl.len(), 1);
+        assert!(ttl.contains(&("host.local".to_string(), 1, "192.168.1.2".to_string())));
+        assert_eq!(unstable.len(), 1);
+        assert!(unstable.contains(&("host.local".to_string(), 1)));
     }
 }

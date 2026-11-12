@@ -43,6 +43,16 @@ pub struct Anomaly {
     pub rfc: &'static str,
 }
 
+/// Anomaly kinds where the TTL itself is the problem, not the record
+/// content: rows with only these findings mark the TTL cell instead of
+/// the type cell.
+pub const TTL_KINDS: &[&str] = &["ttl-low", "ttl-high", "ttl-base-mismatch", "ttl-unstable"];
+
+/// Whether `kind` is a TTL problem (marks the TTL cell, not the type).
+pub fn is_ttl_kind(kind: &str) -> bool {
+    TTL_KINDS.contains(&kind)
+}
+
 /// A service slice for analysis: borrows browser state, owns nothing.
 pub struct ServiceView<'a> {
     pub instance: &'a str,
