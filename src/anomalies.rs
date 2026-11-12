@@ -190,7 +190,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
                     rtype_str: Some(rec.rtype_str.clone()),
                     rdata: Some(rec.rdata.clone()),
                     source: Some(rec.source.to_string()),
-                    message: format!("bad enumerated type: {reason}"),
+                    message: format!("bad enumerated type {target}: {reason}"),
                     rfc: "RFC 6763 §7",
                     requirement: "MUST",
                 });
@@ -199,7 +199,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
                 // (e.g. _T35._sub._matterd._udp.local) is queried
                 // separately and does not belong in the enumeration list.
                 out.push(Anomaly {
-                    kind: "subtype-in-enumeration",
+                    kind: "enum-subtype",
                     severity: Severity::Warning,
                     service: ENUMERATION_SERVICE.to_string(),
                     record_name: Some(rec.name.clone()),
@@ -207,7 +207,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
                     rtype_str: Some(rec.rtype_str.clone()),
                     rdata: Some(rec.rdata.clone()),
                     source: Some(rec.source.to_string()),
-                    message: "is a subtype; want base type".to_string(),
+                    message: format!("{target} is a subtype; want base type"),
                     rfc: "RFC 6763 §9",
                     requirement: "SHOULD",
                 });
@@ -487,6 +487,18 @@ fn check_subtypes(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>) {
             });
         }
     }
+}
+
+/// Whether a finding sits on the enumeration row itself (owner
+/// `_services._dns-sd._udp.local`): its scope is constant across every
+/// enumeration finding, so views omit it and let the message carry the
+/// varying target instead.
+pub(crate) fn is_enumeration_row(service: &str, record_name: Option<&str>) -> bool {
+    service == ENUMERATION_SERVICE
+        && record_name.is_some_and(|n| {
+            n.trim_end_matches('.')
+                .eq_ignore_ascii_case("_services._dns-sd._udp.local")
+        })
 }
 
 /// Whether a PTR owner name is a reverse-mapping name. Those PTRs are
@@ -1917,9 +1929,16 @@ mod tests {
         let found = analyze(&snap);
         let item = found
             .iter()
-            .find(|a| a.kind == "subtype-in-enumeration")
-            .expect("expected subtype-in-enumeration");
+            .find(|a| a.kind == "enum-subtype")
+            .expect("expected enum-subtype");
         assert_eq!(item.severity, Severity::Warning);
+        // The message names the subtype: enumeration rows all share one
+        // scope, so the target tells identical rows apart.
+        assert!(
+            item.message.contains("_T35._sub._matterd._udp.local"),
+            "message should name the subtype, got: {}",
+            item.message
+        );
         // Valid subtype: no naming-shape finding alongside.
         assert!(!found.iter().any(|a| a.kind == "type-format"));
         let base = rec(
@@ -1937,9 +1956,7 @@ mod tests {
             questions: Vec::new(),
         };
         assert!(
-            !analyze(&snap)
-                .iter()
-                .any(|a| a.kind == "subtype-in-enumeration"),
+            !analyze(&snap).iter().any(|a| a.kind == "enum-subtype"),
             "base types stay quiet"
         );
     }

@@ -1119,26 +1119,35 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
                     crate::anomalies::Severity::Info => Color::Blue,
                 };
                 // Which row the finding belongs to: empty for
-                // service-level findings, which describe the target.
+                // service-level findings, which describe the target, and
+                // for the enumeration row itself, whose scope is constant
+                // across every finding (the message carries the target).
                 // Question sources render as stored (self sends never
                 // produce findings, so no `self` case arises).
-                let scope = match (&a.record_name, a.rtype_str.as_deref()) {
-                    (Some(name), Some(rtype)) if crate::anomalies::is_question_kind(a.kind) => {
-                        format!("QRY {rtype} {name}")
-                    }
-                    (Some(name), Some(rtype)) => {
-                        let base = format!("{rtype} {name}");
-                        let key = (
-                            name.trim_end_matches('.').to_lowercase(),
-                            a.rtype.unwrap_or(0),
-                        );
-                        match (&a.rdata, identity_count.get(&key)) {
-                            (Some(rdata), Some(&n)) if n > 1 => format!("{base} = {rdata}"),
-                            _ => base,
+                let scope =
+                    if crate::anomalies::is_enumeration_row(&a.service, a.record_name.as_deref()) {
+                        String::new()
+                    } else {
+                        match (&a.record_name, a.rtype_str.as_deref()) {
+                            (Some(name), Some(rtype))
+                                if crate::anomalies::is_question_kind(a.kind) =>
+                            {
+                                format!("QRY {rtype} {name}")
+                            }
+                            (Some(name), Some(rtype)) => {
+                                let base = format!("{rtype} {name}");
+                                let key = (
+                                    name.trim_end_matches('.').to_lowercase(),
+                                    a.rtype.unwrap_or(0),
+                                );
+                                match (&a.rdata, identity_count.get(&key)) {
+                                    (Some(rdata), Some(&n)) if n > 1 => format!("{base} = {rdata}"),
+                                    _ => base,
+                                }
+                            }
+                            _ => String::new(),
                         }
-                    }
-                    _ => String::new(),
-                };
+                    };
                 // No severity word: the level icon already carries it.
                 let head = if scope.is_empty() {
                     a.kind.to_string()

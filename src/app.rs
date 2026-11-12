@@ -1757,13 +1757,19 @@ impl App {
             // `<source> <service> <scope> <text>`; unsourced findings omit
             // the source slot, and the key's icon carries the level. Scope
             // names the pointed-to row so same-kind findings from one
-            // announcer tell apart; the RFC rides along for info-level rows.
-            let scope = match (&a.record_name, a.rtype_str.as_deref()) {
-                (Some(name), Some(rtype)) if anomalies::is_question_kind(a.kind) => {
-                    format!("QRY {rtype} {name}")
+            // announcer tell apart — except the enumeration row itself,
+            // whose scope is constant (the message carries the target).
+            // The RFC rides along for info-level rows.
+            let scope = if anomalies::is_enumeration_row(&a.service, a.record_name.as_deref()) {
+                String::new()
+            } else {
+                match (&a.record_name, a.rtype_str.as_deref()) {
+                    (Some(name), Some(rtype)) if anomalies::is_question_kind(a.kind) => {
+                        format!("QRY {rtype} {name}")
+                    }
+                    (Some(name), Some(rtype)) => format!("{rtype} {name}"),
+                    _ => String::new(),
                 }
-                (Some(name), Some(rtype)) => format!("{rtype} {name}"),
-                _ => String::new(),
             };
             let scoped = if scope.is_empty() {
                 a.message.clone()
