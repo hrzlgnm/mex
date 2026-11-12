@@ -80,6 +80,19 @@ pub enum RecordLiveness {
     Expired,
 }
 
+/// Liveness of one record row, shared by the finding filter, the pane
+/// copy, and the metrics counts so the three cannot disagree about
+/// what counts as gone.
+pub(crate) fn record_liveness(rec: &browse::RawRecord) -> RecordLiveness {
+    if rec.ttl == 0 {
+        RecordLiveness::Goodbye
+    } else if rec.received_at.elapsed().as_secs() as u32 > rec.ttl {
+        RecordLiveness::Expired
+    } else {
+        RecordLiveness::Live
+    }
+}
+
 /// What the Anomalies pane shows findings for: the highlighted record
 /// or question row, the displayed target while resting on a header, or
 /// nothing at all. Single discriminant shared by the finding filter and
@@ -1730,14 +1743,10 @@ impl App {
         let mut live = 0;
         let mut expired = 0;
         let mut goodbye = 0;
-        let mut count = |rec: &browse::RawRecord| {
-            if rec.ttl == 0 {
-                goodbye += 1;
-            } else if rec.received_at.elapsed().as_secs() as u32 <= rec.ttl {
-                live += 1;
-            } else {
-                expired += 1;
-            }
+        let mut count = |rec: &browse::RawRecord| match record_liveness(rec) {
+            RecordLiveness::Live => live += 1,
+            RecordLiveness::Expired => expired += 1,
+            RecordLiveness::Goodbye => goodbye += 1,
         };
         for svc in &self.services {
             for rec in &svc.answers {
@@ -4615,25 +4624,12 @@ impl App {
             .collect()
     }
 
-    /// Liveness of a record row: goodbye (TTL 0), expired (past TTL),
-    /// or live. Shared by the finding filter and the pane copy so the
-    /// two cannot disagree about what counts as gone.
-    pub(crate) fn record_liveness(rec: &browse::RawRecord) -> RecordLiveness {
-        if rec.ttl == 0 {
-            RecordLiveness::Goodbye
-        } else if rec.received_at.elapsed().as_secs() as u32 > rec.ttl {
-            RecordLiveness::Expired
-        } else {
-            RecordLiveness::Live
-        }
-    }
-
     /// Anomalies for the highlighted record row: findings whose (name,
     /// type, rdata) identity matches the selected `DetailEntry::Record`
     /// and whose service owns the displayed target, including spanning
     /// `ttl-unstable` findings matched by (name, type).
     fn record_anomalies(&self, rec: &browse::RawRecord) -> Vec<anomalies::Anomaly> {
-        if Self::record_liveness(rec) != RecordLiveness::Live {
+        if record_liveness(rec) != RecordLiveness::Live {
             return Vec::new();
         }
         let Some(target) = self.display_detail() else {
@@ -7793,15 +7789,7 @@ mod tests {
         app.evict_expired();
         select_instance(&mut app, "Test");
         // Age the PTR past its TTL: the expired row reports nothing.
-        for svc in &mut app.services {
-            for rec in &mut svc.answers {
-                if rec.rtype == 12 {
-                    rec.received_at = Instant::now()
-                        .checked_sub(Duration::from_secs(5000))
-                        .unwrap_or_else(Instant::now);
-                }
-            }
-        }
+        expire_rtype(&mut app, 12, 5000);
         let ptr_idx = app
             .display_detail()
             .expect("service displayed")
@@ -8040,6 +8028,19 @@ mod tests {
         );
     }
 
+    /// Park the detail cursor on a raw-answer row and return the
+    /// finding kinds shown in the Anomalies pane there.
+    fn park_on(app: &mut App, idx: usize) -> Vec<String> {
+        app.detail_selected = idx;
+        app.detail_anchor = app
+            .display_detail()
+            .and_then(|d| App::identity_at_detail(&d, idx));
+        app.anomalies_for_selected()
+            .iter()
+            .map(|a| a.kind.to_string())
+            .collect()
+    }
+
     /// Park the detail cursor on the raw-answer row with this identity
     /// and return the finding kinds shown there.
     fn park_on_answer(app: &mut App, rtype: u16, rdata: &str) -> Vec<String> {
@@ -8050,14 +8051,7 @@ mod tests {
             .iter()
             .position(|r| r.rtype == rtype && r.rdata == rdata)
             .unwrap_or_else(|| panic!("row for {rdata}"));
-        app.detail_selected = idx;
-        app.detail_anchor = app
-            .display_detail()
-            .and_then(|d| App::identity_at_detail(&d, idx));
-        app.anomalies_for_selected()
-            .iter()
-            .map(|a| a.kind.to_string())
-            .collect()
+        park_on(app, idx)
     }
 
     /// Park the detail cursor on the question row from this source and
@@ -8069,15 +8063,21 @@ mod tests {
             .iter()
             .position(|q| q.2 == source)
             .unwrap_or_else(|| panic!("question row for {source}"));
-        let idx = target.ordered_answers().len() + pos;
-        app.detail_selected = idx;
-        app.detail_anchor = app
-            .display_detail()
-            .and_then(|d| App::identity_at_detail(&d, idx));
-        app.anomalies_for_selected()
-            .iter()
-            .map(|a| a.kind.to_string())
-            .collect()
+        park_on(app, target.ordered_answers().len() + pos)
+    }
+
+    /// Age every answer of this type past its TTL, turning live rows
+    /// into expired ones.
+    fn expire_rtype(app: &mut App, rtype: u16, secs: u64) {
+        for svc in &mut app.services {
+            for rec in &mut svc.answers {
+                if rec.rtype == rtype {
+                    rec.received_at = Instant::now()
+                        .checked_sub(Duration::from_secs(secs))
+                        .unwrap_or_else(Instant::now);
+                }
+            }
+        }
     }
 
     #[test]
@@ -8132,15 +8132,7 @@ mod tests {
         );
         // Expire the PTR: its row goes quiet instead of keeping the
         // shared-flush finding it showed while live.
-        for svc in &mut app.services {
-            for rec in &mut svc.answers {
-                if rec.rtype == 12 {
-                    rec.received_at = Instant::now()
-                        .checked_sub(Duration::from_secs(5000))
-                        .unwrap_or_else(Instant::now);
-                }
-            }
-        }
+        expire_rtype(&mut app, 12, 5000);
         // Back on the instance row: scope is per-record again.
         app.collapsed_hosts.remove("test.local");
         select_instance(&mut app, "Test");
@@ -8164,15 +8156,7 @@ mod tests {
             .position(|r| r.rtype == 12)
             .expect("PTR row");
         // Expired rows name their state instead of findings.
-        for svc in &mut app.services {
-            for rec in &mut svc.answers {
-                if rec.rtype == 12 {
-                    rec.received_at = Instant::now()
-                        .checked_sub(Duration::from_secs(5000))
-                        .unwrap_or_else(Instant::now);
-                }
-            }
-        }
+        expire_rtype(&mut app, 12, 5000);
         app.detail_selected = ptr_idx;
         app.detail_anchor = app
             .display_detail()

@@ -1140,7 +1140,7 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
     let lines: Vec<Line<'_>> = match app.anomaly_scope() {
         // Gone rows name their state instead of findings: a goodbye or
         // an expiry is information, not an empty result.
-        AnomalyScope::Record(rec) => match crate::app::App::record_liveness(rec) {
+        AnomalyScope::Record(rec) => match crate::app::record_liveness(rec) {
             crate::app::RecordLiveness::Goodbye => vec![Line::from(Span::styled(
                 "Goodbye received — record withdrawn",
                 dimmed,
