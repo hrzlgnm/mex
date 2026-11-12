@@ -2211,6 +2211,7 @@ impl App {
                     source: a.source.clone(),
                     message: a.message.clone(),
                     rfc: a.rfc.to_string(),
+                    requirement: a.requirement.to_string(),
                 })
                 .collect(),
         }

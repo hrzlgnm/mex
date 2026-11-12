@@ -51,6 +51,9 @@ pub struct Anomaly {
     pub message: String,
     /// RFC reference, e.g. `RFC 6762 §10.2`.
     pub rfc: &'static str,
+    /// RFC obligation level: `MUST`, `MUST NOT`, `SHOULD`, `SHOULD NOT`,
+    /// or `MAY`. Separates violations from recommendation deviations.
+    pub requirement: &'static str,
 }
 
 impl Anomaly {
@@ -189,6 +192,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
                     source: Some(rec.source.to_string()),
                     message: format!("enumerated type {target} invalid: {reason}"),
                     rfc: "RFC 6763 §7",
+                    requirement: "MUST",
                 });
             }
         }
@@ -341,6 +345,7 @@ fn check_missing_addr(
         source: None,
         message: format!("hostname {host} has no live A/AAAA"),
         rfc: "RFC 6763 §12",
+        requirement: "SHOULD",
     });
 }
 
@@ -361,6 +366,7 @@ fn check_type_format(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>
             source: None,
             message: format!("service type {st} invalid: {reason}"),
             rfc: "RFC 6763 §7",
+            requirement: "MUST",
         });
     }
 }
@@ -457,6 +463,7 @@ fn check_subtypes(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>) {
                 source: None,
                 message: format!("subtype {sub} invalid: {reason}"),
                 rfc: "RFC 6763 §7.1",
+                requirement: "MUST",
             });
         }
     }
@@ -522,6 +529,10 @@ fn check_question(q: &QuestionView, out: &mut Vec<Anomaly>) {
         return;
     };
     let name = q.name.to_string();
+    let requirement = match severity {
+        Severity::Error => "MUST NOT",
+        _ => "SHOULD NOT",
+    };
     out.push(Anomaly {
         kind: "unicast-question",
         severity,
@@ -536,6 +547,7 @@ fn check_question(q: &QuestionView, out: &mut Vec<Anomaly>) {
             q.rtype_str,
         ),
         rfc: "RFC 6762 §3",
+        requirement,
     });
 }
 
@@ -562,6 +574,10 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
                 rec.rtype_str
             )
         };
+        let requirement = match severity {
+            Severity::Error => "MUST NOT",
+            _ => "SHOULD NOT",
+        };
         out.push(Anomaly {
             kind: "unicast-leak",
             severity,
@@ -573,6 +589,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             source: Some(src.clone()),
             message,
             rfc: "RFC 6762 §3",
+            requirement,
         });
     }
 
@@ -591,6 +608,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             source: Some(src.clone()),
             message: "shared PTR record has cache-flush bit set".to_string(),
             rfc: "RFC 6762 §10.2",
+            requirement: "MUST NOT",
         });
     }
     // Unique records SHOULD set it; missing is only informational. Scoped
@@ -608,10 +626,13 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             source: Some(src.clone()),
             message: format!("unique {} record missing cache-flush bit", rec.rtype_str),
             rfc: "RFC 6762 §10.2",
+            requirement: "SHOULD",
         });
     }
 
-    // TTL band.
+    // TTL band. Recommendations per RFC 6762 §10 (SHOULD): 120s base
+    // for SRV/A/AAAA, 4500s for PTR/TXT. Values outside [10s, 7200s] risk
+    // churn or stale caches.
     if rec.ttl < TTL_LOW {
         out.push(Anomaly {
             kind: "ttl-low",
@@ -622,8 +643,13 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             rtype_str: Some(rec.rtype_str.clone()),
             rdata: Some(rdata.clone()),
             source: Some(src.clone()),
-            message: format!("TTL {}s is far below the expected base", rec.ttl),
+            message: format!(
+                "TTL {}s is far below the expected base ({}s recommended, SHOULD)",
+                rec.ttl,
+                expected_base(rec.rtype)
+            ),
             rfc: "RFC 6762 §5.2",
+            requirement: "SHOULD",
         });
     } else if rec.ttl > TTL_HIGH {
         out.push(Anomaly {
@@ -635,8 +661,13 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             rtype_str: Some(rec.rtype_str.clone()),
             rdata: Some(rdata),
             source: Some(src),
-            message: format!("TTL {}s is far above the expected base", rec.ttl),
+            message: format!(
+                "TTL {}s is far above the expected base ({}s recommended, SHOULD)",
+                rec.ttl,
+                expected_base(rec.rtype)
+            ),
             rfc: "RFC 6762 §5.2",
+            requirement: "SHOULD",
         });
     }
 
@@ -655,12 +686,15 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         // The announcer is appended centrally below.
         let message = if service_id == ENUMERATION_SERVICE {
             format!(
-                "PTR for {} base TTL {}s far below the conventional 4500s",
+                "PTR for {} TTL is {}s; RFC recommends 4500s (SHOULD)",
                 rec.rdata.trim_end_matches('.'),
                 rec.ttl
             )
         } else {
-            format!("PTR base TTL {}s far below the conventional 4500s", rec.ttl)
+            format!(
+                "PTR base TTL is {}s; RFC recommends 4500s (SHOULD)",
+                rec.ttl
+            )
         };
         out.push(Anomaly {
             kind: "ttl-base-mismatch",
@@ -673,6 +707,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             source: Some(rec.source.to_string()),
             message,
             rfc: "RFC 6762 §10",
+            requirement: "SHOULD",
         });
     }
 
@@ -700,6 +735,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
                 source: Some(rec.source.to_string()),
                 message: format!("TXT payload ~{payload_len}B exceeds {TXT_MAX}B"),
                 rfc: "RFC 6762 §17",
+                requirement: "SHOULD",
             });
         }
     }
@@ -764,6 +800,7 @@ fn srv_anomaly_info(service_id: &str, rec: &RawRecord, message: &str) -> Anomaly
         source: Some(rec.source.to_string()),
         message: message.to_string(),
         rfc: "RFC 6763 §12",
+        requirement: "MAY",
     }
 }
 
@@ -779,6 +816,17 @@ fn srv_anomaly(service_id: &str, rec: &RawRecord, message: &str) -> Anomaly {
         source: Some(rec.source.to_string()),
         message: message.to_string(),
         rfc: "RFC 6763 §12",
+        requirement: "MUST",
+    }
+}
+
+/// Recommended TTL base per type (RFC 6762 §10, SHOULD): 4500s for
+/// shared PTR/TXT, 120s for unique SRV/A/AAAA. Used in TTL messages so
+/// users see observed vs recommended values.
+fn expected_base(rtype: u16) -> u32 {
+    match rtype {
+        12 | 16 => 4500,
+        _ => 120,
     }
 }
 
@@ -839,6 +887,7 @@ fn check_ttl_stable(svc: &ServiceView, service_id: &str, now: Instant, out: &mut
                 source: None,
                 message: format!("unstable TTL bases {sorted:?} for same name/type"),
                 rfc: "RFC 6762 §5.2",
+                requirement: "SHOULD",
             });
         }
     }
