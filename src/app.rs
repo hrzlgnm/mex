@@ -1698,6 +1698,25 @@ impl App {
                 failed_count
             ),
         );
+        let mut sorted_hosts: Vec<(&String, &anomalies::UnicastStatus)> =
+            self.unicast_cache.iter().collect();
+        sorted_hosts.sort_by_key(|(k, _)| *k);
+        let host_count = sorted_hosts.len();
+        for (i, (host, status)) in sorted_hosts.into_iter().enumerate() {
+            let branch = if i + 1 == host_count {
+                "  └─"
+            } else {
+                "  ├─"
+            };
+            let status_desc = match status {
+                anomalies::UnicastStatus::Resolved(ips) => {
+                    format!("resolved: {}", ips.join(", "))
+                }
+                anomalies::UnicastStatus::Pending => "pending".to_string(),
+                anomalies::UnicastStatus::Failed => "failed".to_string(),
+            };
+            kv(&mut rows, &format!("{branch} {host}"), status_desc);
+        }
 
         // Links.
         section(&mut rows, "Links");
