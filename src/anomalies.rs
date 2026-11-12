@@ -194,6 +194,25 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
                     rfc: "RFC 6763 §7",
                     requirement: "MUST",
                 });
+            } else if is_subtype_target(target) {
+                // RFC 6763 §9 enumerates base service types; a subtype
+                // (e.g. _T35._sub._matterd._udp.local) is queried
+                // separately and does not belong in the enumeration list.
+                out.push(Anomaly {
+                    kind: "subtype-in-enumeration",
+                    severity: Severity::Warning,
+                    service: ENUMERATION_SERVICE.to_string(),
+                    record_name: Some(rec.name.clone()),
+                    rtype: Some(rec.rtype),
+                    rtype_str: Some(rec.rtype_str.clone()),
+                    rdata: Some(rec.rdata.clone()),
+                    source: Some(rec.source.to_string()),
+                    message: format!(
+                        "enumerated type {target} is a subtype; enumeration should list base service types"
+                    ),
+                    rfc: "RFC 6763 §9",
+                    requirement: "SHOULD",
+                });
             }
         }
     }
@@ -412,6 +431,14 @@ fn service_type_problem(st: &str) -> Option<String> {
         }
         _ => Some("expected _service._tcp.local or _subtype._sub._service._tcp.local".to_string()),
     }
+}
+
+/// Whether an enumeration target is a subtype (`_x._sub._svc._tcp.local`).
+/// Valid subtypes pass `service_type_problem` but still don't belong in
+/// `_services._dns-sd._udp.local` (RFC 6763 §9 lists base types).
+fn is_subtype_target(st: &str) -> bool {
+    let parts: Vec<&str> = st.split('.').collect();
+    matches!(parts.as_slice(), [_, sub_kw, _, _, _] if sub_kw.eq_ignore_ascii_case("_sub"))
 }
 
 /// Why an underscore-led service/subtype label is invalid, if it is.
@@ -1734,6 +1761,52 @@ mod tests {
         // enforced by real stacks, so the SHIELD's real type stays quiet.
         let found = analyze_service("SHIELD", "_nv_shield_remote._tcp.local", "", &[]);
         assert!(!found.iter().any(|a| a.kind == "type-format"));
+    }
+
+    #[test]
+    fn enumeration_subtype_target_flags_new_kind() {
+        let subtype = rec(
+            "_services._dns-sd._udp.local.",
+            12,
+            "PTR",
+            "_T35._sub._matterd._udp.local.",
+            4500,
+            false,
+        );
+        let snap = Snapshot {
+            services: Vec::new(),
+            enum_answers: vec![&subtype],
+            pending_hosts: HashSet::new(),
+            questions: Vec::new(),
+        };
+        let found = analyze(&snap);
+        let item = found
+            .iter()
+            .find(|a| a.kind == "subtype-in-enumeration")
+            .expect("expected subtype-in-enumeration");
+        assert_eq!(item.severity, Severity::Warning);
+        // Valid subtype: no naming-shape finding alongside.
+        assert!(!found.iter().any(|a| a.kind == "type-format"));
+        let base = rec(
+            "_services._dns-sd._udp.local.",
+            12,
+            "PTR",
+            "_http._tcp.local.",
+            4500,
+            false,
+        );
+        let snap = Snapshot {
+            services: Vec::new(),
+            enum_answers: vec![&base],
+            pending_hosts: HashSet::new(),
+            questions: Vec::new(),
+        };
+        assert!(
+            !analyze(&snap)
+                .iter()
+                .any(|a| a.kind == "subtype-in-enumeration"),
+            "base types stay quiet"
+        );
     }
 
     #[test]
