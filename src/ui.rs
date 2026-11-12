@@ -1155,7 +1155,14 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
                     ),
                     Span::raw(" "),
                     Span::styled(
-                        format!("{head}: {}", a.message),
+                        // Sourced findings lead with the announcer; question
+                        // scope already names the querier (`QRY .. @ src`).
+                        match a.source.as_deref() {
+                            Some(src) if !crate::anomalies::is_question_kind(a.kind) => {
+                                format!("{head}: {src}: {}", a.message)
+                            }
+                            _ => format!("{head}: {}", a.message),
+                        },
                         Style::default().fg(Color::White),
                     ),
                     Span::styled(

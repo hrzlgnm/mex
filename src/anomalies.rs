@@ -190,7 +190,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
                     rtype_str: Some(rec.rtype_str.clone()),
                     rdata: Some(rec.rdata.clone()),
                     source: Some(rec.source.to_string()),
-                    message: format!("enumerated type {target} invalid: {reason}"),
+                    message: format!("bad enumerated type {target}: {reason}"),
                     rfc: "RFC 6763 §7",
                     requirement: "MUST",
                 });
@@ -207,9 +207,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
                     rtype_str: Some(rec.rtype_str.clone()),
                     rdata: Some(rec.rdata.clone()),
                     source: Some(rec.source.to_string()),
-                    message: format!(
-                        "enumerated type {target} is a subtype; enumeration should list base service types"
-                    ),
+                    message: format!("{target} is a subtype; want base type"),
                     rfc: "RFC 6763 §9",
                     requirement: "SHOULD",
                 });
@@ -234,18 +232,6 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
             .then_with(|| a.rdata.cmp(&b.rdata))
     });
     dedup(out)
-        // Every finding with a known announcer names it, so overlay rows and
-        // dump messages read identically whether the finding is service- or
-        // enumeration-level. Findings without an announcer (missing-addr,
-        // service-level type-format, ttl-unstable) are untouched.
-        .into_iter()
-        .map(|mut a| {
-            if let Some(src) = a.source.clone() {
-                a.message.push_str(&format!(" (from {src})"));
-            }
-            a
-        })
-        .collect()
 }
 
 fn severity_rank(s: Severity) -> u8 {
@@ -369,7 +355,7 @@ fn check_missing_addr(
         rtype_str: None,
         rdata: None,
         source: None,
-        message: format!("hostname {host} has no live A/AAAA"),
+        message: format!("no A/AAAA for {host}"),
         rfc: "RFC 6763 §12",
         requirement: "SHOULD",
     });
@@ -390,7 +376,7 @@ fn check_type_format(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>
             rtype_str: None,
             rdata: None,
             source: None,
-            message: format!("service type {st} invalid: {reason}"),
+            message: format!("bad type {st}: {reason}"),
             rfc: "RFC 6763 §7",
             requirement: "MUST",
         });
@@ -495,7 +481,7 @@ fn check_subtypes(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>) {
                 rtype_str: None,
                 rdata: None,
                 source: None,
-                message: format!("subtype {sub} invalid: {reason}"),
+                message: format!("bad subtype {sub}: {reason}"),
                 rfc: "RFC 6763 §7.1",
                 requirement: "MUST",
             });
@@ -576,10 +562,7 @@ fn check_question(q: &QuestionView, out: &mut Vec<Anomaly>) {
         rtype_str: Some(q.rtype_str.to_string()),
         rdata: None,
         source: Some(q.source.to_string()),
-        message: format!(
-            "{} question for {name} on multicast (unicast-only type)",
-            q.rtype_str,
-        ),
+        message: "unicast-only type on multicast".to_string(),
         rfc: "RFC 6762 §3",
         requirement,
     });
@@ -605,15 +588,9 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         };
         let (severity, message, requirement) = if confirmed {
             let message = if base == Severity::Error {
-                format!(
-                    "{} record in multicast answer is not defined for mDNS (multicast answer)",
-                    rec.rtype_str
-                )
+                "not defined for mDNS".to_string()
             } else {
-                format!(
-                    "{} record on multicast (possible unicast leak; multicast answer)",
-                    rec.rtype_str
-                )
+                "possible unicast leak".to_string()
             };
             let requirement = match base {
                 Severity::Error => "MUST NOT",
@@ -623,10 +600,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         } else {
             (
                 Severity::Warning,
-                format!(
-                    "{} record outside multicast answer ({context}; verify capture)",
-                    rec.rtype_str
-                ),
+                format!("outside multicast answer ({context}); verify"),
                 "SHOULD NOT",
             )
         };
@@ -658,7 +632,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             rtype_str: Some(rec.rtype_str.clone()),
             rdata: Some(rdata.clone()),
             source: Some(src.clone()),
-            message: "shared PTR record has cache-flush bit set".to_string(),
+            message: "shared record with flush bit set".to_string(),
             rfc: "RFC 6762 §10.2",
             requirement: "MUST NOT",
         });
@@ -673,12 +647,9 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     if matches!(rec.rtype, 33 | 16) && !rec.flush_bit {
         let confirmed = rec.dst_is_multicast && rec.section == crate::browse::RecordSection::Answer;
         let message = if confirmed {
-            format!(
-                "unique {} record missing cache-flush bit (multicast answer; cache-coherency risk)",
-                rec.rtype_str
-            )
+            "missing flush bit; coherency risk".to_string()
         } else {
-            format!("unique {} record missing cache-flush bit", rec.rtype_str)
+            "missing flush bit".to_string()
         };
         out.push(Anomaly {
             kind: "unique-no-flush",
@@ -712,11 +683,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             rtype_str: Some(rec.rtype_str.clone()),
             rdata: Some(rdata.clone()),
             source: Some(src.clone()),
-            message: format!(
-                "TTL {}s is far below the expected base ({}s recommended, SHOULD)",
-                rec.ttl,
-                expected_base(rec.rtype)
-            ),
+            message: format!("TTL {}s, want ~{}s", rec.ttl, expected_base(rec.rtype)),
             rfc: "RFC 6762 §5.2",
             requirement: "SHOULD",
         });
@@ -730,11 +697,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             rtype_str: Some(rec.rtype_str.clone()),
             rdata: Some(rdata),
             source: Some(src),
-            message: format!(
-                "TTL {}s is far above the expected base ({}s recommended, SHOULD)",
-                rec.ttl,
-                expected_base(rec.rtype)
-            ),
+            message: format!("TTL {}s, want ~{}s", rec.ttl, expected_base(rec.rtype)),
             rfc: "RFC 6762 §5.2",
             requirement: "SHOULD",
         });
@@ -755,15 +718,12 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         // The announcer is appended centrally below.
         let message = if service_id == ENUMERATION_SERVICE {
             format!(
-                "PTR for {} TTL is {}s; RFC recommends 4500s (SHOULD)",
-                rec.rdata.trim_end_matches('.'),
-                rec.ttl
+                "PTR TTL {}s for {}; want 4500s",
+                rec.ttl,
+                rec.rdata.trim_end_matches('.')
             )
         } else {
-            format!(
-                "PTR base TTL is {}s; RFC recommends 4500s (SHOULD)",
-                rec.ttl
-            )
+            format!("PTR base TTL {}s; want 4500s", rec.ttl)
         };
         out.push(Anomaly {
             kind: "ttl-base-mismatch",
@@ -802,7 +762,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
                 rtype_str: Some(rec.rtype_str.clone()),
                 rdata: Some(rec.rdata.clone()),
                 source: Some(rec.source.to_string()),
-                message: format!("TXT payload ~{payload_len}B exceeds {TXT_MAX}B"),
+                message: format!("TXT ~{payload_len}B > {TXT_MAX}B"),
                 rfc: "RFC 6762 §17",
                 requirement: "SHOULD",
             });
@@ -813,7 +773,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
 fn check_srv_target(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     let parts: Vec<&str> = rec.rdata.split_whitespace().collect();
     if parts.len() < 4 {
-        out.push(srv_anomaly(service_id, rec, "SRV rdata is malformed"));
+        out.push(srv_anomaly(service_id, rec, "malformed rdata"));
         return;
     }
     // Priority, weight, and port are 16-bit fields; port 0 stays valid.
@@ -826,7 +786,7 @@ fn check_srv_target(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             out.push(srv_anomaly(
                 service_id,
                 rec,
-                &format!("SRV {field} '{value}' is not a 16-bit number"),
+                &format!("bad {field} '{value}': want 16-bit"),
             ));
             return;
         }
@@ -834,14 +794,14 @@ fn check_srv_target(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     let target = parts[3..].join(" ");
     let trimmed = target.trim().trim_end_matches('.');
     if trimmed.is_empty() || trimmed == "." {
-        out.push(srv_anomaly(service_id, rec, "SRV target is empty"));
+        out.push(srv_anomaly(service_id, rec, "empty target"));
         return;
     }
     if let Some(reason) = dns_name_problem(trimmed) {
         out.push(srv_anomaly(
             service_id,
             rec,
-            &format!("SRV target {target} invalid: {reason}"),
+            &format!("bad target {target}: {reason}"),
         ));
         return;
     }
@@ -852,7 +812,7 @@ fn check_srv_target(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         out.push(srv_anomaly_info(
             service_id,
             rec,
-            &format!("SRV target {target} requires resolution outside mDNS"),
+            &format!("target {target} outside mDNS"),
         ));
     }
 }
@@ -954,7 +914,7 @@ fn check_ttl_stable(svc: &ServiceView, service_id: &str, now: Instant, out: &mut
                 rtype_str,
                 rdata: None,
                 source: None,
-                message: format!("unstable TTL bases {sorted:?} for same name/type"),
+                message: format!("mixed TTL bases {sorted:?}"),
                 rfc: "RFC 6762 §5.2",
                 requirement: "SHOULD",
             });
@@ -1246,10 +1206,11 @@ mod tests {
             .clone();
         assert_eq!(item.service, "enumeration");
         assert_eq!(item.severity, Severity::Error);
-        assert!(
-            item.message.contains("192.168.1.2"),
-            "message should name the announcer, got: {}",
-            item.message
+        assert_eq!(
+            item.source.as_deref(),
+            Some("192.168.1.2:5353"),
+            "finding should name the announcer, got: {:?}",
+            item.source
         );
     }
 
@@ -1309,15 +1270,11 @@ mod tests {
         assert_eq!(item.service, "My._http._tcp.local");
         assert_eq!(item.record_name.as_deref(), Some("fritz.box."));
         assert_eq!(item.rtype, Some(6));
-        assert!(
-            item.message.contains("192.168.1.9"),
-            "message should name the querier, got: {}",
-            item.message
-        );
-        assert!(
-            item.message.contains("fritz.box"),
-            "message should name the queried name, got: {}",
-            item.message
+        assert_eq!(
+            item.source.as_deref(),
+            Some("192.168.1.9:5353"),
+            "finding should name the querier, got: {:?}",
+            item.source
         );
     }
 
@@ -1490,11 +1447,7 @@ mod tests {
                 Severity::Warning,
                 "mcast={mcast} section={section:?}"
             );
-            assert!(
-                item.message.contains("verify capture"),
-                "got: {}",
-                item.message
-            );
+            assert!(item.message.contains("; verify"), "got: {}", item.message);
         }
     }
 
@@ -1644,10 +1597,11 @@ mod tests {
             "message should name the enumerated type, got: {}",
             item.message
         );
-        assert!(
-            item.message.contains("192.168.1.2"),
-            "message should name the announcer, got: {}",
-            item.message
+        assert_eq!(
+            item.source.as_deref(),
+            Some("192.168.1.2:5353"),
+            "finding should name the announcer, got: {:?}",
+            item.source
         );
     }
 

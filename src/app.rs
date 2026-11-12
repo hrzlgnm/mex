@@ -1743,10 +1743,18 @@ impl App {
             },
         );
         for a in found.iter() {
+            // Source leads the value, matching the Anomalies pane; question
+            // rows already name the querier and stay as-is.
+            let detail = match a.source.as_deref() {
+                Some(src) if !anomalies::is_question_kind(a.kind) => {
+                    format!("{src}: {}", a.message)
+                }
+                _ => a.message.clone(),
+            };
             kv(
                 &mut rows,
                 &format!("{} {}", Self::anomaly_level_icon(a.severity), a.kind),
-                format!("{}: {}", a.service, a.message),
+                format!("{}: {}", a.service, detail),
             );
         }
 
