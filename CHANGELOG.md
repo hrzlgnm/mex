@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.1](https://github.com/hrzlgnm/mex/compare/v0.11.0...v0.11.1) (2026-11-12)
+
+
+### Bug Fixes
+
+* label metrics anomaly count row as summary ([#110](https://github.com/hrzlgnm/mex/issues/110)) ([b913b25](https://github.com/hrzlgnm/mex/commit/b913b25ec5c2ab334c4da50ea8bae43920b8af03))
+
 ## [0.11.0](https://github.com/hrzlgnm/mex/compare/v0.10.0...v0.11.0) (2026-11-12)
 
 
