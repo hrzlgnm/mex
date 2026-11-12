@@ -2071,6 +2071,19 @@ impl App {
         anomalies::analyze(&snap)
     }
 
+    fn handle_unicast_spawn_result(&mut self, host: String, result: std::io::Result<()>) {
+        match result {
+            Ok(()) => {
+                self.unicast_cache
+                    .insert(host, anomalies::UnicastStatus::Pending);
+            }
+            Err(_) => {
+                self.unicast_cache
+                    .insert(host, anomalies::UnicastStatus::Failed(Instant::now()));
+            }
+        }
+    }
+
     fn check_external_hosts(&mut self) {
         if self.passive {
             return;
@@ -2142,20 +2155,26 @@ impl App {
                 Some(anomalies::UnicastStatus::Pending) => false,
             };
             if needs_lookup {
-                self.unicast_cache
-                    .insert(h.clone(), anomalies::UnicastStatus::Pending);
-                spawned += 1;
-                let host = h;
+                let host = h.clone();
+                let thread_host = h;
                 let tx = self.unicast_tx.clone();
-                let _ = std::thread::Builder::new()
+                let res = std::thread::Builder::new()
                     .name("unicast-resolver".to_string())
                     .spawn(move || {
                         use std::net::ToSocketAddrs;
-                        let res = (host.as_str(), 0)
+                        let res = (thread_host.as_str(), 0)
                             .to_socket_addrs()
                             .map(|iter| iter.map(|s| s.ip()).collect());
-                        let _ = tx.send((host, res));
-                    });
+                        let _ = tx.send((thread_host, res));
+                    })
+                    .map(|_| ());
+                self.handle_unicast_spawn_result(host.clone(), res);
+                if matches!(
+                    self.unicast_cache.get(&host),
+                    Some(anomalies::UnicastStatus::Pending)
+                ) {
+                    spawned += 1;
+                }
             }
         }
     }
@@ -8801,6 +8820,17 @@ mod tests {
         ));
         render_to_buffer(&app, 100, 30);
         assert_eq!(app.anomalies_offset.get(), 0);
+    }
+
+    #[test]
+    fn unicast_resolver_spawn_failure_marks_failed() {
+        let mut app = App::new().unwrap();
+        let host = "example.com".to_string();
+        app.handle_unicast_spawn_result(host.clone(), Err(std::io::Error::other("spawn failed")));
+        match app.unicast_cache.get(&host) {
+            Some(anomalies::UnicastStatus::Failed(_)) => {}
+            other => panic!("expected Failed status, got {other:?}"),
+        }
     }
 
     #[test]
