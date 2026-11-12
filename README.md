@@ -140,14 +140,15 @@ and paging keys scroll instead, and `Tab`/`Enter` do nothing.
 mex continuously checks observed traffic against the mDNS/DNS-SD RFCs
 and surfaces each deviation as an anomaly with a severity:
 
-- **error** — a definite RFC violation (e.g. a shared record with the
-  cache-flush bit set, a unicast-only type leaked onto multicast).
-- **warning** — a likely misconfiguration (e.g. a service with no
-  address records, a PTR re-announced with a 120 s TTL instead of the
-  conventional 4500 s).
+- **error** — a definite RFC violation in confirmed packet context
+  (e.g. a shared record with the cache-flush bit set, NS/SOA answered
+  in a multicast answer section).
+- **warning** — a likely misconfiguration (e.g. a `.local` service with
+  no address records, a subtype listed in service enumeration).
 - **info** — a SHOULD-level deviation, shown only in the metrics
-  overlay and state dumps (e.g. a unique record missing its
-  cache-flush bit).
+  overlay and state dumps (e.g. a PTR re-announced with a 120 s TTL
+  instead of the recommended 4500 s, a unique record missing its
+  cache-flush bit, an SRV target outside `.local`).
 
 Findings show up in several places: anomalous Answers rows get a `!`
 marker (on the type cell, or on the TTL cell when the TTL itself is
@@ -160,17 +161,18 @@ full list.
 
 | Finding | Meaning |
 | --- | --- |
-| `missing-addr` (warning) | hostname with a live SRV record but no live A/AAAA (RFC 6763 §12) |
-| `type-format` (warning) | malformed service type, subtype, or enumerated type (RFC 6763 §7) |
-| `shared-flush` (error) | shared PTR record with the cache-flush bit set (RFC 6762 §10.2) |
-| `unique-no-flush` (info) | unique SRV/TXT record missing the cache-flush bit (RFC 6762 §10.2) |
-| `unicast-leak` (error: NS/SOA/ANY, warning: MX) | unicast-only type answered on multicast (RFC 6762 §3) |
+| `missing-addr` (warning: `.local`, info: otherwise) | hostname with a live SRV record but no live A/AAAA (RFC 6763 §12, SHOULD) |
+| `type-format` (warning) | malformed service type, subtype, or enumerated type (RFC 6763 §7, MUST) |
+| `subtype-in-enumeration` (warning) | subtype listed in service enumeration instead of a base type (RFC 6763 §9, SHOULD) |
+| `shared-flush` (error) | shared PTR record with the cache-flush bit set (RFC 6762 §10.2, MUST NOT) |
+| `unique-no-flush` (info) | unique SRV/TXT record missing the cache-flush bit (RFC 6762 §10.2, SHOULD) |
+| `unicast-leak` (error when confirmed, else warning) | NS/SOA/ANY/MX outside unicast DNS (RFC 6762 §3); confirmed only in a multicast answer, otherwise pending capture verification |
 | `unicast-question` (error: NS/SOA, warning: MX) | multicast question asking for a unicast-only type (RFC 6762 §3); ANY questions are ownership probes and stay quiet |
-| `ttl-low` / `ttl-high` (warning) | TTL below 10 s (churn risk) or above 7200 s (stale-cache risk) (RFC 6762 §5.2) |
-| `ttl-base-mismatch` (warning) | service PTR at ≤ 120 s instead of the conventional 4500 s base (RFC 6762 §10) |
-| `ttl-unstable` (warning) | same name and type announced with different TTL bases (RFC 6762 §5.2) |
-| `srv-target` (warning) | SRV target malformed or outside `.local` (RFC 6763 §12) |
-| `txt-oversize` (warning) | TXT payload over ~1300 B, risking fragmentation (RFC 6762 §17) |
+| `ttl-low` / `ttl-high` (warning) | TTL below 10 s (churn risk) or above 7200 s (stale-cache risk) (RFC 6762 §5.2, SHOULD) |
+| `ttl-base-mismatch` (info) | service PTR at ≤ 120 s instead of the recommended 4500 s base (RFC 6762 §10, SHOULD) |
+| `ttl-unstable` (warning) | same name and type announced with different TTL bases (RFC 6762 §5.2, SHOULD) |
+| `srv-target` (warning: malformed, info: outside `.local`) | SRV target malformed (MUST) or requiring resolution outside mDNS (MAY) (RFC 6763 §12) |
+| `txt-oversize` (warning) | TXT payload over ~1300 B, risking fragmentation (RFC 6762 §17, SHOULD) |
 
 Reverse-mapping PTRs (`*.in-addr.arpa`, `*.ip6.arpa`) are exempt from
 the shared-record rules: they are unique records. Omitting the flush
