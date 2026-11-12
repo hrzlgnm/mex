@@ -923,6 +923,8 @@ mod tests {
             source: test_source(),
             iface: String::new(),
             ifindex: 0,
+            dst_is_multicast: true,
+            section: crate::browse::RecordSection::Answer,
             received_at: Instant::now(),
         }
     }

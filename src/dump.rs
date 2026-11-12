@@ -23,6 +23,8 @@ pub struct DumpAnswer {
     pub iface: String,
     pub ifindex: u32,
     pub flush: bool,
+    pub section: String,
+    pub multicast_dst: bool,
     pub received_at: String,
     pub age_secs: u64,
 }
