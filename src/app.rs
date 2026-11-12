@@ -57,6 +57,7 @@ pub enum DetailEntry<'a> {
         name: &'a str,
         rtype_str: &'a str,
         raw: &'a [u8],
+        source: &'a std::net::SocketAddr,
     },
 }
 
@@ -4470,19 +4471,94 @@ impl App {
                 name: &q.0,
                 rtype_str: &q.1,
                 raw: &q.4,
+                source: &q.2,
             })
+    }
+
+    /// Anomalies for the highlighted detail row, or for the displayed
+    /// service while the left selection rests on a header: record rows
+    /// match by (name, type, rdata) including spanning `ttl-unstable`,
+    /// question rows match their leaking querier, and headers show
+    /// service-level findings. Only Warning/Error findings; expired and
+    /// goodbye rows report nothing (mirroring the table markers, which
+    /// only flag live rows).
+    pub fn anomalies_for_selected(&self) -> Vec<anomalies::Anomaly> {
+        if self.anomalies_show_service_level() {
+            return self.service_level_anomalies();
+        }
+        match self.selected_detail_entry() {
+            Some(DetailEntry::Record(rec)) => self.record_anomalies(rec),
+            Some(DetailEntry::Question {
+                name,
+                rtype_str,
+                source,
+                ..
+            }) => self.question_anomalies(name, rtype_str, source),
+            None => Vec::new(),
+        }
+    }
+
+    /// Whether the left selection rests on a header instead of a service
+    /// row, so the Anomalies pane shows service-level findings for the
+    /// sticky target rather than row findings.
+    pub fn anomalies_show_service_level(&self) -> bool {
+        self.display_detail().is_some()
+            && self.selected_service().is_none()
+            && self.selected_enum().is_none()
+    }
+
+    /// Service-level findings for the displayed target: findings with no
+    /// record identity (`missing-addr`, `type-format`) plus spanning
+    /// `ttl-unstable` findings, which belong to the service as a whole.
+    fn service_level_anomalies(&self) -> Vec<anomalies::Anomaly> {
+        let Some(target) = self.display_detail() else {
+            return Vec::new();
+        };
+        let id = match &target {
+            DetailTarget::Service(s) => format!("{}.{}", s.instance, s.service_type),
+            DetailTarget::Enum(_) => "enumeration".to_string(),
+        };
+        self.anomalies()
+            .into_iter()
+            .filter(|a| a.service == id)
+            .filter(|a| !matches!(a.severity, anomalies::Severity::Info))
+            .filter(|a| a.record_name.is_none() || a.kind == "ttl-unstable")
+            .collect()
+    }
+
+    /// Findings for one observed question row: the demand-side leak
+    /// attributed to its querier. Own inferred sends (`SELF_SOURCE`, port
+    /// 0) never match a finding, and unrecognised type labels stay quiet.
+    fn question_anomalies(
+        &self,
+        name: &str,
+        rtype_str: &str,
+        source: &std::net::SocketAddr,
+    ) -> Vec<anomalies::Anomaly> {
+        let Some(rtype) = anomalies::rtype_from_str(rtype_str) else {
+            return Vec::new();
+        };
+        let name = name.trim_end_matches('.').to_lowercase();
+        let src = source.to_string();
+        self.anomalies()
+            .into_iter()
+            .filter(|a| a.kind == "unicast-question")
+            .filter(|a| !matches!(a.severity, anomalies::Severity::Info))
+            .filter(|a| a.rtype == Some(rtype))
+            .filter(|a| {
+                a.record_name
+                    .as_ref()
+                    .is_some_and(|n| n.trim_end_matches('.').to_lowercase() == name)
+            })
+            .filter(|a| a.source.as_deref() == Some(src.as_str()))
+            .collect()
     }
 
     /// Anomalies for the highlighted record row: Warning/Error findings
     /// whose (name, type, rdata) identity matches the selected
     /// `DetailEntry::Record`, including spanning `ttl-unstable` findings
-    /// matched by (name, type). Question rows and service-level findings
-    /// are covered separately; expired and goodbye rows report nothing
-    /// (mirroring the table markers, which only flag live rows).
-    pub fn anomalies_for_selected(&self) -> Vec<anomalies::Anomaly> {
-        let Some(DetailEntry::Record(rec)) = self.selected_detail_entry() else {
-            return Vec::new();
-        };
+    /// matched by (name, type).
+    fn record_anomalies(&self, rec: &browse::RawRecord) -> Vec<anomalies::Anomaly> {
         if rec.ttl == 0 || rec.received_at.elapsed().as_secs() as u32 > rec.ttl {
             return Vec::new();
         }
@@ -4525,6 +4601,7 @@ impl App {
                 name,
                 rtype_str,
                 raw,
+                source: _,
             } => {
                 let title = format!(" QRY {rtype_str} {name} ");
                 if raw.is_empty() {
@@ -7463,6 +7540,135 @@ mod tests {
                 "A row {idx} must surface the spanning ttl-unstable finding"
             );
         }
+    }
+
+    #[test]
+    fn anomalies_for_question_marks_leaking_querier_only() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        let src_a = remote_source();
+        let src_b: SocketAddr = "192.168.1.100:5353".parse().unwrap();
+        // Two queriers ask multicast for unicast-only NS: one finding
+        // each, so every row marks only its own querier.
+        app.ingest_event(&query_event(
+            "test.local.",
+            2,
+            "NS",
+            false,
+            Vec::new(),
+            src_a,
+        ));
+        app.ingest_event(&query_event(
+            "test.local.",
+            2,
+            "NS",
+            false,
+            Vec::new(),
+            src_b,
+        ));
+        // Our own inferred send for a multicast type stays quiet.
+        app.route_own_question("test.local", 1);
+        app.evict_expired();
+        select_instance(&mut app, "Test");
+        let raws = app
+            .display_detail()
+            .expect("service displayed")
+            .ordered_answers()
+            .len();
+        for (src, expect_finding) in [
+            (src_a, true),
+            (src_b, true),
+            (crate::app::SELF_SOURCE, false),
+        ] {
+            let pos = app
+                .display_detail()
+                .expect("service displayed")
+                .ordered_questions()
+                .iter()
+                .position(|q| q.2 == src)
+                .unwrap_or_else(|| panic!("question row for {src}"));
+            let idx = raws + pos;
+            app.detail_selected = idx;
+            app.detail_anchor = app
+                .display_detail()
+                .and_then(|d| App::identity_at_detail(&d, idx));
+            let found = app.anomalies_for_selected();
+            if expect_finding {
+                assert_eq!(
+                    found.len(),
+                    1,
+                    "row for {src} must surface exactly its own finding, got: {found:?}"
+                );
+                let item = &found[0];
+                assert_eq!(item.kind, "unicast-question");
+                assert_eq!(item.source.as_deref(), Some(src.to_string()).as_deref());
+            } else {
+                assert!(
+                    found.is_empty(),
+                    "own inferred send must stay quiet, got: {found:?}"
+                );
+            }
+        }
+    }
+
+    /// Park the left selection on a collapsed host header: the detail
+    /// cursor is untouched, but the pane must switch to service level.
+    fn select_host_header(app: &mut App, key: &str) {
+        app.collapsed_hosts.insert(key.to_string());
+        let pos = app
+            .display_items()
+            .iter()
+            .position(|it| matches!(it, DisplayItem::Host { label } if label == key))
+            .unwrap_or_else(|| panic!("host header for {key}"));
+        app.selected_display = pos;
+        app.clamp_selection();
+        assert!(app.selected_service().is_none());
+        assert!(app.anomalies_show_service_level());
+    }
+
+    #[test]
+    fn anomalies_for_header_shows_service_level() {
+        let mut app = App::new().unwrap();
+        // SRV claims test.local but no address exists: service-level
+        // missing-addr with no row identity of its own.
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        app.evict_expired();
+        select_instance(&mut app, "Test");
+        select_host_header(&mut app, "test.local");
+        let found = app.anomalies_for_selected();
+        assert_eq!(
+            found.len(),
+            1,
+            "header must show exactly the service-level finding, got: {found:?}"
+        );
+        assert_eq!(found[0].kind, "missing-addr");
+    }
+
+    #[test]
+    fn anomalies_for_header_shows_spanning_ttl_unstable() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 1, "A", "192.168.1.10", 120),
+        );
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 1, "A", "192.168.1.11", 4500),
+        );
+        app.evict_expired();
+        select_instance(&mut app, "Test");
+        select_host_header(&mut app, "test.local");
+        let found = app.anomalies_for_selected();
+        assert_eq!(
+            found.len(),
+            1,
+            "header must show exactly the spanning finding, got: {found:?}"
+        );
+        assert_eq!(found[0].kind, "ttl-unstable");
     }
 
     #[test]
