@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.12.0](https://github.com/hrzlgnm/mex/compare/v0.11.1...v0.12.0) (2026-11-12)
+
+
+### Features
+
+* attach RFC requirement to every finding ([#119](https://github.com/hrzlgnm/mex/issues/119)) ([5ee0e07](https://github.com/hrzlgnm/mex/commit/5ee0e07d62548b55b07dda44b05b3c65e86f7f86))
+* flag subtypes in service enumeration ([#121](https://github.com/hrzlgnm/mex/issues/121)) ([0dcf6bc](https://github.com/hrzlgnm/mex/commit/0dcf6bcaec5c043c71213df9578a916f7c7849a5))
+* track packet context for each record ([#120](https://github.com/hrzlgnm/mex/issues/120)) ([8171662](https://github.com/hrzlgnm/mex/commit/8171662509e4c713242cd860f070b3ce244b5350))
+
+
+### Bug Fixes
+
+* gate cache-flush verdict on confirmed multicast ([#123](https://github.com/hrzlgnm/mex/issues/123)) ([195bf8d](https://github.com/hrzlgnm/mex/commit/195bf8d26287c2755d9537797fe9fec707534f2a))
+* gate unicast-leak verdict on confirmed multicast ([#122](https://github.com/hrzlgnm/mex/issues/122)) ([c641c21](https://github.com/hrzlgnm/mex/commit/c641c21e12248379d227be50d733757e53198456))
+* reclassify SHOULD-deviations to Info ([#118](https://github.com/hrzlgnm/mex/issues/118)) ([04eb9a9](https://github.com/hrzlgnm/mex/commit/04eb9a9bf4a926bf30ba539b87ac3817eeb91ee4))
+
 ## [0.11.1](https://github.com/hrzlgnm/mex/compare/v0.11.0...v0.11.1) (2026-11-12)
 
 
