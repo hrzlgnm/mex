@@ -4585,12 +4585,19 @@ impl App {
                 return Vec::new();
             }
         }
-        let Some(target) = self.display_detail() else {
-            return Vec::new();
+        let scope = self.anomaly_scope();
+        let id = match &scope {
+            AnomalyScope::ServiceLevel(target) => Self::detail_service_id(target),
+            AnomalyScope::Record(_) | AnomalyScope::Question(_) => {
+                let Some(target) = self.display_detail() else {
+                    return Vec::new();
+                };
+                Self::detail_service_id(&target)
+            }
+            AnomalyScope::None => return Vec::new(),
         };
-        let id = Self::detail_service_id(&target);
         let found = self.anomalies();
-        let row: Vec<anomalies::Anomaly> = match self.anomaly_scope() {
+        let row: Vec<anomalies::Anomaly> = match scope {
             AnomalyScope::Record(rec) => Self::record_anomalies_in(&found, rec, &id),
             AnomalyScope::Question(key) => Self::question_anomalies_in(&found, key, &id),
             _ => Vec::new(),
