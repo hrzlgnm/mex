@@ -490,16 +490,61 @@ fn check_subtypes(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>) {
 }
 
 /// Row identity for a finding (`QRY …` for demand-side questions,
-/// `TYPE name` otherwise): shared by the Anomalies pane and the metrics
-/// overlay so the two surfaces cannot drift. Empty for findings with no
-/// pointed-to row.
-pub(crate) fn finding_scope(a: &Anomaly) -> String {
+/// `TYPE name` otherwise): the shared core of every display scope.
+fn finding_scope(a: &Anomaly) -> String {
     match (&a.record_name, a.rtype_str.as_deref()) {
         (Some(name), Some(rtype)) if is_question_kind(a.kind) => {
             format!("QRY {rtype} {name}")
         }
         (Some(name), Some(rtype)) => format!("{rtype} {name}"),
         _ => String::new(),
+    }
+}
+
+/// How many findings share each pointed-to row identity, keyed by
+/// lowercased `(record name, type)`: rows whose identity repeats name
+/// their rdata so identical findings tell apart. Shared by the pane
+/// and the overlay so repeated identities disambiguate the same way.
+pub(crate) fn identity_counts<'a, I>(items: I) -> HashMap<(String, u16), usize>
+where
+    I: IntoIterator<Item = &'a Anomaly>,
+{
+    let mut counts = HashMap::new();
+    for a in items {
+        if let (Some(name), Some(rtype)) = (&a.record_name, a.rtype) {
+            *counts
+                .entry((name.trim_end_matches('.').to_lowercase(), rtype))
+                .or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// Display scope for a finding, shared by the Anomalies pane and the
+/// metrics overlay: empty for service-level findings and enumeration
+/// rows (constant owner; the message carries the target instead), the
+/// QRY or `TYPE name` identity otherwise — plus `= rdata` when siblings
+/// share the identity so every row stays tellable-apart. Question
+/// findings always keep their QRY scope: the queried type varies.
+pub(crate) fn visible_scope(a: &Anomaly, identity_count: &HashMap<(String, u16), usize>) -> String {
+    if is_enumeration_row(&a.service, a.record_name.as_deref()) && !is_question_kind(a.kind) {
+        return String::new();
+    }
+    let base = finding_scope(a);
+    if base.is_empty() {
+        return base;
+    }
+    let key = (
+        a.record_name
+            .as_deref()
+            .unwrap_or("")
+            .trim_end_matches('.')
+            .to_lowercase(),
+        a.rtype.unwrap_or(0),
+    );
+    match (&a.rdata, identity_count.get(&key)) {
+        (Some(rdata), Some(&n)) if n > 1 => format!("{base} = {rdata}"),
+        _ => base,
     }
 }
 

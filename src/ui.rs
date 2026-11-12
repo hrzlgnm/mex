@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io;
 use std::io::IsTerminal;
 use std::net::SocketAddr;
@@ -1102,16 +1102,8 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
     };
     let dimmed = Style::default().fg(Color::Gray);
     // Row identities already claimed in this pane: a repeated
-    // (name, type) needs its rdata to tell the findings apart.
-    let mut identity_count: HashMap<(String, u16), usize> = HashMap::new();
-    for p in &findings {
-        let a = &p.anomaly;
-        if let (Some(name), Some(rtype)) = (&a.record_name, a.rtype) {
-            *identity_count
-                .entry((name.trim_end_matches('.').to_lowercase(), rtype))
-                .or_insert(0) += 1;
-        }
-    }
+    // (name, type) names its rdata to tell the findings apart.
+    let identity_count = crate::anomalies::identity_counts(findings.iter().map(|p| &p.anomaly));
     let finding_lines = |findings: &[crate::app::PaneAnomaly]| -> Vec<Line<'_>> {
         if findings.is_empty() {
             return vec![Line::from(Span::styled(
@@ -1128,38 +1120,12 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
                     crate::anomalies::Severity::Warning => Color::Yellow,
                     crate::anomalies::Severity::Info => Color::Blue,
                 };
-                // Which row the finding belongs to: empty for
-                // service-level findings, which describe the target, and
-                // for the enumeration row itself, whose scope is constant
-                // across every finding (the message carries the target).
-                // Question findings keep their QRY scope everywhere: the
-                // queried type varies. Question sources render as stored
-                // (self sends never produce findings, so no `self` case
-                // arises).
-                let scope =
-                    if crate::anomalies::is_enumeration_row(&a.service, a.record_name.as_deref())
-                        && !crate::anomalies::is_question_kind(a.kind)
-                    {
-                        String::new()
-                    } else {
-                        let base = crate::anomalies::finding_scope(a);
-                        if base.is_empty() {
-                            base
-                        } else {
-                            let key = (
-                                a.record_name
-                                    .as_deref()
-                                    .unwrap_or("")
-                                    .trim_end_matches('.')
-                                    .to_lowercase(),
-                                a.rtype.unwrap_or(0),
-                            );
-                            match (&a.rdata, identity_count.get(&key)) {
-                                (Some(rdata), Some(&n)) if n > 1 => format!("{base} = {rdata}"),
-                                _ => base,
-                            }
-                        }
-                    };
+                // Which row the finding belongs to: the shared helper
+                // omits service-level and enumeration rows (constant or
+                // absent identity) and disambiguates repeated identities
+                // with `= rdata`. Question scopes render as stored (self
+                // sends never produce findings, so no `self` case arises).
+                let scope = crate::anomalies::visible_scope(a, &identity_count);
                 // No severity word: the level icon already carries it.
                 let head = if scope.is_empty() {
                     a.kind.to_string()

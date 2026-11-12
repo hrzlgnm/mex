@@ -1748,18 +1748,16 @@ impl App {
                 format!("{errors} error · {warnings} warning · {infos} info")
             },
         );
+        // Row identities already claimed in this overlay: repeated
+        // identities name their rdata, mirroring the Anomalies pane.
+        let identity_count = anomalies::identity_counts(found.iter());
         for a in found.iter() {
-            // Scope names the pointed-to row so same-kind findings from
-            // one announcer tell apart — except the enumeration row
-            // itself, whose scope is constant (the message carries the
-            // target). The RFC rides along for info-level rows.
-            let scope = if anomalies::is_enumeration_row(&a.service, a.record_name.as_deref())
-                && !anomalies::is_question_kind(a.kind)
-            {
-                String::new()
-            } else {
-                anomalies::finding_scope(a)
-            };
+            // `<source> <service> <scope> <text>`; unsourced findings omit
+            // the source slot, and the key's icon carries the level. The
+            // scope helper omits constant/absent row identities and names
+            // rdata where siblings share the identity. The RFC rides
+            // along for info-level rows.
+            let scope = anomalies::visible_scope(a, &identity_count);
             let scoped = if scope.is_empty() {
                 a.message.clone()
             } else {
@@ -6117,6 +6115,42 @@ mod tests {
             .find(|(k, _)| k == "questions")
             .expect("questions row");
         assert!(row.1.contains("(1 queriers, 1 one-shot)"), "got: {}", row.1);
+    }
+
+    #[test]
+    fn metrics_overlay_disambiguates_repeated_row_identity() {
+        // Two flushed PTRs sharing owner and type tell apart via their
+        // rdata, mirroring the Anomalies pane's `= rdata` suffix.
+        let mut app = App::new().unwrap();
+        let mut first = ptr_record(4500);
+        first.flush_bit = true;
+        ingest(&mut app, &first);
+        let mut second = raw_record(
+            "_http._tcp.local.",
+            12,
+            "PTR",
+            "Other._http._tcp.local.",
+            4500,
+        );
+        second.flush_bit = true;
+        ingest(&mut app, &second);
+        ingest(&mut app, &srv_record(120));
+        let values: Vec<String> = app
+            .metrics_rows()
+            .into_iter()
+            .filter(|(k, _)| k.ends_with("shared-flush"))
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(values.len(), 2, "both findings listed, got: {values:?}");
+        assert_ne!(values[0], values[1], "rows must differ, got: {values:?}");
+        assert!(
+            values.iter().any(|v| v.contains("Test._http._tcp.local.")),
+            "got: {values:?}"
+        );
+        assert!(
+            values.iter().any(|v| v.contains("Other._http._tcp.local.")),
+            "got: {values:?}"
+        );
     }
 
     #[test]
