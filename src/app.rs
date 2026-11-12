@@ -6119,9 +6119,11 @@ mod tests {
     }
 
     #[test]
-    fn metrics_overlay_disambiguates_repeated_row_identity() {
-        // Two flushed PTRs sharing owner and type tell apart via their
-        // rdata, mirroring the Anomalies pane's `= rdata` suffix.
+    fn metrics_overlay_omits_self_referential_rdata() {
+        // PTR rdata usually names its own service (here each PTR seeds
+        // its own service identity); repeating it after the scope adds no
+        // identity beyond the service column, so it stays short — while
+        // the two services still tell apart.
         let mut app = App::new().unwrap();
         let mut first = ptr_record(4500);
         first.flush_bit = true;
@@ -6143,15 +6145,11 @@ mod tests {
             .map(|(_, v)| v)
             .collect();
         assert_eq!(values.len(), 2, "both findings listed, got: {values:?}");
+        assert!(
+            !values.iter().any(|v| v.contains(" = ")),
+            "self rdata stays short, got: {values:?}"
+        );
         assert_ne!(values[0], values[1], "rows must differ, got: {values:?}");
-        assert!(
-            values.iter().any(|v| v.contains("Test._http._tcp.local.")),
-            "got: {values:?}"
-        );
-        assert!(
-            values.iter().any(|v| v.contains("Other._http._tcp.local.")),
-            "got: {values:?}"
-        );
     }
 
     #[test]

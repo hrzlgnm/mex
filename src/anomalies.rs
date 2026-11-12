@@ -524,8 +524,10 @@ where
 /// metrics overlay: empty for service-level findings and enumeration
 /// rows (constant owner; the message carries the target instead), the
 /// QRY or `TYPE name` identity otherwise — plus `= rdata` when siblings
-/// share the identity so every row stays tellable-apart. Question
-/// findings always keep their QRY scope: the queried type varies.
+/// share the identity so every row stays tellable-apart, unless the
+/// rdata just repeats the service itself (the usual PTR shape: the
+/// service column already names it). Question findings always keep
+/// their QRY scope: the queried type varies.
 pub(crate) fn visible_scope(a: &Anomaly, identity_count: &HashMap<(String, u16), usize>) -> String {
     if is_enumeration_row(&a.service, a.record_name.as_deref()) && !is_question_kind(a.kind) {
         return String::new();
@@ -543,7 +545,14 @@ pub(crate) fn visible_scope(a: &Anomaly, identity_count: &HashMap<(String, u16),
         a.rtype.unwrap_or(0),
     );
     match (&a.rdata, identity_count.get(&key)) {
-        (Some(rdata), Some(&n)) if n > 1 => format!("{base} = {rdata}"),
+        (Some(rdata), Some(&n))
+            if n > 1
+                && !rdata
+                    .trim_end_matches('.')
+                    .eq_ignore_ascii_case(a.service.trim_end_matches('.')) =>
+        {
+            format!("{base} = {rdata}")
+        }
         _ => base,
     }
 }
@@ -1678,6 +1687,35 @@ mod tests {
             .find(|a| a.kind == "shared-flush")
             .expect("expected shared-flush");
         assert_eq!(item.message, "shared record with flush bit set");
+    }
+
+    #[test]
+    fn visible_scope_disambiguates_only_foreign_rdata() {
+        fn finding(service: &str, rdata: &str) -> Anomaly {
+            Anomaly {
+                kind: "shared-flush",
+                severity: Severity::Error,
+                service: service.to_string(),
+                record_name: Some("_http._tcp.local.".to_string()),
+                rtype: Some(12),
+                rtype_str: Some("PTR".to_string()),
+                rdata: Some(rdata.to_string()),
+                source: Some("192.168.1.2:5353".to_string()),
+                message: "shared record with flush bit set".to_string(),
+                rfc: "RFC 6762 §10.2",
+                requirement: "MUST NOT",
+            }
+        }
+        // Same service, same owner and type: the foreign target tells the
+        // rows apart, the self-naming one stays short.
+        let same = finding("Test._http._tcp.local", "Test._http._tcp.local.");
+        let other = finding("Test._http._tcp.local", "Other._http._tcp.local.");
+        let counts = identity_counts([&same, &other]);
+        assert_eq!(visible_scope(&same, &counts), "PTR _http._tcp.local.");
+        assert_eq!(
+            visible_scope(&other, &counts),
+            "PTR _http._tcp.local. = Other._http._tcp.local."
+        );
     }
 
     #[test]
