@@ -94,8 +94,8 @@ pub struct ServiceView<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UnicastStatus {
     Pending,
-    Resolved(Vec<String>),
-    Failed,
+    Resolved(Vec<String>, Instant),
+    Failed(Instant),
 }
 
 /// Snapshot input for the analyzer. Built by the caller from live browser
@@ -360,13 +360,13 @@ fn check_missing_addr(
         format!("no A/AAAA for {host}")
     } else {
         match unicast_cache.get(&key) {
-            Some(UnicastStatus::Resolved(ips)) => {
+            Some(UnicastStatus::Resolved(ips, _)) => {
                 format!("no A/AAAA for {host} (resolved: {})", ips.join(", "))
             }
             Some(UnicastStatus::Pending) => {
                 format!("no A/AAAA for {host} (resolving…)")
             }
-            Some(UnicastStatus::Failed) | None => {
+            Some(UnicastStatus::Failed(_)) | None => {
                 format!("no A/AAAA for {host} (unresolved)")
             }
         }
@@ -972,11 +972,11 @@ fn check_srv_target(
     if !trimmed.to_ascii_lowercase().ends_with(".local") && !trimmed.eq_ignore_ascii_case("local") {
         let key = trimmed.to_lowercase();
         let message = match unicast_cache.get(&key) {
-            Some(UnicastStatus::Resolved(ips)) => {
+            Some(UnicastStatus::Resolved(ips, _)) => {
                 format!("target needs unicast DNS (resolved: {})", ips.join(", "))
             }
             Some(UnicastStatus::Pending) => "target needs unicast DNS (resolving…)".to_string(),
-            Some(UnicastStatus::Failed) | None => {
+            Some(UnicastStatus::Failed(_)) | None => {
                 "target needs unicast DNS (unresolved)".to_string()
             }
         };

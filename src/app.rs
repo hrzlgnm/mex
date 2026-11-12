@@ -778,15 +778,16 @@ impl App {
 
     fn drain_events(&mut self) {
         while let Ok((host, res)) = self.unicast_rx.try_recv() {
+            let now = Instant::now();
             match res {
                 Ok(ips) if !ips.is_empty() => {
                     let ip_strs = ips.iter().map(|ip| ip.to_string()).collect();
                     self.unicast_cache
-                        .insert(host, anomalies::UnicastStatus::Resolved(ip_strs));
+                        .insert(host, anomalies::UnicastStatus::Resolved(ip_strs, now));
                 }
                 _ => {
                     self.unicast_cache
-                        .insert(host, anomalies::UnicastStatus::Failed);
+                        .insert(host, anomalies::UnicastStatus::Failed(now));
                 }
             }
         }
@@ -1675,7 +1676,7 @@ impl App {
         let resolved_count = self
             .unicast_cache
             .values()
-            .filter(|v| matches!(v, anomalies::UnicastStatus::Resolved(_)))
+            .filter(|v| matches!(v, anomalies::UnicastStatus::Resolved(_, _)))
             .count();
         let pending_count = self
             .unicast_cache
@@ -1685,7 +1686,7 @@ impl App {
         let failed_count = self
             .unicast_cache
             .values()
-            .filter(|v| matches!(v, anomalies::UnicastStatus::Failed))
+            .filter(|v| matches!(v, anomalies::UnicastStatus::Failed(_)))
             .count();
         kv(
             &mut rows,
@@ -1709,11 +1710,11 @@ impl App {
                 "  ├─"
             };
             let status_desc = match status {
-                anomalies::UnicastStatus::Resolved(ips) => {
+                anomalies::UnicastStatus::Resolved(ips, _) => {
                     format!("resolved: {}", ips.join(", "))
                 }
                 anomalies::UnicastStatus::Pending => "pending".to_string(),
-                anomalies::UnicastStatus::Failed => "failed".to_string(),
+                anomalies::UnicastStatus::Failed(_) => "failed".to_string(),
             };
             kv(&mut rows, &format!("{branch} {host}"), status_desc);
         }
@@ -2071,6 +2072,18 @@ impl App {
     }
 
     fn check_external_hosts(&mut self) {
+        if self.passive {
+            return;
+        }
+        let pending_count = self
+            .unicast_cache
+            .values()
+            .filter(|v| matches!(v, anomalies::UnicastStatus::Pending))
+            .count();
+        if pending_count >= 4 {
+            return;
+        }
+
         let mut hosts = HashSet::new();
         for s in &self.services {
             if !s.hostname.is_empty() {
@@ -2113,19 +2126,36 @@ impl App {
             }
         }
 
+        let mut spawned = pending_count;
         for h in hosts {
-            if !self.unicast_cache.contains_key(&h) {
+            if spawned >= 4 {
+                break;
+            }
+            let needs_lookup = match self.unicast_cache.get(&h) {
+                None => true,
+                Some(anomalies::UnicastStatus::Failed(at)) => {
+                    at.elapsed() > Duration::from_secs(60)
+                }
+                Some(anomalies::UnicastStatus::Resolved(_, at)) => {
+                    at.elapsed() > Duration::from_secs(1800)
+                }
+                Some(anomalies::UnicastStatus::Pending) => false,
+            };
+            if needs_lookup {
                 self.unicast_cache
                     .insert(h.clone(), anomalies::UnicastStatus::Pending);
+                spawned += 1;
                 let host = h;
                 let tx = self.unicast_tx.clone();
-                std::thread::spawn(move || {
-                    use std::net::ToSocketAddrs;
-                    let res = (host.as_str(), 0)
-                        .to_socket_addrs()
-                        .map(|iter| iter.map(|s| s.ip()).collect());
-                    let _ = tx.send((host, res));
-                });
+                let _ = std::thread::Builder::new()
+                    .name("unicast-resolver".to_string())
+                    .spawn(move || {
+                        use std::net::ToSocketAddrs;
+                        let res = (host.as_str(), 0)
+                            .to_socket_addrs()
+                            .map(|iter| iter.map(|s| s.ip()).collect());
+                        let _ = tx.send((host, res));
+                    });
             }
         }
     }
