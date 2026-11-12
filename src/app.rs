@@ -1754,12 +1754,25 @@ impl App {
             },
         );
         for a in found.iter() {
-            // `<source> <service> <text>`; unsourced findings omit the
-            // source slot, and the key's icon carries the level. The RFC
-            // rides along so info-level findings stay attributable.
+            // `<source> <service> <scope> <text>`; unsourced findings omit
+            // the source slot, and the key's icon carries the level. Scope
+            // names the pointed-to row so same-kind findings from one
+            // announcer tell apart; the RFC rides along for info-level rows.
+            let scope = match (&a.record_name, a.rtype_str.as_deref()) {
+                (Some(name), Some(rtype)) if anomalies::is_question_kind(a.kind) => {
+                    format!("QRY {rtype} {name}")
+                }
+                (Some(name), Some(rtype)) => format!("{rtype} {name}"),
+                _ => String::new(),
+            };
+            let scoped = if scope.is_empty() {
+                a.message.clone()
+            } else {
+                format!("{scope}: {}", a.message)
+            };
             let value = match a.source.as_deref() {
-                Some(src) => format!("{src}: {}: {} ({})", a.service, a.message, a.rfc),
-                _ => format!("{}: {} ({})", a.service, a.message, a.rfc),
+                Some(src) => format!("{src}: {}: {scoped} ({})", a.service, a.rfc),
+                _ => format!("{}: {scoped} ({})", a.service, a.rfc),
             };
             kv(
                 &mut rows,
@@ -7280,6 +7293,10 @@ mod tests {
             "source leads the value, got: {v}"
         );
         assert!(v.contains(&a.service), "value names the service, got: {v}");
+        assert!(
+            v.contains("PTR _http._tcp.local."),
+            "value names the pointed-to row, got: {v}"
+        );
         assert!(
             !k.contains(a.severity.as_str()),
             "no severity word left, got: {k}"
