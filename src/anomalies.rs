@@ -4,6 +4,16 @@ use std::time::Instant;
 
 use crate::browse::RawRecord;
 
+/// Service identity carried by findings: `instance.service_type`, or
+/// `enumeration` for enumeration-row answers. Single definition shared
+/// by the analyzer and the pane filters so the two cannot drift.
+pub const ENUMERATION_SERVICE: &str = "enumeration";
+
+/// Service identity for a confirmed or pending instance.
+pub fn service_id(instance: &str, service_type: &str) -> String {
+    format!("{instance}.{service_type}")
+}
+
 /// Severity of an anomaly: errors are clear RFC violations, warnings are
 /// likely misconfigurations, informational notes are SHOULD-level deviations.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -41,6 +51,15 @@ pub struct Anomaly {
     pub message: String,
     /// RFC reference, e.g. `RFC 6762 §10.2`.
     pub rfc: &'static str,
+}
+
+impl Anomaly {
+    /// Whether the finding surfaces outside the metrics overlay: errors
+    /// and warnings mark table rows and fill the Anomalies pane, while
+    /// informational notes stay in the overlay.
+    pub fn is_surfaced(&self) -> bool {
+        !matches!(self.severity, Severity::Info)
+    }
 }
 
 /// Anomaly kinds where the TTL itself is the problem, not the record
@@ -118,7 +137,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
     }
 
     for svc in &snap.services {
-        let service_id = format!("{}.{}", svc.instance, svc.service_type);
+        let service_id = service_id(svc.instance, svc.service_type);
         // A retained hostname outlives its SRV (expiry, goodbye): only a
         // live SRV proves the service still claims the host.
         let has_live_srv = svc.answers.iter().any(|r| r.rtype == 33 && is_live(r, now));
@@ -145,7 +164,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
         if !is_live(rec, now) {
             continue;
         }
-        check_record("enumeration", rec, &mut out);
+        check_record(ENUMERATION_SERVICE, rec, &mut out);
         // Enumeration PTR targets name service types (or subtypes): a
         // malformed target means the name itself violates DNS-SD naming,
         // so flag the PTR row itself (with full record identity, so the
@@ -156,7 +175,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
                 out.push(Anomaly {
                     kind: "type-format",
                     severity: Severity::Warning,
-                    service: "enumeration".to_string(),
+                    service: ENUMERATION_SERVICE.to_string(),
                     record_name: Some(rec.name.clone()),
                     rtype: Some(rec.rtype),
                     rtype_str: Some(rec.rtype_str.clone()),
@@ -617,7 +636,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         // Enumeration rows all share the owner name, so name the
         // enumerated type: otherwise every finding reads identically.
         // The announcer is appended centrally below.
-        let message = if service_id == "enumeration" {
+        let message = if service_id == ENUMERATION_SERVICE {
             format!(
                 "PTR for {} base TTL {}s far below the conventional 4500s",
                 rec.rdata.trim_end_matches('.'),

@@ -18,7 +18,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::app::{App, DisplayItem, DragMode, Focus};
+use crate::app::{AnomalyScope, App, DisplayItem, DragMode, Focus};
 
 pub type Terminal = ratatui::Terminal<CrosstermBackend<io::Stdout>>;
 
@@ -313,7 +313,7 @@ fn partition_anomaly_keys(found: &[crate::anomalies::Anomaly]) -> AnomalyMarks {
     let mut ttl = HashSet::new();
     let mut unstable = HashSet::new();
     for a in found {
-        if matches!(a.severity, crate::anomalies::Severity::Info) {
+        if !a.is_surfaced() {
             continue;
         }
         let (Some(name), Some(rtype)) = (a.record_name.as_ref(), a.rtype) else {
@@ -944,7 +944,7 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
         .anomalies()
         .into_iter()
         .filter(|a| a.kind == "unicast-question")
-        .filter(|a| !matches!(a.severity, crate::anomalies::Severity::Info))
+        .filter(|a| a.is_surfaced())
         .filter_map(|a| {
             let rtype = a.rtype?;
             Some((
@@ -1076,14 +1076,18 @@ fn question_source_label(source: &SocketAddr) -> String {
 }
 
 fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    // Findings for the highlighted record row: severity icon, kind,
-    // message, and RFC reference per row. Follows the record cursor and
-    // has no cursor of its own; j/k and paging keys scroll.
+    // Findings for the highlighted detail row — or for the displayed
+    // service while resting on a header: severity wording and icon,
+    // kind, message, and RFC reference per row. Follows the detail
+    // cursor and has no cursor of its own; j/k and paging keys scroll.
     app.anomalies_viewport
         .set(area.height.saturating_sub(2) as usize);
     let findings = app.anomalies_for_selected();
-    let title = match app.selected_detail_entry() {
-        Some(crate::app::DetailEntry::Record(rec)) => {
+    let title = match app.anomaly_scope() {
+        AnomalyScope::ServiceLevel(target) => {
+            format!(" Anomalies: {} ({}) ", target.pane_ident(), findings.len())
+        }
+        AnomalyScope::Record(rec) => {
             format!(
                 " Anomalies: {} {} ({}) ",
                 rec.rtype_str,
@@ -1091,7 +1095,16 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
                 findings.len()
             )
         }
-        _ => format!(" Anomalies ({}) ", findings.len()),
+        AnomalyScope::Question(key) => {
+            format!(
+                " Anomalies: QRY {} {} @ {} ({}) ",
+                key.rtype_str,
+                key.name,
+                question_source_label(key.source),
+                findings.len()
+            )
+        }
+        AnomalyScope::None => format!(" Anomalies ({}) ", findings.len()),
     };
     let lines: Vec<Line<'_>> = if findings.is_empty() {
         vec![Line::from(Span::styled(
