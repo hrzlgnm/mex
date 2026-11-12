@@ -165,7 +165,7 @@ full list.
 | `type-format` (warning) | malformed service type, subtype, or enumerated type (RFC 6763 §7, MUST) |
 | `subtype-in-enumeration` (warning) | subtype listed in service enumeration instead of a base type (RFC 6763 §9, SHOULD) |
 | `shared-flush` (error) | shared PTR record with the cache-flush bit set (RFC 6762 §10.2, MUST NOT) |
-| `unique-no-flush` (info) | unique SRV/TXT record missing the cache-flush bit (RFC 6762 §10.2, SHOULD) |
+| `unique-no-flush` (warning when confirmed, else info) | unique SRV/TXT record missing the cache-flush bit (RFC 6762 §10.2, SHOULD); confirmed only in a multicast answer |
 | `unicast-leak` (error when confirmed, else warning) | NS/SOA/ANY/MX outside unicast DNS (RFC 6762 §3); confirmed only in a multicast answer, otherwise pending capture verification |
 | `unicast-question` (error: NS/SOA, warning: MX) | multicast question asking for a unicast-only type (RFC 6762 §3); ANY questions are ownership probes and stay quiet |
 | `ttl-low` / `ttl-high` (warning) | TTL below 10 s (churn risk) or above 7200 s (stale-cache risk) (RFC 6762 §5.2, SHOULD) |

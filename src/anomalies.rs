@@ -663,20 +663,37 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             requirement: "MUST NOT",
         });
     }
-    // Unique records SHOULD set it; missing is only informational. Scoped
-    // to SRV/TXT: omitting the bit on A/AAAA is universal practice across
-    // embedded stacks, so flagging it is pure noise (removed, not tuned).
+    // Unique records SHOULD set the cache-flush bit after uniqueness is
+    // established (RFC 6762 §10.2), but only in multicast responses: in
+    // legacy unicast responses and in known-answer sections the bit MUST
+    // NOT be set, so a missing bit there is not anomalous. Promote to
+    // Warning only for confirmed multicast answers; otherwise Info.
+    // Scoped to SRV/TXT: omitting the bit on A/AAAA is universal practice
+    // across embedded stacks, so flagging it is pure noise (removed).
     if matches!(rec.rtype, 33 | 16) && !rec.flush_bit {
+        let confirmed = rec.dst_is_multicast && rec.section == crate::browse::RecordSection::Answer;
+        let message = if confirmed {
+            format!(
+                "unique {} record missing cache-flush bit (multicast answer; cache-coherency risk)",
+                rec.rtype_str
+            )
+        } else {
+            format!("unique {} record missing cache-flush bit", rec.rtype_str)
+        };
         out.push(Anomaly {
             kind: "unique-no-flush",
-            severity: Severity::Info,
+            severity: if confirmed {
+                Severity::Warning
+            } else {
+                Severity::Info
+            },
             service: service_id.to_string(),
             record_name: Some(name.clone()),
             rtype: Some(rec.rtype),
             rtype_str: Some(rec.rtype_str.clone()),
             rdata: Some(rdata.clone()),
             source: Some(src.clone()),
-            message: format!("unique {} record missing cache-flush bit", rec.rtype_str),
+            message,
             rfc: "RFC 6762 §10.2",
             requirement: "SHOULD",
         });
@@ -1515,7 +1532,8 @@ mod tests {
     }
 
     #[test]
-    fn unique_missing_flush_is_info_only() {
+    fn unique_missing_flush_warns_when_confirmed() {
+        // Multicast answer without the bit: cache-coherency risk (Warning).
         let answers = vec![rec(
             "My._http._tcp.local.",
             33,
@@ -1528,7 +1546,25 @@ mod tests {
         let item = found
             .iter()
             .find(|a| a.kind == "unique-no-flush")
-            .expect("expected info");
+            .expect("expected finding");
+        assert_eq!(item.severity, Severity::Warning);
+        // Same record via unicast reply: Info only (bit MUST NOT be set
+        // in legacy unicast, so its absence is not a coherency signal).
+        let answers = vec![rec_with(
+            "My._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 80 myhost.local.",
+            120,
+            false,
+            false,
+            crate::browse::RecordSection::Answer,
+        )];
+        let found = analyze_service("My", "_http._tcp.local", "myhost.local.", &answers);
+        let item = found
+            .iter()
+            .find(|a| a.kind == "unique-no-flush")
+            .expect("expected finding");
         assert_eq!(item.severity, Severity::Info);
     }
 
