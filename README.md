@@ -27,6 +27,7 @@ standard browse queries (service enumeration, PTR/SRV/TXT/A/AAAA).
 - [Usage](#usage)
 - [Layout](#layout)
 - [Keys](#keys)
+- [Anomalies](#anomalies)
 - [Build & run](#build--run)
 - [Known limitations](#known-limitations)
 
@@ -104,7 +105,7 @@ browsed as before.
   packet, falling back to the service's latest packet. `Tab` focuses it
   for scrolling.
 - **Mouse.** Drag the shared pane borders to resize Hosts vs detail and
-  Answers / Questions / Hex (the seam lights up). Click a row to
+  Answers / Questions / Anomalies / Hex (the seam lights up). Click a row to
   focus its pane and move the cursor there; clicking a host header
   folds it. While mouse input is captured, use Shift+drag to select
   text in most terminals.
@@ -113,8 +114,8 @@ browsed as before.
 
 | Key | Action |
 | --- | ------ |
-| `Tab` / `Shift+Tab` | switch pane (Hosts → Answers → Questions → Hex) |
-| `Up` / `Down`, `j` / `k` | move within the focused pane (scroll Hex when focused) |
+| `Tab` / `Shift+Tab` | switch pane (Hosts → Answers → Questions → Anomalies → Hex) |
+| `Up` / `Down`, `j` / `k` | move within the focused pane (scroll Hex / Anomalies when focused) |
 | `h` / `l`, `←` / `→` | jump between host groups |
 | `H` / `L` | first / last host group |
 | `Home` / `End` | first / last row of the focused pane (top / bottom of Hex) |
@@ -133,6 +134,48 @@ browsed as before.
 
 The header always shows the live hints. In the metrics overlay, `j`/`k`
 and paging keys scroll instead, and `Tab`/`Enter` do nothing.
+
+## Anomalies
+
+mex continuously checks observed traffic against the mDNS/DNS-SD RFCs
+and surfaces each deviation as an anomaly with a severity:
+
+- **error** — a definite RFC violation (e.g. a shared record with the
+  cache-flush bit set, a unicast-only type leaked onto multicast).
+- **warning** — a likely misconfiguration (e.g. a service with no
+  address records, a PTR re-announced with a 120 s TTL instead of the
+  conventional 4500 s).
+- **info** — a SHOULD-level deviation, shown only in the metrics
+  overlay and state dumps (e.g. a unique record missing its
+  cache-flush bit).
+
+Findings show up in several places: anomalous Answers rows get a `!`
+marker (on the type cell, or on the TTL cell when the TTL itself is
+the problem), anomalous Questions rows get one on the type, instances
+carry a `[!N]` badge in the Hosts pane, and the Anomalies pane lists
+every finding for the selected service with a `>` marker on the
+highlighted row's findings. The metrics overlay (`m`) lists all
+findings with severity icons, and `Ctrl+J` state dumps include the
+full list.
+
+| Finding | Meaning |
+| --- | --- |
+| `missing-addr` (warning) | hostname with a live SRV record but no live A/AAAA (RFC 6763 §12) |
+| `type-format` (warning) | malformed service type, subtype, or enumerated type (RFC 6763 §7) |
+| `shared-flush` (error) | shared PTR record with the cache-flush bit set (RFC 6762 §10.2) |
+| `unique-no-flush` (info) | unique SRV/TXT record missing the cache-flush bit (RFC 6762 §10.2) |
+| `unicast-leak` (error: NS/SOA/ANY, warning: MX) | unicast-only type answered on multicast (RFC 6762 §3) |
+| `unicast-question` (error: NS/SOA, warning: MX) | multicast question asking for a unicast-only type (RFC 6762 §3); ANY questions are ownership probes and stay quiet |
+| `ttl-low` / `ttl-high` (warning) | TTL below 10 s (churn risk) or above 7200 s (stale-cache risk) (RFC 6762 §5.2) |
+| `ttl-base-mismatch` (warning) | service PTR at ≤ 120 s instead of the conventional 4500 s base (RFC 6762 §10) |
+| `ttl-unstable` (warning) | same name and type announced with different TTL bases (RFC 6762 §5.2) |
+| `srv-target` (warning) | SRV target malformed or outside `.local` (RFC 6763 §12) |
+| `txt-oversize` (warning) | TXT payload over ~1300 B, risking fragmentation (RFC 6762 §17) |
+
+Reverse-mapping PTRs (`*.in-addr.arpa`, `*.ip6.arpa`) are exempt from
+the shared-record rules: they are unique records. Omitting the flush
+bit on A/AAAA records and publishing TXT records at 120 s are
+universal practice and stay quiet.
 
 ## Build & run
 
