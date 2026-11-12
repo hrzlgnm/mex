@@ -275,7 +275,7 @@ fn dedup(mut items: Vec<Anomaly>) -> Vec<Anomaly> {
             _ => String::new(),
         };
         let context_key = match a.kind {
-            "unicast-leak" | "unique-no-flush" => a.message.clone(),
+            "unicast-leak" | "no-flush" => a.message.clone(),
             _ => String::new(),
         };
         let key = (
@@ -683,7 +683,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             "missing flush bit".to_string()
         };
         out.push(Anomaly {
-            kind: "unique-no-flush",
+            kind: "no-flush",
             severity: if confirmed {
                 Severity::Warning
             } else {
@@ -1562,7 +1562,7 @@ mod tests {
         let found = analyze_service("My", "_http._tcp.local", "myhost.local.", &answers);
         let item = found
             .iter()
-            .find(|a| a.kind == "unique-no-flush")
+            .find(|a| a.kind == "no-flush")
             .expect("expected finding");
         assert_eq!(item.severity, Severity::Warning);
         // Same record via unicast reply: Info only (bit MUST NOT be set
@@ -1580,7 +1580,7 @@ mod tests {
         let found = analyze_service("My", "_http._tcp.local", "myhost.local.", &answers);
         let item = found
             .iter()
-            .find(|a| a.kind == "unique-no-flush")
+            .find(|a| a.kind == "no-flush")
             .expect("expected finding");
         assert_eq!(item.severity, Severity::Info);
     }
@@ -1601,7 +1601,7 @@ mod tests {
             rec("myhost.local.", 28, "AAAA", "fe80::1", 120, false),
         ];
         let found = analyze_service("My", "_http._tcp.local", "myhost.local.", &answers);
-        assert!(!found.iter().any(|a| a.kind == "unique-no-flush"));
+        assert!(!found.iter().any(|a| a.kind == "no-flush"));
     }
 
     #[test]
