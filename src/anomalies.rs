@@ -281,9 +281,15 @@ fn dedup(mut items: Vec<Anomaly>) -> Vec<Anomaly> {
         // Questions carry no rdata: tell queriers apart by source, so each
         // leaking querier keeps its own finding and every row can mark.
         // Answers keep the established behavior (one finding no matter how
-        // many sources announce it).
+        // many sources announce it) — except context-gated kinds, where
+        // the same rdata via multicast vs unicast (or answer vs
+        // authority) is a different verdict and must not collapse.
         let source_key = match a.kind {
             "unicast-question" => a.source.clone().unwrap_or_default(),
+            _ => String::new(),
+        };
+        let context_key = match a.kind {
+            "unicast-leak" | "unique-no-flush" => a.message.clone(),
             _ => String::new(),
         };
         let key = (
@@ -293,6 +299,7 @@ fn dedup(mut items: Vec<Anomaly>) -> Vec<Anomaly> {
             a.rtype.unwrap_or(0),
             rdata_key,
             source_key,
+            context_key,
         );
         if seen.insert(key) {
             out.push(a);
@@ -583,27 +590,45 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     let rdata = rec.rdata.clone();
     let src = rec.source.to_string();
 
-    // Unicast-only types leaking onto multicast. MX is the soft case:
-    // nothing in the RFCs legitimizes mail routing over mDNS, but unlike
-    // SOA/NS/ANY it is not an explicitly unicast-only type, so it stays
-    // a warning about a possible leak rather than a definite violation.
-    // Single shared verdict (also used for observed questions): definite
-    // violations are errors, suspected leaks are warnings.
-    if let Some(severity) = unicast_severity(rec.rtype) {
-        let message = if severity == Severity::Error {
-            format!(
-                "{} record leaked onto multicast (unicast-only type)",
-                rec.rtype_str
-            )
+    // Unicast-only types on mDNS. Definite violations (Error) require
+    // confirmed context: a multicast-destination answer section (RFC 6762
+    // §3 defines no NS/SOA delegations for .local). The same type via a
+    // unicast reply or a non-answer section is only a Warning pending
+    // capture verification — the destination/section is named so users
+    // can tell which case they have.
+    if let Some(base) = unicast_severity(rec.rtype) {
+        let confirmed = rec.dst_is_multicast && rec.section == crate::browse::RecordSection::Answer;
+        let context = if !rec.dst_is_multicast {
+            "unicast reply".to_string()
         } else {
-            format!(
-                "{} record on multicast (possible unicast leak)",
-                rec.rtype_str
-            )
+            format!("{:?} section", rec.section).to_lowercase()
         };
-        let requirement = match severity {
-            Severity::Error => "MUST NOT",
-            _ => "SHOULD NOT",
+        let (severity, message, requirement) = if confirmed {
+            let message = if base == Severity::Error {
+                format!(
+                    "{} record in multicast answer is not defined for mDNS (multicast answer)",
+                    rec.rtype_str
+                )
+            } else {
+                format!(
+                    "{} record on multicast (possible unicast leak; multicast answer)",
+                    rec.rtype_str
+                )
+            };
+            let requirement = match base {
+                Severity::Error => "MUST NOT",
+                _ => "SHOULD NOT",
+            };
+            (base, message, requirement)
+        } else {
+            (
+                Severity::Warning,
+                format!(
+                    "{} record outside multicast answer ({context}; verify capture)",
+                    rec.rtype_str
+                ),
+                "SHOULD NOT",
+            )
         };
         out.push(Anomaly {
             kind: "unicast-leak",
@@ -952,6 +977,35 @@ mod tests {
             ifindex: 0,
             dst_is_multicast: true,
             section: crate::browse::RecordSection::Answer,
+            received_at: Instant::now(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rec_with(
+        name: &str,
+        rtype: u16,
+        rtype_str: &str,
+        rdata: &str,
+        ttl: u32,
+        flush: bool,
+        dst_is_multicast: bool,
+        section: crate::browse::RecordSection,
+    ) -> RawRecord {
+        RawRecord {
+            name: name.to_string(),
+            rtype,
+            rtype_str: rtype_str.to_string(),
+            flush_bit: flush,
+            qu: false,
+            ttl,
+            rdata: rdata.to_string(),
+            wire: Vec::new(),
+            source: test_source(),
+            iface: String::new(),
+            ifindex: 0,
+            dst_is_multicast,
+            section,
             received_at: Instant::now(),
         }
     }
@@ -1387,6 +1441,44 @@ mod tests {
             .iter()
             .filter(|a| a.kind == "unicast-leak")
             .all(|a| a.severity == Severity::Error));
+    }
+
+    #[test]
+    fn unicast_leak_downgraded_outside_multicast_answer() {
+        use crate::browse::RecordSection;
+        // Same SOA via unicast reply and via authority section: Warning
+        // pending verification, naming the context for the user.
+        for (mcast, section) in [
+            (false, RecordSection::Answer),
+            (true, RecordSection::Authority),
+            (true, RecordSection::Additional),
+        ] {
+            let answers = vec![rec_with(
+                "host.local.",
+                6,
+                "SOA",
+                "host.local. admin 1 2 3 4 5",
+                120,
+                false,
+                mcast,
+                section,
+            )];
+            let found = analyze_service("My", "_http._tcp.local", "host.local.", &answers);
+            let item = found
+                .iter()
+                .find(|a| a.kind == "unicast-leak")
+                .expect("expected leak");
+            assert_eq!(
+                item.severity,
+                Severity::Warning,
+                "mcast={mcast} section={section:?}"
+            );
+            assert!(
+                item.message.contains("verify capture"),
+                "got: {}",
+                item.message
+            );
+        }
     }
 
     #[test]
