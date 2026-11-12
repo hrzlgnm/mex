@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io;
 use std::io::IsTerminal;
 use std::net::SocketAddr;
@@ -421,18 +421,23 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
                         [first] => format!(" · {first}"),
                         [first, rest @ ..] => format!(" · {first} (+{})", rest.len()),
                     };
-                    let line = Line::from(Span::styled(
-                        format!("{glyph} {display} ({count}){addr_suffix}"),
-                        if is_selected {
-                            Style::default()
-                                .add_modifier(Modifier::BOLD)
-                                .fg(Color::Yellow)
-                        } else {
-                            Style::default()
-                                .add_modifier(Modifier::BOLD)
-                                .fg(Color::Blue)
-                        },
-                    ));
+                    let base = if is_selected {
+                        Style::default()
+                            .add_modifier(Modifier::BOLD)
+                            .fg(Color::Yellow)
+                    } else {
+                        Style::default()
+                            .add_modifier(Modifier::BOLD)
+                            .fg(Color::Blue)
+                    };
+                    // The hostname is italic: group headers describe
+                    // app-side grouping, not wire records. Terminals
+                    // without italic support render it plain.
+                    let line = Line::from(vec![
+                        Span::styled(format!("{glyph} "), base),
+                        Span::styled(display, base.add_modifier(Modifier::ITALIC)),
+                        Span::styled(format!(" ({count}){addr_suffix}"), base),
+                    ]);
                     ListItem::new(line)
                 }
                 DisplayItem::Instance { index } => {
@@ -747,7 +752,12 @@ fn detail_table_rows<'a>(
 ) -> (Vec<Row<'a>>, Vec<usize>) {
     let mut rows = Vec::new();
 
-    let info_style = Style::default().fg(Color::Green);
+    let info_style = Style::default()
+        .fg(Color::Green)
+        .add_modifier(Modifier::ITALIC);
+    // TXT pair children show verbatim wire content, so they stay
+    // upright: only the constructed header rows are italic.
+    let pair_style = Style::default().fg(Color::Green);
     let dim = Style::default().fg(Color::Gray);
     let local_style = Style::default()
         .fg(Color::Green)
@@ -913,7 +923,7 @@ fn detail_table_rows<'a>(
                             Span::raw(*pair),
                         ]))
                         .column_span(5)])
-                        .style(info_style),
+                        .style(pair_style),
                     );
                 }
             }
@@ -1003,7 +1013,7 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
             target
                 .ordered_questions()
                 .iter()
-                .map(|(_, _, source, _, _)| source.to_string().len())
+                .map(|(_, _, source, _, _)| question_source_label(source).len())
                 .max()
                 .unwrap_or(14)
                 .clamp(14, 45) as u16,
@@ -1066,10 +1076,13 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
 }
 
 /// Source cell for the Questions table: our own inferred sends render
-/// as `self`, everything else as the querier address.
+/// as `self`, one-shot resolvers (§5.1, ephemeral source port) get a tag,
+/// everything else as the querier address.
 fn question_source_label(source: &SocketAddr) -> String {
     if *source == crate::app::SELF_SOURCE {
         "self".to_string()
+    } else if crate::anomalies::is_one_shot_querier(source) {
+        format!("{source} (one-shot)")
     } else {
         source.to_string()
     }
@@ -1089,16 +1102,8 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
     };
     let dimmed = Style::default().fg(Color::Gray);
     // Row identities already claimed in this pane: a repeated
-    // (name, type) needs its rdata to tell the findings apart.
-    let mut identity_count: HashMap<(String, u16), usize> = HashMap::new();
-    for p in &findings {
-        let a = &p.anomaly;
-        if let (Some(name), Some(rtype)) = (&a.record_name, a.rtype) {
-            *identity_count
-                .entry((name.trim_end_matches('.').to_lowercase(), rtype))
-                .or_insert(0) += 1;
-        }
-    }
+    // (name, type) names its rdata to tell the findings apart.
+    let identity_count = crate::anomalies::identity_counts(findings.iter().map(|p| &p.anomaly));
     let finding_lines = |findings: &[crate::app::PaneAnomaly]| -> Vec<Line<'_>> {
         if findings.is_empty() {
             return vec![Line::from(Span::styled(
@@ -1115,34 +1120,17 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
                     crate::anomalies::Severity::Warning => Color::Yellow,
                     crate::anomalies::Severity::Info => Color::Blue,
                 };
-                // Which row the finding belongs to: empty for
-                // service-level findings, which describe the target.
-                // Question sources render as stored (self sends never
-                // produce findings, so no `self` case arises).
-                let scope = match (&a.record_name, a.rtype_str.as_deref()) {
-                    (Some(name), Some(rtype)) if crate::anomalies::is_question_kind(a.kind) => {
-                        format!(
-                            "QRY {rtype} {name} @ {}",
-                            a.source.as_deref().unwrap_or("?")
-                        )
-                    }
-                    (Some(name), Some(rtype)) => {
-                        let base = format!("{rtype} {name}");
-                        let key = (
-                            name.trim_end_matches('.').to_lowercase(),
-                            a.rtype.unwrap_or(0),
-                        );
-                        match (&a.rdata, identity_count.get(&key)) {
-                            (Some(rdata), Some(&n)) if n > 1 => format!("{base} = {rdata}"),
-                            _ => base,
-                        }
-                    }
-                    _ => String::new(),
-                };
+                // Which row the finding belongs to: the shared helper
+                // omits service-level and enumeration rows (constant or
+                // absent identity) and disambiguates repeated identities
+                // with `= rdata`. Question scopes render as stored (self
+                // sends never produce findings, so no `self` case arises).
+                let scope = crate::anomalies::visible_scope(a, &identity_count);
+                // No severity word: the level icon already carries it.
                 let head = if scope.is_empty() {
-                    format!("{} {}", a.severity.as_str(), a.kind)
+                    a.kind.to_string()
                 } else {
-                    format!("{} {} {scope}", a.severity.as_str(), a.kind)
+                    format!("{} {scope}", a.kind)
                 };
                 Line::from(vec![
                     Span::styled(
@@ -1155,7 +1143,12 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
                     ),
                     Span::raw(" "),
                     Span::styled(
-                        format!("{head}: {}", a.message),
+                        // `<icon> <source> <kind…> <text>`; unsourced findings
+                        // omit the source slot.
+                        match a.source.as_deref() {
+                            Some(src) => format!("{src}: {head}: {}", a.message),
+                            _ => format!("{head}: {}", a.message),
+                        },
                         Style::default().fg(Color::White),
                     ),
                     Span::styled(
@@ -1366,6 +1359,12 @@ mod tests {
         assert_eq!(question_source_label(&crate::app::SELF_SOURCE), "self");
         let addr: SocketAddr = "192.168.1.5:5353".parse().unwrap();
         assert_eq!(question_source_label(&addr), "192.168.1.5:5353");
+        // Ephemeral source ports (§5.1) mark one-shot resolvers; other
+        // ports render bare.
+        let stub: SocketAddr = "192.168.1.5:45678".parse().unwrap();
+        assert_eq!(question_source_label(&stub), "192.168.1.5:45678 (one-shot)");
+        let dns: SocketAddr = "192.168.1.5:53".parse().unwrap();
+        assert_eq!(question_source_label(&dns), "192.168.1.5:53");
     }
 
     #[cfg(unix)]

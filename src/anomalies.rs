@@ -68,7 +68,7 @@ impl Anomaly {
 /// Anomaly kinds where the TTL itself is the problem, not the record
 /// content: rows with only these findings mark the TTL cell instead of
 /// the type cell.
-pub const TTL_KINDS: &[&str] = &["ttl-low", "ttl-high", "ttl-base-mismatch", "ttl-unstable"];
+pub const TTL_KINDS: &[&str] = &["ttl-low", "ttl-high", "ttl-mismatch", "ttl-unstable"];
 
 /// Whether `kind` is a TTL problem (marks the TTL cell, not the type).
 pub fn is_ttl_kind(kind: &str) -> bool {
@@ -190,7 +190,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
                     rtype_str: Some(rec.rtype_str.clone()),
                     rdata: Some(rec.rdata.clone()),
                     source: Some(rec.source.to_string()),
-                    message: format!("enumerated type {target} invalid: {reason}"),
+                    message: format!("bad enumerated type {target}: {reason}"),
                     rfc: "RFC 6763 §7",
                     requirement: "MUST",
                 });
@@ -199,7 +199,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
                 // (e.g. _T35._sub._matterd._udp.local) is queried
                 // separately and does not belong in the enumeration list.
                 out.push(Anomaly {
-                    kind: "subtype-in-enumeration",
+                    kind: "enum-subtype",
                     severity: Severity::Warning,
                     service: ENUMERATION_SERVICE.to_string(),
                     record_name: Some(rec.name.clone()),
@@ -207,9 +207,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
                     rtype_str: Some(rec.rtype_str.clone()),
                     rdata: Some(rec.rdata.clone()),
                     source: Some(rec.source.to_string()),
-                    message: format!(
-                        "enumerated type {target} is a subtype; enumeration should list base service types"
-                    ),
+                    message: format!("{target} is a subtype; want base type"),
                     rfc: "RFC 6763 §9",
                     requirement: "SHOULD",
                 });
@@ -234,18 +232,6 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
             .then_with(|| a.rdata.cmp(&b.rdata))
     });
     dedup(out)
-        // Every finding with a known announcer names it, so overlay rows and
-        // dump messages read identically whether the finding is service- or
-        // enumeration-level. Findings without an announcer (missing-addr,
-        // service-level type-format, ttl-unstable) are untouched.
-        .into_iter()
-        .map(|mut a| {
-            if let Some(src) = a.source.clone() {
-                a.message.push_str(&format!(" (from {src})"));
-            }
-            a
-        })
-        .collect()
 }
 
 fn severity_rank(s: Severity) -> u8 {
@@ -289,7 +275,7 @@ fn dedup(mut items: Vec<Anomaly>) -> Vec<Anomaly> {
             _ => String::new(),
         };
         let context_key = match a.kind {
-            "unicast-leak" | "unique-no-flush" => a.message.clone(),
+            "unicast-leak" | "no-flush" => a.message.clone(),
             _ => String::new(),
         };
         let key = (
@@ -369,7 +355,7 @@ fn check_missing_addr(
         rtype_str: None,
         rdata: None,
         source: None,
-        message: format!("hostname {host} has no live A/AAAA"),
+        message: format!("no A/AAAA for {host}"),
         rfc: "RFC 6763 §12",
         requirement: "SHOULD",
     });
@@ -390,7 +376,7 @@ fn check_type_format(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>
             rtype_str: None,
             rdata: None,
             source: None,
-            message: format!("service type {st} invalid: {reason}"),
+            message: format!("bad type {st}: {reason}"),
             rfc: "RFC 6763 §7",
             requirement: "MUST",
         });
@@ -495,12 +481,92 @@ fn check_subtypes(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>) {
                 rtype_str: None,
                 rdata: None,
                 source: None,
-                message: format!("subtype {sub} invalid: {reason}"),
+                message: format!("bad subtype {sub}: {reason}"),
                 rfc: "RFC 6763 §7.1",
                 requirement: "MUST",
             });
         }
     }
+}
+
+/// Row identity for a finding (`QRY …` for demand-side questions,
+/// `TYPE name` otherwise): the shared core of every display scope.
+fn finding_scope(a: &Anomaly) -> String {
+    match (&a.record_name, a.rtype_str.as_deref()) {
+        (Some(name), Some(rtype)) if is_question_kind(a.kind) => {
+            format!("QRY {rtype} {name}")
+        }
+        (Some(name), Some(rtype)) => format!("{rtype} {name}"),
+        _ => String::new(),
+    }
+}
+
+/// How many findings share each pointed-to row identity, keyed by
+/// lowercased `(record name, type)`: rows whose identity repeats name
+/// their rdata so identical findings tell apart. Shared by the pane
+/// and the overlay so repeated identities disambiguate the same way.
+pub(crate) fn identity_counts<'a, I>(items: I) -> HashMap<(String, u16), usize>
+where
+    I: IntoIterator<Item = &'a Anomaly>,
+{
+    let mut counts = HashMap::new();
+    for a in items {
+        if let (Some(name), Some(rtype)) = (&a.record_name, a.rtype) {
+            *counts
+                .entry((name.trim_end_matches('.').to_lowercase(), rtype))
+                .or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// Display scope for a finding, shared by the Anomalies pane and the
+/// metrics overlay: empty for service-level findings and enumeration
+/// rows (constant owner; the message carries the target instead), the
+/// QRY or `TYPE name` identity otherwise — plus `= rdata` when siblings
+/// share the identity so every row stays tellable-apart, unless the
+/// rdata just repeats the service itself (the usual PTR shape: the
+/// service column already names it). Question findings always keep
+/// their QRY scope: the queried type varies.
+pub(crate) fn visible_scope(a: &Anomaly, identity_count: &HashMap<(String, u16), usize>) -> String {
+    if is_enumeration_row(&a.service, a.record_name.as_deref()) && !is_question_kind(a.kind) {
+        return String::new();
+    }
+    let base = finding_scope(a);
+    if base.is_empty() {
+        return base;
+    }
+    let key = (
+        a.record_name
+            .as_deref()
+            .unwrap_or("")
+            .trim_end_matches('.')
+            .to_lowercase(),
+        a.rtype.unwrap_or(0),
+    );
+    match (&a.rdata, identity_count.get(&key)) {
+        (Some(rdata), Some(&n))
+            if n > 1
+                && !rdata
+                    .trim_end_matches('.')
+                    .eq_ignore_ascii_case(a.service.trim_end_matches('.')) =>
+        {
+            format!("{base} = {rdata}")
+        }
+        _ => base,
+    }
+}
+
+/// Whether a finding sits on the enumeration row itself (owner
+/// `_services._dns-sd._udp.local`): its scope is constant across every
+/// enumeration finding, so views omit it and let the message carry the
+/// varying target instead.
+pub(crate) fn is_enumeration_row(service: &str, record_name: Option<&str>) -> bool {
+    service == ENUMERATION_SERVICE
+        && record_name.is_some_and(|n| {
+            n.trim_end_matches('.')
+                .eq_ignore_ascii_case("_services._dns-sd._udp.local")
+        })
 }
 
 /// Whether a PTR owner name is a reverse-mapping name. Those PTRs are
@@ -531,6 +597,17 @@ pub(crate) fn question_unicast_severity(rtype: u16) -> Option<Severity> {
         15 => Some(Severity::Warning),
         _ => None,
     }
+}
+
+/// One-shot (stub) resolver per RFC 6762 §5.1: port 5353 signals a
+/// compliant continuous querier (§5.2), so any other source port is a
+/// stub asking from an ephemeral port — anything at or above 1024
+/// reads as one-shot, i.e. "not a full 5353 querier" (this deliberately
+/// includes registered-range ports). Port 0 is our own inferred send
+/// path, never a real querier; well-known ports stay untagged since no
+/// defined mDNS querier lives there.
+pub(crate) fn is_one_shot_querier(source: &SocketAddr) -> bool {
+    source.port() != 5353 && source.port() >= 1024
 }
 
 /// Numeric type for a displayed `rtype_str` (`A` → 1, …, `TYPE47` → 47).
@@ -567,6 +644,13 @@ fn check_question(q: &QuestionView, out: &mut Vec<Anomaly>) {
         Severity::Error => "MUST NOT",
         _ => "SHOULD NOT",
     };
+    // A stub resolver asking from an ephemeral port explains the leak
+    // differently than a full mDNS stack, so the finding says which.
+    let message = if is_one_shot_querier(&q.source) {
+        "unicast-only type on multicast (one-shot querier)".to_string()
+    } else {
+        "unicast-only type on multicast".to_string()
+    };
     out.push(Anomaly {
         kind: "unicast-question",
         severity,
@@ -576,10 +660,7 @@ fn check_question(q: &QuestionView, out: &mut Vec<Anomaly>) {
         rtype_str: Some(q.rtype_str.to_string()),
         rdata: None,
         source: Some(q.source.to_string()),
-        message: format!(
-            "{} question for {name} on multicast (unicast-only type)",
-            q.rtype_str,
-        ),
+        message,
         rfc: "RFC 6762 §3",
         requirement,
     });
@@ -604,16 +685,12 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             format!("{:?} section", rec.section).to_lowercase()
         };
         let (severity, message, requirement) = if confirmed {
+            // The overlay has no record columns, so the message keeps the
+            // rtype: it names what is not defined for mDNS.
             let message = if base == Severity::Error {
-                format!(
-                    "{} record in multicast answer is not defined for mDNS (multicast answer)",
-                    rec.rtype_str
-                )
+                format!("{} not defined for mDNS", rec.rtype_str)
             } else {
-                format!(
-                    "{} record on multicast (possible unicast leak; multicast answer)",
-                    rec.rtype_str
-                )
+                format!("{} possible unicast leak", rec.rtype_str)
             };
             let requirement = match base {
                 Severity::Error => "MUST NOT",
@@ -624,7 +701,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             (
                 Severity::Warning,
                 format!(
-                    "{} record outside multicast answer ({context}; verify capture)",
+                    "{} outside multicast answer ({context}); verify",
                     rec.rtype_str
                 ),
                 "SHOULD NOT",
@@ -648,7 +725,18 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     // Cache-flush bit misuse: shared records must not set it. Reverse
     // mapping PTRs are the exception: the RFC treats them as unique (no
     // other host may claim the same address), so the bit is correct there.
+    // Enumeration rows share one owner, so the message names the target
+    // for the same reason as ttl-mismatch: both renderers show the
+    // message verbatim there.
     if rec.rtype == 12 && rec.flush_bit && !is_reverse_ptr(&rec.name) {
+        let message = if service_id == ENUMERATION_SERVICE {
+            format!(
+                "shared PTR record {} has cache-flush bit set",
+                rec.rdata.trim_end_matches('.')
+            )
+        } else {
+            "shared record with flush bit set".to_string()
+        };
         out.push(Anomaly {
             kind: "shared-flush",
             severity: Severity::Error,
@@ -658,7 +746,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             rtype_str: Some(rec.rtype_str.clone()),
             rdata: Some(rdata.clone()),
             source: Some(src.clone()),
-            message: "shared PTR record has cache-flush bit set".to_string(),
+            message,
             rfc: "RFC 6762 §10.2",
             requirement: "MUST NOT",
         });
@@ -673,15 +761,12 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     if matches!(rec.rtype, 33 | 16) && !rec.flush_bit {
         let confirmed = rec.dst_is_multicast && rec.section == crate::browse::RecordSection::Answer;
         let message = if confirmed {
-            format!(
-                "unique {} record missing cache-flush bit (multicast answer; cache-coherency risk)",
-                rec.rtype_str
-            )
+            "missing flush bit; coherency risk".to_string()
         } else {
-            format!("unique {} record missing cache-flush bit", rec.rtype_str)
+            "missing flush bit".to_string()
         };
         out.push(Anomaly {
-            kind: "unique-no-flush",
+            kind: "no-flush",
             severity: if confirmed {
                 Severity::Warning
             } else {
@@ -712,11 +797,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             rtype_str: Some(rec.rtype_str.clone()),
             rdata: Some(rdata.clone()),
             source: Some(src.clone()),
-            message: format!(
-                "TTL {}s is far below the expected base ({}s recommended, SHOULD)",
-                rec.ttl,
-                expected_base(rec.rtype)
-            ),
+            message: format!("TTL {}s, want ~{}s", rec.ttl, expected_base(rec.rtype)),
             rfc: "RFC 6762 §5.2",
             requirement: "SHOULD",
         });
@@ -730,11 +811,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             rtype_str: Some(rec.rtype_str.clone()),
             rdata: Some(rdata),
             source: Some(src),
-            message: format!(
-                "TTL {}s is far above the expected base ({}s recommended, SHOULD)",
-                rec.ttl,
-                expected_base(rec.rtype)
-            ),
+            message: format!("TTL {}s, want ~{}s", rec.ttl, expected_base(rec.rtype)),
             rfc: "RFC 6762 §5.2",
             requirement: "SHOULD",
         });
@@ -753,20 +830,20 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         // Enumeration rows all share the owner name, so name the
         // enumerated type: otherwise every finding reads identically.
         // The announcer is appended centrally below.
+        // The row shows the TTL and target; the message repeats the
+        // observed TTL (the overlay has no record columns) and, for
+        // enumeration rows, the target that tells identical rows apart.
         let message = if service_id == ENUMERATION_SERVICE {
             format!(
-                "PTR for {} TTL is {}s; RFC recommends 4500s (SHOULD)",
+                "PTR {} TTL {}s; want 4500s",
                 rec.rdata.trim_end_matches('.'),
                 rec.ttl
             )
         } else {
-            format!(
-                "PTR base TTL is {}s; RFC recommends 4500s (SHOULD)",
-                rec.ttl
-            )
+            format!("PTR base TTL {}s; want 4500s", rec.ttl)
         };
         out.push(Anomaly {
-            kind: "ttl-base-mismatch",
+            kind: "ttl-mismatch",
             severity: Severity::Info,
             service: service_id.to_string(),
             record_name: Some(rec.name.clone()),
@@ -791,6 +868,8 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     if rec.rtype == 16 {
         // Encoded length is this plus ~1 length byte per TXT string;
         // negligible against the threshold, so the decoded length rules.
+        // The row shows the payload; the overlay has no record columns,
+        // so the message repeats the observed length.
         let payload_len = rec.rdata.len();
         if payload_len > TXT_MAX {
             out.push(Anomaly {
@@ -802,7 +881,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
                 rtype_str: Some(rec.rtype_str.clone()),
                 rdata: Some(rec.rdata.clone()),
                 source: Some(rec.source.to_string()),
-                message: format!("TXT payload ~{payload_len}B exceeds {TXT_MAX}B"),
+                message: format!("TXT ~{payload_len}B, max {TXT_MAX}B"),
                 rfc: "RFC 6762 §17",
                 requirement: "SHOULD",
             });
@@ -813,7 +892,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
 fn check_srv_target(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     let parts: Vec<&str> = rec.rdata.split_whitespace().collect();
     if parts.len() < 4 {
-        out.push(srv_anomaly(service_id, rec, "SRV rdata is malformed"));
+        out.push(srv_anomaly(service_id, rec, "malformed rdata"));
         return;
     }
     // Priority, weight, and port are 16-bit fields; port 0 stays valid.
@@ -826,7 +905,7 @@ fn check_srv_target(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             out.push(srv_anomaly(
                 service_id,
                 rec,
-                &format!("SRV {field} '{value}' is not a 16-bit number"),
+                &format!("bad {field}: want 16-bit"),
             ));
             return;
         }
@@ -834,14 +913,14 @@ fn check_srv_target(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     let target = parts[3..].join(" ");
     let trimmed = target.trim().trim_end_matches('.');
     if trimmed.is_empty() || trimmed == "." {
-        out.push(srv_anomaly(service_id, rec, "SRV target is empty"));
+        out.push(srv_anomaly(service_id, rec, "empty target"));
         return;
     }
     if let Some(reason) = dns_name_problem(trimmed) {
         out.push(srv_anomaly(
             service_id,
             rec,
-            &format!("SRV target {target} invalid: {reason}"),
+            &format!("bad target: {reason}"),
         ));
         return;
     }
@@ -852,7 +931,7 @@ fn check_srv_target(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         out.push(srv_anomaly_info(
             service_id,
             rec,
-            &format!("SRV target {target} requires resolution outside mDNS"),
+            "target needs unicast DNS",
         ));
     }
 }
@@ -954,7 +1033,7 @@ fn check_ttl_stable(svc: &ServiceView, service_id: &str, now: Instant, out: &mut
                 rtype_str,
                 rdata: None,
                 source: None,
-                message: format!("unstable TTL bases {sorted:?} for same name/type"),
+                message: format!("mixed TTL bases {sorted:?}"),
                 rfc: "RFC 6762 §5.2",
                 requirement: "SHOULD",
             });
@@ -1246,10 +1325,11 @@ mod tests {
             .clone();
         assert_eq!(item.service, "enumeration");
         assert_eq!(item.severity, Severity::Error);
-        assert!(
-            item.message.contains("192.168.1.2"),
-            "message should name the announcer, got: {}",
-            item.message
+        assert_eq!(
+            item.source.as_deref(),
+            Some("192.168.1.2:5353"),
+            "finding should name the announcer, got: {:?}",
+            item.source
         );
     }
 
@@ -1309,14 +1389,64 @@ mod tests {
         assert_eq!(item.service, "My._http._tcp.local");
         assert_eq!(item.record_name.as_deref(), Some("fritz.box."));
         assert_eq!(item.rtype, Some(6));
+        assert_eq!(
+            item.source.as_deref(),
+            Some("192.168.1.9:5353"),
+            "finding should name the querier, got: {:?}",
+            item.source
+        );
+    }
+
+    #[test]
+    fn unicast_question_marks_one_shot_querier() {
+        // A stub resolver asking from an ephemeral port (§5.1) reads
+        // differently than a full mDNS stack on 5353.
+        let stub: SocketAddr = "192.168.1.9:45678".parse().unwrap();
+        let found = analyze_questions(&[qview("My._http._tcp.local", "fritz.box.", 6, stub)]);
+        let item = found
+            .iter()
+            .find(|a| a.kind == "unicast-question")
+            .expect("expected SOA question leak");
         assert!(
-            item.message.contains("192.168.1.9"),
-            "message should name the querier, got: {}",
+            item.message.contains("one-shot"),
+            "stub resolver should be tagged, got: {}",
             item.message
         );
+        let found =
+            analyze_questions(&[qview("My._http._tcp.local", "fritz.box.", 6, test_source())]);
+        let item = found
+            .iter()
+            .find(|a| a.kind == "unicast-question")
+            .expect("expected SOA question leak");
         assert!(
-            item.message.contains("fritz.box"),
-            "message should name the queried name, got: {}",
+            !item.message.contains("one-shot"),
+            "compliant querier stays untagged, got: {}",
+            item.message
+        );
+        // Well-known ports are no defined mDNS querier either: leave the
+        // finding untagged rather than guessing.
+        let dns: SocketAddr = "192.168.1.9:53".parse().unwrap();
+        let found = analyze_questions(&[qview("My._http._tcp.local", "fritz.box.", 6, dns)]);
+        let item = found
+            .iter()
+            .find(|a| a.kind == "unicast-question")
+            .expect("expected SOA question leak");
+        assert!(
+            !item.message.contains("one-shot"),
+            "well-known port stays untagged, got: {}",
+            item.message
+        );
+        // Registered-range ports are not full 5353 queriers either, so
+        // they read as one-shot by design.
+        let other: SocketAddr = "192.168.1.9:5354".parse().unwrap();
+        let found = analyze_questions(&[qview("My._http._tcp.local", "fritz.box.", 6, other)]);
+        let item = found
+            .iter()
+            .find(|a| a.kind == "unicast-question")
+            .expect("expected SOA question leak");
+        assert!(
+            item.message.contains("one-shot"),
+            "non-5353 port reads as one-shot, got: {}",
             item.message
         );
     }
@@ -1490,11 +1620,7 @@ mod tests {
                 Severity::Warning,
                 "mcast={mcast} section={section:?}"
             );
-            assert!(
-                item.message.contains("verify capture"),
-                "got: {}",
-                item.message
-            );
+            assert!(item.message.contains("; verify"), "got: {}", item.message);
         }
     }
 
@@ -1512,6 +1638,84 @@ mod tests {
         assert!(found
             .iter()
             .any(|a| a.kind == "shared-flush" && a.severity == Severity::Error));
+    }
+
+    #[test]
+    fn enumeration_shared_flush_names_target() {
+        // Enumeration rows share one owner, so the message names the
+        // target: both renderers show the message verbatim there.
+        let flushed = rec(
+            "_services._dns-sd._udp.local.",
+            12,
+            "PTR",
+            "_fog._tcp.local.",
+            4500,
+            true,
+        );
+        let snap = Snapshot {
+            services: Vec::new(),
+            enum_answers: vec![&flushed],
+            pending_hosts: HashSet::new(),
+            questions: Vec::new(),
+        };
+        let item = analyze(&snap)
+            .iter()
+            .find(|a| a.kind == "shared-flush" && a.service == "enumeration")
+            .expect("expected enumeration shared-flush")
+            .clone();
+        assert!(
+            item.message.contains("_fog._tcp.local"),
+            "enum finding should name its target, got: {}",
+            item.message
+        );
+        // Service-level PTRs keep the short message: the row names them.
+        let found = analyze_service(
+            "X",
+            "_http._tcp.local",
+            "",
+            &[rec(
+                "_http._tcp.local.",
+                12,
+                "PTR",
+                "X._http._tcp.local.",
+                4500,
+                true,
+            )],
+        );
+        let item = found
+            .iter()
+            .find(|a| a.kind == "shared-flush")
+            .expect("expected shared-flush");
+        assert_eq!(item.message, "shared record with flush bit set");
+    }
+
+    #[test]
+    fn visible_scope_disambiguates_only_foreign_rdata() {
+        fn finding(service: &str, rdata: &str) -> Anomaly {
+            Anomaly {
+                kind: "shared-flush",
+                severity: Severity::Error,
+                service: service.to_string(),
+                record_name: Some("_http._tcp.local.".to_string()),
+                rtype: Some(12),
+                rtype_str: Some("PTR".to_string()),
+                rdata: Some(rdata.to_string()),
+                source: Some("192.168.1.2:5353".to_string()),
+                message: "shared record with flush bit set".to_string(),
+                rfc: "RFC 6762 §10.2",
+                requirement: "MUST NOT",
+            }
+        }
+        // Same service, same owner and type: the foreign target tells the
+        // rows apart, the self-naming one stays short.
+        let same = finding("Test._http._tcp.local", "Test._http._tcp.local.");
+        let other = finding("Test._http._tcp.local", "Other._http._tcp.local.");
+        let counts = identity_counts([&same, &other]);
+        assert_eq!(visible_scope(&same, &counts), "PTR _http._tcp.local.");
+        assert_eq!(
+            visible_scope(&other, &counts),
+            "PTR _http._tcp.local. = Other._http._tcp.local."
+        );
     }
 
     #[test]
@@ -1545,7 +1749,7 @@ mod tests {
         let found = analyze_service("My", "_http._tcp.local", "myhost.local.", &answers);
         let item = found
             .iter()
-            .find(|a| a.kind == "unique-no-flush")
+            .find(|a| a.kind == "no-flush")
             .expect("expected finding");
         assert_eq!(item.severity, Severity::Warning);
         // Same record via unicast reply: Info only (bit MUST NOT be set
@@ -1563,7 +1767,7 @@ mod tests {
         let found = analyze_service("My", "_http._tcp.local", "myhost.local.", &answers);
         let item = found
             .iter()
-            .find(|a| a.kind == "unique-no-flush")
+            .find(|a| a.kind == "no-flush")
             .expect("expected finding");
         assert_eq!(item.severity, Severity::Info);
     }
@@ -1584,7 +1788,7 @@ mod tests {
             rec("myhost.local.", 28, "AAAA", "fe80::1", 120, false),
         ];
         let found = analyze_service("My", "_http._tcp.local", "myhost.local.", &answers);
-        assert!(!found.iter().any(|a| a.kind == "unique-no-flush"));
+        assert!(!found.iter().any(|a| a.kind == "no-flush"));
     }
 
     #[test]
@@ -1612,7 +1816,7 @@ mod tests {
             let found = analyze_service("X", "_http._tcp.local", "", &answers);
             let item = found
                 .iter()
-                .find(|a| a.kind == "ttl-base-mismatch")
+                .find(|a| a.kind == "ttl-mismatch")
                 .unwrap_or_else(|| panic!("PTR@{ttl} should be flagged"));
             assert_eq!(item.severity, Severity::Info);
         }
@@ -1636,18 +1840,20 @@ mod tests {
         };
         let item = analyze(&snap)
             .iter()
-            .find(|a| a.kind == "ttl-base-mismatch")
-            .expect("expected enumeration ttl-base-mismatch")
+            .find(|a| a.kind == "ttl-mismatch")
+            .expect("expected enumeration ttl-mismatch")
             .clone();
-        assert!(
-            item.message.contains("_http._tcp.local"),
-            "message should name the enumerated type, got: {}",
-            item.message
+        assert_eq!(
+            item.rdata.as_deref(),
+            Some("_http._tcp.local."),
+            "finding should point at the enumerated type, got: {:?}",
+            item.rdata
         );
-        assert!(
-            item.message.contains("192.168.1.2"),
-            "message should name the announcer, got: {}",
-            item.message
+        assert_eq!(
+            item.source.as_deref(),
+            Some("192.168.1.2:5353"),
+            "finding should name the announcer, got: {:?}",
+            item.source
         );
     }
 
@@ -1662,13 +1868,13 @@ mod tests {
             false,
         )];
         let found = analyze_service("X", "_http._tcp.local", "", &answers);
-        assert!(!found.iter().any(|a| a.kind == "ttl-base-mismatch"));
+        assert!(!found.iter().any(|a| a.kind == "ttl-mismatch"));
     }
 
     #[test]
     fn reverse_ptr_with_120_base_is_quiet() {
         // Reverse-mapping PTRs are unique with a 120s base, not the 4500s
-        // service PTR convention, so they must not flag ttl-base-mismatch.
+        // service PTR convention, so they must not flag ttl-mismatch.
         for name in [
             "1.0.0.127.in-addr.arpa.",
             "2.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa.",
@@ -1676,7 +1882,7 @@ mod tests {
             let answers = vec![rec(name, 12, "PTR", "myhost.local.", 120, true)];
             let found = analyze_service("X", "_http._tcp.local", "", &answers);
             assert!(
-                !found.iter().any(|a| a.kind == "ttl-base-mismatch"),
+                !found.iter().any(|a| a.kind == "ttl-mismatch"),
                 "reverse PTR {name} at 120s should be quiet"
             );
         }
@@ -1694,7 +1900,7 @@ mod tests {
             true,
         )];
         let found = analyze_service("X", "_http._tcp.local", "myhost.local.", &answers);
-        assert!(!found.iter().any(|a| a.kind == "ttl-base-mismatch"));
+        assert!(!found.iter().any(|a| a.kind == "ttl-mismatch"));
     }
 
     #[test]
@@ -1770,7 +1976,7 @@ mod tests {
             .expect("expected srv-target");
         assert_eq!(item.severity, Severity::Info);
         assert!(
-            item.message.contains("outside mDNS"),
+            item.message.contains("needs unicast DNS"),
             "got: {}",
             item.message
         );
@@ -1910,9 +2116,16 @@ mod tests {
         let found = analyze(&snap);
         let item = found
             .iter()
-            .find(|a| a.kind == "subtype-in-enumeration")
-            .expect("expected subtype-in-enumeration");
+            .find(|a| a.kind == "enum-subtype")
+            .expect("expected enum-subtype");
         assert_eq!(item.severity, Severity::Warning);
+        // The message names the subtype: enumeration rows all share one
+        // scope, so the target tells identical rows apart.
+        assert!(
+            item.message.contains("_T35._sub._matterd._udp.local"),
+            "message should name the subtype, got: {}",
+            item.message
+        );
         // Valid subtype: no naming-shape finding alongside.
         assert!(!found.iter().any(|a| a.kind == "type-format"));
         let base = rec(
@@ -1930,9 +2143,7 @@ mod tests {
             questions: Vec::new(),
         };
         assert!(
-            !analyze(&snap)
-                .iter()
-                .any(|a| a.kind == "subtype-in-enumeration"),
+            !analyze(&snap).iter().any(|a| a.kind == "enum-subtype"),
             "base types stay quiet"
         );
     }

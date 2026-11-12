@@ -752,13 +752,8 @@ impl App {
             // deliver to every match, not just the first.
             let mut hits = Vec::new();
             let mut matched = false;
-            for j in 0..self.services.len() {
-                if self.services[j]
-                    .hostname
-                    .trim_end_matches('.')
-                    .to_lowercase()
-                    == host
-                {
+            for (j, svc) in self.services.iter().enumerate() {
+                if svc.hostname.trim_end_matches('.').to_lowercase() == host {
                     hits.push(j);
                 }
             }
@@ -1573,11 +1568,22 @@ impl App {
                 }
             }
         }
+        // One-shot resolvers (§5.1) ask from ephemeral ports; the rest are
+        // full queriers on 5353. Quiet when none, to keep the common line.
+        let one_shots = queriers
+            .iter()
+            .filter(|q| anomalies::is_one_shot_querier(q))
+            .count();
+        let querier_breakdown = if one_shots > 0 {
+            format!(", {one_shots} one-shot")
+        } else {
+            String::new()
+        };
         kv(
             &mut rows,
             "questions",
             format!(
-                "{current_q} current ({} queriers) · {} ever ({} QU / {} QM) · {} KAs seen",
+                "{current_q} current ({} queriers{querier_breakdown}) · {} ever ({} QU / {} QM) · {} KAs seen",
                 queriers.len(),
                 self.metrics.questions_total,
                 self.metrics.qu_questions_seen,
@@ -1742,11 +1748,34 @@ impl App {
                 format!("{errors} error · {warnings} warning · {infos} info")
             },
         );
+        // Row identities already claimed in this overlay: repeated
+        // identities name their rdata, mirroring the Anomalies pane.
+        let identity_count = anomalies::identity_counts(found.iter());
         for a in found.iter() {
+            // `<source> <service> <scope> <text>`; unsourced findings omit
+            // the source slot, and the key's icon carries the level. The
+            // scope helper omits constant/absent row identities and names
+            // rdata where siblings share the identity. Every row carries
+            // its RFC reference: the key shows no requirement level, and
+            // info-level findings surface nowhere else.
+            let scope = anomalies::visible_scope(a, &identity_count);
+            let scoped = if scope.is_empty() {
+                a.message.clone()
+            } else {
+                format!("{scope}: {}", a.message)
+            };
+            // `<source> <service> <scope> <text>`; unsourced findings omit
+            // the source slot, and the key's icon carries the level. The
+            // colon sits before the message when no scope intervenes.
+            let sep = if scope.is_empty() { ":" } else { "" };
+            let value = match a.source.as_deref() {
+                Some(src) => format!("{src}: {}{sep} {scoped} ({})", a.service, a.rfc),
+                _ => format!("{}{sep} {scoped} ({})", a.service, a.rfc),
+            };
             kv(
                 &mut rows,
                 &format!("{} {}", Self::anomaly_level_icon(a.severity), a.kind),
-                format!("{}: {}", a.service, a.message),
+                value,
             );
         }
 
@@ -3581,17 +3610,10 @@ impl App {
         // One hostname backs many services: file the goodbye on every
         // match (notably TTL 0 A/AAAA) instead of stopping at the first.
         let mut hits = Vec::new();
-        for i in 0..self.services.len() {
-            let full = format!(
-                "{}.{}",
-                self.services[i].instance, self.services[i].service_type
-            )
-            .to_lowercase();
-            let host = self.services[i]
-                .hostname
-                .trim_end_matches('.')
-                .to_lowercase();
-            let inst = self.services[i].instance.to_lowercase();
+        for (i, svc) in self.services.iter().enumerate() {
+            let full = format!("{}.{}", svc.instance, svc.service_type).to_lowercase();
+            let host = svc.hostname.trim_end_matches('.').to_lowercase();
+            let inst = svc.instance.to_lowercase();
             if names.iter().any(|n| *n == full || *n == host || *n == inst) {
                 hits.push(i);
             }
@@ -4071,13 +4093,8 @@ impl App {
         // One hostname backs many services (several SRVs, one host):
         // file on every match, not just the first.
         let mut hits = Vec::new();
-        for i in 0..self.services.len() {
-            if self.services[i]
-                .hostname
-                .trim_end_matches('.')
-                .to_lowercase()
-                == host
-            {
+        for (i, svc) in self.services.iter().enumerate() {
+            if svc.hostname.trim_end_matches('.').to_lowercase() == host {
                 hits.push(i);
             }
         }
@@ -6082,6 +6099,116 @@ mod tests {
     }
 
     #[test]
+    fn metrics_questions_count_one_shot_queriers() {
+        let mut app = two_group_app();
+        let stub: std::net::SocketAddr = "192.168.1.9:45678".parse().unwrap();
+        app.ingest_event(&query_event(
+            "_http._tcp.local.",
+            12,
+            "PTR",
+            false,
+            vec![],
+            stub,
+        ));
+        let row = app
+            .metrics_rows()
+            .into_iter()
+            .find(|(k, _)| k == "questions")
+            .expect("questions row");
+        assert!(row.1.contains("(1 queriers, 1 one-shot)"), "got: {}", row.1);
+    }
+
+    #[test]
+    fn metrics_overlay_omits_self_referential_rdata() {
+        // PTR rdata usually names its own service (here each PTR seeds
+        // its own service identity); repeating it after the scope adds no
+        // identity beyond the service column, so it stays short — while
+        // the two services still tell apart.
+        let mut app = App::new().unwrap();
+        let mut first = ptr_record(4500);
+        first.flush_bit = true;
+        ingest(&mut app, &first);
+        let mut second = raw_record(
+            "_http._tcp.local.",
+            12,
+            "PTR",
+            "Other._http._tcp.local.",
+            4500,
+        );
+        second.flush_bit = true;
+        ingest(&mut app, &second);
+        ingest(&mut app, &srv_record(120));
+        let values: Vec<String> = app
+            .metrics_rows()
+            .into_iter()
+            .filter(|(k, _)| k.ends_with("shared-flush"))
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(values.len(), 2, "both findings listed, got: {values:?}");
+        assert!(
+            !values.iter().any(|v| v.contains(" = ")),
+            "self rdata stays short, got: {values:?}"
+        );
+        assert_ne!(values[0], values[1], "rows must differ, got: {values:?}");
+    }
+
+    #[test]
+    fn metrics_enum_question_keeps_qry_scope() {
+        // Questions on the enumeration row keep their QRY scope: the
+        // queried type varies, so suppressing it would collapse NS and
+        // SOA askers into identical rows.
+        let mut app = App::new().unwrap();
+        let stub: SocketAddr = "192.168.1.9:45678".parse().unwrap();
+        app.ingest_event(&query_event(
+            "_services._dns-sd._udp.local.",
+            2,
+            "NS",
+            false,
+            Vec::new(),
+            stub,
+        ));
+        let row = app
+            .metrics_rows()
+            .into_iter()
+            .find(|(k, _)| k.ends_with("unicast-question"))
+            .expect("unicast-question row");
+        assert!(
+            row.1.contains("QRY NS _services._dns-sd._udp.local"),
+            "enum question keeps its QRY scope, got: {}",
+            row.1
+        );
+    }
+
+    #[test]
+    fn anomalies_pane_keeps_qry_scope_on_enumeration_row() {
+        let mut app = App::new().unwrap();
+        let stub: SocketAddr = "192.168.1.9:45678".parse().unwrap();
+        app.ingest_event(&query_event(
+            "_services._dns-sd._udp.local.",
+            6,
+            "SOA",
+            false,
+            Vec::new(),
+            stub,
+        ));
+        app.evict_expired();
+        let enum_pos = app
+            .display_items()
+            .iter()
+            .position(|it| matches!(it, DisplayItem::Enum { .. }))
+            .expect("enum row");
+        app.selected_display = enum_pos;
+        app.clamp_selection();
+        park_on_question(&mut app, stub);
+        let buf = render_to_buffer(&app, 140, 30);
+        let text = rect_text(&buf, app.anomalies_rect.get());
+        assert!(
+            text.contains("QRY SOA _services._dns-sd._udp.local"),
+            "pane keeps the QRY scope, got: {text:?}"
+        );
+    }
+
+    #[test]
     fn enter_is_scoped_to_focused_pane() {
         use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
         let mut app = App::new().unwrap();
@@ -7238,8 +7365,13 @@ mod tests {
             .expect("anomaly row");
         assert_eq!(k, &format!("{icon} shared-flush"));
         assert!(
-            v.starts_with(&a.service),
-            "value names the service, got: {v}"
+            v.starts_with("192.168.1.2:5353: "),
+            "source leads the value, got: {v}"
+        );
+        assert!(v.contains(&a.service), "value names the service, got: {v}");
+        assert!(
+            v.contains("PTR _http._tcp.local."),
+            "value names the pointed-to row, got: {v}"
         );
         assert!(
             !k.contains(a.severity.as_str()),
@@ -7753,6 +7885,92 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_rows_and_hostnames_render_italic() {
+        use ratatui::style::Modifier;
+        let app = two_group_app();
+        let buf = render_to_buffer(&app, 100, 30);
+        // Host group header: the display name after the glyph is italic,
+        // the count and addresses are not.
+        let area = app.left_rect.get();
+        let mut header = None;
+        for y in (area.y + 1)..(area.y + area.height.saturating_sub(1)) {
+            let mut row = String::new();
+            for x in (area.x + 1)..(area.x + area.width.saturating_sub(1)) {
+                row.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or_default());
+            }
+            if row.starts_with("\u{25be} ") || row.starts_with("\u{25b8} ") {
+                header = Some((y, row));
+                break;
+            }
+        }
+        let (y, row) = header.expect("host header row");
+        let name_cell = buf.cell((area.x + 3, y)).expect("display-name cell");
+        assert!(
+            name_cell.modifier.contains(Modifier::ITALIC),
+            "hostname should be italic"
+        );
+        let paren = row.rfind(" (").expect("header count");
+        let count_cell = buf
+            .cell((area.x + 1 + paren as u16 + 1, y))
+            .expect("count cell");
+        assert!(
+            !count_cell.modifier.contains(Modifier::ITALIC),
+            "only the hostname is italic"
+        );
+        // Detail table synthetic rows (`srvc`, …) are italic throughout.
+        let area = app.answers_rect.get();
+        let label_cell = buf.cell((area.x + 1, area.y + 2)).expect("srvc cell");
+        assert_eq!(label_cell.symbol(), "s");
+        assert!(
+            label_cell.modifier.contains(Modifier::ITALIC),
+            "synthetic rows should be italic"
+        );
+    }
+
+    #[test]
+    fn txt_children_render_upright() {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
+        use ratatui::style::Modifier;
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1; b=2");
+        let key = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        app.handle_key(&key(KeyCode::Tab));
+        app.handle_key(&key(KeyCode::Enter));
+        let buf = render_to_buffer(&app, 100, 30);
+        let area = app.answers_rect.get();
+        // Expanded TXT pair rows show verbatim wire content: green like
+        // the header rows, but never italic.
+        let mut pair = None;
+        for y in (area.y + 1)..(area.y + area.height.saturating_sub(1)) {
+            let mut row = String::new();
+            for x in (area.x + 1)..(area.x + area.width.saturating_sub(1)) {
+                row.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or_default());
+            }
+            if (row.contains("├─") || row.contains("└─")) && row.contains("a=1") {
+                pair = Some((y, row));
+                break;
+            }
+        }
+        let (y, _) = pair.expect("expanded TXT pair row");
+        let cell = buf.cell((area.x + 1, y)).expect("pair cell");
+        assert!(
+            !cell.modifier.contains(Modifier::ITALIC),
+            "wire content stays upright"
+        );
+        assert_eq!(
+            cell.fg,
+            ratatui::style::Color::Green,
+            "pair rows keep the info color, got: {:?}",
+            cell.fg
+        );
+    }
+
+    #[test]
     fn mouse_border_hit_test_prefers_seams() {
         use ratatui::layout::Rect;
         let app = App::new().unwrap();
@@ -7860,7 +8078,7 @@ mod tests {
         let all = app.anomalies();
         let base = all
             .iter()
-            .find(|a| a.kind == "ttl-base-mismatch")
+            .find(|a| a.kind == "ttl-mismatch")
             .expect("base mismatch still analyzed");
         assert_eq!(
             base.severity,
@@ -8455,7 +8673,8 @@ mod tests {
     #[test]
     fn anomalies_pane_marks_severity_like_metrics() {
         let mut app = App::new().unwrap();
-        // shared-flush is an error: red level icon plus severity word.
+        // shared-flush is an error: the red level icon carries the
+        // severity, so the line spells no severity word.
         let mut ptr = ptr_record(4500);
         ptr.flush_bit = true;
         ingest(&mut app, &ptr);
@@ -8477,8 +8696,16 @@ mod tests {
         let area = app.anomalies_rect.get();
         let text = rect_text(&buf, area);
         assert!(
-            text.contains("error shared-flush"),
-            "pane must spell out the severity, got: {text:?}"
+            text.contains("shared-flush"),
+            "pane must name the kind, got: {text:?}"
+        );
+        assert!(
+            !text.contains("error shared-flush"),
+            "no severity word: the icon carries the level, got: {text:?}"
+        );
+        assert!(
+            text.contains("192.168.1.2:5353: shared-flush"),
+            "source leads the finding, got: {text:?}"
         );
         assert!(
             text.contains("> \u{f057}"),
