@@ -7418,6 +7418,72 @@ mod tests {
     }
 
     #[test]
+    fn mouse_click_anomalies_focuses_without_moving_cursor() {
+        use ratatui::layout::Rect;
+        let mut app = two_group_app();
+        app.focus = Focus::Services;
+        let cursor = app.detail_selected;
+        app.left_rect.set(Rect::new(0, 3, 33, 30));
+        app.right_rect.set(Rect::new(33, 3, 67, 30));
+        app.answers_rect.set(Rect::new(33, 3, 67, 10));
+        app.questions_rect.set(Rect::new(33, 13, 67, 8));
+        app.anomalies_rect.set(Rect::new(33, 21, 67, 6));
+        app.hex_rect.set(Rect::new(33, 27, 67, 6));
+        // Interior click (not a seam): focuses the pane, leaves the
+        // cursor and both dump offsets alone.
+        app.anomalies_offset.set(2);
+        app.hex_offset.set(4);
+        app.mouse_down(40, 23);
+        assert_eq!(app.focus, Focus::Anomalies);
+        assert_eq!(app.detail_selected, cursor);
+        assert_eq!(app.anomalies_offset.get(), 2);
+        assert_eq!(app.hex_offset.get(), 4);
+    }
+
+    #[test]
+    fn mouse_drag_moves_middle_and_lower_dividers() {
+        use ratatui::layout::Rect;
+        let mut app = App::new().unwrap();
+        app.body_rect.set(Rect::new(0, 3, 100, 40));
+        app.right_rect.set(Rect::new(33, 3, 67, 30));
+        app.answers_pct = 30;
+        app.questions_pct = 25;
+        app.anomalies_pct = 20;
+        // Middle seam (Questions/Anomalies) moves the questions share.
+        app.drag = DragMode::HorizMiddle;
+        app.mouse_drag(40, 3 + 20);
+        assert_eq!(app.questions_pct, 36);
+        assert_eq!(app.hover.get(), DragMode::HorizMiddle);
+        assert!(app.answers_pct + app.questions_pct + app.anomalies_pct <= 90);
+        // Lower seam (Anomalies/Hex) moves the anomalies share.
+        app.drag = DragMode::HorizLower;
+        app.mouse_drag(40, 3 + 25);
+        assert_eq!(app.anomalies_pct, 17);
+        assert_eq!(app.hover.get(), DragMode::HorizLower);
+        assert!(app.answers_pct + app.questions_pct + app.anomalies_pct <= 90);
+    }
+
+    #[test]
+    fn tiny_terminal_renders_anomalies_pane() {
+        let app = two_group_app();
+        for (width, height) in [(100, 30), (60, 12), (40, 8)] {
+            let buf = render_to_buffer(&app, width, height);
+            let mut text = String::new();
+            for y in 0..height {
+                for x in 0..width {
+                    if let Some(cell) = buf.cell((x, y)) {
+                        text.push_str(cell.symbol());
+                    }
+                }
+            }
+            assert!(
+                text.contains("Anomalies"),
+                "{width}x{height} must still show the Anomalies pane"
+            );
+        }
+    }
+
+    #[test]
     fn mouse_border_hit_test_prefers_seams() {
         use ratatui::layout::Rect;
         let app = App::new().unwrap();
