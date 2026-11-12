@@ -72,6 +72,12 @@ pub fn is_ttl_kind(kind: &str) -> bool {
     TTL_KINDS.contains(&kind)
 }
 
+/// Whether `kind` is a demand-side unicast-only finding: observed
+/// questions asking multicast for a type that can only live in unicast.
+pub fn is_question_kind(kind: &str) -> bool {
+    kind == "unicast-question"
+}
+
 /// A service slice for analysis: borrows browser state, owns nothing.
 pub struct ServiceView<'a> {
     pub instance: &'a str,
@@ -786,13 +792,20 @@ fn check_ttl_stable(svc: &ServiceView, service_id: &str, now: Instant, out: &mut
         if ttls.len() > 1 {
             let mut sorted: Vec<u32> = ttls.into_iter().collect();
             sorted.sort_unstable();
+            // Type label from a live row of the same type, so the
+            // finding carries the same row identity the tables mark.
+            let rtype_str = svc
+                .answers
+                .iter()
+                .find(|r| r.rtype == rtype)
+                .map(|r| r.rtype_str.clone());
             out.push(Anomaly {
                 kind: "ttl-unstable",
                 severity: Severity::Warning,
                 service: service_id.to_string(),
                 record_name: Some(name),
                 rtype: Some(rtype),
-                rtype_str: None,
+                rtype_str,
                 rdata: None,
                 source: None,
                 message: format!("unstable TTL bases {sorted:?} for same name/type"),

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::io::IsTerminal;
 use std::net::SocketAddr;
@@ -1083,53 +1083,79 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
     app.anomalies_viewport
         .set(area.height.saturating_sub(2) as usize);
     let findings = app.anomalies_for_selected();
-    let title = match app.anomaly_scope() {
-        AnomalyScope::ServiceLevel(target) => {
-            format!(" Anomalies: {} ({}) ", target.pane_ident(), findings.len())
-        }
-        AnomalyScope::Record(rec) => {
-            format!(
-                " Anomalies: {} {} ({}) ",
-                rec.rtype_str,
-                rec.name,
-                findings.len()
-            )
-        }
-        AnomalyScope::Question(key) => {
-            format!(
-                " Anomalies: QRY {} {} @ {} ({}) ",
-                key.rtype_str,
-                key.name,
-                question_source_label(key.source),
-                findings.len()
-            )
-        }
-        AnomalyScope::None => format!(" Anomalies ({}) ", findings.len()),
+    let title = match app.display_detail() {
+        Some(target) => format!(" Anomalies: {} ({}) ", target.pane_ident(), findings.len()),
+        None => format!(" Anomalies ({}) ", findings.len()),
     };
     let dimmed = Style::default().fg(Color::Gray);
-    let finding_lines = |findings: &[crate::anomalies::Anomaly]| -> Vec<Line<'_>> {
+    // Row identities already claimed in this pane: a repeated
+    // (name, type) needs its rdata to tell the findings apart.
+    let mut identity_count: HashMap<(String, u16), usize> = HashMap::new();
+    for p in &findings {
+        let a = &p.anomaly;
+        if let (Some(name), Some(rtype)) = (&a.record_name, a.rtype) {
+            *identity_count
+                .entry((name.trim_end_matches('.').to_lowercase(), rtype))
+                .or_insert(0) += 1;
+        }
+    }
+    let finding_lines = |findings: &[crate::app::PaneAnomaly]| -> Vec<Line<'_>> {
         if findings.is_empty() {
             return vec![Line::from(Span::styled(
-                "No anomalies for this record",
+                "No anomalies for this service",
                 dimmed,
             ))];
         }
         findings
             .iter()
-            .map(|a| {
+            .map(|p| {
+                let a = &p.anomaly;
                 let color = match a.severity {
                     crate::anomalies::Severity::Error => Color::Red,
                     crate::anomalies::Severity::Warning => Color::Yellow,
                     crate::anomalies::Severity::Info => Color::Blue,
                 };
+                // Which row the finding belongs to: empty for
+                // service-level findings, which describe the target.
+                // Question sources render as stored (self sends never
+                // produce findings, so no `self` case arises).
+                let scope = match (&a.record_name, a.rtype_str.as_deref()) {
+                    (Some(name), Some(rtype)) if crate::anomalies::is_question_kind(a.kind) => {
+                        format!(
+                            "QRY {rtype} {name} @ {}",
+                            a.source.as_deref().unwrap_or("?")
+                        )
+                    }
+                    (Some(name), Some(rtype)) => {
+                        let base = format!("{rtype} {name}");
+                        let key = (
+                            name.trim_end_matches('.').to_lowercase(),
+                            a.rtype.unwrap_or(0),
+                        );
+                        match (&a.rdata, identity_count.get(&key)) {
+                            (Some(rdata), Some(&n)) if n > 1 => format!("{base} = {rdata}"),
+                            _ => base,
+                        }
+                    }
+                    _ => String::new(),
+                };
+                let head = if scope.is_empty() {
+                    format!("{} {}", a.severity.as_str(), a.kind)
+                } else {
+                    format!("{} {} {scope}", a.severity.as_str(), a.kind)
+                };
                 Line::from(vec![
+                    Span::styled(
+                        if p.cursor_match { "> " } else { "  " },
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(
                         crate::app::App::anomaly_level_icon(a.severity).to_string(),
                         Style::default().fg(color),
                     ),
                     Span::raw(" "),
                     Span::styled(
-                        format!("{} {}: {}", a.severity.as_str(), a.kind, a.message),
+                        format!("{head}: {}", a.message),
                         Style::default().fg(Color::White),
                     ),
                     Span::styled(format!(" ({})", a.rfc), Style::default().fg(Color::Gray)),
@@ -1155,6 +1181,18 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
     };
 
     let total = lines.len();
+    // While tracking, a changed finding list re-anchors the viewport
+    // to the cursor's finding instead of leaving the marker behind.
+    // Manual scrolling clears tracking, so user offsets are untouched.
+    // The pure decision is unit-tested; draw only clamps to viewport.
+    let at = findings.iter().position(|p| p.cursor_match);
+    app.anomalies_offset
+        .set(crate::app::App::tracked_anomalies_offset(
+            app.anomalies_follow.get(),
+            app.anomalies_offset.get(),
+            at,
+            total,
+        ));
     let offset = clamp_scroll(
         app.anomalies_offset.get(),
         total,
