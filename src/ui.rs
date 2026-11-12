@@ -1121,10 +1121,7 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
                 // produce findings, so no `self` case arises).
                 let scope = match (&a.record_name, a.rtype_str.as_deref()) {
                     (Some(name), Some(rtype)) if crate::anomalies::is_question_kind(a.kind) => {
-                        format!(
-                            "QRY {rtype} {name} @ {}",
-                            a.source.as_deref().unwrap_or("?")
-                        )
+                        format!("QRY {rtype} {name}")
                     }
                     (Some(name), Some(rtype)) => {
                         let base = format!("{rtype} {name}");
@@ -1139,10 +1136,11 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
                     }
                     _ => String::new(),
                 };
+                // No severity word: the level icon already carries it.
                 let head = if scope.is_empty() {
-                    format!("{} {}", a.severity.as_str(), a.kind)
+                    a.kind.to_string()
                 } else {
-                    format!("{} {} {scope}", a.severity.as_str(), a.kind)
+                    format!("{} {scope}", a.kind)
                 };
                 Line::from(vec![
                     Span::styled(
@@ -1155,12 +1153,10 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
                     ),
                     Span::raw(" "),
                     Span::styled(
-                        // Sourced findings lead with the announcer; question
-                        // scope already names the querier (`QRY .. @ src`).
+                        // `<icon> <source> <kind…> <text>`; unsourced findings
+                        // omit the source slot.
                         match a.source.as_deref() {
-                            Some(src) if !crate::anomalies::is_question_kind(a.kind) => {
-                                format!("{head}: {src}: {}", a.message)
-                            }
+                            Some(src) => format!("{src}: {head}: {}", a.message),
                             _ => format!("{head}: {}", a.message),
                         },
                         Style::default().fg(Color::White),

@@ -1743,18 +1743,17 @@ impl App {
             },
         );
         for a in found.iter() {
-            // Source leads the value, matching the Anomalies pane; question
-            // rows already name the querier and stay as-is.
-            let detail = match a.source.as_deref() {
-                Some(src) if !anomalies::is_question_kind(a.kind) => {
-                    format!("{src}: {}", a.message)
-                }
-                _ => a.message.clone(),
+            // `<source> <service> <text>`; unsourced findings omit the
+            // source slot, and the key's icon carries the level. The RFC
+            // rides along so info-level findings stay attributable.
+            let value = match a.source.as_deref() {
+                Some(src) => format!("{src}: {}: {} ({})", a.service, a.message, a.rfc),
+                _ => format!("{}: {} ({})", a.service, a.message, a.rfc),
             };
             kv(
                 &mut rows,
                 &format!("{} {}", Self::anomaly_level_icon(a.severity), a.kind),
-                format!("{}: {}", a.service, detail),
+                value,
             );
         }
 
@@ -7246,9 +7245,10 @@ mod tests {
             .expect("anomaly row");
         assert_eq!(k, &format!("{icon} shared-flush"));
         assert!(
-            v.starts_with(&a.service),
-            "value names the service, got: {v}"
+            v.starts_with("192.168.1.2:5353: "),
+            "source leads the value, got: {v}"
         );
+        assert!(v.contains(&a.service), "value names the service, got: {v}");
         assert!(
             !k.contains(a.severity.as_str()),
             "no severity word left, got: {k}"
@@ -8463,7 +8463,8 @@ mod tests {
     #[test]
     fn anomalies_pane_marks_severity_like_metrics() {
         let mut app = App::new().unwrap();
-        // shared-flush is an error: red level icon plus severity word.
+        // shared-flush is an error: the red level icon carries the
+        // severity, so the line spells no severity word.
         let mut ptr = ptr_record(4500);
         ptr.flush_bit = true;
         ingest(&mut app, &ptr);
@@ -8485,8 +8486,16 @@ mod tests {
         let area = app.anomalies_rect.get();
         let text = rect_text(&buf, area);
         assert!(
-            text.contains("error shared-flush"),
-            "pane must spell out the severity, got: {text:?}"
+            text.contains("shared-flush"),
+            "pane must name the kind, got: {text:?}"
+        );
+        assert!(
+            !text.contains("error shared-flush"),
+            "no severity word: the icon carries the level, got: {text:?}"
+        );
+        assert!(
+            text.contains("192.168.1.2:5353: shared-flush"),
+            "source leads the finding, got: {text:?}"
         );
         assert!(
             text.contains("> \u{f057}"),
