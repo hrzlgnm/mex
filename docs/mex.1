@@ -1,7 +1,8 @@
 .TH mex 1 "2026-11-09" "mex" "User Commands"
 
 .SH NAME
-mex \- terminal UI to browse and debug mDNS/DNS-SD on the local link
+mex \- terminal UI to browse and debug mDNS/DNS-SD on the local link,
+with anomaly detection
 
 .SH SYNOPSIS
 .B mex
@@ -9,9 +10,12 @@ mex \- terminal UI to browse and debug mDNS/DNS-SD on the local link
 
 .SH DESCRIPTION
 Terminal UI to browse and debug mDNS/DNS-SD on the local link \(em live
-services, records, queries, and raw packets. Listens passively on UDP port
+services, records, queries, raw packets, and anomaly detection. Listens
+passively on UDP port
 5353 (IPv4 + IPv6 multicast) and also sends the standard browse queries
-(service enumeration, PTR/SRV/TXT/A/AAAA).
+(service enumeration, PTR/SRV/TXT/A/AAAA). Suspicious records and
+questions are flagged as anomalies, listed per service in the Anomalies
+pane and in the metrics overlay.
 
 .SH OPTIONS
 .TP
@@ -53,13 +57,19 @@ Recently observed queries asking for the selected service, newest first,
 with per-query age instead of TTL. Questions from this host are highlighted
 like local records.
 .TP
+.B Anomalies (right, below Questions)
+Every surfaced finding for the selected service, with the row's own
+findings marked. Expired and goodbye rows name their state instead of
+findings. Tab focuses it for scrolling; the pane follows the record
+cursor.
+.TP
 .B Hex (right bottom)
 Wire bytes of the selected record or question packet, falling back to the
 service's latest packet. Tab focuses it for scrolling.
 .TP
 .B Mouse
 Drag the shared pane borders to resize Hosts vs detail, and Answers /
-Questions / Hex (the seam lights up). Click a row to
+Questions / Anomalies / Hex (the seam lights up). Click a row to
 focus its pane and move the cursor there; clicking a host header folds it.
 While mouse input is captured, use Shift+drag to select text in most
 terminals.
@@ -68,7 +78,7 @@ terminals.
 .TP
 .B Pane switching
 .br
-Tab / Shift+Tab      - Switch pane (Hosts \(-> Answers \(-> Questions \(-> Hex)
+Tab / Shift+Tab      - Switch pane (Hosts \(-> Answers \(-> Questions \(-> Anomalies \(-> Hex)
 .TP
 .B Navigation
 .br

@@ -3,7 +3,7 @@ name = "mex"
 version = "0.10.0"
 edition = "2021"
 license = "MIT"
-description = "Terminal UI to browse and debug mDNS/DNS-SD on the local link — live services, records, queries, and raw packets"
+description = "Terminal UI to browse and debug mDNS/DNS-SD on the local link — live services, records, queries, raw packets, and anomaly detection"
 
 [package.metadata.deb]
 maintainer = "hrzlgnm"
