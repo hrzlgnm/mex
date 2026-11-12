@@ -1754,7 +1754,9 @@ impl App {
             kv(
                 &mut rows,
                 &format!("{} {}", Self::anomaly_level_icon(a.severity), a.kind),
-                format!("{}: {}", a.service, detail),
+                // RFC rides along in the value (single label, linked in the
+                // UI) so info-level findings stay attributable in the overlay.
+                format!("{}: {} ({})", a.service, detail, a.rfc),
             );
         }
 

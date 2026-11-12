@@ -9,7 +9,8 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::buffer::{Buffer, CellDiffOption};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -239,14 +240,17 @@ fn draw_metrics_overlay(frame: &mut Frame, app: &App) {
     let val_style = Style::default().fg(Color::White);
 
     let body: Vec<Row<'_>> = rows
-        .into_iter()
+        .iter()
         .map(|(k, v)| {
             if v.is_empty() {
-                Row::new(vec![Cell::from(k).style(section_style), Cell::from("")])
+                Row::new(vec![
+                    Cell::from(k.as_str()).style(section_style),
+                    Cell::from(""),
+                ])
             } else {
                 Row::new(vec![
-                    Cell::from(format!(" {k}")).style(metrics_key_style(&k, key_style)),
-                    Cell::from(shift_str(&v, hscroll)).style(val_style),
+                    Cell::from(format!(" {k}")).style(metrics_key_style(k, key_style)),
+                    Cell::from(shift_str(v, hscroll)).style(val_style),
                 ])
             }
         })
@@ -272,6 +276,52 @@ fn draw_metrics_overlay(frame: &mut Frame, app: &App) {
     *state.offset_mut() = offset;
     frame.render_stateful_widget(table, area, &mut state);
     app.metrics_scroll.set(state.offset());
+    // OSC 8 links for anomaly values carrying an appended ` (RFC …)`
+    // suffix; found by parsing the rendered (possibly hscrolled) value.
+    if osc8_supported() {
+        let buf = frame.buffer_mut();
+        let value_x = area
+            .x
+            .saturating_add(1)
+            .saturating_add(key_w)
+            .saturating_add(1);
+        let value_w = area.width.saturating_sub(key_w.saturating_add(3));
+        let link_style = Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::UNDERLINED);
+        for (idx, (_, v)) in rows.iter().enumerate().skip(offset) {
+            let y = area
+                .y
+                .saturating_add(2)
+                .saturating_add((idx - offset) as u16);
+            if y >= area.y.saturating_add(area.height.saturating_sub(1)) {
+                break;
+            }
+            reset_row_diff(buf, value_x, value_x.saturating_add(value_w), y);
+            if v.is_empty() {
+                continue;
+            }
+            let shifted = shift_str(v, hscroll);
+            let Some((x, label, url)) = overlay_rfc_link(&shifted, value_x, value_w) else {
+                continue;
+            };
+            patch_osc8_link(buf, x, y, &label, &url, link_style);
+        }
+    }
+}
+
+/// Visible x-range of an appended ` (RFC …)` suffix in an overlay value:
+/// `None` when the suffix is hscrolled away, truncated, or unparseable.
+fn overlay_rfc_link(value: &str, value_x: u16, visible_w: u16) -> Option<(u16, String, String)> {
+    let tail = value.rfind(" (")?;
+    let label = value.get(tail + 2..)?.strip_suffix(')')?;
+    let url = rfc_url(label)?;
+    let label_w = Line::from(label).width() as u16;
+    let x = value_x.saturating_add(Line::from(&value[..tail + 2]).width() as u16);
+    if label_w == 0 || x.saturating_add(label_w) > value_x.saturating_add(visible_w) {
+        return None;
+    }
+    Some((x, label.to_string(), url))
 }
 
 /// Skip `skip` chars of `s` for horizontal panning. Char-boundary safe;
@@ -1075,6 +1125,77 @@ fn question_source_label(source: &SocketAddr) -> String {
     }
 }
 
+/// Canonical section anchor for an anomaly `rfc` field (`RFC 6762 §5.2`).
+/// `None` for unparseable labels, which render as plain text.
+fn rfc_url(rfc: &str) -> Option<String> {
+    let (num, section) = rfc.strip_prefix("RFC ")?.split_once(" §")?;
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if section.is_empty() || !section.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return None;
+    }
+    Some(format!(
+        "https://www.rfc-editor.org/rfc/rfc{num}#section-{section}"
+    ))
+}
+
+/// OSC 8 hyperlink: `label` displayed, `url` as the click target.
+fn encode_osc8(label: &str, url: &str) -> String {
+    format!("\u{1b}]8;;{url}\u{1b}\\{label}\u{1b}]8;;\u{1b}\\")
+}
+
+/// Whether emitted OSC 8 links likely render: unknown sequences are
+/// ignored by most emulators (plain label remains), but `dumb`
+/// terminals and non-TTY output (headless logs, pipes) stay plain.
+fn osc8_supported() -> bool {
+    osc8_supported_in(
+        std::env::var("TERM").ok().as_deref(),
+        io::stdout().is_terminal(),
+    )
+}
+
+fn osc8_supported_in(term: Option<&str>, is_tty: bool) -> bool {
+    is_tty && term.map(|t| t != "dumb").unwrap_or(true)
+}
+
+/// One OSC 8 link over buffer cells: the escape-wrapped label in the
+/// first cell, `Skip` on the rest so diffing keeps terminal columns
+/// aligned with the visible text width.
+fn patch_osc8_link(buf: &mut Buffer, x: u16, y: u16, label: &str, url: &str, style: Style) {
+    let width = Line::from(label).width();
+    if width == 0 {
+        return;
+    }
+    if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
+        cell.set_symbol(&encode_osc8(label, url));
+        cell.set_style(style);
+        cell.set_diff_option(CellDiffOption::None);
+    }
+    for dx in 1..width {
+        if let Some(cell) = buf.cell_mut(Position::new(x + dx as u16, y)) {
+            cell.set_symbol(" ");
+            cell.set_style(style);
+            cell.set_diff_option(CellDiffOption::Skip);
+        }
+    }
+}
+
+/// Clear stale per-cell diff flags on a re-rendered row: the text
+/// widgets rewrite symbols and styles but leave diff options alone, so
+/// last frame's `Skip` marks must not survive scrolling.
+fn reset_row_diff(buf: &mut Buffer, x0: u16, x1: u16, y: u16) {
+    for x in x0..x1 {
+        if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
+            cell.set_diff_option(CellDiffOption::None);
+        }
+    }
+}
+
+/// One Anomalies-pane row's RFC link slot: visible width before the
+/// `(rfc, …)` suffix, the RFC label, and its URL when parseable.
+type FindingLink = Option<(usize, &'static str, String)>;
+
 fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     // Findings for the highlighted detail row — or for the displayed
     // service while resting on a header: severity wording and icon,
@@ -1099,12 +1220,28 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
                 .or_insert(0) += 1;
         }
     }
-    let finding_lines = |findings: &[crate::app::PaneAnomaly]| -> Vec<Line<'_>> {
+    // OSC 8 links render only where supported; elsewhere the RFC stays
+    // plain text (underlining an unlinkable label would mislead).
+    let link_rfc = osc8_supported();
+    let link_style = Style::default()
+        .fg(Color::Gray)
+        .add_modifier(Modifier::UNDERLINED);
+    let rfc_style = if link_rfc {
+        link_style
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    // Rows plus per-row link slots: visible width before the `(rfc, …)`
+    // suffix, the RFC label, and its URL when parseable.
+    let finding_rows = |findings: &[crate::app::PaneAnomaly]| -> (Vec<Line<'_>>, Vec<FindingLink>) {
         if findings.is_empty() {
-            return vec![Line::from(Span::styled(
-                "No anomalies for this service",
-                dimmed,
-            ))];
+            return (
+                vec![Line::from(Span::styled(
+                    "No anomalies for this service",
+                    dimmed,
+                ))],
+                vec![None],
+            );
         }
         findings
             .iter()
@@ -1144,7 +1281,7 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
                 } else {
                     format!("{} {} {scope}", a.severity.as_str(), a.kind)
                 };
-                Line::from(vec![
+                let line = Line::from(vec![
                     Span::styled(
                         if p.cursor_match { "> " } else { "  " },
                         Style::default().add_modifier(Modifier::BOLD),
@@ -1165,29 +1302,43 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
                         },
                         Style::default().fg(Color::White),
                     ),
+                    Span::raw(" ("),
+                    Span::styled(a.rfc, rfc_style),
                     Span::styled(
-                        format!(" ({}, {})", a.rfc, a.requirement),
+                        format!(", {})", a.requirement),
                         Style::default().fg(Color::Gray),
                     ),
-                ])
+                ]);
+                // The suffix is built from the same plain strings, so the
+                // prefix width matches what the paragraph lays out.
+                let suffix_width = Line::from(format!(" ({}, {})", a.rfc, a.requirement)).width();
+                let link = rfc_url(a.rfc)
+                    .map(|url| (line.width().saturating_sub(suffix_width), a.rfc, url));
+                (line, link)
             })
-            .collect()
+            .unzip()
     };
-    let lines: Vec<Line<'_>> = match app.anomaly_scope() {
+    let (lines, links): (Vec<Line<'_>>, Vec<FindingLink>) = match app.anomaly_scope() {
         // Gone rows name their state instead of findings: a goodbye or
         // an expiry is information, not an empty result.
         AnomalyScope::Record(rec) => match crate::app::record_liveness(rec) {
-            crate::app::RecordLiveness::Goodbye => vec![Line::from(Span::styled(
-                "Goodbye received — record withdrawn",
-                dimmed,
-            ))],
-            crate::app::RecordLiveness::Expired => vec![Line::from(Span::styled(
-                "Record expired — TTL elapsed",
-                dimmed,
-            ))],
-            crate::app::RecordLiveness::Live => finding_lines(&findings),
+            crate::app::RecordLiveness::Goodbye => (
+                vec![Line::from(Span::styled(
+                    "Goodbye received — record withdrawn",
+                    dimmed,
+                ))],
+                vec![None],
+            ),
+            crate::app::RecordLiveness::Expired => (
+                vec![Line::from(Span::styled(
+                    "Record expired — TTL elapsed",
+                    dimmed,
+                ))],
+                vec![None],
+            ),
+            crate::app::RecordLiveness::Live => finding_rows(&findings),
         },
-        _ => finding_lines(&findings),
+        _ => finding_rows(&findings),
     };
 
     let total = lines.len();
@@ -1221,6 +1372,31 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
             )),
     );
     frame.render_widget(para, area);
+    // OSC 8 links cannot ride inside paragraph spans (escape bytes would
+    // count as visible width), so the RFC label renders plain first and
+    // is patched into a link here when it fits untruncated.
+    if link_rfc {
+        let buf = frame.buffer_mut();
+        let inner_x = area.x.saturating_add(1);
+        let inner_y = area.y.saturating_add(1);
+        let inner_right = area.x.saturating_add(area.width.saturating_sub(1));
+        for (idx, slot) in links.iter().enumerate().skip(offset).take(total) {
+            let y = inner_y.saturating_add((idx - offset) as u16);
+            if y >= inner_y.saturating_add(area.height.saturating_sub(2)) {
+                break;
+            }
+            reset_row_diff(buf, inner_x, inner_right, y);
+            let Some((prefix_w, label, url)) = slot else {
+                continue;
+            };
+            let label_w = Line::from(*label).width();
+            let x = inner_x.saturating_add(*prefix_w as u16).saturating_add(2);
+            if label_w == 0 || x.saturating_add(label_w as u16) > inner_right {
+                continue;
+            }
+            patch_osc8_link(buf, x, y, label, url, link_style);
+        }
+    }
 }
 
 fn draw_hex_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
@@ -1475,6 +1651,101 @@ mod tests {
         );
         assert_eq!(shift_str("\u{f057} missing-addr", 1), " missing-addr");
         assert_eq!(shift_str("\u{f057} missing-addr", 2), "missing-addr");
+    }
+
+    #[test]
+    fn rfc_url_maps_section_anchors() {
+        assert_eq!(
+            rfc_url("RFC 6762 §5.2"),
+            Some("https://www.rfc-editor.org/rfc/rfc6762#section-5.2".to_string())
+        );
+        assert_eq!(
+            rfc_url("RFC 6763 §7"),
+            Some("https://www.rfc-editor.org/rfc/rfc6763#section-7".to_string())
+        );
+        // Unparseable labels render plain, never linked.
+        for bad in [
+            "",
+            "RFC 6762",
+            "RFC 6762 §",
+            "RFC abcd §1",
+            "RFC 6762 §5.2a",
+            "rfc 6762 §5.2",
+            "RFC 6762 5.2",
+        ] {
+            assert_eq!(rfc_url(bad), None, "{bad:?} must not link");
+        }
+    }
+
+    #[test]
+    fn encode_osc8_wraps_label() {
+        assert_eq!(
+            encode_osc8("RFC 6762 §5.2", "https://example.com/rfc"),
+            "\u{1b}]8;;https://example.com/rfc\u{1b}\\RFC 6762 §5.2\u{1b}]8;;\u{1b}\\"
+        );
+    }
+
+    #[test]
+    fn osc8_support_gates_on_tty_and_dumb() {
+        assert!(osc8_supported_in(Some("xterm-256color"), true));
+        assert!(osc8_supported_in(None, true));
+        assert!(!osc8_supported_in(Some("dumb"), true));
+        assert!(!osc8_supported_in(Some("xterm-256color"), false));
+        assert!(!osc8_supported_in(None, false));
+    }
+
+    #[test]
+    fn patch_osc8_link_marks_skip_cells() {
+        use ratatui::layout::Position;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 30, 1));
+        patch_osc8_link(
+            &mut buf,
+            2,
+            0,
+            "RFC 6762 §5.2",
+            "https://example.com/",
+            Style::default(),
+        );
+        let label_w = Line::from("RFC 6762 §5.2").width();
+        let first = buf.cell(Position::new(2, 0)).expect("first cell");
+        assert!(
+            first
+                .symbol()
+                .contains("\u{1b}]8;;https://example.com/\u{1b}\\"),
+            "got: {:?}",
+            first.symbol()
+        );
+        assert!(first.symbol().contains("RFC 6762 §5.2"));
+        for dx in 1..label_w {
+            let cell = buf
+                .cell(Position::new(2 + dx as u16, 0))
+                .expect("link cell");
+            assert_eq!(cell.symbol(), " ");
+            assert_eq!(cell.diff_option, CellDiffOption::Skip);
+        }
+        // The cell past the label keeps defaults.
+        let after = buf
+            .cell(Position::new(2 + label_w as u16, 0))
+            .expect("cell");
+        assert_ne!(after.diff_option, CellDiffOption::Skip);
+    }
+
+    #[test]
+    fn overlay_rfc_link_finds_appended_suffix() {
+        let v = "My._http._tcp.local: 192.168.1.2:5353: not defined for mDNS (RFC 6762 §3)";
+        let (x, label, url) = overlay_rfc_link(v, 10, 200).expect("link");
+        assert_eq!(label, "RFC 6762 §3");
+        assert!(url.ends_with("#section-3"), "got: {url}");
+        let prefix_w = Line::from("My._http._tcp.local: 192.168.1.2:5353: not defined for mDNS (")
+            .width() as u16;
+        assert_eq!(x, 10 + prefix_w);
+        // Message parens earlier in the value do not confuse the parse.
+        let v2 = "svc: outside multicast answer (authority section); verify (RFC 6762 §3)";
+        assert!(overlay_rfc_link(v2, 0, 200).is_some());
+        // Missing, malformed, or truncated suffixes stay plain.
+        assert!(overlay_rfc_link("svc: no suffix here", 0, 200).is_none());
+        assert!(overlay_rfc_link("svc: cut (RFC 6762 §", 0, 200).is_none());
+        assert!(overlay_rfc_link(v, 0, 10).is_none());
     }
 
     #[test]
