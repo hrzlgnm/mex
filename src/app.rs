@@ -104,6 +104,14 @@ pub enum AnomalyScope<'a> {
     None,
 }
 
+/// One finding in the Anomalies pane plus whether it belongs to the
+/// highlighted detail row.
+#[derive(Debug)]
+pub struct PaneAnomaly {
+    pub anomaly: anomalies::Anomaly,
+    pub cursor_match: bool,
+}
+
 /// Identity of the cursor row, so the selection survives resorting of the
 /// table (TTL countdowns and re-announcements constantly reshuffle rows).
 /// Matches the dedup identities used at ingest.
@@ -2781,12 +2789,13 @@ impl App {
         if let Some(idx) = self.answers_table_row_to_detail(table_row) {
             // Stay on the clicked target: the cursor follows the click
             // instead of the manual-scroll viewport. A new row also
-            // restarts the hex dump and the anomalies list at the top.
+            // restarts the hex dump at the top and scrolls the
+            // anomalies pane to the row's finding.
             self.detail_free_scroll = false;
             if self.detail_selected != idx {
                 self.detail_selected = idx;
                 self.hex_offset.set(0);
-                self.anomalies_offset.set(0);
+                self.follow_anomalies_cursor();
             }
             self.detail_anchor = self
                 .display_detail()
@@ -2815,7 +2824,7 @@ impl App {
             if self.detail_selected != idx {
                 self.detail_selected = idx;
                 self.hex_offset.set(0);
-                self.anomalies_offset.set(0);
+                self.follow_anomalies_cursor();
             }
             self.detail_anchor = self
                 .display_detail()
@@ -3089,11 +3098,11 @@ impl App {
         if hi > lo && (self.detail_selected < lo || self.detail_selected >= hi) {
             self.detail_selected = lo;
         }
-        // New row means new hex bytes and a new finding set: restart both
-        // panes at the top.
+        // New row means new hex bytes: restart the dump at the top and
+        // scroll the anomalies pane to the row's finding.
         if self.detail_selected != before {
             self.hex_offset.set(0);
-            self.anomalies_offset.set(0);
+            self.follow_anomalies_cursor();
         }
         self.detail_anchor = self
             .display_detail()
@@ -3125,11 +3134,11 @@ impl App {
         self.detail_anchor = self
             .display_detail()
             .and_then(|d| Self::identity_at_detail(&d, self.detail_selected));
-        // New row means new hex bytes and a new finding set: restart both
-        // panes at the top.
+        // New row means new hex bytes: restart the dump at the top and
+        // scroll the anomalies pane to the row's finding.
         if self.detail_selected != before {
             self.hex_offset.set(0);
-            self.anomalies_offset.set(0);
+            self.follow_anomalies_cursor();
         }
     }
 
@@ -3145,7 +3154,7 @@ impl App {
             .and_then(|d| Self::identity_at_detail(&d, self.detail_selected));
         if self.detail_selected != before {
             self.hex_offset.set(0);
-            self.anomalies_offset.set(0);
+            self.follow_anomalies_cursor();
         }
     }
 
@@ -3232,6 +3241,19 @@ impl App {
     /// cursor, so there is no cursor to resume and no pin flag.
     fn scroll_anomalies(&mut self, delta: isize) {
         Self::bump_offset(&self.anomalies_offset, delta);
+    }
+
+    /// Scroll the Anomalies pane to the finding that belongs to the
+    /// highlighted row, or to the top when nothing matches. Called on
+    /// cursor moves so the marker stays in view; manual scrolling in
+    /// between is untouched until the cursor moves again.
+    fn follow_anomalies_cursor(&mut self) {
+        let at = self
+            .anomalies_for_selected()
+            .iter()
+            .position(|p| p.cursor_match)
+            .unwrap_or(0);
+        self.anomalies_offset.set(at);
     }
 
     fn scroll_anomalies_edge(&mut self, first: bool) {
@@ -3338,7 +3360,7 @@ impl App {
             self.detail_offset.set(0);
             self.detail_free_scroll = false;
             self.questions_offset.set(0);
-            self.anomalies_offset.set(0);
+            self.follow_anomalies_cursor();
             self.hex_offset.set(0);
             self.detail_anchor = self
                 .display_detail()
@@ -4553,15 +4575,37 @@ impl App {
         }
     }
 
-    /// Findings for the pane scope: row findings for records and
-    /// questions, service-level findings for headers.
-    pub fn anomalies_for_selected(&self) -> Vec<anomalies::Anomaly> {
-        match self.anomaly_scope() {
-            AnomalyScope::ServiceLevel(target) => self.service_level_anomalies(&target),
-            AnomalyScope::Record(rec) => self.record_anomalies(rec),
-            AnomalyScope::Question(key) => self.question_anomalies(key),
-            AnomalyScope::None => Vec::new(),
+    /// Every surfaced finding for the displayed service, each flagged
+    /// when it belongs to the highlighted detail row. A gone record row
+    /// (expired or goodbye) yields nothing: the pane names the gone
+    /// state instead of any list.
+    pub fn anomalies_for_selected(&self) -> Vec<PaneAnomaly> {
+        if let Some(DetailEntry::Record(rec)) = self.selected_detail_entry() {
+            if record_liveness(rec) != RecordLiveness::Live {
+                return Vec::new();
+            }
         }
+        let Some(target) = self.display_detail() else {
+            return Vec::new();
+        };
+        let id = Self::detail_service_id(&target);
+        let found = self.anomalies();
+        let row: Vec<anomalies::Anomaly> = match self.anomaly_scope() {
+            AnomalyScope::Record(rec) => Self::record_anomalies_in(&found, rec, &id),
+            AnomalyScope::Question(key) => Self::question_anomalies_in(&found, key, &id),
+            _ => Vec::new(),
+        };
+        found
+            .into_iter()
+            .filter(|a| a.service == id && a.is_surfaced())
+            .map(|a| {
+                let cursor_match = row.contains(&a);
+                PaneAnomaly {
+                    anomaly: a,
+                    cursor_match,
+                }
+            })
+            .collect()
     }
 
     /// Service id owning a detail target, matching `Anomaly.service`.
@@ -4572,45 +4616,22 @@ impl App {
         }
     }
 
-    /// Service-level findings for the displayed target: findings with no
-    /// record identity (`missing-addr`, `type-format`) plus spanning
-    /// `ttl-unstable` findings and enumeration `type-format` findings,
-    /// which describe the target as a whole.
-    fn service_level_anomalies(&self, target: &DetailTarget<'_>) -> Vec<anomalies::Anomaly> {
-        let id = Self::detail_service_id(target);
-        let is_enum = matches!(target, DetailTarget::Enum(_));
-        self.anomalies()
-            .into_iter()
-            .filter(|a| a.service == id)
-            .filter(|a| a.is_surfaced())
-            .filter(|a| {
-                a.record_name.is_none()
-                    || a.kind == "ttl-unstable"
-                    // Enumeration `type-format` carries the PTR row's
-                    // identity so the row marks, but it describes the
-                    // enumerated type as a whole: it belongs on the
-                    // enumeration header too.
-                    || (is_enum && a.kind == "type-format")
-            })
-            .collect()
-    }
-
-    /// Findings for one observed question row: the demand-side leak
-    /// attributed to its querier, scoped to the row's own service. Own
-    /// inferred sends (`SELF_SOURCE`, port 0) never match a finding, and
-    /// unrecognised type labels stay quiet.
-    fn question_anomalies(&self, key: QuestionKey<'_>) -> Vec<anomalies::Anomaly> {
+    /// Row-identity match for one observed question row within a
+    /// precomputed finding set: the demand-side leak attributed to its
+    /// querier. Own inferred sends (`SELF_SOURCE`, port 0) never match a
+    /// finding, and unrecognised type labels stay quiet.
+    fn question_anomalies_in(
+        found: &[anomalies::Anomaly],
+        key: QuestionKey<'_>,
+        id: &str,
+    ) -> Vec<anomalies::Anomaly> {
         let Some(rtype) = anomalies::rtype_from_str(key.rtype_str) else {
             return Vec::new();
         };
-        let Some(target) = self.display_detail() else {
-            return Vec::new();
-        };
-        let id = Self::detail_service_id(&target);
         let name = key.name.trim_end_matches('.').to_lowercase();
         let src = key.source.to_string();
-        self.anomalies()
-            .into_iter()
+        found
+            .iter()
             .filter(|a| a.kind == "unicast-question")
             .filter(|a| a.is_surfaced())
             .filter(|a| a.service == id)
@@ -4621,25 +4642,23 @@ impl App {
                     .is_some_and(|n| n.trim_end_matches('.').to_lowercase() == name)
             })
             .filter(|a| a.source.as_deref() == Some(src.as_str()))
+            .cloned()
             .collect()
     }
 
-    /// Anomalies for the highlighted record row: findings whose (name,
-    /// type, rdata) identity matches the selected `DetailEntry::Record`
-    /// and whose service owns the displayed target, including spanning
-    /// `ttl-unstable` findings matched by (name, type).
-    fn record_anomalies(&self, rec: &browse::RawRecord) -> Vec<anomalies::Anomaly> {
-        if record_liveness(rec) != RecordLiveness::Live {
-            return Vec::new();
-        }
-        let Some(target) = self.display_detail() else {
-            return Vec::new();
-        };
-        let id = Self::detail_service_id(&target);
+    /// Row-identity match for the highlighted record row within a
+    /// precomputed finding set: findings whose (name, type, rdata)
+    /// identity matches and whose service owns the displayed target,
+    /// including spanning `ttl-unstable` findings matched by (name, type).
+    fn record_anomalies_in(
+        found: &[anomalies::Anomaly],
+        rec: &browse::RawRecord,
+        id: &str,
+    ) -> Vec<anomalies::Anomaly> {
         let name = rec.name.trim_end_matches('.').to_lowercase();
         let rdata_key = anomalies::anomaly_match_key(rec.rtype, &rec.rdata);
-        self.anomalies()
-            .into_iter()
+        found
+            .iter()
             .filter(|a| a.service == id)
             .filter(|a| a.is_surfaced())
             .filter(|a| a.rtype == Some(rec.rtype))
@@ -4656,6 +4675,7 @@ impl App {
                 // another kind must not silently span rows.
                 None => a.kind == "ttl-unstable",
             })
+            .cloned()
             .collect()
     }
 
@@ -7468,8 +7488,11 @@ mod tests {
             state: KeyEventState::empty(),
         };
         // Tab reachability lives in the focus-cycle tests; park here
-        // directly so this test pins scrolling, not tab order.
+        // directly so this test pins scrolling, not tab order. Start
+        // from a known offset: the follow-on-select already scrolled to
+        // the row's finding.
         app.focus = Focus::Anomalies;
+        app.anomalies_offset.set(0);
         // Single-line scroll keys.
         app.handle_key(&plain(KeyCode::Char('j')));
         assert_eq!(app.anomalies_offset.get(), 1);
@@ -7698,9 +7721,9 @@ mod tests {
     }
 
     #[test]
-    fn anomalies_for_selected_matches_record_identity() {
+    fn anomalies_pane_lists_service_findings_with_cursor_match() {
         let mut app = App::new().unwrap();
-        // Quiet 4500s base so the only finding on the row is the
+        // Quiet 4500s base so the PTR row's only finding is the
         // shared-flush error from the set bit below.
         let mut ptr = ptr_record(4500);
         ptr.flush_bit = true;
@@ -7708,8 +7731,8 @@ mod tests {
         ingest(&mut app, &srv_record(120));
         app.evict_expired();
         select_instance(&mut app, "Test");
-        // Park the cursor on the PTR row: it must surface shared-flush
-        // and nothing from other rows.
+        // Park the cursor on the PTR row: the pane lists the whole
+        // service, marking only the row's own finding.
         let ptr_idx = app
             .display_detail()
             .expect("service displayed")
@@ -7722,13 +7745,14 @@ mod tests {
             .display_detail()
             .and_then(|d| App::identity_at_detail(&d, ptr_idx));
         let found = app.anomalies_for_selected();
-        assert!(
-            found.iter().any(|a| a.kind == "shared-flush"),
-            "PTR row must surface shared-flush, got: {found:?}"
+        assert_eq!(
+            kinds(&found),
+            ["shared-flush", "missing-addr"],
+            "pane lists the full service, got: {found:?}"
         );
-        assert!(found.iter().all(|a| a.rtype == Some(12)));
-        // The SRV row is healthy (its missing flush bit is info-only,
-        // excluded): service-level missing-addr must not leak onto it.
+        assert_eq!(matched(&found), ["shared-flush"]);
+        // The healthy SRV row sees the same list with nothing marked
+        // (its missing flush bit is info-only, excluded).
         let srv_idx = app
             .display_detail()
             .expect("service displayed")
@@ -7740,14 +7764,16 @@ mod tests {
         app.detail_anchor = app
             .display_detail()
             .and_then(|d| App::identity_at_detail(&d, srv_idx));
+        let found = app.anomalies_for_selected();
+        assert_eq!(kinds(&found), ["shared-flush", "missing-addr"]);
         assert!(
-            app.anomalies_for_selected().is_empty(),
-            "healthy SRV row must be quiet"
+            matched(&found).is_empty(),
+            "healthy row marks nothing, got: {found:?}"
         );
     }
 
     #[test]
-    fn anomalies_for_selected_matches_ttl_base_mismatch() {
+    fn anomalies_pane_marks_ttl_base_mismatch_in_list() {
         let mut app = App::new().unwrap();
         // Short PTR base with the flush bit clear: only the base TTL is
         // remarkable — the spec's second example finding.
@@ -7767,14 +7793,14 @@ mod tests {
             .display_detail()
             .and_then(|d| App::identity_at_detail(&d, ptr_idx));
         let found = app.anomalies_for_selected();
-        assert!(
-            found.iter().any(|a| a.kind == "ttl-base-mismatch"),
-            "PTR row must surface ttl-base-mismatch, got: {found:?}"
+        assert_eq!(
+            kinds(&found),
+            ["missing-addr", "ttl-base-mismatch"],
+            "pane lists the full service, got: {found:?}"
         );
+        assert_eq!(matched(&found), ["ttl-base-mismatch"]);
         assert!(
-            found
-                .iter()
-                .all(|a| !matches!(a.severity, crate::anomalies::Severity::Info)),
+            found.iter().all(|p| p.anomaly.is_surfaced()),
             "pane never shows informational notes"
         );
     }
@@ -7835,11 +7861,16 @@ mod tests {
             app.detail_anchor = app
                 .display_detail()
                 .and_then(|d| App::identity_at_detail(&d, idx));
-            assert!(
-                app.anomalies_for_selected()
-                    .iter()
-                    .any(|a| a.kind == "ttl-unstable"),
-                "A row {idx} must surface the spanning ttl-unstable finding"
+            let found = app.anomalies_for_selected();
+            assert_eq!(
+                kinds(&found),
+                ["ttl-unstable"],
+                "pane lists the full service, got: {found:?}"
+            );
+            assert_eq!(
+                matched(&found),
+                ["ttl-unstable"],
+                "A row {idx} must mark the spanning finding"
             );
         }
     }
@@ -7896,26 +7927,36 @@ mod tests {
                 .display_detail()
                 .and_then(|d| App::identity_at_detail(&d, idx));
             let found = app.anomalies_for_selected();
+            // Every question row sees the full service list: both
+            // queriers' findings plus the service-level missing-addr
+            // (no A records here), each marked only on its own row.
+            assert_eq!(
+                kinds(&found),
+                ["unicast-question", "unicast-question", "missing-addr"],
+                "pane lists the full service, got: {found:?}"
+            );
+            let marked: Vec<_> = found
+                .iter()
+                .filter(|p| p.cursor_match)
+                .map(|p| p.anomaly.source.clone())
+                .collect();
             if expect_finding {
                 assert_eq!(
-                    found.len(),
-                    1,
-                    "row for {src} must surface exactly its own finding, got: {found:?}"
+                    marked,
+                    vec![Some(src.to_string())],
+                    "row for {src} must mark exactly its own finding, got: {found:?}"
                 );
-                let item = &found[0];
-                assert_eq!(item.kind, "unicast-question");
-                assert_eq!(item.source.as_deref(), Some(src.to_string()).as_deref());
             } else {
                 assert!(
-                    found.is_empty(),
-                    "own inferred send must stay quiet, got: {found:?}"
+                    marked.is_empty(),
+                    "own inferred send marks nothing, got: {found:?}"
                 );
             }
         }
     }
 
-    /// Park the left selection on a collapsed host header: the detail
-    /// cursor is untouched, but the pane must switch to service level.
+    /// Park the left selection on a collapsed host header: scope and
+    /// cursor stay service-wide, with nothing marked.
     fn select_host_header(app: &mut App, key: &str) {
         app.collapsed_hosts.insert(key.to_string());
         let pos = app
@@ -7941,11 +7982,14 @@ mod tests {
         select_host_header(&mut app, "test.local");
         let found = app.anomalies_for_selected();
         assert_eq!(
-            found.len(),
-            1,
-            "header must show exactly the service-level finding, got: {found:?}"
+            kinds(&found),
+            ["missing-addr"],
+            "header shows the service list, got: {found:?}"
         );
-        assert_eq!(found[0].kind, "missing-addr");
+        assert!(
+            matched(&found).is_empty(),
+            "header marks nothing, got: {found:?}"
+        );
     }
 
     #[test]
@@ -7966,11 +8010,14 @@ mod tests {
         select_host_header(&mut app, "test.local");
         let found = app.anomalies_for_selected();
         assert_eq!(
-            found.len(),
-            1,
-            "header must show exactly the spanning finding, got: {found:?}"
+            kinds(&found),
+            ["ttl-unstable"],
+            "header shows the service list, got: {found:?}"
         );
-        assert_eq!(found[0].kind, "ttl-unstable");
+        assert!(
+            matched(&found).is_empty(),
+            "header marks nothing, got: {found:?}"
+        );
     }
 
     #[test]
@@ -8001,13 +8048,18 @@ mod tests {
         assert!(app.selected_enum().is_some());
         select_host_header(&mut app, ENUM_HOST);
         let found = app.anomalies_for_selected();
-        assert!(
-            found.iter().any(|a| a.kind == "type-format"),
-            "enum header must surface the bad-type finding, got: {found:?}"
+        assert_eq!(
+            kinds(&found),
+            ["type-format"],
+            "enum header shows the service list, got: {found:?}"
         );
-        // The row itself still shows it via the record path: expand the
-        // group again and park on the record row (the collapsed header
-        // index would not restore it).
+        assert!(
+            matched(&found).is_empty(),
+            "header marks nothing, got: {found:?}"
+        );
+        // The row itself marks the finding too: expand the group again
+        // and park on the record row (the collapsed header index would
+        // not restore it).
         app.collapsed_hosts.remove(ENUM_HOST);
         let enum_pos = app
             .display_items()
@@ -8020,30 +8072,38 @@ mod tests {
             app.anomaly_scope(),
             crate::app::AnomalyScope::Record(_)
         ));
-        assert!(
-            app.anomalies_for_selected()
-                .iter()
-                .any(|a| a.kind == "type-format"),
-            "enum row must keep its own finding"
-        );
+        let found = app.anomalies_for_selected();
+        assert_eq!(kinds(&found), ["type-format"]);
+        assert_eq!(matched(&found), ["type-format"]);
     }
 
-    /// Park the detail cursor on a raw-answer row and return the
-    /// finding kinds shown in the Anomalies pane there.
-    fn park_on(app: &mut App, idx: usize) -> Vec<String> {
+    /// Park the detail cursor on a raw-answer row and return the pane
+    /// entries shown there.
+    fn park_on(app: &mut App, idx: usize) -> Vec<PaneAnomaly> {
         app.detail_selected = idx;
         app.detail_anchor = app
             .display_detail()
             .and_then(|d| App::identity_at_detail(&d, idx));
         app.anomalies_for_selected()
+    }
+
+    /// Finding kinds in pane order.
+    fn kinds(found: &[PaneAnomaly]) -> Vec<&str> {
+        found.iter().map(|p| p.anomaly.kind).collect()
+    }
+
+    /// Kinds of the entries marked as the cursor's own finding.
+    fn matched(found: &[PaneAnomaly]) -> Vec<&str> {
+        found
             .iter()
-            .map(|a| a.kind.to_string())
+            .filter(|p| p.cursor_match)
+            .map(|p| p.anomaly.kind)
             .collect()
     }
 
     /// Park the detail cursor on the raw-answer row with this identity
-    /// and return the finding kinds shown there.
-    fn park_on_answer(app: &mut App, rtype: u16, rdata: &str) -> Vec<String> {
+    /// and return the pane entries shown there.
+    fn park_on_answer(app: &mut App, rtype: u16, rdata: &str) -> Vec<PaneAnomaly> {
         let idx = app
             .display_detail()
             .expect("service displayed")
@@ -8055,8 +8115,8 @@ mod tests {
     }
 
     /// Park the detail cursor on the question row from this source and
-    /// return the finding kinds shown there.
-    fn park_on_question(app: &mut App, source: SocketAddr) -> Vec<String> {
+    /// return the pane entries shown there.
+    fn park_on_question(app: &mut App, source: SocketAddr) -> Vec<PaneAnomaly> {
         let target = app.display_detail().expect("service displayed");
         let pos = target
             .ordered_questions()
@@ -8106,37 +8166,74 @@ mod tests {
         ));
         app.evict_expired();
         select_instance(&mut app, "Test");
-        // Every stop shows exactly its own findings: nothing leaks from
-        // the previously highlighted row.
-        assert_eq!(
+        // Every stop shows the full service list with only its own
+        // findings marked: nothing leaks from the previously
+        // highlighted row.
+        let full = ["shared-flush", "unicast-question", "ttl-unstable"];
+        let stop = |found: Vec<PaneAnomaly>, marked: &[&str]| {
+            assert_eq!(
+                kinds(&found),
+                full,
+                "pane lists the full service, got: {found:?}"
+            );
+            assert_eq!(matched(&found), marked);
+        };
+        stop(
             park_on_answer(&mut app, 12, "Test._http._tcp.local."),
-            ["shared-flush"]
+            &["shared-flush"],
         );
-        assert!(park_on_answer(&mut app, 33, "0 0 80 test.local.").is_empty());
-        assert_eq!(
+        stop(park_on_answer(&mut app, 33, "0 0 80 test.local."), &[]);
+        stop(
             park_on_answer(&mut app, 1, "192.168.1.10"),
-            ["ttl-unstable"]
+            &["ttl-unstable"],
         );
-        assert_eq!(
+        stop(
             park_on_answer(&mut app, 1, "192.168.1.11"),
-            ["ttl-unstable"]
+            &["ttl-unstable"],
         );
-        assert_eq!(park_on_question(&mut app, querier), ["unicast-question"]);
+        stop(park_on_question(&mut app, querier), &["unicast-question"]);
         select_host_header(&mut app, "test.local");
-        assert_eq!(
-            app.anomalies_for_selected()
-                .iter()
-                .map(|a| a.kind.to_string())
-                .collect::<Vec<_>>(),
-            ["ttl-unstable"]
-        );
+        stop(app.anomalies_for_selected(), &[]);
         // Expire the PTR: its row goes quiet instead of keeping the
         // shared-flush finding it showed while live.
         expire_rtype(&mut app, 12, 5000);
-        // Back on the instance row: scope is per-record again.
+        // Back on the instance row: the gone row names its state.
         app.collapsed_hosts.remove("test.local");
         select_instance(&mut app, "Test");
         assert!(park_on_answer(&mut app, 12, "Test._http._tcp.local.").is_empty());
+    }
+
+    #[test]
+    fn anomalies_pane_follows_cursor_to_match() {
+        let mut app = App::new().unwrap();
+        let mut ptr = ptr_record(4500);
+        ptr.flush_bit = true;
+        ingest(&mut app, &ptr);
+        ingest(&mut app, &srv_record(120));
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 1, "A", "192.168.1.10", 120),
+        );
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 1, "A", "192.168.1.11", 4500),
+        );
+        app.evict_expired();
+        select_instance(&mut app, "Test");
+        // Cursor starts on the first A row, whose finding is second in
+        // the pane: follow scrolls there, not to the top.
+        assert_eq!(app.anomalies_offset.get(), 1);
+        app.focus = Focus::Answers;
+        app.move_detail_cursor(1);
+        assert_eq!(app.detail_selected, 1);
+        assert_eq!(app.anomalies_offset.get(), 1);
+        app.move_detail_cursor(1);
+        assert_eq!(app.detail_selected, 2);
+        assert_eq!(app.anomalies_offset.get(), 0);
+        // Header: nothing marked, back to the top.
+        select_host_header(&mut app, "test.local");
+        app.follow_anomalies_cursor();
+        assert_eq!(app.anomalies_offset.get(), 0);
     }
 
     #[test]
@@ -8219,6 +8316,14 @@ mod tests {
         assert!(
             text.contains("error shared-flush"),
             "pane must spell out the severity, got: {text:?}"
+        );
+        assert!(
+            text.contains("> \u{f057}"),
+            "cursor row's finding must carry the marker, got: {text:?}"
+        );
+        assert!(
+            text.contains("PTR _http._tcp.local."),
+            "line must name its row, got: {text:?}"
         );
         let mut icon_fg = None;
         for y in area.y..area.y.saturating_add(area.height) {
