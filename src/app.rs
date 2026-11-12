@@ -2042,6 +2042,8 @@ impl App {
             iface: rec.iface.clone(),
             ifindex: rec.ifindex,
             flush: rec.flush_bit,
+            section: format!("{:?}", rec.section).to_lowercase(),
+            multicast_dst: rec.dst_is_multicast,
             received_at: dump::instant_to_iso(rec.received_at),
             age_secs: rec.received_at.elapsed().as_secs(),
         }
@@ -4791,6 +4793,8 @@ mod tests {
             source: test_source(),
             iface: String::new(),
             ifindex: 0,
+            dst_is_multicast: true,
+            section: browse::RecordSection::Answer,
             received_at: Instant::now(),
         }
     }
@@ -6921,6 +6925,8 @@ mod tests {
             source,
             iface: String::new(),
             ifindex: 0,
+            dst_is_multicast: true,
+            section: browse::RecordSection::Question,
             received_at: Instant::now(),
         };
         browse::Event {
@@ -7098,6 +7104,8 @@ mod tests {
                 source: remote_source(),
                 iface: String::new(),
                 ifindex: 0,
+                dst_is_multicast: true,
+                section: browse::RecordSection::Question,
                 received_at: Instant::now(),
             }],
             query_kas: vec![ptr_record(120)],

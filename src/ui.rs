@@ -1333,6 +1333,8 @@ mod tests {
             source: "192.168.1.5:5353".parse().unwrap(),
             iface: iface.to_string(),
             ifindex: 0,
+            dst_is_multicast: true,
+            section: crate::browse::RecordSection::Answer,
             received_at: Instant::now(),
         }
     }

@@ -61,6 +61,17 @@ enum Family {
     V6,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordSection {
+    Answer,
+    Authority,
+    Additional,
+    /// Known answers in query packets (RFC 6762 §7.1): beliefs, not facts.
+    KnownAnswer,
+    /// Question rows reuse RawRecord; section is not meaningful there.
+    Question,
+}
+
 #[derive(Debug, Clone)]
 pub struct RawRecord {
     pub name: String,
@@ -81,6 +92,13 @@ pub struct RawRecord {
     /// supplied none). Survives when `iface` is empty so unmapped
     /// traffic stays identifiable (`if#7`) instead of one opaque pile.
     pub ifindex: u32,
+    /// Whether the packet's destination was the mDNS multicast group.
+    /// False means a unicast reply (QU response or legacy unicast), which
+    /// the analyzer treats as unconfirmed context for leak/flush verdicts.
+    pub dst_is_multicast: bool,
+    /// Which DNS section carried the record. Responses merge answer /
+    /// authority / additional sections; known answers ride in queries.
+    pub section: RecordSection,
     pub received_at: Instant,
 }
 
@@ -597,7 +615,7 @@ fn listen(
                 if !interface_selected(iface, selection.as_ref()) {
                     continue;
                 }
-                match parse_packet(&raw, info.addr_src, iface, ifindex) {
+                match parse_packet(&raw, info.addr_src, info.addr_dst, iface, ifindex) {
                     Some(ev) => {
                         if tx.send(ev).is_err() {
                             break;
@@ -701,8 +719,15 @@ fn send_query(socket: &PktInfoUdpSocket, req: &QueryRequest, dest: SocketAddr, e
     let _ = socket.send_to(&bytes, &SockAddr::from(dest));
 }
 
-fn parse_packet(raw: &[u8], source: SocketAddr, iface: &str, ifindex: u32) -> Option<Event> {
+fn parse_packet(
+    raw: &[u8],
+    source: SocketAddr,
+    dst: std::net::IpAddr,
+    iface: &str,
+    ifindex: u32,
+) -> Option<Event> {
     let msg = Message::from_bytes(raw).ok()?;
+    let dst_is_multicast = mdns_multicast_dest(&dst);
 
     let mut answers = Vec::new();
 
@@ -713,11 +738,20 @@ fn parse_packet(raw: &[u8], source: SocketAddr, iface: &str, ifindex: u32) -> Op
     // source. Filing them would conjure phantom sightings on links the
     // device never touched.
     if msg.metadata.message_type == MessageType::Response {
-        for rec in msg
+        for (section, rec) in msg
             .answers
             .iter()
-            .chain(&msg.authorities)
-            .chain(&msg.additionals)
+            .map(|r| (RecordSection::Answer, r))
+            .chain(
+                msg.authorities
+                    .iter()
+                    .map(|r| (RecordSection::Authority, r)),
+            )
+            .chain(
+                msg.additionals
+                    .iter()
+                    .map(|r| (RecordSection::Additional, r)),
+            )
         {
             answers.push(RawRecord {
                 name: unescape(&rec.name.to_string()),
@@ -734,6 +768,8 @@ fn parse_packet(raw: &[u8], source: SocketAddr, iface: &str, ifindex: u32) -> Op
                 source,
                 iface: iface.to_string(),
                 ifindex,
+                dst_is_multicast,
+                section,
                 received_at: Instant::now(),
             });
         }
@@ -756,6 +792,8 @@ fn parse_packet(raw: &[u8], source: SocketAddr, iface: &str, ifindex: u32) -> Op
                 source,
                 iface: iface.to_string(),
                 ifindex,
+                dst_is_multicast,
+                section: RecordSection::KnownAnswer,
                 received_at: Instant::now(),
             });
         }
@@ -775,6 +813,8 @@ fn parse_packet(raw: &[u8], source: SocketAddr, iface: &str, ifindex: u32) -> Op
             source,
             iface: iface.to_string(),
             ifindex,
+            dst_is_multicast,
+            section: RecordSection::Question,
             received_at: Instant::now(),
         });
     }
@@ -1037,7 +1077,14 @@ mod tests {
             "Inst.svc._http._tcp.local.",
             120,
         ));
-        let ev = parse_packet(&q.to_vec().unwrap(), test_source(), "enx", 2).unwrap();
+        let ev = parse_packet(
+            &q.to_vec().unwrap(),
+            test_source(),
+            std::net::IpAddr::V4(MDNS_V4),
+            "enx",
+            2,
+        )
+        .unwrap();
         // The known answer must not become a sighting; the question stays.
         assert!(ev.answers.is_empty());
         assert_eq!(ev.questions.len(), 1);
@@ -1054,7 +1101,14 @@ mod tests {
             "Inst.svc._http._tcp.local.",
             120,
         ));
-        let ev = parse_packet(&r.to_vec().unwrap(), test_source(), "enx", 2).unwrap();
+        let ev = parse_packet(
+            &r.to_vec().unwrap(),
+            test_source(),
+            std::net::IpAddr::V4(MDNS_V4),
+            "enx",
+            2,
+        )
+        .unwrap();
         assert_eq!(ev.answers.len(), 1);
         assert_eq!(ev.answers[0].rdata, "Inst.svc._http._tcp.local.");
         assert_eq!(ev.answers[0].iface, "enx");
@@ -1071,7 +1125,14 @@ mod tests {
         );
         query.set_mdns_unicast_response(true);
         q.add_query(query);
-        let ev = parse_packet(&q.to_vec().unwrap(), test_source(), "enx", 2).unwrap();
+        let ev = parse_packet(
+            &q.to_vec().unwrap(),
+            test_source(),
+            std::net::IpAddr::V4(MDNS_V4),
+            "enx",
+            2,
+        )
+        .unwrap();
         assert_eq!(ev.questions.len(), 1);
         assert!(ev.questions[0].qu);
     }
@@ -1085,7 +1146,14 @@ mod tests {
         );
         rec.mdns_cache_flush = flush;
         msg.add_answer(rec);
-        parse_packet(&msg.to_vec().unwrap(), test_source(), "", 7).unwrap()
+        parse_packet(
+            &msg.to_vec().unwrap(),
+            test_source(),
+            std::net::IpAddr::V4(MDNS_V4),
+            "",
+            7,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1120,7 +1188,14 @@ mod tests {
         );
         ka.mdns_cache_flush = true;
         q.add_answer(ka);
-        let ev = parse_packet(&q.to_vec().unwrap(), test_source(), "", 7).unwrap();
+        let ev = parse_packet(
+            &q.to_vec().unwrap(),
+            test_source(),
+            std::net::IpAddr::V4(MDNS_V4),
+            "",
+            7,
+        )
+        .unwrap();
         assert!(ev.answers.is_empty());
         assert_eq!(ev.query_kas.len(), 1);
         assert!(ev.query_kas[0].flush_bit);
@@ -1243,11 +1318,35 @@ mod tests {
         msg.add_answer(nsec);
         let raw = msg.to_vec().unwrap();
         let addr: SocketAddr = "192.168.178.5:5353".parse().unwrap();
-        let ev = parse_packet(&raw, addr, "br0", 3).unwrap();
+        let ev = parse_packet(&raw, addr, std::net::IpAddr::V4(MDNS_V4), "br0", 3).unwrap();
         assert_eq!(ev.answers.len(), 1);
         assert_eq!(ev.answers[0].rdata, "host.local. A");
         assert_eq!(ev.answers[0].iface, "br0");
         assert!(ev.questions.is_empty());
+    }
+
+    #[test]
+    fn packet_context_tags_section_and_destination() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let mut msg = Message::new(0, MessageType::Response, OpCode::Query);
+        msg.add_answer(known_answer("a.local.", "x.local.", 120));
+        msg.add_authority(known_answer("b.local.", "x.local.", 120));
+        msg.add_additional(known_answer("c.local.", "x.local.", 120));
+        let raw = msg.to_vec().unwrap();
+        let mcast = IpAddr::V4(MDNS_V4);
+        let ev = parse_packet(&raw, test_source(), mcast, "br0", 3).unwrap();
+        assert_eq!(
+            ev.answers.iter().map(|r| r.section).collect::<Vec<_>>(),
+            vec![
+                RecordSection::Answer,
+                RecordSection::Authority,
+                RecordSection::Additional,
+            ]
+        );
+        assert!(ev.answers.iter().all(|r| r.dst_is_multicast));
+        let unicast: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+        let ev = parse_packet(&raw, test_source(), unicast, "br0", 3).unwrap();
+        assert!(ev.answers.iter().all(|r| !r.dst_is_multicast));
     }
 
     #[test]
