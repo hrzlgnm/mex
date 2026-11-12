@@ -72,6 +72,12 @@ pub fn is_ttl_kind(kind: &str) -> bool {
     TTL_KINDS.contains(&kind)
 }
 
+/// Whether `kind` is a demand-side unicast-only finding: observed
+/// questions asking multicast for a type that can only live in unicast.
+pub fn is_question_kind(kind: &str) -> bool {
+    kind == "unicast-question"
+}
+
 /// A service slice for analysis: borrows browser state, owns nothing.
 pub struct ServiceView<'a> {
     pub instance: &'a str,

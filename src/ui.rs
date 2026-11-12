@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::io::IsTerminal;
 use std::net::SocketAddr;
@@ -1088,6 +1088,17 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
         None => format!(" Anomalies ({}) ", findings.len()),
     };
     let dimmed = Style::default().fg(Color::Gray);
+    // Row identities already claimed in this pane: a repeated
+    // (name, type) needs its rdata to tell the findings apart.
+    let mut identity_count: HashMap<(String, u16), usize> = HashMap::new();
+    for p in &findings {
+        let a = &p.anomaly;
+        if let (Some(name), Some(rtype)) = (&a.record_name, a.rtype) {
+            *identity_count
+                .entry((name.trim_end_matches('.').to_lowercase(), rtype))
+                .or_insert(0) += 1;
+        }
+    }
     let finding_lines = |findings: &[crate::app::PaneAnomaly]| -> Vec<Line<'_>> {
         if findings.is_empty() {
             return vec![Line::from(Span::styled(
@@ -1109,11 +1120,23 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
                 // Question sources render as stored (self sends never
                 // produce findings, so no `self` case arises).
                 let scope = match (&a.record_name, a.rtype_str.as_deref()) {
-                    (Some(name), Some(rtype)) if a.kind == "unicast-question" => format!(
-                        "QRY {rtype} {name} @ {}",
-                        a.source.as_deref().unwrap_or("?")
-                    ),
-                    (Some(name), Some(rtype)) => format!("{rtype} {name}"),
+                    (Some(name), Some(rtype)) if crate::anomalies::is_question_kind(a.kind) => {
+                        format!(
+                            "QRY {rtype} {name} @ {}",
+                            a.source.as_deref().unwrap_or("?")
+                        )
+                    }
+                    (Some(name), Some(rtype)) => {
+                        let base = format!("{rtype} {name}");
+                        let key = (
+                            name.trim_end_matches('.').to_lowercase(),
+                            a.rtype.unwrap_or(0),
+                        );
+                        match (&a.rdata, identity_count.get(&key)) {
+                            (Some(rdata), Some(&n)) if n > 1 => format!("{base} = {rdata}"),
+                            _ => base,
+                        }
+                    }
                     _ => String::new(),
                 };
                 let head = if scope.is_empty() {

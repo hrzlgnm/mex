@@ -2794,8 +2794,7 @@ impl App {
             self.detail_free_scroll = false;
             if self.detail_selected != idx {
                 self.detail_selected = idx;
-                self.hex_offset.set(0);
-                self.follow_anomalies_cursor();
+                self.restart_for_new_row();
             }
             self.detail_anchor = self
                 .display_detail()
@@ -2823,8 +2822,7 @@ impl App {
             let idx = raws + table_row;
             if self.detail_selected != idx {
                 self.detail_selected = idx;
-                self.hex_offset.set(0);
-                self.follow_anomalies_cursor();
+                self.restart_for_new_row();
             }
             self.detail_anchor = self
                 .display_detail()
@@ -3101,8 +3099,7 @@ impl App {
         // New row means new hex bytes: restart the dump at the top and
         // scroll the anomalies pane to the row's finding.
         if self.detail_selected != before {
-            self.hex_offset.set(0);
-            self.follow_anomalies_cursor();
+            self.restart_for_new_row();
         }
         self.detail_anchor = self
             .display_detail()
@@ -3137,8 +3134,7 @@ impl App {
         // New row means new hex bytes: restart the dump at the top and
         // scroll the anomalies pane to the row's finding.
         if self.detail_selected != before {
-            self.hex_offset.set(0);
-            self.follow_anomalies_cursor();
+            self.restart_for_new_row();
         }
     }
 
@@ -3153,8 +3149,7 @@ impl App {
             .display_detail()
             .and_then(|d| Self::identity_at_detail(&d, self.detail_selected));
         if self.detail_selected != before {
-            self.hex_offset.set(0);
-            self.follow_anomalies_cursor();
+            self.restart_for_new_row();
         }
     }
 
@@ -3241,6 +3236,13 @@ impl App {
     /// cursor, so there is no cursor to resume and no pin flag.
     fn scroll_anomalies(&mut self, delta: isize) {
         Self::bump_offset(&self.anomalies_offset, delta);
+    }
+
+    /// New detail row: restart the hex dump at the top and scroll the
+    /// Anomalies pane to the row's finding.
+    fn restart_for_new_row(&mut self) {
+        self.hex_offset.set(0);
+        self.follow_anomalies_cursor();
     }
 
     /// Scroll the Anomalies pane to the finding that belongs to the
@@ -3360,8 +3362,7 @@ impl App {
             self.detail_offset.set(0);
             self.detail_free_scroll = false;
             self.questions_offset.set(0);
-            self.follow_anomalies_cursor();
-            self.hex_offset.set(0);
+            self.restart_for_new_row();
             self.detail_anchor = self
                 .display_detail()
                 .and_then(|d| Self::identity_at_detail(&d, self.detail_selected));
@@ -4639,7 +4640,7 @@ impl App {
         let src = key.source.to_string();
         found
             .iter()
-            .filter(|a| a.kind == "unicast-question")
+            .filter(|a| anomalies::is_question_kind(a.kind))
             .filter(|a| a.is_surfaced())
             .filter(|a| a.service == id)
             .filter(|a| a.rtype == Some(rtype))
@@ -8267,9 +8268,11 @@ mod tests {
             .and_then(|d| App::identity_at_detail(&d, ptr_idx));
         assert!(app.anomalies_for_selected().is_empty());
         let buf = render_to_buffer(&app, 100, 30);
+        let text = rect_text(&buf, app.anomalies_rect.get());
+        assert!(text.contains("Record expired"), "expired rows must say so");
         assert!(
-            rect_text(&buf, app.anomalies_rect.get()).contains("Record expired"),
-            "expired rows must say so"
+            text.contains("(0)"),
+            "gone rows count zero findings, got: {text:?}"
         );
         // Goodbye rows get their own copy.
         let mut app = App::new().unwrap();
@@ -8290,9 +8293,14 @@ mod tests {
             .and_then(|d| App::identity_at_detail(&d, ptr_idx));
         assert!(app.anomalies_for_selected().is_empty());
         let buf = render_to_buffer(&app, 100, 30);
+        let text = rect_text(&buf, app.anomalies_rect.get());
         assert!(
-            rect_text(&buf, app.anomalies_rect.get()).contains("Goodbye received"),
+            text.contains("Goodbye received"),
             "goodbye rows must say so"
+        );
+        assert!(
+            text.contains("(0)"),
+            "gone rows count zero findings, got: {text:?}"
         );
     }
 
@@ -8346,6 +8354,48 @@ mod tests {
             icon_fg,
             Some(ratatui::style::Color::Red),
             "error icon must match the metrics overlay color"
+        );
+    }
+
+    #[test]
+    fn anomalies_pane_disambiguates_shared_identity() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        // Same name and type, distinct rdata: two findings that share
+        // their row identity.
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 1, "A", "192.168.1.10", 5),
+        );
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 1, "A", "192.168.1.11", 5),
+        );
+        app.evict_expired();
+        select_instance(&mut app, "Test");
+        let found = app.anomalies_for_selected();
+        assert_eq!(kinds(&found), ["ttl-low", "ttl-low"]);
+        // Park on the second row: only its finding is marked, and the
+        // lines name their rdata so the rows tell apart.
+        park_on_answer(&mut app, 1, "192.168.1.11");
+        let found = app.anomalies_for_selected();
+        assert_eq!(matched(&found), ["ttl-low"]);
+        assert!(
+            found
+                .iter()
+                .all(|p| p.anomaly.rdata.as_deref() == Some("192.168.1.11") || !p.cursor_match),
+            "only the parked row's finding may mark, got: {found:?}"
+        );
+        let buf = render_to_buffer(&app, 100, 30);
+        let text = rect_text(&buf, app.anomalies_rect.get());
+        assert!(
+            text.contains("A test.local. = 192.168.1.10"),
+            "lines must disambiguate shared identities, got: {text:?}"
+        );
+        assert!(
+            text.contains("A test.local. = 192.168.1.11"),
+            "lines must disambiguate shared identities, got: {text:?}"
         );
     }
 
