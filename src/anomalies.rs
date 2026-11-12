@@ -366,6 +366,12 @@ fn check_type_format(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>
     if st.eq_ignore_ascii_case("_services._dns-sd._udp.local") {
         return;
     }
+    // Reverse-mapping names map addresses to hostnames; they are not
+    // service types and must never flag here (ingest refuses to browse
+    // them, this is the backstop for any other path).
+    if is_reverse_ptr(st) {
+        return;
+    }
     if let Some(reason) = service_type_problem(st) {
         out.push(Anomaly {
             kind: "type-format",
@@ -571,7 +577,7 @@ pub(crate) fn is_enumeration_row(service: &str, record_name: Option<&str>) -> bo
 
 /// Whether a PTR owner name is a reverse-mapping name. Those PTRs are
 /// unique (one address, one owner), unlike service/enumeration PTRs.
-fn is_reverse_ptr(name: &str) -> bool {
+pub(crate) fn is_reverse_ptr(name: &str) -> bool {
     let lower = name.trim_end_matches('.').to_ascii_lowercase();
     lower.ends_with(".in-addr.arpa") || lower.ends_with(".ip6.arpa")
 }
@@ -1999,6 +2005,18 @@ mod tests {
         let answers = vec![rec("X._http._tcp.local.", 16, "TXT", &big, 120, true)];
         let found = analyze_service("X", "_http._tcp.local", "", &answers);
         assert!(found.iter().any(|a| a.kind == "txt-oversize"));
+    }
+
+    #[test]
+    fn reverse_service_type_is_not_a_type_format() {
+        // Reverse-mapping names map addresses to hostnames; they are not
+        // service types, so a reverse-named service must stay quiet even
+        // if one ever reaches the analyzer.
+        let found = analyze_service("Android", "local.37.178.168.192.in-addr.arpa", "", &[]);
+        assert!(
+            !found.iter().any(|a| a.kind == "type-format"),
+            "reverse name must not flag, got: {found:?}"
+        );
     }
 
     #[test]
