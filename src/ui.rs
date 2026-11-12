@@ -1003,7 +1003,7 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
             target
                 .ordered_questions()
                 .iter()
-                .map(|(_, _, source, _, _)| source.to_string().len())
+                .map(|(_, _, source, _, _)| question_source_label(source).len())
                 .max()
                 .unwrap_or(14)
                 .clamp(14, 45) as u16,
@@ -1066,10 +1066,13 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
 }
 
 /// Source cell for the Questions table: our own inferred sends render
-/// as `self`, everything else as the querier address.
+/// as `self`, one-shot resolvers (§5.1, ephemeral source port) get a tag,
+/// everything else as the querier address.
 fn question_source_label(source: &SocketAddr) -> String {
     if *source == crate::app::SELF_SOURCE {
         "self".to_string()
+    } else if crate::anomalies::is_one_shot_querier(source) {
+        format!("{source} (one-shot)")
     } else {
         source.to_string()
     }
@@ -1369,6 +1372,9 @@ mod tests {
         assert_eq!(question_source_label(&crate::app::SELF_SOURCE), "self");
         let addr: SocketAddr = "192.168.1.5:5353".parse().unwrap();
         assert_eq!(question_source_label(&addr), "192.168.1.5:5353");
+        // Ephemeral source ports (§5.1) mark one-shot resolvers.
+        let stub: SocketAddr = "192.168.1.5:45678".parse().unwrap();
+        assert_eq!(question_source_label(&stub), "192.168.1.5:45678 (one-shot)");
     }
 
     #[cfg(unix)]

@@ -1573,11 +1573,22 @@ impl App {
                 }
             }
         }
+        // One-shot resolvers (§5.1) ask from ephemeral ports; the rest are
+        // full queriers on 5353. Quiet when none, to keep the common line.
+        let one_shots = queriers
+            .iter()
+            .filter(|q| anomalies::is_one_shot_querier(q))
+            .count();
+        let querier_breakdown = if one_shots > 0 {
+            format!(", {one_shots} one-shot")
+        } else {
+            String::new()
+        };
         kv(
             &mut rows,
             "questions",
             format!(
-                "{current_q} current ({} queriers) · {} ever ({} QU / {} QM) · {} KAs seen",
+                "{current_q} current ({} queriers{querier_breakdown}) · {} ever ({} QU / {} QM) · {} KAs seen",
                 queriers.len(),
                 self.metrics.questions_total,
                 self.metrics.qu_questions_seen,
@@ -6086,6 +6097,26 @@ mod tests {
             "got: {}",
             row.1
         );
+    }
+
+    #[test]
+    fn metrics_questions_count_one_shot_queriers() {
+        let mut app = two_group_app();
+        let stub: std::net::SocketAddr = "192.168.1.9:45678".parse().unwrap();
+        app.ingest_event(&query_event(
+            "_http._tcp.local.",
+            12,
+            "PTR",
+            false,
+            vec![],
+            stub,
+        ));
+        let row = app
+            .metrics_rows()
+            .into_iter()
+            .find(|(k, _)| k == "questions")
+            .expect("questions row");
+        assert!(row.1.contains("(1 queriers, 1 one-shot)"), "got: {}", row.1);
     }
 
     #[test]

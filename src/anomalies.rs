@@ -519,6 +519,13 @@ pub(crate) fn question_unicast_severity(rtype: u16) -> Option<Severity> {
     }
 }
 
+/// One-shot (stub) resolver per RFC 6762 §5.1: a querier asking from an
+/// ephemeral port, unlike a compliant continuous querier on 5353. Port 0
+/// is our own inferred send path, never a real querier.
+pub(crate) fn is_one_shot_querier(source: &SocketAddr) -> bool {
+    source.port() != 5353 && source.port() != 0
+}
+
 /// Numeric type for a displayed `rtype_str` (`A` → 1, …, `TYPE47` → 47).
 /// `None` means unrecognised: the row stays quiet rather than guessing.
 pub(crate) fn rtype_from_str(s: &str) -> Option<u16> {
@@ -553,6 +560,13 @@ fn check_question(q: &QuestionView, out: &mut Vec<Anomaly>) {
         Severity::Error => "MUST NOT",
         _ => "SHOULD NOT",
     };
+    // A stub resolver asking from an ephemeral port explains the leak
+    // differently than a full mDNS stack, so the finding says which.
+    let message = if is_one_shot_querier(&q.source) {
+        "unicast-only type on multicast (one-shot querier)".to_string()
+    } else {
+        "unicast-only type on multicast".to_string()
+    };
     out.push(Anomaly {
         kind: "unicast-question",
         severity,
@@ -562,7 +576,7 @@ fn check_question(q: &QuestionView, out: &mut Vec<Anomaly>) {
         rtype_str: Some(q.rtype_str.to_string()),
         rdata: None,
         source: Some(q.source.to_string()),
-        message: "unicast-only type on multicast".to_string(),
+        message,
         rfc: "RFC 6762 §3",
         requirement,
     });
@@ -1285,6 +1299,34 @@ mod tests {
             Some("192.168.1.9:5353"),
             "finding should name the querier, got: {:?}",
             item.source
+        );
+    }
+
+    #[test]
+    fn unicast_question_marks_one_shot_querier() {
+        // A stub resolver asking from an ephemeral port (§5.1) reads
+        // differently than a full mDNS stack on 5353.
+        let stub: SocketAddr = "192.168.1.9:45678".parse().unwrap();
+        let found = analyze_questions(&[qview("My._http._tcp.local", "fritz.box.", 6, stub)]);
+        let item = found
+            .iter()
+            .find(|a| a.kind == "unicast-question")
+            .expect("expected SOA question leak");
+        assert!(
+            item.message.contains("one-shot"),
+            "stub resolver should be tagged, got: {}",
+            item.message
+        );
+        let found =
+            analyze_questions(&[qview("My._http._tcp.local", "fritz.box.", 6, test_source())]);
+        let item = found
+            .iter()
+            .find(|a| a.kind == "unicast-question")
+            .expect("expected SOA question leak");
+        assert!(
+            !item.message.contains("one-shot"),
+            "compliant querier stays untagged, got: {}",
+            item.message
         );
     }
 
