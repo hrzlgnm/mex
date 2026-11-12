@@ -355,7 +355,7 @@ fn check_missing_addr(
         rtype_str: None,
         rdata: None,
         source: None,
-        message: "no A/AAAA".to_string(),
+        message: format!("no A/AAAA for {host}"),
         rfc: "RFC 6763 §12",
         requirement: "SHOULD",
     });
@@ -376,7 +376,7 @@ fn check_type_format(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>
             rtype_str: None,
             rdata: None,
             source: None,
-            message: format!("bad type: {reason}"),
+            message: format!("bad type {st}: {reason}"),
             rfc: "RFC 6763 §7",
             requirement: "MUST",
         });
@@ -481,11 +481,25 @@ fn check_subtypes(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>) {
                 rtype_str: None,
                 rdata: None,
                 source: None,
-                message: format!("bad subtype: {reason}"),
+                message: format!("bad subtype {sub}: {reason}"),
                 rfc: "RFC 6763 §7.1",
                 requirement: "MUST",
             });
         }
+    }
+}
+
+/// Row identity for a finding (`QRY …` for demand-side questions,
+/// `TYPE name` otherwise): shared by the Anomalies pane and the metrics
+/// overlay so the two surfaces cannot drift. Empty for findings with no
+/// pointed-to row.
+pub(crate) fn finding_scope(a: &Anomaly) -> String {
+    match (&a.record_name, a.rtype_str.as_deref()) {
+        (Some(name), Some(rtype)) if is_question_kind(a.kind) => {
+            format!("QRY {rtype} {name}")
+        }
+        (Some(name), Some(rtype)) => format!("{rtype} {name}"),
+        _ => String::new(),
     }
 }
 
@@ -531,11 +545,13 @@ pub(crate) fn question_unicast_severity(rtype: u16) -> Option<Severity> {
     }
 }
 
-/// One-shot (stub) resolver per RFC 6762 §5.1: a querier asking from an
-/// ephemeral port, unlike a compliant continuous querier on 5353. Port 0
-/// is our own inferred send path, never a real querier.
+/// One-shot (stub) resolver per RFC 6762 §5.1: queries from port 5353
+/// signal a compliant continuous querier (§5.2); anything else comes
+/// from a stub resolver, which asks from an ephemeral port. Port 0 is
+/// our own inferred send path, never a real querier; ports below 1024
+/// are left untagged (no defined mDNS querier lives there).
 pub(crate) fn is_one_shot_querier(source: &SocketAddr) -> bool {
-    source.port() != 5353 && source.port() != 0
+    source.port() != 5353 && source.port() >= 1024
 }
 
 /// Numeric type for a displayed `rtype_str` (`A` → 1, …, `TYPE47` → 47).
@@ -1338,6 +1354,19 @@ mod tests {
         assert!(
             !item.message.contains("one-shot"),
             "compliant querier stays untagged, got: {}",
+            item.message
+        );
+        // Well-known ports are no defined mDNS querier either: leave the
+        // finding untagged rather than guessing.
+        let dns: SocketAddr = "192.168.1.9:53".parse().unwrap();
+        let found = analyze_questions(&[qview("My._http._tcp.local", "fritz.box.", 6, dns)]);
+        let item = found
+            .iter()
+            .find(|a| a.kind == "unicast-question")
+            .expect("expected SOA question leak");
+        assert!(
+            !item.message.contains("one-shot"),
+            "well-known port stays untagged, got: {}",
             item.message
         );
     }

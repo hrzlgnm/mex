@@ -1135,24 +1135,22 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
                     if crate::anomalies::is_enumeration_row(&a.service, a.record_name.as_deref()) {
                         String::new()
                     } else {
-                        match (&a.record_name, a.rtype_str.as_deref()) {
-                            (Some(name), Some(rtype))
-                                if crate::anomalies::is_question_kind(a.kind) =>
-                            {
-                                format!("QRY {rtype} {name}")
+                        let base = crate::anomalies::finding_scope(a);
+                        if base.is_empty() {
+                            base
+                        } else {
+                            let key = (
+                                a.record_name
+                                    .as_deref()
+                                    .unwrap_or("")
+                                    .trim_end_matches('.')
+                                    .to_lowercase(),
+                                a.rtype.unwrap_or(0),
+                            );
+                            match (&a.rdata, identity_count.get(&key)) {
+                                (Some(rdata), Some(&n)) if n > 1 => format!("{base} = {rdata}"),
+                                _ => base,
                             }
-                            (Some(name), Some(rtype)) => {
-                                let base = format!("{rtype} {name}");
-                                let key = (
-                                    name.trim_end_matches('.').to_lowercase(),
-                                    a.rtype.unwrap_or(0),
-                                );
-                                match (&a.rdata, identity_count.get(&key)) {
-                                    (Some(rdata), Some(&n)) if n > 1 => format!("{base} = {rdata}"),
-                                    _ => base,
-                                }
-                            }
-                            _ => String::new(),
                         }
                     };
                 // No severity word: the level icon already carries it.
@@ -1388,9 +1386,12 @@ mod tests {
         assert_eq!(question_source_label(&crate::app::SELF_SOURCE), "self");
         let addr: SocketAddr = "192.168.1.5:5353".parse().unwrap();
         assert_eq!(question_source_label(&addr), "192.168.1.5:5353");
-        // Ephemeral source ports (§5.1) mark one-shot resolvers.
+        // Ephemeral source ports (§5.1) mark one-shot resolvers; other
+        // ports render bare.
         let stub: SocketAddr = "192.168.1.5:45678".parse().unwrap();
         assert_eq!(question_source_label(&stub), "192.168.1.5:45678 (one-shot)");
+        let dns: SocketAddr = "192.168.1.5:53".parse().unwrap();
+        assert_eq!(question_source_label(&dns), "192.168.1.5:53");
     }
 
     #[cfg(unix)]

@@ -1754,31 +1754,27 @@ impl App {
             },
         );
         for a in found.iter() {
-            // `<source> <service> <scope> <text>`; unsourced findings omit
-            // the source slot, and the key's icon carries the level. Scope
-            // names the pointed-to row so same-kind findings from one
-            // announcer tell apart — except the enumeration row itself,
-            // whose scope is constant (the message carries the target).
-            // The RFC rides along for info-level rows.
+            // Scope names the pointed-to row so same-kind findings from
+            // one announcer tell apart — except the enumeration row
+            // itself, whose scope is constant (the message carries the
+            // target). The RFC rides along for info-level rows.
             let scope = if anomalies::is_enumeration_row(&a.service, a.record_name.as_deref()) {
                 String::new()
             } else {
-                match (&a.record_name, a.rtype_str.as_deref()) {
-                    (Some(name), Some(rtype)) if anomalies::is_question_kind(a.kind) => {
-                        format!("QRY {rtype} {name}")
-                    }
-                    (Some(name), Some(rtype)) => format!("{rtype} {name}"),
-                    _ => String::new(),
-                }
+                anomalies::finding_scope(a)
             };
             let scoped = if scope.is_empty() {
                 a.message.clone()
             } else {
                 format!("{scope}: {}", a.message)
             };
+            // `<source> <service> <scope> <text>`; unsourced findings omit
+            // the source slot, and the key's icon carries the level. The
+            // colon sits before the message when no scope intervenes.
+            let sep = if scope.is_empty() { ":" } else { "" };
             let value = match a.source.as_deref() {
-                Some(src) => format!("{src}: {}: {scoped} ({})", a.service, a.rfc),
-                _ => format!("{}: {scoped} ({})", a.service, a.rfc),
+                Some(src) => format!("{src}: {}{sep} {scoped} ({})", a.service, a.rfc),
+                _ => format!("{}{sep} {scoped} ({})", a.service, a.rfc),
             };
             kv(
                 &mut rows,
