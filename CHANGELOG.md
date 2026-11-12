@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.13.0](https://github.com/hrzlgnm/mex/compare/v0.12.0...v0.13.0) (2026-11-12)
+
+
+### Features
+
+* source-first, concise anomaly lines ([#128](https://github.com/hrzlgnm/mex/issues/128)) ([b68c065](https://github.com/hrzlgnm/mex/commit/b68c065c30bb595b5242f35736417e4b01869671))
+
+
+### Bug Fixes
+
+* ignore reverse-mapping PTRs for service browsing ([#130](https://github.com/hrzlgnm/mex/issues/130)) ([3a1e88a](https://github.com/hrzlgnm/mex/commit/3a1e88a1d516585c8c6845c30b931886251299c8))
+
 ## [0.12.0](https://github.com/hrzlgnm/mex/compare/v0.11.1...v0.12.0) (2026-11-12)
 
 
