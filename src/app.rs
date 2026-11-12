@@ -19,14 +19,16 @@ use crate::dump;
 use crate::ui;
 
 /// Pane with keyboard focus: Tab cycles the service list, the two
-/// record tables, and the hex dump. Arrows and j/k navigate inside the
-/// focused pane; the hex pane has no cursor, so its keys scroll.
+/// record tables, the anomalies pane, and the hex dump. Arrows and j/k
+/// navigate inside the focused pane; the hex and anomalies panes have no
+/// cursor, so their keys scroll.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Focus {
     #[default]
     Services,
     Answers,
     Questions,
+    Anomalies,
     Hex,
 }
 
@@ -37,6 +39,7 @@ pub enum DragMode {
     None,
     Vertical,
     HorizUpper,
+    HorizMiddle,
     HorizLower,
 }
 
@@ -230,6 +233,13 @@ pub struct App {
     /// through. Any cursor or fold action clears it.
     pub detail_free_scroll: bool,
     pub questions_offset: Cell<usize>,
+    /// Manual scroll of the Anomalies pane, which follows the record
+    /// cursor and has no cursor of its own. Reset when the cursor or
+    /// target changes; upper clamping happens at render time.
+    pub anomalies_offset: Cell<usize>,
+    /// Visible rows of the Anomalies pane (minus borders), recorded
+    /// during draw so paging matches the viewport.
+    pub anomalies_viewport: Cell<usize>,
     /// Manual scroll of the Hex pane, which follows the record cursor and
     /// has no cursor of its own. Reset when the cursor or target changes;
     /// upper clamping happens at render time, where the line count is known.
@@ -241,10 +251,11 @@ pub struct App {
     /// The shared pane borders are the mouse-drag handles.
     pub left_pct: u16,
     /// Vertical split of the right stack: percent of its height given to
-    /// Answers and Questions (the hex pane takes the remainder). The
-    /// shared pane borders are mouse-draggable.
+    /// Answers, Questions, and Anomalies (the hex pane takes the
+    /// remainder). The shared pane borders are mouse-draggable.
     pub answers_pct: u16,
     pub questions_pct: u16,
+    pub anomalies_pct: u16,
     /// Active mouse drag; `None` when no button is held on a pane border.
     pub drag: DragMode,
     /// Pane border under the mouse cursor, for highlight. Updated on
@@ -256,6 +267,7 @@ pub struct App {
     pub right_rect: Cell<Rect>,
     pub answers_rect: Cell<Rect>,
     pub questions_rect: Cell<Rect>,
+    pub anomalies_rect: Cell<Rect>,
     pub hex_rect: Cell<Rect>,
     pub packet_count: u64,
     pub start_time: Instant,
@@ -555,11 +567,14 @@ impl App {
             detail_offset: Cell::new(0),
             detail_free_scroll: false,
             questions_offset: Cell::new(0),
+            anomalies_offset: Cell::new(0),
+            anomalies_viewport: Cell::new(0),
             hex_offset: Cell::new(0),
             hex_viewport: Cell::new(0),
             left_pct: 33,
-            answers_pct: 34,
-            questions_pct: 33,
+            answers_pct: 30,
+            questions_pct: 25,
+            anomalies_pct: 20,
             drag: DragMode::None,
             hover: Cell::new(DragMode::None),
             body_rect: Cell::new(Rect::default()),
@@ -567,6 +582,7 @@ impl App {
             right_rect: Cell::new(Rect::default()),
             answers_rect: Cell::new(Rect::default()),
             questions_rect: Cell::new(Rect::default()),
+            anomalies_rect: Cell::new(Rect::default()),
             hex_rect: Cell::new(Rect::default()),
             detail_svc_key: None,
             detail_enum_key: None,
@@ -2317,7 +2333,8 @@ impl App {
                 self.focus = match self.focus {
                     Focus::Services => Focus::Answers,
                     Focus::Answers => Focus::Questions,
-                    Focus::Questions => Focus::Hex,
+                    Focus::Questions => Focus::Anomalies,
+                    Focus::Anomalies => Focus::Hex,
                     Focus::Hex => Focus::Services,
                 };
                 self.snap_detail_to_focus();
@@ -2328,7 +2345,8 @@ impl App {
                     Focus::Services => Focus::Hex,
                     Focus::Answers => Focus::Services,
                     Focus::Questions => Focus::Answers,
-                    Focus::Hex => Focus::Questions,
+                    Focus::Anomalies => Focus::Questions,
+                    Focus::Hex => Focus::Anomalies,
                 };
                 self.snap_detail_to_focus();
                 return;
@@ -2378,15 +2396,21 @@ impl App {
         pct.clamp(15, 80)
     }
 
-    /// Answers/Questions shares keep at least 10% each and leave at least
-    /// 10% for the hex pane (`answers + questions <= 90`).
-    fn clamp_answers_pct(pct: u16, questions_pct: u16) -> u16 {
-        let max = 90u16.saturating_sub(questions_pct).max(10);
+    /// Answers/Questions/Anomalies shares keep at least 10% each and leave
+    /// at least 10% for the hex pane (`answers + questions + anomalies <=
+    /// 90`). The second argument is the sum of the other two shares.
+    fn clamp_answers_pct(pct: u16, others: u16) -> u16 {
+        let max = 90u16.saturating_sub(others).max(10);
         pct.clamp(10, 70).min(max)
     }
 
-    fn clamp_questions_pct(pct: u16, answers_pct: u16) -> u16 {
-        let max = 90u16.saturating_sub(answers_pct).max(10);
+    fn clamp_questions_pct(pct: u16, others: u16) -> u16 {
+        let max = 90u16.saturating_sub(others).max(10);
+        pct.clamp(10, 70).min(max)
+    }
+
+    fn clamp_anomalies_pct(pct: u16, others: u16) -> u16 {
+        let max = 90u16.saturating_sub(others).max(10);
         pct.clamp(10, 70).min(max)
     }
 
@@ -2416,7 +2440,8 @@ impl App {
     /// Shared pane border under the cursor, if any. With no gutter the
     /// two abutting border cells form a 2-cell grab zone: the Hosts
     /// right edge / detail left edge vertically, and the Answers bottom
-    /// / Questions top (then Questions bottom / Hex top) horizontally.
+    /// / Questions top, Questions bottom / Anomalies top, then Anomalies
+    /// bottom / Hex top horizontally.
     /// Seams win over panes so the border stays grabbable.
     fn divider_at(&self, col: u16, row: u16) -> DragMode {
         let left = self.left_rect.get();
@@ -2432,6 +2457,7 @@ impl App {
         }
         let answers = self.answers_rect.get();
         let questions = self.questions_rect.get();
+        let anomalies = self.anomalies_rect.get();
         if answers.height > 0 && questions.height > 0 {
             let bottom = answers.y.saturating_add(answers.height.saturating_sub(1));
             if (row == bottom || row == questions.y)
@@ -2441,14 +2467,25 @@ impl App {
                 return DragMode::HorizUpper;
             }
         }
-        let hex = self.hex_rect.get();
-        if questions.height > 0 && hex.height > 0 {
+        if questions.height > 0 && anomalies.height > 0 {
             let bottom = questions
                 .y
                 .saturating_add(questions.height.saturating_sub(1));
-            if (row == bottom || row == hex.y)
+            if (row == bottom || row == anomalies.y)
                 && col >= questions.x
                 && col < questions.x.saturating_add(questions.width)
+            {
+                return DragMode::HorizMiddle;
+            }
+        }
+        let hex = self.hex_rect.get();
+        if anomalies.height > 0 && hex.height > 0 {
+            let bottom = anomalies
+                .y
+                .saturating_add(anomalies.height.saturating_sub(1));
+            if (row == bottom || row == hex.y)
+                && col >= anomalies.x
+                && col < anomalies.x.saturating_add(anomalies.width)
             {
                 return DragMode::HorizLower;
             }
@@ -2463,13 +2500,19 @@ impl App {
 
     fn set_answers_from_y(&mut self, row: u16) {
         let pct = Self::pct_from_y(row, self.right_rect.get());
-        self.answers_pct = Self::clamp_answers_pct(pct, self.questions_pct);
+        self.answers_pct = Self::clamp_answers_pct(pct, self.questions_pct + self.anomalies_pct);
+    }
+
+    fn set_middle_from_y(&mut self, row: u16) {
+        let combined = Self::pct_from_y(row, self.right_rect.get());
+        let want = combined.saturating_sub(self.answers_pct);
+        self.questions_pct = Self::clamp_questions_pct(want, self.answers_pct + self.anomalies_pct);
     }
 
     fn set_lower_from_y(&mut self, row: u16) {
         let combined = Self::pct_from_y(row, self.right_rect.get());
-        let want = combined.saturating_sub(self.answers_pct);
-        self.questions_pct = Self::clamp_questions_pct(want, self.answers_pct);
+        let want = combined.saturating_sub(self.answers_pct + self.questions_pct);
+        self.anomalies_pct = Self::clamp_anomalies_pct(want, self.answers_pct + self.questions_pct);
     }
 
     fn handle_mouse(&mut self, mouse: &MouseEvent) {
@@ -2505,6 +2548,7 @@ impl App {
         match self.focus {
             Focus::Services => self.move_selection(delta),
             Focus::Answers | Focus::Questions => self.move_detail_cursor(delta),
+            Focus::Anomalies => self.scroll_anomalies(delta),
             Focus::Hex => self.scroll_hex(delta),
         }
     }
@@ -2536,6 +2580,10 @@ impl App {
             self.click_answers(row);
         } else if Self::point_in(self.questions_rect.get(), col, row) {
             self.click_questions(row);
+        } else if Self::point_in(self.anomalies_rect.get(), col, row) {
+            // The anomalies pane follows the cursor; clicking focuses
+            // it so its keys scroll the findings.
+            self.focus = Focus::Anomalies;
         } else if Self::point_in(self.hex_rect.get(), col, row) {
             // The hex pane follows the cursor; clicking focuses it so its
             // keys scroll the dump.
@@ -2556,6 +2604,10 @@ impl App {
             DragMode::HorizUpper => {
                 self.set_answers_from_y(row);
                 self.hover.set(DragMode::HorizUpper);
+            }
+            DragMode::HorizMiddle => {
+                self.set_middle_from_y(row);
+                self.hover.set(DragMode::HorizMiddle);
             }
             DragMode::HorizLower => {
                 self.set_lower_from_y(row);
@@ -2695,11 +2747,12 @@ impl App {
         if let Some(idx) = self.answers_table_row_to_detail(table_row) {
             // Stay on the clicked target: the cursor follows the click
             // instead of the manual-scroll viewport. A new row also
-            // restarts the hex dump at the top.
+            // restarts the hex dump and the anomalies list at the top.
             self.detail_free_scroll = false;
             if self.detail_selected != idx {
                 self.detail_selected = idx;
                 self.hex_offset.set(0);
+                self.anomalies_offset.set(0);
             }
             self.detail_anchor = self
                 .display_detail()
@@ -2728,6 +2781,7 @@ impl App {
             if self.detail_selected != idx {
                 self.detail_selected = idx;
                 self.hex_offset.set(0);
+                self.anomalies_offset.set(0);
             }
             self.detail_anchor = self
                 .display_detail()
@@ -2787,8 +2841,8 @@ impl App {
                 KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => self.page_detail(1),
                 _ => {}
             },
-            // The hex pane has no cursor; its keys scroll the dump, which
-            // follows the record cursor.
+            // The hex and anomalies panes have no cursor; their keys scroll
+            // the dumps, which follow the record cursor.
             Focus::Hex => match key.code {
                 KeyCode::Up | KeyCode::Char('k') => self.scroll_hex(-1),
                 KeyCode::Down | KeyCode::Char('j') => self.scroll_hex(1),
@@ -2796,6 +2850,17 @@ impl App {
                 KeyCode::End => self.scroll_hex_edge(false),
                 KeyCode::PageUp | KeyCode::Char('b') => self.page_hex(-1),
                 KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => self.page_hex(1),
+                _ => {}
+            },
+            Focus::Anomalies => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.scroll_anomalies(-1),
+                KeyCode::Down | KeyCode::Char('j') => self.scroll_anomalies(1),
+                KeyCode::Home => self.scroll_anomalies_edge(true),
+                KeyCode::End => self.scroll_anomalies_edge(false),
+                KeyCode::PageUp | KeyCode::Char('b') => self.page_anomalies(-1),
+                KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => {
+                    self.page_anomalies(1)
+                }
                 _ => {}
             },
         }
@@ -2961,7 +3026,8 @@ impl App {
     /// Index range of the focused record table inside the combined
     /// [answers, questions] cursor order: Answers covers the raw answers,
     /// Questions the question rows. Services focus is unused by the
-    /// record cursor; it spans everything. Hex has no cursor rows.
+    /// record cursor; it spans everything. Anomalies and Hex have no
+    /// cursor rows.
     fn detail_range(&self) -> (usize, usize) {
         let (raws, total) = self
             .display_detail()
@@ -2976,7 +3042,7 @@ impl App {
             Focus::Answers => (0, raws),
             Focus::Questions => (raws, total),
             Focus::Services => (0, total),
-            Focus::Hex => (0, 0),
+            Focus::Anomalies | Focus::Hex => (0, 0),
         }
     }
 
@@ -2989,9 +3055,11 @@ impl App {
         if hi > lo && (self.detail_selected < lo || self.detail_selected >= hi) {
             self.detail_selected = lo;
         }
-        // New row means new hex bytes: restart the dump at the top.
+        // New row means new hex bytes and a new finding set: restart both
+        // panes at the top.
         if self.detail_selected != before {
             self.hex_offset.set(0);
+            self.anomalies_offset.set(0);
         }
         self.detail_anchor = self
             .display_detail()
@@ -3023,9 +3091,11 @@ impl App {
         self.detail_anchor = self
             .display_detail()
             .and_then(|d| Self::identity_at_detail(&d, self.detail_selected));
-        // New row means new hex bytes: restart the dump at the top.
+        // New row means new hex bytes and a new finding set: restart both
+        // panes at the top.
         if self.detail_selected != before {
             self.hex_offset.set(0);
+            self.anomalies_offset.set(0);
         }
     }
 
@@ -3041,6 +3111,7 @@ impl App {
             .and_then(|d| Self::identity_at_detail(&d, self.detail_selected));
         if self.detail_selected != before {
             self.hex_offset.set(0);
+            self.anomalies_offset.set(0);
         }
     }
 
@@ -3073,12 +3144,14 @@ impl App {
         self.detail_free_scroll = true;
     }
 
-    /// Scroll the focused detail viewport: the Hex dump while it holds
-    /// focus, otherwise the Answers table (which also scrolls from the
-    /// Services and Questions panes).
+    /// Scroll the focused detail viewport: the Hex or Anomalies dump
+    /// while it holds focus, otherwise the Answers table (which also
+    /// scrolls from the Services and Questions panes).
     fn scroll_focused_detail(&mut self, delta: isize) {
         if self.focus == Focus::Hex {
             self.scroll_hex(delta);
+        } else if self.focus == Focus::Anomalies {
+            self.scroll_anomalies(delta);
         } else {
             self.scroll_detail(delta);
         }
@@ -3109,6 +3182,33 @@ impl App {
         let per_page = self.hex_viewport.get().max(1) as isize;
         let steps = pages * per_page;
         self.scroll_hex(steps);
+    }
+
+    /// Nudge the Anomalies viewport; the findings follow the record
+    /// cursor, so there is no cursor to resume and no pin flag. Upper
+    /// clamping happens at render time, where the line count is known.
+    fn scroll_anomalies(&mut self, delta: isize) {
+        let cur = self.anomalies_offset.get();
+        let next = if delta < 0 {
+            cur.saturating_sub(delta.unsigned_abs())
+        } else {
+            cur.saturating_add(delta.unsigned_abs())
+        };
+        self.anomalies_offset.set(next);
+    }
+
+    fn scroll_anomalies_edge(&mut self, first: bool) {
+        if first {
+            self.anomalies_offset.set(0);
+        } else {
+            self.anomalies_offset.set(usize::MAX / 2);
+        }
+    }
+
+    fn page_anomalies(&mut self, pages: isize) {
+        let per_page = self.anomalies_viewport.get().max(1) as isize;
+        let steps = pages * per_page;
+        self.scroll_anomalies(steps);
     }
 
     /// Scroll the metrics overlay; upper clamping happens at render time.
@@ -3215,6 +3315,7 @@ impl App {
             self.detail_offset.set(0);
             self.detail_free_scroll = false;
             self.questions_offset.set(0);
+            self.anomalies_offset.set(0);
             self.hex_offset.set(0);
             self.detail_anchor = self
                 .display_detail()
@@ -4393,6 +4494,39 @@ impl App {
             })
     }
 
+    /// Anomalies for the highlighted record row: Warning/Error findings
+    /// whose (name, type, rdata) identity matches the selected
+    /// `DetailEntry::Record`, including spanning `ttl-unstable` findings
+    /// matched by (name, type). Question rows and service-level findings
+    /// are covered separately; expired and goodbye rows report nothing
+    /// (mirroring the table markers, which only flag live rows).
+    pub fn anomalies_for_selected(&self) -> Vec<anomalies::Anomaly> {
+        let Some(DetailEntry::Record(rec)) = self.selected_detail_entry() else {
+            return Vec::new();
+        };
+        if rec.ttl == 0 || rec.received_at.elapsed().as_secs() as u32 > rec.ttl {
+            return Vec::new();
+        }
+        let name = rec.name.trim_end_matches('.').to_lowercase();
+        let rdata_key = anomalies::anomaly_match_key(rec.rtype, &rec.rdata);
+        self.anomalies()
+            .into_iter()
+            .filter(|a| !matches!(a.severity, anomalies::Severity::Info))
+            .filter(|a| a.rtype == Some(rec.rtype))
+            .filter(|a| {
+                a.record_name
+                    .as_ref()
+                    .is_some_and(|n| n.trim_end_matches('.').to_lowercase() == name)
+            })
+            .filter(|a| match a.rdata.as_ref() {
+                Some(rdata) => anomalies::anomaly_match_key(rec.rtype, rdata) == rdata_key,
+                // Record-scoped TTL findings without rdata span every row
+                // of the same name and type (`ttl-unstable`).
+                None => anomalies::is_ttl_kind(a.kind),
+            })
+            .collect()
+    }
+
     /// Hex dump payload for the hex pane: wire bytes of the selected record,
     /// or the stored query packet for a selected question row.
     pub fn selected_detail_bytes(&self) -> Option<(Vec<u8>, String)> {
@@ -4829,9 +4963,11 @@ mod tests {
         app.handle_key(&plain(KeyCode::Char('k')));
         assert!(!app.detail_free_scroll);
         assert_eq!(app.detail_selected, before - 1);
-        // Tab cycles Answers -> Questions -> Hex -> Services.
+        // Tab cycles Answers -> Questions -> Anomalies -> Hex -> Services.
         app.handle_key(&plain(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Questions);
+        app.handle_key(&plain(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Anomalies);
         app.handle_key(&plain(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Hex);
         app.handle_key(&plain(KeyCode::Tab));
@@ -5465,11 +5601,13 @@ mod tests {
         }
         app.hex_offset.set(5);
         app.focus = Focus::Hex;
-        let (mods, title) = hex_body_marks(&app, 100, 12);
+        // Tall enough that the scrolled dump keeps a viewport in the
+        // four-pane stack.
+        let (mods, title) = hex_body_marks(&app, 100, 20);
         assert!(title.contains('↕'), "dump must be scrolled, got: {title}");
         assert!(mods.iter().any(|m| m.contains(Modifier::BOLD)));
         app.focus = Focus::Services;
-        let (mods, _) = hex_body_marks(&app, 100, 12);
+        let (mods, _) = hex_body_marks(&app, 100, 20);
         assert!(mods.iter().all(|m| !m.contains(Modifier::BOLD)));
     }
 
@@ -6391,7 +6529,8 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::empty(),
         };
-        // Tab reaches Hex after Questions; the focused pane lights its border.
+        // Tab reaches Hex after Anomalies; the focused pane lights its border.
+        app.handle_key(&plain(KeyCode::Tab));
         app.handle_key(&plain(KeyCode::Tab));
         app.handle_key(&plain(KeyCode::Tab));
         app.handle_key(&plain(KeyCode::Tab));
@@ -6407,6 +6546,7 @@ mod tests {
         app.handle_key(&plain(KeyCode::End));
         assert!(app.hex_offset.get() > 1000);
         // Moving the record cursor restarts the dump at the top.
+        app.handle_key(&plain(KeyCode::BackTab));
         app.handle_key(&plain(KeyCode::BackTab));
         app.handle_key(&plain(KeyCode::BackTab));
         assert_eq!(app.focus, Focus::Answers);
@@ -6425,9 +6565,10 @@ mod tests {
         assert_eq!(app.hex_offset.get(), 5);
         // Clicking the hex pane focuses it for scrolling.
         app.left_rect.set(Rect::new(0, 3, 33, 30));
-        app.answers_rect.set(Rect::new(33, 3, 67, 10));
-        app.questions_rect.set(Rect::new(33, 13, 67, 8));
-        app.hex_rect.set(Rect::new(33, 21, 67, 12));
+        app.answers_rect.set(Rect::new(33, 3, 67, 8));
+        app.questions_rect.set(Rect::new(33, 11, 67, 7));
+        app.anomalies_rect.set(Rect::new(33, 18, 67, 6));
+        app.hex_rect.set(Rect::new(33, 24, 67, 9));
         app.focus = Focus::Services;
         app.mouse_down(40, 25);
         assert_eq!(app.focus, Focus::Hex);
@@ -7130,10 +7271,12 @@ mod tests {
         assert_eq!(App::pct_from_x(50, body), 50);
         let right = Rect::new(33, 3, 67, 30);
         assert_eq!(App::pct_from_y(3 + 15, right), 50);
-        // Hex keeps at least 10%: answers + questions <= 90.
-        assert_eq!(App::clamp_answers_pct(80, 33), 57);
-        assert_eq!(App::clamp_questions_pct(80, 34), 56);
-        assert_eq!(App::clamp_answers_pct(30, 30), 30);
+        // Hex keeps at least 10%: answers + questions + anomalies <= 90.
+        // The second argument is the sum of the other two shares.
+        assert_eq!(App::clamp_answers_pct(80, 45), 45);
+        assert_eq!(App::clamp_questions_pct(80, 50), 40);
+        assert_eq!(App::clamp_anomalies_pct(80, 55), 35);
+        assert_eq!(App::clamp_answers_pct(30, 45), 30);
     }
 
     #[test]
@@ -7146,12 +7289,18 @@ mod tests {
         assert_eq!(app.left_pct, 15);
         app.set_left_from_x(50);
         assert_eq!(app.left_pct, 50);
-        app.questions_pct = 33;
+        app.questions_pct = 25;
+        app.anomalies_pct = 20;
         app.set_answers_from_y(3 + 27);
-        assert!(app.answers_pct <= 57);
-        app.answers_pct = 34;
+        assert!(app.answers_pct + app.questions_pct + app.anomalies_pct <= 90);
+        app.answers_pct = 30;
+        app.anomalies_pct = 20;
+        app.set_middle_from_y(3 + 27);
+        assert!(app.answers_pct + app.questions_pct + app.anomalies_pct <= 90);
+        app.answers_pct = 30;
+        app.questions_pct = 25;
         app.set_lower_from_y(3 + 27);
-        assert!(app.answers_pct + app.questions_pct <= 90);
+        assert!(app.answers_pct + app.questions_pct + app.anomalies_pct <= 90);
     }
 
     #[test]
@@ -7163,18 +7312,143 @@ mod tests {
         app.right_rect.set(Rect::new(33, 3, 67, 30));
         app.answers_rect.set(Rect::new(33, 3, 67, 10));
         app.questions_rect.set(Rect::new(33, 13, 67, 8));
-        app.hex_rect.set(Rect::new(33, 21, 67, 12));
+        app.anomalies_rect.set(Rect::new(33, 21, 67, 6));
+        app.hex_rect.set(Rect::new(33, 27, 67, 6));
         // Either border cell grabs vertically.
         assert_eq!(app.divider_at(32, 5), DragMode::Vertical);
         assert_eq!(app.divider_at(33, 5), DragMode::Vertical);
         // Either border row grabs horizontally.
         assert_eq!(app.divider_at(40, 12), DragMode::HorizUpper);
         assert_eq!(app.divider_at(40, 13), DragMode::HorizUpper);
-        assert_eq!(app.divider_at(40, 20), DragMode::HorizLower);
-        assert_eq!(app.divider_at(40, 21), DragMode::HorizLower);
+        assert_eq!(app.divider_at(40, 20), DragMode::HorizMiddle);
+        assert_eq!(app.divider_at(40, 21), DragMode::HorizMiddle);
+        assert_eq!(app.divider_at(40, 26), DragMode::HorizLower);
+        assert_eq!(app.divider_at(40, 27), DragMode::HorizLower);
         // Interior cells belong to panes.
         assert_eq!(app.divider_at(10, 5), DragMode::None);
         assert_eq!(app.divider_at(40, 5), DragMode::None);
+    }
+
+    #[test]
+    fn anomalies_for_selected_matches_record_identity() {
+        let mut app = App::new().unwrap();
+        // Quiet 4500s base so the only finding on the row is the
+        // shared-flush error from the set bit below.
+        let mut ptr = ptr_record(4500);
+        ptr.flush_bit = true;
+        ingest(&mut app, &ptr);
+        ingest(&mut app, &srv_record(120));
+        app.evict_expired();
+        select_instance(&mut app, "Test");
+        // Park the cursor on the PTR row: it must surface shared-flush
+        // and nothing from other rows.
+        let ptr_idx = app
+            .display_detail()
+            .expect("service displayed")
+            .ordered_answers()
+            .iter()
+            .position(|r| r.rtype == 12)
+            .expect("PTR row");
+        app.detail_selected = ptr_idx;
+        app.detail_anchor = app
+            .display_detail()
+            .and_then(|d| App::identity_at_detail(&d, ptr_idx));
+        let found = app.anomalies_for_selected();
+        assert!(
+            found.iter().any(|a| a.kind == "shared-flush"),
+            "PTR row must surface shared-flush, got: {found:?}"
+        );
+        assert!(found.iter().all(|a| a.rtype == Some(12)));
+        // The SRV row is healthy (its missing flush bit is info-only,
+        // excluded): service-level missing-addr must not leak onto it.
+        let srv_idx = app
+            .display_detail()
+            .expect("service displayed")
+            .ordered_answers()
+            .iter()
+            .position(|r| r.rtype == 33)
+            .expect("SRV row");
+        app.detail_selected = srv_idx;
+        app.detail_anchor = app
+            .display_detail()
+            .and_then(|d| App::identity_at_detail(&d, srv_idx));
+        assert!(
+            app.anomalies_for_selected().is_empty(),
+            "healthy SRV row must be quiet"
+        );
+    }
+
+    #[test]
+    fn anomalies_for_selected_empty_for_expired_rows() {
+        let mut app = App::new().unwrap();
+        let mut ptr = ptr_record(4500);
+        ptr.flush_bit = true;
+        ingest(&mut app, &ptr);
+        ingest(&mut app, &srv_record(120));
+        app.evict_expired();
+        select_instance(&mut app, "Test");
+        // Age the PTR past its TTL: the expired row reports nothing.
+        for svc in &mut app.services {
+            for rec in &mut svc.answers {
+                if rec.rtype == 12 {
+                    rec.received_at = Instant::now()
+                        .checked_sub(Duration::from_secs(5000))
+                        .unwrap_or_else(Instant::now);
+                }
+            }
+        }
+        let ptr_idx = app
+            .display_detail()
+            .expect("service displayed")
+            .ordered_answers()
+            .iter()
+            .position(|r| r.rtype == 12)
+            .expect("PTR row");
+        app.detail_selected = ptr_idx;
+        app.detail_anchor = app
+            .display_detail()
+            .and_then(|d| App::identity_at_detail(&d, ptr_idx));
+        assert!(app.anomalies_for_selected().is_empty());
+    }
+
+    #[test]
+    fn anomalies_for_selected_spans_ttl_unstable_rows() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        // Same name and type, different TTL bases: one spanning finding.
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 1, "A", "192.168.1.10", 120),
+        );
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 1, "A", "192.168.1.11", 4500),
+        );
+        app.evict_expired();
+        select_instance(&mut app, "Test");
+        let a_rows: Vec<usize> = app
+            .display_detail()
+            .expect("service displayed")
+            .ordered_answers()
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.rtype == 1)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(a_rows.len(), 2);
+        for idx in a_rows {
+            app.detail_selected = idx;
+            app.detail_anchor = app
+                .display_detail()
+                .and_then(|d| App::identity_at_detail(&d, idx));
+            assert!(
+                app.anomalies_for_selected()
+                    .iter()
+                    .any(|a| a.kind == "ttl-unstable"),
+                "A row {idx} must surface the spanning ttl-unstable finding"
+            );
+        }
     }
 
     #[test]
@@ -7353,6 +7627,12 @@ mod tests {
         assert_eq!(app.hex_offset.get(), 1);
         app.handle_mouse(&wheel(MouseEventKind::ScrollUp));
         assert_eq!(app.hex_offset.get(), 0);
+        // Anomalies: one notch scrolls the findings one line.
+        app.focus = Focus::Anomalies;
+        app.handle_mouse(&wheel(MouseEventKind::ScrollDown));
+        assert_eq!(app.anomalies_offset.get(), 1);
+        app.handle_mouse(&wheel(MouseEventKind::ScrollUp));
+        assert_eq!(app.anomalies_offset.get(), 0);
         // Metrics overlay owns the wheel while open.
         app.show_metrics = true;
         app.handle_mouse(&wheel(MouseEventKind::ScrollDown));
