@@ -1106,12 +1106,14 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
         }
         AnomalyScope::None => format!(" Anomalies ({}) ", findings.len()),
     };
-    let lines: Vec<Line<'_>> = if findings.is_empty() {
-        vec![Line::from(Span::styled(
-            "No anomalies for this record",
-            Style::default().fg(Color::Gray),
-        ))]
-    } else {
+    let dimmed = Style::default().fg(Color::Gray);
+    let finding_lines = |findings: &[crate::anomalies::Anomaly]| -> Vec<Line<'_>> {
+        if findings.is_empty() {
+            return vec![Line::from(Span::styled(
+                "No anomalies for this record",
+                dimmed,
+            ))];
+        }
         findings
             .iter()
             .map(|a| {
@@ -1134,6 +1136,22 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
                 ])
             })
             .collect()
+    };
+    let lines: Vec<Line<'_>> = match app.anomaly_scope() {
+        // Gone rows name their state instead of findings: a goodbye or
+        // an expiry is information, not an empty result.
+        AnomalyScope::Record(rec) => match crate::app::App::record_liveness(rec) {
+            crate::app::RecordLiveness::Goodbye => vec![Line::from(Span::styled(
+                "Goodbye received — record withdrawn",
+                dimmed,
+            ))],
+            crate::app::RecordLiveness::Expired => vec![Line::from(Span::styled(
+                "Record expired — TTL elapsed",
+                dimmed,
+            ))],
+            crate::app::RecordLiveness::Live => finding_lines(&findings),
+        },
+        _ => finding_lines(&findings),
     };
 
     let total = lines.len();
