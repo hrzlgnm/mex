@@ -1735,7 +1735,7 @@ impl App {
         let infos = found.len().saturating_sub(errors + warnings);
         kv(
             &mut rows,
-            "anomalies",
+            "summary",
             if found.is_empty() {
                 "none".to_string()
             } else {
