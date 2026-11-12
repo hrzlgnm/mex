@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.11.0](https://github.com/hrzlgnm/mex/compare/v0.10.0...v0.11.0) (2026-11-12)
+
+
+### Features
+
+* list full service findings in anomalies pane with cursor marker ([#105](https://github.com/hrzlgnm/mex/issues/105)) ([518a4c4](https://github.com/hrzlgnm/mex/commit/518a4c4541237b9161da81bfcccbe9c9e37f798b))
+* name gone rows and pin pane freshness ([#102](https://github.com/hrzlgnm/mex/issues/102)) ([e2fa1f5](https://github.com/hrzlgnm/mex/commit/e2fa1f5e9bff657391203981f261fab098611b70))
+* rework metrics anomalies display and TTL anomaly marks ([#92](https://github.com/hrzlgnm/mex/issues/92)) ([1d8ff22](https://github.com/hrzlgnm/mex/commit/1d8ff22bac4d9edaab5b81f4a592a90e5c68e40d))
+* show highlighted record anomalies in new pane ([#98](https://github.com/hrzlgnm/mex/issues/98)) ([2312c51](https://github.com/hrzlgnm/mex/commit/2312c515bc4aa76c7e4722639bdaff689af76203))
+* show question and service-level findings in anomalies pane ([#100](https://github.com/hrzlgnm/mex/issues/100)) ([87c137e](https://github.com/hrzlgnm/mex/commit/87c137e68daabbbb54d045b6c3f26f9e6b683244))
+
+
+### Bug Fixes
+
+* exclude reverse PTRs from 4500s base TTL expectation ([#90](https://github.com/hrzlgnm/mex/issues/90)) ([e1f9e57](https://github.com/hrzlgnm/mex/commit/e1f9e57e1345da7bc734b357ddfabdafca6e26db))
+
+
+### Dependencies
+
+* lock file maintenance ([#103](https://github.com/hrzlgnm/mex/issues/103)) ([0396b28](https://github.com/hrzlgnm/mex/commit/0396b280a6af28f8a04a889876ede9f41f56492a))
+* update rust crate socket-pktinfo to v0.4.2 ([#99](https://github.com/hrzlgnm/mex/issues/99)) ([316791e](https://github.com/hrzlgnm/mex/commit/316791e9269d27838de41644857e5f568a0c3540))
+
+
+### Documentation
+
+* document metrics overlay scroll keys, fix pan step comment ([#93](https://github.com/hrzlgnm/mex/issues/93)) ([037fb06](https://github.com/hrzlgnm/mex/commit/037fb069f94163d71456aedbb7992f869e007e9d))
+* document the anomaly detector in the README ([#108](https://github.com/hrzlgnm/mex/issues/108)) ([0c54d55](https://github.com/hrzlgnm/mex/commit/0c54d55713606477746710bb5525a977751df1eb))
+* mention anomaly detection in every summary and the man page ([#109](https://github.com/hrzlgnm/mex/issues/109)) ([dd3e232](https://github.com/hrzlgnm/mex/commit/dd3e232662d8fd38085446519d9452982160e743))
+
+
+### Tests
+
+* pin anomalies pane mouse and resize integration ([#101](https://github.com/hrzlgnm/mex/issues/101)) ([e01e479](https://github.com/hrzlgnm/mex/commit/e01e479ae7bdca2156062a41d93ee69a28527852))
+
 ## [0.10.0](https://github.com/hrzlgnm/mex/compare/v0.9.0...v0.10.0) (2026-11-11)
 
 
