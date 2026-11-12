@@ -169,7 +169,7 @@ full list.
 | `unicast-leak` (error when confirmed, else warning) | NS/SOA/ANY/MX outside unicast DNS (RFC 6762 §3); confirmed only in a multicast answer, otherwise pending capture verification |
 | `unicast-question` (error: NS/SOA, warning: MX) | multicast question asking for a unicast-only type (RFC 6762 §3); ANY questions are ownership probes and stay quiet |
 | `ttl-low` / `ttl-high` (warning) | TTL below 10 s (churn risk) or above 7200 s (stale-cache risk) (RFC 6762 §5.2, SHOULD) |
-| `ttl-base-mismatch` (info) | service PTR at ≤ 120 s instead of the recommended 4500 s base (RFC 6762 §10, SHOULD) |
+| `ttl-mismatch` (info) | service PTR at ≤ 120 s instead of the recommended 4500 s base (RFC 6762 §10, SHOULD) |
 | `ttl-unstable` (warning) | same name and type announced with different TTL bases (RFC 6762 §5.2, SHOULD) |
 | `srv-target` (warning: malformed, info: outside `.local`) | SRV target malformed (MUST) or requiring resolution outside mDNS (MAY) (RFC 6763 §12) |
 | `txt-oversize` (warning) | TXT payload over ~1300 B, risking fragmentation (RFC 6762 §17, SHOULD) |

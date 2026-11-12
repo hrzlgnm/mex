@@ -7916,7 +7916,7 @@ mod tests {
         let all = app.anomalies();
         let base = all
             .iter()
-            .find(|a| a.kind == "ttl-base-mismatch")
+            .find(|a| a.kind == "ttl-mismatch")
             .expect("base mismatch still analyzed");
         assert_eq!(
             base.severity,

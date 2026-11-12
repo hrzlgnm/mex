@@ -68,7 +68,7 @@ impl Anomaly {
 /// Anomaly kinds where the TTL itself is the problem, not the record
 /// content: rows with only these findings mark the TTL cell instead of
 /// the type cell.
-pub const TTL_KINDS: &[&str] = &["ttl-low", "ttl-high", "ttl-base-mismatch", "ttl-unstable"];
+pub const TTL_KINDS: &[&str] = &["ttl-low", "ttl-high", "ttl-mismatch", "ttl-unstable"];
 
 /// Whether `kind` is a TTL problem (marks the TTL cell, not the type).
 pub fn is_ttl_kind(kind: &str) -> bool {
@@ -748,7 +748,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             format!("PTR base TTL {}s; want 4500s", rec.ttl)
         };
         out.push(Anomaly {
-            kind: "ttl-base-mismatch",
+            kind: "ttl-mismatch",
             severity: Severity::Info,
             service: service_id.to_string(),
             record_name: Some(rec.name.clone()),
@@ -1617,7 +1617,7 @@ mod tests {
             let found = analyze_service("X", "_http._tcp.local", "", &answers);
             let item = found
                 .iter()
-                .find(|a| a.kind == "ttl-base-mismatch")
+                .find(|a| a.kind == "ttl-mismatch")
                 .unwrap_or_else(|| panic!("PTR@{ttl} should be flagged"));
             assert_eq!(item.severity, Severity::Info);
         }
@@ -1641,8 +1641,8 @@ mod tests {
         };
         let item = analyze(&snap)
             .iter()
-            .find(|a| a.kind == "ttl-base-mismatch")
-            .expect("expected enumeration ttl-base-mismatch")
+            .find(|a| a.kind == "ttl-mismatch")
+            .expect("expected enumeration ttl-mismatch")
             .clone();
         assert_eq!(
             item.rdata.as_deref(),
@@ -1669,13 +1669,13 @@ mod tests {
             false,
         )];
         let found = analyze_service("X", "_http._tcp.local", "", &answers);
-        assert!(!found.iter().any(|a| a.kind == "ttl-base-mismatch"));
+        assert!(!found.iter().any(|a| a.kind == "ttl-mismatch"));
     }
 
     #[test]
     fn reverse_ptr_with_120_base_is_quiet() {
         // Reverse-mapping PTRs are unique with a 120s base, not the 4500s
-        // service PTR convention, so they must not flag ttl-base-mismatch.
+        // service PTR convention, so they must not flag ttl-mismatch.
         for name in [
             "1.0.0.127.in-addr.arpa.",
             "2.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa.",
@@ -1683,7 +1683,7 @@ mod tests {
             let answers = vec![rec(name, 12, "PTR", "myhost.local.", 120, true)];
             let found = analyze_service("X", "_http._tcp.local", "", &answers);
             assert!(
-                !found.iter().any(|a| a.kind == "ttl-base-mismatch"),
+                !found.iter().any(|a| a.kind == "ttl-mismatch"),
                 "reverse PTR {name} at 120s should be quiet"
             );
         }
@@ -1701,7 +1701,7 @@ mod tests {
             true,
         )];
         let found = analyze_service("X", "_http._tcp.local", "myhost.local.", &answers);
-        assert!(!found.iter().any(|a| a.kind == "ttl-base-mismatch"));
+        assert!(!found.iter().any(|a| a.kind == "ttl-mismatch"));
     }
 
     #[test]
