@@ -70,6 +70,29 @@ pub struct QuestionKey<'a> {
     pub source: &'a std::net::SocketAddr,
 }
 
+/// Liveness of a record row for finding purposes. Goodbye rows (TTL 0)
+/// and rows past their TTL carry no findings; the table markers and the
+/// Anomalies pane only flag live rows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RecordLiveness {
+    Live,
+    Goodbye,
+    Expired,
+}
+
+/// Liveness of one record row, shared by the finding filter, the pane
+/// copy, and the metrics counts so the three cannot disagree about
+/// what counts as gone.
+pub(crate) fn record_liveness(rec: &browse::RawRecord) -> RecordLiveness {
+    if rec.ttl == 0 {
+        RecordLiveness::Goodbye
+    } else if rec.received_at.elapsed().as_secs() as u32 > rec.ttl {
+        RecordLiveness::Expired
+    } else {
+        RecordLiveness::Live
+    }
+}
+
 /// What the Anomalies pane shows findings for: the highlighted record
 /// or question row, the displayed target while resting on a header, or
 /// nothing at all. Single discriminant shared by the finding filter and
@@ -1720,14 +1743,10 @@ impl App {
         let mut live = 0;
         let mut expired = 0;
         let mut goodbye = 0;
-        let mut count = |rec: &browse::RawRecord| {
-            if rec.ttl == 0 {
-                goodbye += 1;
-            } else if rec.received_at.elapsed().as_secs() as u32 <= rec.ttl {
-                live += 1;
-            } else {
-                expired += 1;
-            }
+        let mut count = |rec: &browse::RawRecord| match record_liveness(rec) {
+            RecordLiveness::Live => live += 1,
+            RecordLiveness::Expired => expired += 1,
+            RecordLiveness::Goodbye => goodbye += 1,
         };
         for svc in &self.services {
             for rec in &svc.answers {
@@ -4610,7 +4629,7 @@ impl App {
     /// and whose service owns the displayed target, including spanning
     /// `ttl-unstable` findings matched by (name, type).
     fn record_anomalies(&self, rec: &browse::RawRecord) -> Vec<anomalies::Anomaly> {
-        if rec.ttl == 0 || rec.received_at.elapsed().as_secs() as u32 > rec.ttl {
+        if record_liveness(rec) != RecordLiveness::Live {
             return Vec::new();
         }
         let Some(target) = self.display_detail() else {
@@ -7770,15 +7789,7 @@ mod tests {
         app.evict_expired();
         select_instance(&mut app, "Test");
         // Age the PTR past its TTL: the expired row reports nothing.
-        for svc in &mut app.services {
-            for rec in &mut svc.answers {
-                if rec.rtype == 12 {
-                    rec.received_at = Instant::now()
-                        .checked_sub(Duration::from_secs(5000))
-                        .unwrap_or_else(Instant::now);
-                }
-            }
-        }
+        expire_rtype(&mut app, 12, 5000);
         let ptr_idx = app
             .display_detail()
             .expect("service displayed")
@@ -8014,6 +8025,215 @@ mod tests {
                 .iter()
                 .any(|a| a.kind == "type-format"),
             "enum row must keep its own finding"
+        );
+    }
+
+    /// Park the detail cursor on a raw-answer row and return the
+    /// finding kinds shown in the Anomalies pane there.
+    fn park_on(app: &mut App, idx: usize) -> Vec<String> {
+        app.detail_selected = idx;
+        app.detail_anchor = app
+            .display_detail()
+            .and_then(|d| App::identity_at_detail(&d, idx));
+        app.anomalies_for_selected()
+            .iter()
+            .map(|a| a.kind.to_string())
+            .collect()
+    }
+
+    /// Park the detail cursor on the raw-answer row with this identity
+    /// and return the finding kinds shown there.
+    fn park_on_answer(app: &mut App, rtype: u16, rdata: &str) -> Vec<String> {
+        let idx = app
+            .display_detail()
+            .expect("service displayed")
+            .ordered_answers()
+            .iter()
+            .position(|r| r.rtype == rtype && r.rdata == rdata)
+            .unwrap_or_else(|| panic!("row for {rdata}"));
+        park_on(app, idx)
+    }
+
+    /// Park the detail cursor on the question row from this source and
+    /// return the finding kinds shown there.
+    fn park_on_question(app: &mut App, source: SocketAddr) -> Vec<String> {
+        let target = app.display_detail().expect("service displayed");
+        let pos = target
+            .ordered_questions()
+            .iter()
+            .position(|q| q.2 == source)
+            .unwrap_or_else(|| panic!("question row for {source}"));
+        park_on(app, target.ordered_answers().len() + pos)
+    }
+
+    /// Age every answer of this type past its TTL, turning live rows
+    /// into expired ones.
+    fn expire_rtype(app: &mut App, rtype: u16, secs: u64) {
+        for svc in &mut app.services {
+            for rec in &mut svc.answers {
+                if rec.rtype == rtype {
+                    rec.received_at = Instant::now()
+                        .checked_sub(Duration::from_secs(secs))
+                        .unwrap_or_else(Instant::now);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn anomalies_pane_never_shows_stale_findings() {
+        let mut app = App::new().unwrap();
+        let mut ptr = ptr_record(4500);
+        ptr.flush_bit = true;
+        ingest(&mut app, &ptr);
+        ingest(&mut app, &srv_record(120));
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 1, "A", "192.168.1.10", 120),
+        );
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 1, "A", "192.168.1.11", 4500),
+        );
+        let querier: SocketAddr = "192.168.1.9:5353".parse().unwrap();
+        app.ingest_event(&query_event(
+            "test.local.",
+            2,
+            "NS",
+            false,
+            Vec::new(),
+            querier,
+        ));
+        app.evict_expired();
+        select_instance(&mut app, "Test");
+        // Every stop shows exactly its own findings: nothing leaks from
+        // the previously highlighted row.
+        assert_eq!(
+            park_on_answer(&mut app, 12, "Test._http._tcp.local."),
+            ["shared-flush"]
+        );
+        assert!(park_on_answer(&mut app, 33, "0 0 80 test.local.").is_empty());
+        assert_eq!(
+            park_on_answer(&mut app, 1, "192.168.1.10"),
+            ["ttl-unstable"]
+        );
+        assert_eq!(
+            park_on_answer(&mut app, 1, "192.168.1.11"),
+            ["ttl-unstable"]
+        );
+        assert_eq!(park_on_question(&mut app, querier), ["unicast-question"]);
+        select_host_header(&mut app, "test.local");
+        assert_eq!(
+            app.anomalies_for_selected()
+                .iter()
+                .map(|a| a.kind.to_string())
+                .collect::<Vec<_>>(),
+            ["ttl-unstable"]
+        );
+        // Expire the PTR: its row goes quiet instead of keeping the
+        // shared-flush finding it showed while live.
+        expire_rtype(&mut app, 12, 5000);
+        // Back on the instance row: scope is per-record again.
+        app.collapsed_hosts.remove("test.local");
+        select_instance(&mut app, "Test");
+        assert!(park_on_answer(&mut app, 12, "Test._http._tcp.local.").is_empty());
+    }
+
+    #[test]
+    fn anomalies_pane_names_gone_rows() {
+        let mut app = App::new().unwrap();
+        let mut ptr = ptr_record(4500);
+        ptr.flush_bit = true;
+        ingest(&mut app, &ptr);
+        ingest(&mut app, &srv_record(120));
+        app.evict_expired();
+        select_instance(&mut app, "Test");
+        let ptr_idx = app
+            .display_detail()
+            .expect("service displayed")
+            .ordered_answers()
+            .iter()
+            .position(|r| r.rtype == 12)
+            .expect("PTR row");
+        // Expired rows name their state instead of findings.
+        expire_rtype(&mut app, 12, 5000);
+        app.detail_selected = ptr_idx;
+        app.detail_anchor = app
+            .display_detail()
+            .and_then(|d| App::identity_at_detail(&d, ptr_idx));
+        assert!(app.anomalies_for_selected().is_empty());
+        let buf = render_to_buffer(&app, 100, 30);
+        assert!(
+            rect_text(&buf, app.anomalies_rect.get()).contains("Record expired"),
+            "expired rows must say so"
+        );
+        // Goodbye rows get their own copy.
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        ingest(&mut app, &ptr_record(0));
+        select_instance(&mut app, "Test");
+        let ptr_idx = app
+            .display_detail()
+            .expect("service displayed")
+            .ordered_answers()
+            .iter()
+            .position(|r| r.rtype == 12)
+            .expect("PTR row");
+        app.detail_selected = ptr_idx;
+        app.detail_anchor = app
+            .display_detail()
+            .and_then(|d| App::identity_at_detail(&d, ptr_idx));
+        assert!(app.anomalies_for_selected().is_empty());
+        let buf = render_to_buffer(&app, 100, 30);
+        assert!(
+            rect_text(&buf, app.anomalies_rect.get()).contains("Goodbye received"),
+            "goodbye rows must say so"
+        );
+    }
+
+    #[test]
+    fn anomalies_pane_marks_severity_like_metrics() {
+        let mut app = App::new().unwrap();
+        // shared-flush is an error: red level icon plus severity word.
+        let mut ptr = ptr_record(4500);
+        ptr.flush_bit = true;
+        ingest(&mut app, &ptr);
+        ingest(&mut app, &srv_record(120));
+        app.evict_expired();
+        select_instance(&mut app, "Test");
+        let ptr_idx = app
+            .display_detail()
+            .expect("service displayed")
+            .ordered_answers()
+            .iter()
+            .position(|r| r.rtype == 12)
+            .expect("PTR row");
+        app.detail_selected = ptr_idx;
+        app.detail_anchor = app
+            .display_detail()
+            .and_then(|d| App::identity_at_detail(&d, ptr_idx));
+        let buf = render_to_buffer(&app, 100, 30);
+        let area = app.anomalies_rect.get();
+        let text = rect_text(&buf, area);
+        assert!(
+            text.contains("error shared-flush"),
+            "pane must spell out the severity, got: {text:?}"
+        );
+        let mut icon_fg = None;
+        for y in area.y..area.y.saturating_add(area.height) {
+            for x in area.x..area.x.saturating_add(area.width) {
+                if let Some(cell) = buf.cell((x, y)) {
+                    if cell.symbol() == "\u{f057}" {
+                        icon_fg = Some(cell.fg);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            icon_fg,
+            Some(ratatui::style::Color::Red),
+            "error icon must match the metrics overlay color"
         );
     }
 
