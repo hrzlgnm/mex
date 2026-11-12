@@ -421,18 +421,23 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
                         [first] => format!(" · {first}"),
                         [first, rest @ ..] => format!(" · {first} (+{})", rest.len()),
                     };
-                    let line = Line::from(Span::styled(
-                        format!("{glyph} {display} ({count}){addr_suffix}"),
-                        if is_selected {
-                            Style::default()
-                                .add_modifier(Modifier::BOLD)
-                                .fg(Color::Yellow)
-                        } else {
-                            Style::default()
-                                .add_modifier(Modifier::BOLD)
-                                .fg(Color::Blue)
-                        },
-                    ));
+                    let base = if is_selected {
+                        Style::default()
+                            .add_modifier(Modifier::BOLD)
+                            .fg(Color::Yellow)
+                    } else {
+                        Style::default()
+                            .add_modifier(Modifier::BOLD)
+                            .fg(Color::Blue)
+                    };
+                    // The hostname is italic: group headers describe
+                    // app-side grouping, not wire records. Terminals
+                    // without italic support render it plain.
+                    let line = Line::from(vec![
+                        Span::styled(format!("{glyph} "), base),
+                        Span::styled(display, base.add_modifier(Modifier::ITALIC)),
+                        Span::styled(format!(" ({count}){addr_suffix}"), base),
+                    ]);
                     ListItem::new(line)
                 }
                 DisplayItem::Instance { index } => {
@@ -747,7 +752,9 @@ fn detail_table_rows<'a>(
 ) -> (Vec<Row<'a>>, Vec<usize>) {
     let mut rows = Vec::new();
 
-    let info_style = Style::default().fg(Color::Green);
+    let info_style = Style::default()
+        .fg(Color::Green)
+        .add_modifier(Modifier::ITALIC);
     let dim = Style::default().fg(Color::Gray);
     let local_style = Style::default()
         .fg(Color::Green)

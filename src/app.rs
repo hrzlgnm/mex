@@ -7815,6 +7815,49 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_rows_and_hostnames_render_italic() {
+        use ratatui::style::Modifier;
+        let app = two_group_app();
+        let buf = render_to_buffer(&app, 100, 30);
+        // Host group header: the display name after the glyph is italic,
+        // the count and addresses are not.
+        let area = app.left_rect.get();
+        let mut header = None;
+        for y in (area.y + 1)..(area.y + area.height.saturating_sub(1)) {
+            let mut row = String::new();
+            for x in (area.x + 1)..(area.x + area.width.saturating_sub(1)) {
+                row.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or_default());
+            }
+            if row.starts_with("\u{25be} ") || row.starts_with("\u{25b8} ") {
+                header = Some((y, row));
+                break;
+            }
+        }
+        let (y, row) = header.expect("host header row");
+        let name_cell = buf.cell((area.x + 3, y)).expect("display-name cell");
+        assert!(
+            name_cell.modifier.contains(Modifier::ITALIC),
+            "hostname should be italic"
+        );
+        let paren = row.rfind(" (").expect("header count");
+        let count_cell = buf
+            .cell((area.x + 1 + paren as u16 + 1, y))
+            .expect("count cell");
+        assert!(
+            !count_cell.modifier.contains(Modifier::ITALIC),
+            "only the hostname is italic"
+        );
+        // Detail table synthetic rows (`srvc`, …) are italic throughout.
+        let area = app.answers_rect.get();
+        let label_cell = buf.cell((area.x + 1, area.y + 2)).expect("srvc cell");
+        assert_eq!(label_cell.symbol(), "s");
+        assert!(
+            label_cell.modifier.contains(Modifier::ITALIC),
+            "synthetic rows should be italic"
+        );
+    }
+
+    #[test]
     fn mouse_border_hit_test_prefers_seams() {
         use ratatui::layout::Rect;
         let app = App::new().unwrap();
