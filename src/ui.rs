@@ -1129,10 +1129,14 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
                 // service-level findings, which describe the target, and
                 // for the enumeration row itself, whose scope is constant
                 // across every finding (the message carries the target).
-                // Question sources render as stored (self sends never
-                // produce findings, so no `self` case arises).
+                // Question findings keep their QRY scope everywhere: the
+                // queried type varies. Question sources render as stored
+                // (self sends never produce findings, so no `self` case
+                // arises).
                 let scope =
-                    if crate::anomalies::is_enumeration_row(&a.service, a.record_name.as_deref()) {
+                    if crate::anomalies::is_enumeration_row(&a.service, a.record_name.as_deref())
+                        && !crate::anomalies::is_question_kind(a.kind)
+                    {
                         String::new()
                     } else {
                         let base = crate::anomalies::finding_scope(a);

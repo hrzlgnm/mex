@@ -669,7 +669,18 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     // Cache-flush bit misuse: shared records must not set it. Reverse
     // mapping PTRs are the exception: the RFC treats them as unique (no
     // other host may claim the same address), so the bit is correct there.
+    // Enumeration rows share one owner, so the message names the target
+    // for the same reason as ttl-mismatch: both renderers show the
+    // message verbatim there.
     if rec.rtype == 12 && rec.flush_bit && !is_reverse_ptr(&rec.name) {
+        let message = if service_id == ENUMERATION_SERVICE {
+            format!(
+                "shared PTR record {} has cache-flush bit set",
+                rec.rdata.trim_end_matches('.')
+            )
+        } else {
+            "shared record with flush bit set".to_string()
+        };
         out.push(Anomaly {
             kind: "shared-flush",
             severity: Severity::Error,
@@ -679,7 +690,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             rtype_str: Some(rec.rtype_str.clone()),
             rdata: Some(rdata.clone()),
             source: Some(src.clone()),
-            message: "shared record with flush bit set".to_string(),
+            message,
             rfc: "RFC 6762 §10.2",
             requirement: "MUST NOT",
         });
@@ -1558,6 +1569,55 @@ mod tests {
         assert!(found
             .iter()
             .any(|a| a.kind == "shared-flush" && a.severity == Severity::Error));
+    }
+
+    #[test]
+    fn enumeration_shared_flush_names_target() {
+        // Enumeration rows share one owner, so the message names the
+        // target: both renderers show the message verbatim there.
+        let flushed = rec(
+            "_services._dns-sd._udp.local.",
+            12,
+            "PTR",
+            "_fog._tcp.local.",
+            4500,
+            true,
+        );
+        let snap = Snapshot {
+            services: Vec::new(),
+            enum_answers: vec![&flushed],
+            pending_hosts: HashSet::new(),
+            questions: Vec::new(),
+        };
+        let item = analyze(&snap)
+            .iter()
+            .find(|a| a.kind == "shared-flush" && a.service == "enumeration")
+            .expect("expected enumeration shared-flush")
+            .clone();
+        assert!(
+            item.message.contains("_fog._tcp.local"),
+            "enum finding should name its target, got: {}",
+            item.message
+        );
+        // Service-level PTRs keep the short message: the row names them.
+        let found = analyze_service(
+            "X",
+            "_http._tcp.local",
+            "",
+            &[rec(
+                "_http._tcp.local.",
+                12,
+                "PTR",
+                "X._http._tcp.local.",
+                4500,
+                true,
+            )],
+        );
+        let item = found
+            .iter()
+            .find(|a| a.kind == "shared-flush")
+            .expect("expected shared-flush");
+        assert_eq!(item.message, "shared record with flush bit set");
     }
 
     #[test]

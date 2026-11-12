@@ -752,13 +752,8 @@ impl App {
             // deliver to every match, not just the first.
             let mut hits = Vec::new();
             let mut matched = false;
-            for j in 0..self.services.len() {
-                if self.services[j]
-                    .hostname
-                    .trim_end_matches('.')
-                    .to_lowercase()
-                    == host
-                {
+            for (j, svc) in self.services.iter().enumerate() {
+                if svc.hostname.trim_end_matches('.').to_lowercase() == host {
                     hits.push(j);
                 }
             }
@@ -1758,7 +1753,9 @@ impl App {
             // one announcer tell apart — except the enumeration row
             // itself, whose scope is constant (the message carries the
             // target). The RFC rides along for info-level rows.
-            let scope = if anomalies::is_enumeration_row(&a.service, a.record_name.as_deref()) {
+            let scope = if anomalies::is_enumeration_row(&a.service, a.record_name.as_deref())
+                && !anomalies::is_question_kind(a.kind)
+            {
                 String::new()
             } else {
                 anomalies::finding_scope(a)
@@ -3614,17 +3611,10 @@ impl App {
         // One hostname backs many services: file the goodbye on every
         // match (notably TTL 0 A/AAAA) instead of stopping at the first.
         let mut hits = Vec::new();
-        for i in 0..self.services.len() {
-            let full = format!(
-                "{}.{}",
-                self.services[i].instance, self.services[i].service_type
-            )
-            .to_lowercase();
-            let host = self.services[i]
-                .hostname
-                .trim_end_matches('.')
-                .to_lowercase();
-            let inst = self.services[i].instance.to_lowercase();
+        for (i, svc) in self.services.iter().enumerate() {
+            let full = format!("{}.{}", svc.instance, svc.service_type).to_lowercase();
+            let host = svc.hostname.trim_end_matches('.').to_lowercase();
+            let inst = svc.instance.to_lowercase();
             if names.iter().any(|n| *n == full || *n == host || *n == inst) {
                 hits.push(i);
             }
@@ -4104,13 +4094,8 @@ impl App {
         // One hostname backs many services (several SRVs, one host):
         // file on every match, not just the first.
         let mut hits = Vec::new();
-        for i in 0..self.services.len() {
-            if self.services[i]
-                .hostname
-                .trim_end_matches('.')
-                .to_lowercase()
-                == host
-            {
+        for (i, svc) in self.services.iter().enumerate() {
+            if svc.hostname.trim_end_matches('.').to_lowercase() == host {
                 hits.push(i);
             }
         }
@@ -6132,6 +6117,62 @@ mod tests {
             .find(|(k, _)| k == "questions")
             .expect("questions row");
         assert!(row.1.contains("(1 queriers, 1 one-shot)"), "got: {}", row.1);
+    }
+
+    #[test]
+    fn metrics_enum_question_keeps_qry_scope() {
+        // Questions on the enumeration row keep their QRY scope: the
+        // queried type varies, so suppressing it would collapse NS and
+        // SOA askers into identical rows.
+        let mut app = App::new().unwrap();
+        let stub: SocketAddr = "192.168.1.9:45678".parse().unwrap();
+        app.ingest_event(&query_event(
+            "_services._dns-sd._udp.local.",
+            2,
+            "NS",
+            false,
+            Vec::new(),
+            stub,
+        ));
+        let row = app
+            .metrics_rows()
+            .into_iter()
+            .find(|(k, _)| k.ends_with("unicast-question"))
+            .expect("unicast-question row");
+        assert!(
+            row.1.contains("QRY NS _services._dns-sd._udp.local"),
+            "enum question keeps its QRY scope, got: {}",
+            row.1
+        );
+    }
+
+    #[test]
+    fn anomalies_pane_keeps_qry_scope_on_enumeration_row() {
+        let mut app = App::new().unwrap();
+        let stub: SocketAddr = "192.168.1.9:45678".parse().unwrap();
+        app.ingest_event(&query_event(
+            "_services._dns-sd._udp.local.",
+            6,
+            "SOA",
+            false,
+            Vec::new(),
+            stub,
+        ));
+        app.evict_expired();
+        let enum_pos = app
+            .display_items()
+            .iter()
+            .position(|it| matches!(it, DisplayItem::Enum { .. }))
+            .expect("enum row");
+        app.selected_display = enum_pos;
+        app.clamp_selection();
+        park_on_question(&mut app, stub);
+        let buf = render_to_buffer(&app, 140, 30);
+        let text = rect_text(&buf, app.anomalies_rect.get());
+        assert!(
+            text.contains("QRY SOA _services._dns-sd._udp.local"),
+            "pane keeps the QRY scope, got: {text:?}"
+        );
     }
 
     #[test]
