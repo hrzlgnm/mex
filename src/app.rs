@@ -7759,9 +7759,21 @@ mod tests {
             found.iter().any(|a| a.kind == "type-format"),
             "enum header must surface the bad-type finding, got: {found:?}"
         );
-        // The row itself still shows it via the record path.
+        // The row itself still shows it via the record path: expand the
+        // group again and park on the record row (the collapsed header
+        // index would not restore it).
+        app.collapsed_hosts.remove(ENUM_HOST);
+        let enum_pos = app
+            .display_items()
+            .iter()
+            .position(|it| matches!(it, DisplayItem::Enum { .. }))
+            .expect("enum row");
         app.selected_display = enum_pos;
         app.clamp_selection();
+        assert!(matches!(
+            app.anomaly_scope(),
+            crate::app::AnomalyScope::Record(_)
+        ));
         assert!(
             app.anomalies_for_selected()
                 .iter()

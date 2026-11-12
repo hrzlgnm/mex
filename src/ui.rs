@@ -1097,9 +1097,10 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
         }
         AnomalyScope::Question(key) => {
             format!(
-                " Anomalies: QRY {} {} ({}) ",
+                " Anomalies: QRY {} {} @ {} ({}) ",
                 key.rtype_str,
                 key.name,
+                question_source_label(key.source),
                 findings.len()
             )
         }
