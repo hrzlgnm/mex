@@ -81,7 +81,8 @@ browsed as before.
 ## Layout
 
 - **Left — Hosts.** Collapsible tree grouped by hostname (`printer`,
-  `.local` stripped as redundant);
+  `.local` stripped as redundant, hostname in *italic* as app-side
+  grouping, not a wire record);
   each header shows `(service count) · primary address (+extra)` — e.g.
   `printer (2) · 192.168.1.10 (+1)` — with `(+N)` only when more
   than one live address is known. Each row shows `instance [short
@@ -91,7 +92,8 @@ browsed as before.
   selectable), the selection is inverted, and the pane title always names
   the selected row's host.
 - **Right top — Answers.** For the selected service: derived rows
-  (`srvc`, `subt`), then one row per observed raw record
+  (`srvc`, `subt`, in *italic* as constructed summaries, not wire
+  records), then one row per observed raw record
   (deduplicated across responders, sorted by type then source) with
   remaining TTL (heat-colored by requery schedule: yellow once past
   80% elapsed — a refresh is due — red past ~95% or expired), flush bit,
@@ -101,6 +103,8 @@ browsed as before.
 - **Right middle — Questions.** Recently observed queries asking for this
   service, newest first (capped), with per-query age instead of TTL.
   Questions from this host are highlighted like local records.
+  Queriers asking from an ephemeral port ([RFC 6762 §5.1](https://www.rfc-editor.org/rfc/rfc6762#section-5.1)) are tagged
+  `(one-shot)`: stub resolvers, not full continuous queriers.
 - **Right bottom — Hex.** Wire bytes of the selected record or question
   packet, falling back to the service's latest packet. `Tab` focuses it
   for scrolling.
@@ -155,24 +159,29 @@ marker (on the type cell, or on the TTL cell when the TTL itself is
 the problem), anomalous Questions rows get one on the type, instances
 carry a `[!N]` badge in the Hosts pane, and the Anomalies pane lists
 every finding for the selected service with a `>` marker on the
-highlighted row's findings. The metrics overlay (`m`) lists all
-findings with severity icons, and `Ctrl+J` state dumps include the
+highlighted row's findings. Each line reads
+`<icon> <source>: <kind> <record>: <message> (<rfc>, <requirement>)` —
+the announcer/querier address leads, the level icon carries the
+severity (no severity word), and enumeration-row findings omit their
+constant scope. The metrics overlay (`m`) lists all findings with
+severity icons as `<icon> <kind>` → `<source>: <service>
+<record>: <message> (<rfc>)`, and `Ctrl+J` state dumps include the
 full list.
 
 | Finding | Meaning |
 | --- | --- |
-| `missing-addr` (warning: `.local`, info: otherwise) | hostname with a live SRV record but no live A/AAAA (RFC 6763 §12, SHOULD) |
-| `type-format` (warning) | malformed service type, subtype, or enumerated type (RFC 6763 §7, MUST) |
-| `enum-subtype` (warning) | subtype listed in service enumeration instead of a base type (RFC 6763 §9, SHOULD) |
-| `shared-flush` (error) | shared PTR record with the cache-flush bit set (RFC 6762 §10.2, MUST NOT) |
-| `no-flush` (warning when confirmed, else info) | unique SRV/TXT record missing the cache-flush bit (RFC 6762 §10.2, SHOULD); confirmed only in a multicast answer |
-| `unicast-leak` (error when confirmed, else warning) | NS/SOA/ANY/MX outside unicast DNS (RFC 6762 §3); confirmed only in a multicast answer, otherwise pending capture verification |
-| `unicast-question` (error: NS/SOA, warning: MX) | multicast question asking for a unicast-only type (RFC 6762 §3); ANY questions are ownership probes and stay quiet |
-| `ttl-low` / `ttl-high` (warning) | TTL below 10 s (churn risk) or above 7200 s (stale-cache risk) (RFC 6762 §5.2, SHOULD) |
-| `ttl-mismatch` (info) | service PTR at ≤ 120 s instead of the recommended 4500 s base (RFC 6762 §10, SHOULD) |
-| `ttl-unstable` (warning) | same name and type announced with different TTL bases (RFC 6762 §5.2, SHOULD) |
-| `srv-target` (warning: malformed, info: outside `.local`) | SRV target malformed (MUST) or requiring resolution outside mDNS (MAY) (RFC 6763 §12) |
-| `txt-oversize` (warning) | TXT payload over ~1300 B, risking fragmentation (RFC 6762 §17, SHOULD) |
+| `missing-addr` (warning: `.local`, info: otherwise) | hostname with a live SRV record but no live A/AAAA ([RFC 6763 §12](https://www.rfc-editor.org/rfc/rfc6763#section-12), SHOULD) |
+| `type-format` (warning) | malformed service type, subtype, or enumerated type ([RFC 6763 §7](https://www.rfc-editor.org/rfc/rfc6763#section-7), MUST) |
+| `enum-subtype` (warning) | subtype listed in service enumeration instead of a base type ([RFC 6763 §9](https://www.rfc-editor.org/rfc/rfc6763#section-9), SHOULD) |
+| `shared-flush` (error) | shared PTR record with the cache-flush bit set ([RFC 6762 §10.2](https://www.rfc-editor.org/rfc/rfc6762#section-10.2), MUST NOT) |
+| `no-flush` (warning when confirmed, else info) | unique SRV/TXT record missing the cache-flush bit ([RFC 6762 §10.2](https://www.rfc-editor.org/rfc/rfc6762#section-10.2), SHOULD); confirmed only in a multicast answer |
+| `unicast-leak` (error when confirmed, else warning) | NS/SOA/ANY/MX outside unicast DNS ([RFC 6762 §3](https://www.rfc-editor.org/rfc/rfc6762#section-3)); confirmed only in a multicast answer, otherwise pending capture verification |
+| `unicast-question` (error: NS/SOA, warning: MX) | multicast question asking for a unicast-only type ([RFC 6762 §3](https://www.rfc-editor.org/rfc/rfc6762#section-3)); ANY questions are ownership probes and stay quiet; ephemeral-port queriers are tagged one-shot |
+| `ttl-low` / `ttl-high` (warning) | TTL below 10 s (churn risk) or above 7200 s (stale-cache risk) ([RFC 6762 §5.2](https://www.rfc-editor.org/rfc/rfc6762#section-5.2), SHOULD) |
+| `ttl-mismatch` (info) | service PTR at ≤ 120 s instead of the recommended 4500 s base ([RFC 6762 §10](https://www.rfc-editor.org/rfc/rfc6762#section-10), SHOULD) |
+| `ttl-unstable` (warning) | same name and type announced with different TTL bases ([RFC 6762 §5.2](https://www.rfc-editor.org/rfc/rfc6762#section-5.2), SHOULD) |
+| `srv-target` (warning: malformed, info: target needs unicast DNS) | SRV target malformed (MUST) or resolving outside mDNS (MAY) ([RFC 6763 §12](https://www.rfc-editor.org/rfc/rfc6763#section-12)) |
+| `txt-oversize` (warning) | TXT payload over ~1300 B, risking fragmentation ([RFC 6762 §17](https://www.rfc-editor.org/rfc/rfc6762#section-17), SHOULD) |
 
 Reverse-mapping PTRs (`*.in-addr.arpa`, `*.ip6.arpa`) are exempt from
 the shared-record rules: they are unique records. Omitting the flush
