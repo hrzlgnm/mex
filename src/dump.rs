@@ -73,6 +73,7 @@ pub struct DumpAnomaly {
     pub source: Option<String>,
     pub message: String,
     pub rfc: String,
+    pub requirement: String,
 }
 
 #[derive(serde::Serialize)]

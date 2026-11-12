@@ -1158,7 +1158,10 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
                         format!("{head}: {}", a.message),
                         Style::default().fg(Color::White),
                     ),
-                    Span::styled(format!(" ({})", a.rfc), Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        format!(" ({}, {})", a.rfc, a.requirement),
+                        Style::default().fg(Color::Gray),
+                    ),
                 ])
             })
             .collect()
@@ -1498,6 +1501,7 @@ mod tests {
                 source: Some("192.168.1.2:5353".to_string()),
                 message: "test".to_string(),
                 rfc: "RFC 6762 §5.2",
+                requirement: "SHOULD",
             }
         };
         let found = vec![
