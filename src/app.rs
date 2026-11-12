@@ -7464,6 +7464,135 @@ mod tests {
     }
 
     #[test]
+    fn anomalies_pane_pages_with_paging_keys() {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1; b=2");
+        let plain = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        // Services -> Answers -> Questions -> Anomalies.
+        app.handle_key(&plain(KeyCode::Tab));
+        app.handle_key(&plain(KeyCode::Tab));
+        app.handle_key(&plain(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Anomalies);
+        app.anomalies_viewport.set(5);
+        app.handle_key(&plain(KeyCode::PageDown));
+        assert_eq!(app.anomalies_offset.get(), 5);
+        app.handle_key(&plain(KeyCode::Char('f')));
+        assert_eq!(app.anomalies_offset.get(), 10);
+        app.handle_key(&plain(KeyCode::PageUp));
+        assert_eq!(app.anomalies_offset.get(), 5);
+        app.handle_key(&plain(KeyCode::Char('b')));
+        assert_eq!(app.anomalies_offset.get(), 0);
+        app.handle_key(&plain(KeyCode::End));
+        assert!(app.anomalies_offset.get() > 1000);
+        app.handle_key(&plain(KeyCode::Home));
+        assert_eq!(app.anomalies_offset.get(), 0);
+    }
+
+    #[test]
+    fn mouse_down_drag_sequence_moves_seams() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::layout::Rect;
+        let mut app = App::new().unwrap();
+        app.body_rect.set(Rect::new(0, 3, 100, 40));
+        app.left_rect.set(Rect::new(0, 3, 33, 37));
+        app.right_rect.set(Rect::new(33, 3, 67, 37));
+        app.answers_rect.set(Rect::new(33, 3, 67, 10));
+        app.questions_rect.set(Rect::new(33, 13, 67, 8));
+        app.anomalies_rect.set(Rect::new(33, 21, 67, 6));
+        app.hex_rect.set(Rect::new(33, 27, 67, 10));
+        let down = |column, row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+        let drag = |column, row| MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+        let up = || MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 40,
+            row: 20,
+            modifiers: KeyModifiers::empty(),
+        };
+        // Upper seam grabs the answers share through a real Down/Drag.
+        app.answers_pct = 30;
+        app.questions_pct = 25;
+        app.anomalies_pct = 20;
+        app.handle_mouse(&down(40, 12));
+        assert_eq!(app.drag, DragMode::HorizUpper);
+        app.handle_mouse(&drag(40, 23));
+        assert_eq!(app.answers_pct, 45);
+        app.handle_mouse(&up());
+        assert_eq!(app.drag, DragMode::None);
+        // Middle seam grabs the questions share.
+        app.answers_pct = 30;
+        app.questions_pct = 25;
+        app.anomalies_pct = 20;
+        app.handle_mouse(&down(40, 20));
+        assert_eq!(app.drag, DragMode::HorizMiddle);
+        app.handle_mouse(&drag(40, 25));
+        assert_eq!(app.questions_pct, 29);
+        app.handle_mouse(&up());
+        assert_eq!(app.drag, DragMode::None);
+        // Lower seam grabs the anomalies share.
+        app.answers_pct = 30;
+        app.questions_pct = 25;
+        app.anomalies_pct = 20;
+        app.handle_mouse(&down(40, 26));
+        assert_eq!(app.drag, DragMode::HorizLower);
+        app.handle_mouse(&drag(40, 33));
+        assert_eq!(app.anomalies_pct, 26);
+        app.handle_mouse(&up());
+        assert_eq!(app.drag, DragMode::None);
+    }
+
+    #[test]
+    fn pane_shares_keep_minimums_at_extremes() {
+        use ratatui::layout::Rect;
+        let mut app = App::new().unwrap();
+        app.body_rect.set(Rect::new(0, 3, 100, 40));
+        app.right_rect.set(Rect::new(33, 3, 67, 30));
+        let check = |app: &App| {
+            assert!(app.answers_pct >= 10, "answers: {}", app.answers_pct);
+            assert!(app.questions_pct >= 10, "questions: {}", app.questions_pct);
+            assert!(app.anomalies_pct >= 10, "anomalies: {}", app.anomalies_pct);
+            assert!(
+                app.answers_pct + app.questions_pct + app.anomalies_pct <= 90,
+                "hex keeps >= 10: {}+{}+{}",
+                app.answers_pct,
+                app.questions_pct,
+                app.anomalies_pct
+            );
+        };
+        // Slam every divider against the bottom, then the top.
+        app.questions_pct = 25;
+        app.anomalies_pct = 20;
+        app.set_answers_from_y(3 + 30);
+        check(&app);
+        app.answers_pct = 30;
+        app.anomalies_pct = 20;
+        app.set_middle_from_y(3 + 30);
+        check(&app);
+        app.answers_pct = 30;
+        app.questions_pct = 25;
+        app.set_lower_from_y(3 + 30);
+        check(&app);
+        app.set_answers_from_y(3);
+        check(&app);
+        assert_eq!(app.answers_pct, 10);
+    }
+
+    #[test]
     fn tiny_terminal_renders_anomalies_pane() {
         let app = two_group_app();
         for (width, height) in [(100, 30), (60, 12), (40, 8)] {
@@ -7476,10 +7605,25 @@ mod tests {
                     }
                 }
             }
-            assert!(
-                text.contains("Anomalies"),
-                "{width}x{height} must still show the Anomalies pane"
-            );
+            // Every right-stack pane keeps a visible row: titles render
+            // on the top border even when the pane is one row tall.
+            for pane in [
+                &app.answers_rect,
+                &app.questions_rect,
+                &app.anomalies_rect,
+                &app.hex_rect,
+            ] {
+                assert!(
+                    pane.get().height >= 1,
+                    "{width}x{height}: every pane keeps a row"
+                );
+            }
+            for title in ["Answers", "Questions", "Anomalies"] {
+                assert!(
+                    text.contains(title),
+                    "{width}x{height} must still show the {title} pane"
+                );
+            }
         }
     }
 
