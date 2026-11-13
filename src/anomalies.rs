@@ -24,7 +24,7 @@ pub enum Severity {
 }
 
 impl Severity {
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Severity::Info => "info",
             Severity::Warning => "warning",
@@ -33,12 +33,86 @@ impl Severity {
     }
 }
 
+/// Stable machine-readable identifier for an anomaly kind.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum AnomalyKind {
+    MissingAddr,
+    UnicastLeak,
+    UnicastQuestion,
+    TtlLow,
+    TtlHigh,
+    TtlMismatch,
+    TtlUnstable,
+    NonUtf8,
+    SharedFlush,
+    NoFlush,
+    TxtOversize,
+    SrvTarget,
+    TypeFormat,
+    EnumSubtype,
+}
+
+impl AnomalyKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AnomalyKind::MissingAddr => "missing-addr",
+            AnomalyKind::UnicastLeak => "unicast-leak",
+            AnomalyKind::UnicastQuestion => "unicast-question",
+            AnomalyKind::TtlLow => "ttl-low",
+            AnomalyKind::TtlHigh => "ttl-high",
+            AnomalyKind::TtlMismatch => "ttl-mismatch",
+            AnomalyKind::TtlUnstable => "ttl-unstable",
+            AnomalyKind::NonUtf8 => "non-utf8-name",
+            AnomalyKind::SharedFlush => "shared-flush",
+            AnomalyKind::NoFlush => "no-flush",
+            AnomalyKind::TxtOversize => "txt-oversize",
+            AnomalyKind::SrvTarget => "srv-target",
+            AnomalyKind::TypeFormat => "type-format",
+            AnomalyKind::EnumSubtype => "enum-subtype",
+        }
+    }
+
+    /// Whether the TTL itself is the problem (marks the TTL cell, not the type).
+    pub fn is_ttl(self) -> bool {
+        matches!(
+            self,
+            AnomalyKind::TtlLow
+                | AnomalyKind::TtlHigh
+                | AnomalyKind::TtlMismatch
+                | AnomalyKind::TtlUnstable
+        )
+    }
+
+    /// Whether this is a demand-side unicast-only question finding.
+    pub fn is_question(self) -> bool {
+        self == AnomalyKind::UnicastQuestion
+    }
+}
+
+impl std::fmt::Display for AnomalyKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl PartialOrd for AnomalyKind {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for AnomalyKind {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
 /// One RFC-referenced anomaly. All strings are owned so the analyzer stays
 /// a pure snapshot function with no borrows into browser state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Anomaly {
     /// Stable machine-readable identifier (`missing-addr`, `unicast-leak`, ...).
-    pub kind: &'static str,
+    pub kind: AnomalyKind,
     pub severity: Severity,
     /// Owning service as `instance.service_type`, or `enumeration` for
     /// enumeration-row answers.
@@ -63,22 +137,6 @@ impl Anomaly {
     pub fn is_surfaced(&self) -> bool {
         !matches!(self.severity, Severity::Info)
     }
-}
-
-/// Anomaly kinds where the TTL itself is the problem, not the record
-/// content: rows with only these findings mark the TTL cell instead of
-/// the type cell.
-pub const TTL_KINDS: &[&str] = &["ttl-low", "ttl-high", "ttl-mismatch", "ttl-unstable"];
-
-/// Whether `kind` is a TTL problem (marks the TTL cell, not the type).
-pub fn is_ttl_kind(kind: &str) -> bool {
-    TTL_KINDS.contains(&kind)
-}
-
-/// Whether `kind` is a demand-side unicast-only finding: observed
-/// questions asking multicast for a type that can only live in unicast.
-pub fn is_question_kind(kind: &str) -> bool {
-    kind == "unicast-question"
 }
 
 /// A service slice for analysis: borrows browser state, owns nothing.
@@ -182,7 +240,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
             let target = rec.rdata.trim_end_matches('.');
             if let Some(reason) = service_type_problem(target) {
                 out.push(Anomaly {
-                    kind: "type-format",
+                    kind: AnomalyKind::TypeFormat,
                     severity: Severity::Warning,
                     service: ENUMERATION_SERVICE.to_string(),
                     record_name: Some(rec.name.clone()),
@@ -199,7 +257,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
                 // (e.g. _T35._sub._matterd._udp.local) is queried
                 // separately and does not belong in the enumeration list.
                 out.push(Anomaly {
-                    kind: "enum-subtype",
+                    kind: AnomalyKind::EnumSubtype,
                     severity: Severity::Warning,
                     service: ENUMERATION_SERVICE.to_string(),
                     record_name: Some(rec.name.clone()),
@@ -226,7 +284,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
     out.sort_by(|a, b| {
         severity_rank(b.severity)
             .cmp(&severity_rank(a.severity))
-            .then_with(|| a.kind.cmp(b.kind))
+            .then_with(|| a.kind.cmp(&b.kind))
             .then_with(|| a.service.cmp(&b.service))
             .then_with(|| a.record_name.cmp(&b.record_name))
             .then_with(|| a.rdata.cmp(&b.rdata))
@@ -261,7 +319,9 @@ fn dedup(mut items: Vec<Anomaly>) -> Vec<Anomaly> {
         // leaks differing only in serial are the same finding. Normalize
         // the serial away for the dedup key; the stored rdata keeps it.
         let rdata_key = match (a.kind, a.rtype) {
-            ("unicast-leak", Some(6)) => anomaly_match_key(6, &a.rdata.clone().unwrap_or_default()),
+            (AnomalyKind::UnicastLeak, Some(6)) => {
+                anomaly_match_key(6, &a.rdata.clone().unwrap_or_default())
+            }
             _ => a.rdata.clone().unwrap_or_default(),
         };
         // Questions carry no rdata: tell queriers apart by source, so each
@@ -271,11 +331,11 @@ fn dedup(mut items: Vec<Anomaly>) -> Vec<Anomaly> {
         // the same rdata via multicast vs unicast (or answer vs
         // authority) is a different verdict and must not collapse.
         let source_key = match a.kind {
-            "unicast-question" => a.source.clone().unwrap_or_default(),
+            AnomalyKind::UnicastQuestion => a.source.clone().unwrap_or_default(),
             _ => String::new(),
         };
         let context_key = match a.kind {
-            "unicast-leak" | "no-flush" => a.message.clone(),
+            AnomalyKind::UnicastLeak | AnomalyKind::NoFlush => a.message.clone(),
             _ => String::new(),
         };
         let key = (
@@ -343,7 +403,7 @@ fn check_missing_addr(
     // recommends, not requires, additional address records).
     let local = host.eq_ignore_ascii_case("local") || host.to_ascii_lowercase().ends_with(".local");
     out.push(Anomaly {
-        kind: "missing-addr",
+        kind: AnomalyKind::MissingAddr,
         severity: if local {
             Severity::Warning
         } else {
@@ -374,7 +434,7 @@ fn check_type_format(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>
     }
     if let Some(reason) = service_type_problem(st) {
         out.push(Anomaly {
-            kind: "type-format",
+            kind: AnomalyKind::TypeFormat,
             severity: Severity::Warning,
             service: service_id.to_string(),
             record_name: None,
@@ -479,7 +539,7 @@ fn check_subtypes(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>) {
     for sub in svc.subtypes {
         if let Some(reason) = label_problem(sub.trim_end_matches('.')) {
             out.push(Anomaly {
-                kind: "type-format",
+                kind: AnomalyKind::TypeFormat,
                 severity: Severity::Warning,
                 service: service_id.to_string(),
                 record_name: None,
@@ -499,7 +559,7 @@ fn check_subtypes(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>) {
 /// `TYPE name` otherwise): the shared core of every display scope.
 fn finding_scope(a: &Anomaly) -> String {
     match (&a.record_name, a.rtype_str.as_deref()) {
-        (Some(name), Some(rtype)) if is_question_kind(a.kind) => {
+        (Some(name), Some(rtype)) if a.kind.is_question() => {
             format!("QRY {rtype} {name}")
         }
         (Some(name), Some(rtype)) => format!("{rtype} {name}"),
@@ -535,7 +595,7 @@ where
 /// service column already names it). Question findings always keep
 /// their QRY scope: the queried type varies.
 pub(crate) fn visible_scope(a: &Anomaly, identity_count: &HashMap<(String, u16), usize>) -> String {
-    if is_enumeration_row(&a.service, a.record_name.as_deref()) && !is_question_kind(a.kind) {
+    if is_enumeration_row(&a.service, a.record_name.as_deref()) && !a.kind.is_question() {
         return String::new();
     }
     let base = finding_scope(a);
@@ -658,7 +718,7 @@ fn check_question(q: &QuestionView, out: &mut Vec<Anomaly>) {
         "unicast-only type on multicast".to_string()
     };
     out.push(Anomaly {
-        kind: "unicast-question",
+        kind: AnomalyKind::UnicastQuestion,
         severity,
         service: q.service.clone(),
         record_name: Some(name.clone()),
@@ -684,7 +744,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     // row so that failure is explained instead of silent.
     if rec.invalid_utf8 {
         out.push(Anomaly {
-            kind: "non-utf8-name",
+            kind: AnomalyKind::NonUtf8,
             severity: Severity::Warning,
             service: service_id.to_string(),
             record_name: Some(name.clone()),
@@ -735,7 +795,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             )
         };
         out.push(Anomaly {
-            kind: "unicast-leak",
+            kind: AnomalyKind::UnicastLeak,
             severity,
             service: service_id.to_string(),
             record_name: Some(name.clone()),
@@ -765,7 +825,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             "shared record with flush bit set".to_string()
         };
         out.push(Anomaly {
-            kind: "shared-flush",
+            kind: AnomalyKind::SharedFlush,
             severity: Severity::Error,
             service: service_id.to_string(),
             record_name: Some(name.clone()),
@@ -793,7 +853,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             "missing flush bit".to_string()
         };
         out.push(Anomaly {
-            kind: "no-flush",
+            kind: AnomalyKind::NoFlush,
             severity: if confirmed {
                 Severity::Warning
             } else {
@@ -816,7 +876,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     // churn or stale caches.
     if rec.ttl < TTL_LOW {
         out.push(Anomaly {
-            kind: "ttl-low",
+            kind: AnomalyKind::TtlLow,
             severity: Severity::Warning,
             service: service_id.to_string(),
             record_name: Some(name.clone()),
@@ -830,7 +890,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         });
     } else if rec.ttl > TTL_HIGH {
         out.push(Anomaly {
-            kind: "ttl-high",
+            kind: AnomalyKind::TtlHigh,
             severity: Severity::Warning,
             service: service_id.to_string(),
             record_name: Some(name),
@@ -870,7 +930,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             format!("PTR base TTL {}s; want 4500s", rec.ttl)
         };
         out.push(Anomaly {
-            kind: "ttl-mismatch",
+            kind: AnomalyKind::TtlMismatch,
             severity: Severity::Info,
             service: service_id.to_string(),
             record_name: Some(rec.name.clone()),
@@ -900,7 +960,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         let payload_len = rec.rdata.len();
         if payload_len > TXT_MAX {
             out.push(Anomaly {
-                kind: "txt-oversize",
+                kind: AnomalyKind::TxtOversize,
                 severity: Severity::Warning,
                 service: service_id.to_string(),
                 record_name: Some(rec.name.clone()),
@@ -965,7 +1025,7 @@ fn check_srv_target(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
 
 fn srv_anomaly_info(service_id: &str, rec: &RawRecord, message: &str) -> Anomaly {
     Anomaly {
-        kind: "srv-target",
+        kind: AnomalyKind::SrvTarget,
         severity: Severity::Info,
         service: service_id.to_string(),
         record_name: Some(rec.name.clone()),
@@ -981,7 +1041,7 @@ fn srv_anomaly_info(service_id: &str, rec: &RawRecord, message: &str) -> Anomaly
 
 fn srv_anomaly(service_id: &str, rec: &RawRecord, message: &str) -> Anomaly {
     Anomaly {
-        kind: "srv-target",
+        kind: AnomalyKind::SrvTarget,
         severity: Severity::Warning,
         service: service_id.to_string(),
         record_name: Some(rec.name.clone()),
@@ -1052,7 +1112,7 @@ fn check_ttl_stable(svc: &ServiceView, service_id: &str, now: Instant, out: &mut
                 .find(|r| r.rtype == rtype)
                 .map(|r| r.rtype_str.clone());
             out.push(Anomaly {
-                kind: "ttl-unstable",
+                kind: AnomalyKind::TtlUnstable,
                 severity: Severity::Warning,
                 service: service_id.to_string(),
                 record_name: Some(name),
@@ -1179,7 +1239,7 @@ mod tests {
         )];
         let item = analyze_service("My", "_http._tcp.local", "myhost.local.", &local)
             .into_iter()
-            .find(|a| a.kind == "missing-addr")
+            .find(|a| a.kind == AnomalyKind::MissingAddr)
             .expect("expected missing-addr");
         assert_eq!(item.severity, Severity::Warning);
         let remote = vec![rec(
@@ -1192,7 +1252,7 @@ mod tests {
         )];
         let item = analyze_service("My", "_http._tcp.local", "fritz.box.", &remote)
             .into_iter()
-            .find(|a| a.kind == "missing-addr")
+            .find(|a| a.kind == AnomalyKind::MissingAddr)
             .expect("expected missing-addr");
         assert_eq!(item.severity, Severity::Info);
     }
@@ -1218,7 +1278,7 @@ mod tests {
             ),
         ];
         let found = analyze_service("My", "_http._tcp.local", "myhost.local.", &answers);
-        assert!(found.iter().any(|a| a.kind == "missing-addr"));
+        assert!(found.iter().any(|a| a.kind == AnomalyKind::MissingAddr));
     }
 
     #[test]
@@ -1235,7 +1295,7 @@ mod tests {
             rec("myhost.local.", 1, "A", "192.168.1.10", 120, true),
         ];
         let found = analyze_service("My", "_http._tcp.local", "myhost.local.", &answers);
-        assert!(!found.iter().any(|a| a.kind == "missing-addr"));
+        assert!(!found.iter().any(|a| a.kind == AnomalyKind::MissingAddr));
     }
 
     #[test]
@@ -1261,7 +1321,9 @@ mod tests {
             pending_hosts: HashSet::from(["myhost.local".to_string()]),
             questions: Vec::new(),
         };
-        assert!(!analyze(&snap).iter().any(|a| a.kind == "missing-addr"));
+        assert!(!analyze(&snap)
+            .iter()
+            .any(|a| a.kind == AnomalyKind::MissingAddr));
     }
 
     #[test]
@@ -1280,7 +1342,7 @@ mod tests {
             500,
         )];
         let found = analyze_service("My", "_http._tcp.local", "myhost.local.", &answers);
-        assert!(!found.iter().any(|a| a.kind == "missing-addr"));
+        assert!(!found.iter().any(|a| a.kind == AnomalyKind::MissingAddr));
     }
 
     #[test]
@@ -1294,7 +1356,7 @@ mod tests {
             false,
         )];
         let found = analyze_service("My", "_http._tcp.local", "myhost.local.", &answers);
-        assert!(!found.iter().any(|a| a.kind == "missing-addr"));
+        assert!(!found.iter().any(|a| a.kind == AnomalyKind::MissingAddr));
     }
 
     #[test]
@@ -1319,7 +1381,7 @@ mod tests {
         let found = analyze_service("My", "_http._tcp.local", "host.local.", &answers);
         let item = found
             .iter()
-            .find(|a| a.kind == "unicast-leak")
+            .find(|a| a.kind == AnomalyKind::UnicastLeak)
             .expect("expected ANY leak");
         assert_eq!(item.severity, Severity::Error);
     }
@@ -1342,7 +1404,7 @@ mod tests {
         };
         let item = analyze(&snap)
             .iter()
-            .find(|a| a.kind == "unicast-leak")
+            .find(|a| a.kind == AnomalyKind::UnicastLeak)
             .expect("expected enumeration SOA leak")
             .clone();
         assert_eq!(item.service, "enumeration");
@@ -1402,7 +1464,7 @@ mod tests {
         bad.invalid_utf8 = true;
         let found = analyze_service("Test", "_http._tcp.local", "myhost.local.", &[bad])
             .into_iter()
-            .find(|a| a.kind == "non-utf8-name")
+            .find(|a| a.kind == AnomalyKind::NonUtf8)
             .expect("expected non-utf8-name");
         assert_eq!(found.severity, Severity::Warning);
         assert_eq!(found.rfc, "RFC 6762 §16");
@@ -1417,7 +1479,7 @@ mod tests {
             true,
         )];
         let found = analyze_service("Test", "_http._tcp.local", "myhost.local.", &clean);
-        assert!(found.iter().all(|a| a.kind != "non-utf8-name"));
+        assert!(found.iter().all(|a| a.kind != AnomalyKind::NonUtf8));
     }
 
     #[test]
@@ -1436,7 +1498,7 @@ mod tests {
         let found = analyze_questions(&[qview("My._http._tcp.local", "fritz.box.", 6, querier)]);
         let item = found
             .iter()
-            .find(|a| a.kind == "unicast-question")
+            .find(|a| a.kind == AnomalyKind::UnicastQuestion)
             .expect("expected SOA question leak");
         assert_eq!(item.severity, Severity::Error);
         assert_eq!(item.service, "My._http._tcp.local");
@@ -1458,7 +1520,7 @@ mod tests {
         let found = analyze_questions(&[qview("My._http._tcp.local", "fritz.box.", 6, stub)]);
         let item = found
             .iter()
-            .find(|a| a.kind == "unicast-question")
+            .find(|a| a.kind == AnomalyKind::UnicastQuestion)
             .expect("expected SOA question leak");
         assert!(
             item.message.contains("one-shot"),
@@ -1469,7 +1531,7 @@ mod tests {
             analyze_questions(&[qview("My._http._tcp.local", "fritz.box.", 6, test_source())]);
         let item = found
             .iter()
-            .find(|a| a.kind == "unicast-question")
+            .find(|a| a.kind == AnomalyKind::UnicastQuestion)
             .expect("expected SOA question leak");
         assert!(
             !item.message.contains("one-shot"),
@@ -1482,7 +1544,7 @@ mod tests {
         let found = analyze_questions(&[qview("My._http._tcp.local", "fritz.box.", 6, dns)]);
         let item = found
             .iter()
-            .find(|a| a.kind == "unicast-question")
+            .find(|a| a.kind == AnomalyKind::UnicastQuestion)
             .expect("expected SOA question leak");
         assert!(
             !item.message.contains("one-shot"),
@@ -1495,7 +1557,7 @@ mod tests {
         let found = analyze_questions(&[qview("My._http._tcp.local", "fritz.box.", 6, other)]);
         let item = found
             .iter()
-            .find(|a| a.kind == "unicast-question")
+            .find(|a| a.kind == AnomalyKind::UnicastQuestion)
             .expect("expected SOA question leak");
         assert!(
             item.message.contains("one-shot"),
@@ -1514,7 +1576,7 @@ mod tests {
         )]);
         let item = found
             .iter()
-            .find(|a| a.kind == "unicast-question")
+            .find(|a| a.kind == AnomalyKind::UnicastQuestion)
             .expect("expected MX question leak");
         assert_eq!(item.severity, Severity::Warning);
     }
@@ -1526,7 +1588,7 @@ mod tests {
         let zelf: SocketAddr = "0.0.0.0:0".parse().unwrap();
         let found = analyze_questions(&[qview("My._http._tcp.local", "fritz.box.", 6, zelf)]);
         assert!(
-            !found.iter().any(|a| a.kind == "unicast-question"),
+            !found.iter().any(|a| a.kind == AnomalyKind::UnicastQuestion),
             "self sends must stay quiet"
         );
     }
@@ -1540,7 +1602,7 @@ mod tests {
             test_source(),
         )]);
         assert!(
-            !found.iter().any(|a| a.kind == "unicast-question"),
+            !found.iter().any(|a| a.kind == AnomalyKind::UnicastQuestion),
             "multicast-type questions must stay quiet"
         );
     }
@@ -1557,7 +1619,7 @@ mod tests {
         assert_eq!(
             found
                 .iter()
-                .filter(|a| a.kind == "unicast-question")
+                .filter(|a| a.kind == AnomalyKind::UnicastQuestion)
                 .count(),
             1
         );
@@ -1569,7 +1631,7 @@ mod tests {
         assert_eq!(
             found
                 .iter()
-                .filter(|a| a.kind == "unicast-question")
+                .filter(|a| a.kind == AnomalyKind::UnicastQuestion)
                 .count(),
             2
         );
@@ -1587,7 +1649,7 @@ mod tests {
         )]);
         let item = found
             .iter()
-            .find(|a| a.kind == "unicast-question")
+            .find(|a| a.kind == AnomalyKind::UnicastQuestion)
             .expect("expected NS question leak");
         assert_eq!(item.severity, Severity::Error);
         assert_eq!(item.rtype_str.as_deref(), Some("NS"));
@@ -1598,7 +1660,7 @@ mod tests {
             test_source(),
         )]);
         assert!(
-            !found.iter().any(|a| a.kind == "unicast-question"),
+            !found.iter().any(|a| a.kind == AnomalyKind::UnicastQuestion),
             "ANY probe questions must stay quiet"
         );
     }
@@ -1616,7 +1678,10 @@ mod tests {
         ];
         let found = analyze_service("My", "_http._tcp.local", "host.local.", &answers);
         assert_eq!(
-            found.iter().filter(|a| a.kind == "unicast-leak").count(),
+            found
+                .iter()
+                .filter(|a| a.kind == AnomalyKind::UnicastLeak)
+                .count(),
             1,
             "same answer from two sources must stay one finding"
         );
@@ -1636,10 +1701,16 @@ mod tests {
             rec("host.local.", 2, "NS", "host.local.", 120, false),
         ];
         let found = analyze_service("My", "_http._tcp.local", "host.local.", &answers);
-        assert_eq!(found.iter().filter(|a| a.kind == "unicast-leak").count(), 2);
+        assert_eq!(
+            found
+                .iter()
+                .filter(|a| a.kind == AnomalyKind::UnicastLeak)
+                .count(),
+            2
+        );
         assert!(found
             .iter()
-            .filter(|a| a.kind == "unicast-leak")
+            .filter(|a| a.kind == AnomalyKind::UnicastLeak)
             .all(|a| a.severity == Severity::Error));
     }
 
@@ -1666,7 +1737,7 @@ mod tests {
             let found = analyze_service("My", "_http._tcp.local", "host.local.", &answers);
             let item = found
                 .iter()
-                .find(|a| a.kind == "unicast-leak")
+                .find(|a| a.kind == AnomalyKind::UnicastLeak)
                 .expect("expected leak");
             assert_eq!(
                 item.severity,
@@ -1690,7 +1761,7 @@ mod tests {
         let found = analyze_service("My", "_http._tcp.local", "", &answers);
         assert!(found
             .iter()
-            .any(|a| a.kind == "shared-flush" && a.severity == Severity::Error));
+            .any(|a| a.kind == AnomalyKind::SharedFlush && a.severity == Severity::Error));
     }
 
     #[test]
@@ -1713,7 +1784,7 @@ mod tests {
         };
         let item = analyze(&snap)
             .iter()
-            .find(|a| a.kind == "shared-flush" && a.service == "enumeration")
+            .find(|a| a.kind == AnomalyKind::SharedFlush && a.service == "enumeration")
             .expect("expected enumeration shared-flush")
             .clone();
         assert!(
@@ -1737,7 +1808,7 @@ mod tests {
         );
         let item = found
             .iter()
-            .find(|a| a.kind == "shared-flush")
+            .find(|a| a.kind == AnomalyKind::SharedFlush)
             .expect("expected shared-flush");
         assert_eq!(item.message, "shared record with flush bit set");
     }
@@ -1746,7 +1817,7 @@ mod tests {
     fn visible_scope_disambiguates_only_foreign_rdata() {
         fn finding(service: &str, rdata: &str) -> Anomaly {
             Anomaly {
-                kind: "shared-flush",
+                kind: AnomalyKind::SharedFlush,
                 severity: Severity::Error,
                 service: service.to_string(),
                 record_name: Some("_http._tcp.local.".to_string()),
@@ -1782,7 +1853,7 @@ mod tests {
             let answers = vec![rec(name, 12, "PTR", "Android.local.", 120, true)];
             let found = analyze_service("X", "_http._tcp.local", "", &answers);
             assert!(
-                !found.iter().any(|a| a.kind == "shared-flush"),
+                !found.iter().any(|a| a.kind == AnomalyKind::SharedFlush),
                 "reverse PTR {name} should be quiet"
             );
         }
@@ -1802,7 +1873,7 @@ mod tests {
         let found = analyze_service("My", "_http._tcp.local", "myhost.local.", &answers);
         let item = found
             .iter()
-            .find(|a| a.kind == "no-flush")
+            .find(|a| a.kind == AnomalyKind::NoFlush)
             .expect("expected finding");
         assert_eq!(item.severity, Severity::Warning);
         // Same record via unicast reply: Info only (bit MUST NOT be set
@@ -1820,7 +1891,7 @@ mod tests {
         let found = analyze_service("My", "_http._tcp.local", "myhost.local.", &answers);
         let item = found
             .iter()
-            .find(|a| a.kind == "no-flush")
+            .find(|a| a.kind == AnomalyKind::NoFlush)
             .expect("expected finding");
         assert_eq!(item.severity, Severity::Info);
     }
@@ -1841,7 +1912,7 @@ mod tests {
             rec("myhost.local.", 28, "AAAA", "fe80::1", 120, false),
         ];
         let found = analyze_service("My", "_http._tcp.local", "myhost.local.", &answers);
-        assert!(!found.iter().any(|a| a.kind == "no-flush"));
+        assert!(!found.iter().any(|a| a.kind == AnomalyKind::NoFlush));
     }
 
     #[test]
@@ -1850,7 +1921,7 @@ mod tests {
         let found = analyze_service("My", "_http._tcp.local", "host.local.", &answers);
         let item = found
             .iter()
-            .find(|a| a.kind == "unicast-leak")
+            .find(|a| a.kind == AnomalyKind::UnicastLeak)
             .expect("expected leak");
         assert_eq!(item.severity, Severity::Warning);
     }
@@ -1869,7 +1940,7 @@ mod tests {
             let found = analyze_service("X", "_http._tcp.local", "", &answers);
             let item = found
                 .iter()
-                .find(|a| a.kind == "ttl-mismatch")
+                .find(|a| a.kind == AnomalyKind::TtlMismatch)
                 .unwrap_or_else(|| panic!("PTR@{ttl} should be flagged"));
             assert_eq!(item.severity, Severity::Info);
         }
@@ -1893,7 +1964,7 @@ mod tests {
         };
         let item = analyze(&snap)
             .iter()
-            .find(|a| a.kind == "ttl-mismatch")
+            .find(|a| a.kind == AnomalyKind::TtlMismatch)
             .expect("expected enumeration ttl-mismatch")
             .clone();
         assert_eq!(
@@ -1921,7 +1992,7 @@ mod tests {
             false,
         )];
         let found = analyze_service("X", "_http._tcp.local", "", &answers);
-        assert!(!found.iter().any(|a| a.kind == "ttl-mismatch"));
+        assert!(!found.iter().any(|a| a.kind == AnomalyKind::TtlMismatch));
     }
 
     #[test]
@@ -1935,7 +2006,7 @@ mod tests {
             let answers = vec![rec(name, 12, "PTR", "myhost.local.", 120, true)];
             let found = analyze_service("X", "_http._tcp.local", "", &answers);
             assert!(
-                !found.iter().any(|a| a.kind == "ttl-mismatch"),
+                !found.iter().any(|a| a.kind == AnomalyKind::TtlMismatch),
                 "reverse PTR {name} at 120s should be quiet"
             );
         }
@@ -1953,7 +2024,7 @@ mod tests {
             true,
         )];
         let found = analyze_service("X", "_http._tcp.local", "myhost.local.", &answers);
-        assert!(!found.iter().any(|a| a.kind == "ttl-mismatch"));
+        assert!(!found.iter().any(|a| a.kind == AnomalyKind::TtlMismatch));
     }
 
     #[test]
@@ -1973,7 +2044,7 @@ mod tests {
         let found = analyze_service("X", "_http._tcp.local", "a.local.", &answers);
         assert!(!found
             .iter()
-            .any(|a| a.kind == "ttl-low" || a.kind == "ttl-high"));
+            .any(|a| a.kind == AnomalyKind::TtlLow || a.kind == AnomalyKind::TtlHigh));
     }
 
     #[test]
@@ -1983,8 +2054,8 @@ mod tests {
             rec("b.local.", 28, "AAAA", "fe80::1", 20000, true),
         ];
         let found = analyze_service("X", "_http._tcp.local", "a.local.", &answers);
-        assert!(found.iter().any(|a| a.kind == "ttl-low"));
-        assert!(found.iter().any(|a| a.kind == "ttl-high"));
+        assert!(found.iter().any(|a| a.kind == AnomalyKind::TtlLow));
+        assert!(found.iter().any(|a| a.kind == AnomalyKind::TtlHigh));
     }
 
     #[test]
@@ -1995,7 +2066,7 @@ mod tests {
         let _ = (&mut r1, &mut r2);
         let answers = vec![r1, r2];
         let found = analyze_service("X", "_http._tcp.local", "a.local.", &answers);
-        assert!(found.iter().any(|a| a.kind == "ttl-unstable"));
+        assert!(found.iter().any(|a| a.kind == AnomalyKind::TtlUnstable));
     }
 
     #[test]
@@ -2009,7 +2080,7 @@ mod tests {
             true,
         )];
         let found = analyze_service("My", "_http._tcp.local", "myhost.local.", &answers);
-        assert!(!found.iter().any(|a| a.kind == "srv-target"));
+        assert!(!found.iter().any(|a| a.kind == AnomalyKind::SrvTarget));
     }
 
     #[test]
@@ -2025,7 +2096,7 @@ mod tests {
         let found = analyze_service("My", "_http._tcp.local", "example.com.", &answers);
         let item = found
             .iter()
-            .find(|a| a.kind == "srv-target")
+            .find(|a| a.kind == AnomalyKind::SrvTarget)
             .expect("expected srv-target");
         assert_eq!(item.severity, Severity::Info);
         assert!(
@@ -2043,7 +2114,7 @@ mod tests {
             rec("X._http._tcp.local.", 16, "TXT", "k=v; bare", 120, true),
         ];
         let found = analyze_service("X", "_http._tcp.local", "", &answers);
-        assert!(!found.iter().any(|a| a.kind == "txt-oversize"));
+        assert!(!found.iter().any(|a| a.kind == AnomalyKind::TxtOversize));
     }
 
     #[test]
@@ -2051,7 +2122,7 @@ mod tests {
         let big = "k=".to_string() + &"x".repeat(1400);
         let answers = vec![rec("X._http._tcp.local.", 16, "TXT", &big, 120, true)];
         let found = analyze_service("X", "_http._tcp.local", "", &answers);
-        assert!(found.iter().any(|a| a.kind == "txt-oversize"));
+        assert!(found.iter().any(|a| a.kind == AnomalyKind::TxtOversize));
     }
 
     #[test]
@@ -2061,7 +2132,7 @@ mod tests {
         // if one ever reaches the analyzer.
         let found = analyze_service("Android", "local.37.178.168.192.in-addr.arpa", "", &[]);
         assert!(
-            !found.iter().any(|a| a.kind == "type-format"),
+            !found.iter().any(|a| a.kind == AnomalyKind::TypeFormat),
             "reverse name must not flag, got: {found:?}"
         );
     }
@@ -2070,7 +2141,7 @@ mod tests {
     fn type_format_flags_bad_shape() {
         let answers = vec![];
         let found = analyze_service("X", "http.tcp.local", "", &answers);
-        assert!(found.iter().any(|a| a.kind == "type-format"));
+        assert!(found.iter().any(|a| a.kind == AnomalyKind::TypeFormat));
     }
 
     #[test]
@@ -2083,7 +2154,7 @@ mod tests {
         ] {
             let found = analyze_service("X", t, "", &[]);
             assert!(
-                found.iter().any(|a| a.kind == "type-format"),
+                found.iter().any(|a| a.kind == AnomalyKind::TypeFormat),
                 "type {t} should be flagged"
             );
         }
@@ -2093,14 +2164,14 @@ mod tests {
     fn type_format_accepts_valid_subtype_label() {
         let subtypes = vec!["_printer".to_string()];
         let found = analyze_service_sub("X", "_http._tcp.local", "", &[], &subtypes);
-        assert!(!found.iter().any(|a| a.kind == "type-format"));
+        assert!(!found.iter().any(|a| a.kind == AnomalyKind::TypeFormat));
     }
 
     #[test]
     fn type_format_flags_bad_subtype_label() {
         let subtypes = vec!["_80".to_string()];
         let found = analyze_service_sub("X", "_http._tcp.local", "", &[], &subtypes);
-        assert!(found.iter().any(|a| a.kind == "type-format"));
+        assert!(found.iter().any(|a| a.kind == AnomalyKind::TypeFormat));
     }
 
     #[test]
@@ -2114,7 +2185,7 @@ mod tests {
             true,
         )];
         let found = analyze_service("My", "_http._tcp.local", "myhost.local.", &answers);
-        assert!(found.iter().any(|a| a.kind == "srv-target"));
+        assert!(found.iter().any(|a| a.kind == AnomalyKind::SrvTarget));
     }
 
     #[test]
@@ -2128,7 +2199,7 @@ mod tests {
             true,
         )];
         let found = analyze_service("My", "_http._tcp.local", "foo..local.", &answers);
-        assert!(found.iter().any(|a| a.kind == "srv-target"));
+        assert!(found.iter().any(|a| a.kind == AnomalyKind::SrvTarget));
     }
 
     #[test]
@@ -2136,7 +2207,7 @@ mod tests {
         let mut r = rec("X._http._tcp.local.", 16, "TXT", "k=v", 120, true);
         r.wire = vec![0u8; 1400];
         let found = analyze_service("X", "_http._tcp.local", "", &[r]);
-        assert!(!found.iter().any(|a| a.kind == "txt-oversize"));
+        assert!(!found.iter().any(|a| a.kind == AnomalyKind::TxtOversize));
     }
 
     #[test]
@@ -2148,7 +2219,7 @@ mod tests {
         ] {
             let found = analyze_service("X", t, "", &[]);
             assert!(
-                !found.iter().any(|a| a.kind == "type-format"),
+                !found.iter().any(|a| a.kind == AnomalyKind::TypeFormat),
                 "type {t} should be quiet"
             );
         }
@@ -2159,7 +2230,7 @@ mod tests {
         // Neither the RFC's 15-character limit nor inner underscores are
         // enforced by real stacks, so the SHIELD's real type stays quiet.
         let found = analyze_service("SHIELD", "_nv_shield_remote._tcp.local", "", &[]);
-        assert!(!found.iter().any(|a| a.kind == "type-format"));
+        assert!(!found.iter().any(|a| a.kind == AnomalyKind::TypeFormat));
     }
 
     #[test]
@@ -2181,7 +2252,7 @@ mod tests {
         let found = analyze(&snap);
         let item = found
             .iter()
-            .find(|a| a.kind == "enum-subtype")
+            .find(|a| a.kind == AnomalyKind::EnumSubtype)
             .expect("expected enum-subtype");
         assert_eq!(item.severity, Severity::Warning);
         // The message names the subtype: enumeration rows all share one
@@ -2192,7 +2263,7 @@ mod tests {
             item.message
         );
         // Valid subtype: no naming-shape finding alongside.
-        assert!(!found.iter().any(|a| a.kind == "type-format"));
+        assert!(!found.iter().any(|a| a.kind == AnomalyKind::TypeFormat));
         let base = rec(
             "_services._dns-sd._udp.local.",
             12,
@@ -2208,7 +2279,9 @@ mod tests {
             questions: Vec::new(),
         };
         assert!(
-            !analyze(&snap).iter().any(|a| a.kind == "enum-subtype"),
+            !analyze(&snap)
+                .iter()
+                .any(|a| a.kind == AnomalyKind::EnumSubtype),
             "base types stay quiet"
         );
     }
@@ -2232,7 +2305,7 @@ mod tests {
         let found = analyze(&snap);
         let item = found
             .iter()
-            .find(|a| a.kind == "type-format" && a.service == "enumeration")
+            .find(|a| a.kind == AnomalyKind::TypeFormat && a.service == "enumeration")
             .expect("expected enumeration type-format");
         // Full record identity so the Answers table can mark the PTR row.
         assert_eq!(
@@ -2259,7 +2332,9 @@ mod tests {
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
         };
-        assert!(!analyze(&snap).iter().any(|a| a.kind == "type-format"));
+        assert!(!analyze(&snap)
+            .iter()
+            .any(|a| a.kind == AnomalyKind::TypeFormat));
     }
 
     #[test]
@@ -2278,7 +2353,9 @@ mod tests {
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
         };
-        assert!(!analyze(&snap).iter().any(|a| a.kind == "type-format"));
+        assert!(!analyze(&snap)
+            .iter()
+            .any(|a| a.kind == AnomalyKind::TypeFormat));
     }
 
     #[test]
@@ -2299,7 +2376,7 @@ mod tests {
         };
         assert!(analyze(&snap)
             .iter()
-            .any(|a| a.kind == "type-format" && a.service == "enumeration"));
+            .any(|a| a.kind == AnomalyKind::TypeFormat && a.service == "enumeration"));
     }
 
     #[test]
@@ -2336,7 +2413,10 @@ mod tests {
         ];
         let found = analyze_service("My", "_http._tcp.local", "host.local.", &answers);
         assert_eq!(
-            found.iter().filter(|a| a.kind == "unicast-leak").count(),
+            found
+                .iter()
+                .filter(|a| a.kind == AnomalyKind::UnicastLeak)
+                .count(),
             1,
             "serial-only differences must not multiply findings"
         );
@@ -2366,7 +2446,7 @@ mod tests {
         let answers = vec![old, gone];
         let found = analyze_service("My", "_http._tcp.local", "host.local.", &answers);
         assert!(
-            !found.iter().any(|a| a.kind == "unicast-leak"),
+            !found.iter().any(|a| a.kind == AnomalyKind::UnicastLeak),
             "expired and goodbye SOA must not leak-flag"
         );
     }
@@ -2397,7 +2477,7 @@ mod tests {
         ];
         let found = analyze_service("X", "_http._tcp.local", "h.local.", &answers);
         assert!(
-            !found.iter().any(|a| a.kind == "unicast-leak"),
+            !found.iter().any(|a| a.kind == AnomalyKind::UnicastLeak),
             "valid multicast types and CNAME must not leak-flag"
         );
     }
@@ -2413,10 +2493,10 @@ mod tests {
             found.is_empty()
                 || !found
                     .iter()
-                    .any(|a| a.kind == "unicast-leak" || a.kind == "ttl-low")
+                    .any(|a| a.kind == AnomalyKind::UnicastLeak || a.kind == AnomalyKind::TtlLow)
         );
         // Expired AAAA must not trigger missing-addr either via itself; the
         // hostname here has no SRV target overlap, and goodbye is excluded.
-        assert!(!found.iter().any(|a| a.kind == "ttl-high"));
+        assert!(!found.iter().any(|a| a.kind == AnomalyKind::TtlHigh));
     }
 }
