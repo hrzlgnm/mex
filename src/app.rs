@@ -7477,6 +7477,21 @@ mod tests {
         assert!(app
             .host_addresses("host-b.local")
             .contains(&"192.168.1.10".to_string()));
+        for rec in &mut app.services[0].answers {
+            if rec.rtype == 1 && rec.rdata == "192.168.1.10" {
+                rec.received_at = Instant::now() - Duration::from_secs(121);
+            }
+        }
+        assert!(!app
+            .host_addresses("host-b.local")
+            .contains(&"192.168.1.10".to_string()));
+        ingest(
+            &mut app,
+            &raw_record("host-a.local.", 1, "A", "192.168.1.10", 120),
+        );
+        assert!(app
+            .host_addresses("host-b.local")
+            .contains(&"192.168.1.10".to_string()));
     }
 
     #[test]
