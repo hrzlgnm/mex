@@ -51,12 +51,14 @@ Headless run (no TTY) logs to stderr.
 * Create branches from `origin/main` (`git fetch origin` first).
 * Commit messages must follow Conventional Commits (`feat:`, `fix:`, `docs:`,
   …): release-please owns the changelog and derives releases from them.
+* Before opening a PR, proofread the title/body plus any new user-facing
+  text and run `typos` (CI enforces it via `typos.toml`).
 
 ## Conventions
 
 * `cargo fmt` before commit; clippy with `-D warnings` must pass.
 * Prefer editing existing files; no new deps without need
-  (`hickory-proto` uses the `mdns` feature for the QU bit).
+  (`simple-dns` exposes the mDNS QU bit and cache-flush bit natively).
 * Random jitter uses the std-only `rand_u32` helper in `app.rs`.
 
 ## Agent skills

@@ -6,38 +6,28 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use hickory_proto::op::{Message, MessageType, OpCode, Query};
-use hickory_proto::rr::{Name, RData, Record, RecordType};
+use simple_dns::{
+    rdata::RData, Packet, PacketFlag, Question, ResourceRecord, CLASS, QCLASS, QTYPE, TYPE,
+};
 
-use hickory_proto::serialize::binary::BinDecodable;
-use hickory_proto::serialize::binary::BinEncodable;
-
-fn unescape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            // collect up to 3 octal digits
-            let mut octal = String::with_capacity(3);
-            for _ in 0..3 {
-                match chars.clone().next() {
-                    Some(d) if d.is_ascii_digit() && d <= '7' => {
-                        octal.push(chars.next().unwrap());
-                    }
-                    _ => break,
-                }
-            }
-            if !octal.is_empty() {
-                if let Ok(byte) = u8::from_str_radix(&octal, 8) {
-                    out.push(byte as char);
-                }
-            } else if let Some(next) = chars.next() {
-                out.push(next);
-            }
-        } else {
-            out.push(c);
+/// Display form of a parsed DNS name: labels joined as UTF-8 (lossy),
+/// with a trailing dot. Non-UTF-8 bytes render as U+FFFD (RFC 6762 §16
+/// names are UTF-8); this matches the in-flight instance-name fix and
+/// replaces the old latin-1 byte-as-char rendering. Labels go on the
+/// wire as raw bytes, so this deliberately does not interpret escapes:
+/// a dot inside a DNS-SD instance label (RFC 6763 §4.1.1) renders as a
+/// plain separator, the same ambiguous-but-stable form the old codec
+/// produced after unescaping presentation format. `split_instance_labels`
+/// below recovers the label split for re-encoding.
+fn display_name(name: &simple_dns::Name<'_>) -> String {
+    let mut out = String::new();
+    for (i, label) in name.get_labels().iter().enumerate() {
+        if i > 0 {
+            out.push('.');
         }
+        out.push_str(&String::from_utf8_lossy(label.as_ref()));
     }
+    out.push('.');
     out
 }
 use socket2::{Domain, SockAddr};
@@ -126,7 +116,7 @@ pub struct KnownAnswer {
 #[derive(Debug, Clone)]
 pub struct QueryRequest {
     pub name: String,
-    pub record_type: RecordType,
+    pub record_type: TYPE,
     /// PTR target names to include as known answers (owner name = self.name).
     /// Each TTL must be the *remaining* TTL, and callers must omit targets
     /// with less than half of the original TTL left (RFC 6762 §7.1).
@@ -152,7 +142,7 @@ impl QueryTx {
 }
 
 /// Refused-packet accounting shared with the App thread: RFC 6762 §11
-/// off-link discards plus messages hickory-proto cannot decode at all.
+/// off-link discards plus messages the DNS codec cannot decode at all.
 /// Listener threads only bump these; rendering reads them.
 #[derive(Debug, Default)]
 pub struct DropStats {
@@ -690,31 +680,162 @@ fn known_answers_for_iface<'a>(kas: &'a [KnownAnswer], iface: &str) -> Vec<(&'a 
         .collect()
 }
 
-fn send_query(socket: &PktInfoUdpSocket, req: &QueryRequest, dest: SocketAddr, egress_iface: &str) {
-    let qname = match Name::from_ascii(format!("{}.", req.name)) {
-        Ok(n) => n,
-        Err(_) => return,
+/// Split an unescaped display name into wire labels. Records are stored
+/// unescaped for display, so a dot inside a DNS-SD instance label
+/// (RFC 6763 §4.1.1 allows arbitrary text) is indistinguishable from a
+/// separator: everything left of the LAST `<_service>._tcp|_udp` is one
+/// instance label. Last-match matters: an instance label containing
+/// `._tcp.`-like text (e.g. `foo._tcp.bar._http._tcp.local`) still
+/// resolves to the real service suffix. Subtype owners
+/// (`<sub>._sub.<_service>…`), service types, and host names split on
+/// every dot.
+///
+/// Limits: a host or service name that itself ends in a
+/// `<_service>._tcp|_udp`-shaped suffix (e.g. a host literally named
+/// `x._tcp.example.com`) would split at the wrong label — but such
+/// names never appear as query owners in this browser (queries are only
+/// built for live interests), and re-encoding still yields a valid
+/// name, just not the intended split.
+fn split_instance_labels(name: &str) -> Vec<&str> {
+    let name = name.trim_end_matches('.');
+    let parts: Vec<&str> = name.split('.').collect();
+    let Some(proto) = parts
+        .iter()
+        .rposition(|l| l.eq_ignore_ascii_case("_tcp") || l.eq_ignore_ascii_case("_udp"))
+    else {
+        return parts;
     };
-    let mut msg = Message::new(0, MessageType::Query, OpCode::Query);
-    let mut query = Query::query(qname.clone(), req.record_type);
-    query.set_mdns_unicast_response(req.qu);
-    msg.add_query(query);
+    if proto < 2
+        || !parts[proto - 1].starts_with('_')
+        || parts[proto - 2].eq_ignore_ascii_case("_sub")
+    {
+        return parts;
+    }
+    let service = proto - 1;
+    let instance_len = parts[..service].iter().map(|l| l.len() + 1).sum::<usize>() - 1;
+    let mut labels = vec![&name[..instance_len]];
+    labels.extend_from_slice(&parts[service..]);
+    labels
+}
 
-    for (ka_target, ka_ttl) in known_answers_for_iface(&req.known_answers, egress_iface) {
-        let target = ka_target.trim_end_matches('.');
-        if let Ok(rdata) = Name::from_ascii(format!("{target}.")) {
-            let rec = Record::from_rdata(
-                qname.clone(),
-                ka_ttl,
-                RData::PTR(hickory_proto::rr::rdata::PTR(rdata)),
-            );
-            msg.add_answer(rec);
+/// Wire name for an unescaped display name. Labels go in as raw bytes,
+/// so instance names with spaces and punctuation (which presentation
+/// parsers reject) encode fine. `None` means the name cannot go on the
+/// wire (empty or over-long label).
+fn wire_name(name: &str) -> Option<simple_dns::Name<'_>> {
+    let parts = split_instance_labels(name);
+    if parts.is_empty() {
+        return None;
+    }
+    let mut labels = Vec::with_capacity(parts.len());
+    for part in parts {
+        let bytes = part.as_bytes();
+        if bytes.is_empty() || bytes.len() > 63 {
+            return None;
         }
+        labels.push(simple_dns::Label::new_unchecked(bytes));
+    }
+    Some(simple_dns::Name::new_with_labels(&labels))
+}
+
+/// Largest UDP payload we will emit (RFC 6762 §17: packets MUST NOT
+/// exceed 9000 bytes including IP+UDP headers; the 40-byte IPv6 header
+/// is the roomier deduction).
+const MAX_QUERY_BYTES: usize = 9000 - 40 - 8;
+
+/// Encode one query for an egress interface. `None` means the owner name
+/// cannot go on the wire (empty or over-long label); that is logged
+/// because the scheduler has already counted the query as sent.
+///
+/// Names compress against byte-identical repeats (differing-case names
+/// are written in full, so wire case is preserved), which keeps dense
+/// known-answer lists small. If the packet still exceeds
+/// `MAX_QUERY_BYTES`, known answers are shed — never the question — and
+/// the cut is logged: a short refresh still elicits answers, while a
+/// dropped one would lose the refresh silently (EMSGSIZE on send, past
+/// the 65507-byte kernel limit). Full multipacket known-answer
+/// suppression (RFC 6762 §7.2, TC-bit follow-ups) is future work.
+fn encode_query(req: &QueryRequest, egress_iface: &str) -> Option<Vec<u8>> {
+    let qname = match wire_name(&req.name) {
+        Some(n) => n,
+        None => {
+            log::warn!(
+                "mex: cannot encode {:?} query name {:?}",
+                u16::from(req.record_type),
+                req.name
+            );
+            return None;
+        }
+    };
+    let mut kas = Vec::with_capacity(req.known_answers.len());
+    for (ka_target, ka_ttl) in known_answers_for_iface(&req.known_answers, egress_iface) {
+        let Some(rdata) = wire_name(ka_target) else {
+            log::warn!(
+                "mex: cannot encode known answer {ka_target:?} for {}",
+                req.name
+            );
+            continue;
+        };
+        kas.push((rdata, ka_ttl));
     }
 
-    let bytes = match msg.to_vec() {
-        Ok(b) => b,
-        Err(_) => return,
+    let mut bytes = build_query(&qname, req.record_type, req.qu, &kas)?;
+    if bytes.len() > MAX_QUERY_BYTES {
+        let total = kas.len();
+        let mut n = total;
+        while n > 0 {
+            n /= 2;
+            kas.truncate(n);
+            bytes = build_query(&qname, req.record_type, req.qu, &kas)?;
+            if bytes.len() <= MAX_QUERY_BYTES {
+                break;
+            }
+        }
+        log::warn!(
+            "mex: truncated known answers for {} to {} of {total} ({} bytes)",
+            req.name,
+            kas.len(),
+            bytes.len()
+        );
+    }
+    Some(bytes)
+}
+
+/// One query packet: question plus the given known answers, names
+/// compressed. `None` only on codec failure (logged by the caller).
+fn build_query(
+    qname: &simple_dns::Name<'_>,
+    record_type: TYPE,
+    qu: bool,
+    kas: &[(simple_dns::Name<'_>, u32)],
+) -> Option<Vec<u8>> {
+    let mut pkt = Packet::new_query(0);
+    pkt.questions.push(simple_dns::Question::new(
+        qname.clone(),
+        QTYPE::TYPE(record_type),
+        QCLASS::CLASS(CLASS::IN),
+        qu,
+    ));
+    for (rdata, ttl) in kas {
+        pkt.answers.push(ResourceRecord::new(
+            qname.clone(),
+            CLASS::IN,
+            *ttl,
+            RData::PTR(rdata.clone().into()),
+        ));
+    }
+    match pkt.build_bytes_vec_compressed() {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            log::warn!("mex: cannot encode query for {qname}: {e}");
+            None
+        }
+    }
+}
+
+fn send_query(socket: &PktInfoUdpSocket, req: &QueryRequest, dest: SocketAddr, egress_iface: &str) {
+    let Some(bytes) = encode_query(req, egress_iface) else {
+        return;
     };
     let _ = socket.send_to(&bytes, &SockAddr::from(dest));
 }
@@ -726,8 +847,15 @@ fn parse_packet(
     iface: &str,
     ifindex: u32,
 ) -> Option<Event> {
-    let msg = Message::from_bytes(raw).ok()?;
+    let pkt = Packet::parse(raw).ok()?;
     let dst_is_multicast = mdns_multicast_dest(&dst);
+    let is_response = pkt.has_flags(PacketFlag::RESPONSE);
+    let ing = Ingress {
+        source,
+        iface,
+        ifindex,
+        dst_is_multicast,
+    };
 
     let mut answers = Vec::new();
 
@@ -737,86 +865,38 @@ fn parse_packet(
     // link; multicast loop is disabled so never ourselves) is not their
     // source. Filing them would conjure phantom sightings on links the
     // device never touched.
-    if msg.metadata.message_type == MessageType::Response {
-        for (section, rec) in msg
+    if is_response {
+        for (section, rec) in pkt
             .answers
             .iter()
             .map(|r| (RecordSection::Answer, r))
             .chain(
-                msg.authorities
+                pkt.name_servers
                     .iter()
                     .map(|r| (RecordSection::Authority, r)),
             )
             .chain(
-                msg.additionals
+                pkt.additional_records
                     .iter()
                     .map(|r| (RecordSection::Additional, r)),
             )
         {
-            answers.push(RawRecord {
-                name: unescape(&rec.name.to_string()),
-                rtype: u16::from(rec.record_type()),
-                rtype_str: rtype_label(rec.record_type()),
-                // hickory-proto strips the top CLASS bit at decode and
-                // exposes it via the mdns_cache_flush field; reading
-                // dns_class directly always yields a clear bit (RFC 6762 §10.2).
-                flush_bit: rec.mdns_cache_flush,
-                qu: false,
-                ttl: rec.ttl,
-                rdata: rdata_label(&rec.data, raw),
-                wire: rec.to_bytes().unwrap_or_default(),
-                source,
-                iface: iface.to_string(),
-                ifindex,
-                dst_is_multicast,
-                section,
-                received_at: Instant::now(),
-            });
+            answers.push(record_row(rec, record_wire(rec), section, ing));
         }
     }
 
     // Known answers in queries are parsed separately for duplicate
     // question suppression (§7.3) and never filed as answers.
     let mut query_kas = Vec::new();
-    if msg.metadata.message_type == MessageType::Query {
-        for rec in msg.answers.iter() {
-            query_kas.push(RawRecord {
-                name: unescape(&rec.name.to_string()),
-                rtype: u16::from(rec.record_type()),
-                rtype_str: rtype_label(rec.record_type()),
-                flush_bit: rec.mdns_cache_flush,
-                qu: false,
-                ttl: rec.ttl,
-                rdata: rdata_label(&rec.data, raw),
-                wire: Vec::new(),
-                source,
-                iface: iface.to_string(),
-                ifindex,
-                dst_is_multicast,
-                section: RecordSection::KnownAnswer,
-                received_at: Instant::now(),
-            });
+    if !is_response {
+        for rec in pkt.answers.iter() {
+            query_kas.push(record_row(rec, Vec::new(), RecordSection::KnownAnswer, ing));
         }
     }
 
     let mut questions = Vec::new();
-    for q in &msg.queries {
-        questions.push(RawRecord {
-            name: unescape(&q.name().to_string()),
-            rtype: u16::from(q.query_type()),
-            rtype_str: rtype_label(q.query_type()),
-            flush_bit: false,
-            qu: q.mdns_unicast_response(),
-            ttl: 0,
-            rdata: String::new(),
-            wire: Vec::new(),
-            source,
-            iface: iface.to_string(),
-            ifindex,
-            dst_is_multicast,
-            section: RecordSection::Question,
-            received_at: Instant::now(),
-        });
+    for q in &pkt.questions {
+        questions.push(question_row(q, ing));
     }
 
     Some(Event {
@@ -828,50 +908,150 @@ fn parse_packet(
     })
 }
 
-fn rtype_label(rtype: RecordType) -> String {
-    match rtype {
-        RecordType::A => "A".into(),
-        RecordType::AAAA => "AAAA".into(),
-        RecordType::SRV => "SRV".into(),
-        RecordType::TXT => "TXT".into(),
-        RecordType::PTR => "PTR".into(),
-        RecordType::CNAME => "CNAME".into(),
-        RecordType::NS => "NS".into(),
-        RecordType::NSEC => "NSEC".into(),
-        RecordType::ANY => "ANY".into(),
-        RecordType::SOA => "SOA".into(),
-        RecordType::MX => "MX".into(),
-        _ => format!("TYPE{}", u16::from(rtype)),
+/// Per-packet ingress context threaded into every row so the three
+/// record/question pushes share one construction path.
+#[derive(Clone, Copy)]
+struct Ingress<'a> {
+    source: SocketAddr,
+    iface: &'a str,
+    ifindex: u32,
+    dst_is_multicast: bool,
+}
+
+fn record_row(
+    rec: &ResourceRecord<'_>,
+    wire: Vec<u8>,
+    section: RecordSection,
+    ing: Ingress<'_>,
+) -> RawRecord {
+    let rtype = u16::from(rec.rdata.type_code());
+    RawRecord {
+        name: display_name(&rec.name),
+        rtype,
+        rtype_str: rtype_label(rtype),
+        // simple-dns exposes the top CLASS bit natively as
+        // `cache_flush` (RFC 6762 §10.2).
+        flush_bit: rec.cache_flush,
+        qu: false,
+        ttl: rec.ttl,
+        rdata: rdata_label(&rec.rdata),
+        wire,
+        source: ing.source,
+        iface: ing.iface.to_string(),
+        ifindex: ing.ifindex,
+        dst_is_multicast: ing.dst_is_multicast,
+        section,
+        received_at: Instant::now(),
     }
 }
 
-fn rdata_label(data: &RData, msg: &[u8]) -> String {
+fn question_row(q: &Question<'_>, ing: Ingress<'_>) -> RawRecord {
+    let rtype = u16::from(q.qtype);
+    RawRecord {
+        name: display_name(&q.qname),
+        rtype,
+        rtype_str: rtype_label(rtype),
+        flush_bit: false,
+        qu: q.unicast_response,
+        ttl: 0,
+        rdata: String::new(),
+        wire: Vec::new(),
+        source: ing.source,
+        iface: ing.iface.to_string(),
+        ifindex: ing.ifindex,
+        dst_is_multicast: ing.dst_is_multicast,
+        section: RecordSection::Question,
+        received_at: Instant::now(),
+    }
+}
+
+/// Standalone wire encoding of one record for the hex pane. simple-dns
+/// only serializes whole packets, so the record is wrapped in a minimal
+/// reply and the 12-byte header is stripped. This deliberately uses the
+/// uncompressed builder (`build_bytes_vec`, never `*_compressed`), so
+/// names are written expanded with no compression pointers — matching
+/// the old per-record encoding and keeping the slice self-contained.
+fn record_wire(rec: &ResourceRecord<'_>) -> Vec<u8> {
+    let mut pkt = Packet::new_reply(0);
+    pkt.answers.push(rec.clone());
+    match pkt.build_bytes_vec() {
+        Ok(bytes) => bytes.get(12..).unwrap_or_default().to_vec(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The record types this browser maintains interest in (RFC 6762 §5.2:
+/// no queries without active interest). Single source of truth for the
+/// u16 wire code → query type mapping; the scheduler and the refresh
+/// pass share it. Kept separate from `rtype_label` on purpose: the label
+/// map must stay keyed by raw u16 because it also renders QTYPE-only
+/// codes such as ANY (255), which have no `TYPE` counterpart.
+pub fn record_type_from_u16(rtype: u16) -> Option<TYPE> {
+    match rtype {
+        12 => Some(TYPE::PTR),
+        33 => Some(TYPE::SRV),
+        16 => Some(TYPE::TXT),
+        1 => Some(TYPE::A),
+        28 => Some(TYPE::AAAA),
+        _ => None,
+    }
+}
+
+fn rtype_label(rtype: u16) -> String {
+    match rtype {
+        1 => "A".into(),
+        28 => "AAAA".into(),
+        33 => "SRV".into(),
+        16 => "TXT".into(),
+        12 => "PTR".into(),
+        5 => "CNAME".into(),
+        2 => "NS".into(),
+        47 => "NSEC".into(),
+        255 => "ANY".into(),
+        6 => "SOA".into(),
+        15 => "MX".into(),
+        _ => format!("TYPE{rtype}"),
+    }
+}
+
+fn rdata_label(data: &RData) -> String {
     match data {
-        RData::A(ip) => ip.to_string(),
-        RData::AAAA(ip) => ip.to_string(),
+        RData::A(a) => Ipv4Addr::from(a.address).to_string(),
+        RData::AAAA(a) => Ipv6Addr::from(a.address).to_string(),
         RData::SRV(srv) => {
             format!(
                 "{} {} {} {}",
                 srv.priority,
                 srv.weight,
                 srv.port,
-                unescape(&srv.target.to_string())
+                display_name(&srv.target)
             )
         }
         RData::TXT(txt) => txt
-            .txt_data
-            .iter()
-            .map(|b| String::from_utf8_lossy(b).to_string())
+            .iter_raw()
+            .map(|(k, v)| {
+                let key = String::from_utf8_lossy(k).into_owned();
+                match v {
+                    Some(val) => format!("{key}={}", String::from_utf8_lossy(val)),
+                    None => key,
+                }
+            })
             .collect::<Vec<_>>()
             .join("; "),
-        RData::PTR(n) => unescape(&n.to_string()),
-        RData::CNAME(n) => unescape(&n.to_string()),
-        RData::NS(n) => unescape(&n.to_string()),
-        RData::MX(mx) => format!("{} {}", mx.preference, unescape(&mx.exchange.to_string())),
+        RData::PTR(n) => display_name(n),
+        RData::CNAME(n) => display_name(n),
+        RData::NS(n) => display_name(n),
+        RData::MD(n) => display_name(n),
+        RData::MF(n) => display_name(n),
+        RData::MB(n) => display_name(n),
+        RData::MG(n) => display_name(n),
+        RData::MR(n) => display_name(n),
+        RData::NSAP_PTR(n) => display_name(n),
+        RData::MX(mx) => format!("{} {}", mx.preference, display_name(&mx.exchange)),
         RData::SOA(soa) => format!(
             "{} {} {} {} {} {} {}",
-            unescape(&soa.mname.to_string()),
-            unescape(&soa.rname.to_string()),
+            display_name(&soa.mname),
+            display_name(&soa.rname),
             soa.serial,
             soa.refresh,
             soa.retry,
@@ -879,141 +1059,24 @@ fn rdata_label(data: &RData, msg: &[u8]) -> String {
             soa.minimum
         ),
         RData::HINFO(h) => {
-            let cpu = String::from_utf8_lossy(&h.cpu);
-            let os = String::from_utf8_lossy(&h.os);
-            format!("{cpu} {os}")
+            format!("{} {}", h.cpu, h.os)
         }
-        RData::SVCB(svcb) => unescape(&svcb.target_name.to_string()),
-        RData::Unknown { code, rdata } if *code == RecordType::NSEC => {
-            decode_nsec(&rdata.anything, msg)
+        RData::SVCB(svcb) => display_name(&svcb.target),
+        RData::HTTPS(svcb) => display_name(&svcb.target),
+        RData::NSEC(nsec) => {
+            let types = nsec
+                .types()
+                .map(|t| rtype_label(t.into()))
+                .collect::<Vec<_>>();
+            let name = display_name(&nsec.next_name);
+            if types.is_empty() {
+                name
+            } else {
+                format!("{name} {}", types.join(" "))
+            }
         }
         _ => String::new(),
     }
-}
-
-/// Decode NSEC rdata (next name + type bit maps, RFC 4034 §4.1) for display:
-/// "<next-name> <TYPE>...". The next name is usually inline, but may be a
-/// compression pointer (or end in one) whose target lives outside rdata, so
-/// the full message is passed for context and pointers are resolved against
-/// it. Names that cannot be resolved render as "…".
-fn decode_nsec(rdata: &[u8], msg: &[u8]) -> String {
-    let mut pos = 0;
-    let mut labels = Vec::new();
-    let mut unresolved = false;
-    // Next domain name in wire format. Inline labels are collected here; a
-    // compression pointer terminates the inline part (`pos` still advances
-    // past it, so the type bitmaps below are read from the right offset).
-    let mut truncated = false;
-    while let Some(&len) = rdata.get(pos) {
-        if len == 0 {
-            pos += 1;
-            break;
-        }
-        if len & 0xC0 == 0xC0 {
-            let hi = (len & 0x3F) as usize;
-            let Some(&lo) = rdata.get(pos + 1) else {
-                truncated = true;
-                break;
-            };
-            match read_name_at(msg, (hi << 8) | lo as usize) {
-                Some(resolved) => labels.extend(resolved),
-                None => unresolved = true,
-            }
-            pos += 2;
-            break;
-        }
-        if len & 0xC0 != 0 {
-            // Extended label type, not a compression pointer: give up on
-            // the name but still try the type bitmaps below.
-            truncated = true;
-            break;
-        }
-        let len = len as usize;
-        pos += 1;
-        match rdata.get(pos..pos + len) {
-            Some(label) => labels.push(String::from_utf8_lossy(label).into_owned()),
-            None => {
-                truncated = true;
-                break;
-            }
-        }
-        pos += len;
-    }
-    let mut name = labels.join(".");
-    if !name.is_empty() {
-        name.push('.');
-    }
-    if unresolved || name.is_empty() {
-        name.push('…');
-    }
-    if truncated {
-        return name;
-    }
-
-    // Type bit maps: (window, bitmap-len, bitmap...).
-    let mut types = Vec::new();
-    while pos + 2 <= rdata.len() {
-        let window = rdata[pos] as u16;
-        let blen = rdata[pos + 1] as usize;
-        pos += 2;
-        if blen == 0 || pos + blen > rdata.len() {
-            break;
-        }
-        for (i, &byte) in rdata[pos..pos + blen].iter().enumerate() {
-            for bit in 0..8u16 {
-                if byte & (0x80 >> bit) != 0 {
-                    let rrtype = RecordType::from(window * 256 + i as u16 * 8 + bit);
-                    types.push(rtype_label(rrtype));
-                }
-            }
-        }
-        pos += blen;
-    }
-
-    if types.is_empty() {
-        name
-    } else {
-        format!("{name} {}", types.join(" "))
-    }
-}
-
-/// Read a (possibly compressed) domain name starting at absolute `offset`
-/// in `msg`, returning its labels. Pointer loops, excessive depth, and
-/// overruns all yield None instead of hanging or panicking, so a corrupt
-/// name only affects its own display string.
-fn read_name_at(msg: &[u8], offset: usize) -> Option<Vec<String>> {
-    let mut labels = Vec::new();
-    let mut pos = offset;
-    let mut visited: Vec<usize> = Vec::new();
-    loop {
-        let len = *msg.get(pos)?;
-        if len == 0 {
-            break;
-        }
-        if len & 0xC0 == 0xC0 {
-            // Compression pointer: 14-bit absolute offset into the message.
-            let target = (((len & 0x3F) as usize) << 8) | (*msg.get(pos + 1)? as usize);
-            if visited.contains(&target) || visited.len() >= 32 {
-                return None;
-            }
-            visited.push(target);
-            pos = target;
-            continue;
-        }
-        if len & 0xC0 != 0 {
-            // Extended label type: not a plain name label.
-            return None;
-        }
-        let len = len as usize;
-        pos += 1;
-        let label = msg.get(pos..pos + len)?;
-        labels.push(String::from_utf8_lossy(label).into_owned());
-        if labels.len() > 127 {
-            return None;
-        }
-        pos += len;
-    }
-    Some(labels)
 }
 
 #[cfg(test)]
@@ -1028,17 +1091,22 @@ mod tests {
         }
     }
 
-    fn known_answer(owner: &str, target: &str, ttl: u32) -> Record {
-        let target = Name::from_ascii(target).unwrap();
-        Record::from_rdata(
-            Name::from_ascii(owner).unwrap(),
+    fn known_answer<'a>(owner: &'a str, target: &'a str, ttl: u32) -> ResourceRecord<'a> {
+        ResourceRecord::new(
+            simple_dns::Name::new_unchecked(owner),
+            CLASS::IN,
             ttl,
-            RData::PTR(hickory_proto::rr::rdata::PTR(target)),
+            RData::PTR(simple_dns::Name::new_unchecked(target).into()),
         )
     }
 
     fn test_source() -> std::net::SocketAddr {
         "192.168.178.60:5353".parse().unwrap()
+    }
+
+    fn roundtrip_query(req: &QueryRequest) -> Event {
+        let bytes = encode_query(req, "").expect("query must encode");
+        parse_packet(&bytes, test_source(), std::net::IpAddr::V4(MDNS_V4), "", 0).unwrap()
     }
 
     #[test]
@@ -1067,18 +1135,20 @@ mod tests {
 
     #[test]
     fn query_known_answers_are_not_filed_as_records() {
-        let mut q = Message::new(0, MessageType::Query, OpCode::Query);
-        q.add_query(Query::query(
-            Name::from_ascii("svc._http._tcp.local.").unwrap(),
-            RecordType::PTR,
+        let mut q = Packet::new_query(0);
+        q.questions.push(simple_dns::Question::new(
+            simple_dns::Name::new_unchecked("svc._http._tcp.local."),
+            QTYPE::TYPE(TYPE::PTR),
+            QCLASS::CLASS(CLASS::IN),
+            false,
         ));
-        q.add_answer(known_answer(
+        q.answers.push(known_answer(
             "svc._http._tcp.local.",
             "Inst.svc._http._tcp.local.",
             120,
         ));
         let ev = parse_packet(
-            &q.to_vec().unwrap(),
+            &q.build_bytes_vec().unwrap(),
             test_source(),
             std::net::IpAddr::V4(MDNS_V4),
             "enx",
@@ -1095,14 +1165,14 @@ mod tests {
         assert_eq!(ev.query_kas[0].rdata, "Inst.svc._http._tcp.local.");
         assert_eq!(ev.query_kas[0].iface, "enx");
 
-        let mut r = Message::new(0, MessageType::Response, OpCode::Query);
-        r.add_answer(known_answer(
+        let mut r = Packet::new_reply(0);
+        r.answers.push(known_answer(
             "svc._http._tcp.local.",
             "Inst.svc._http._tcp.local.",
             120,
         ));
         let ev = parse_packet(
-            &r.to_vec().unwrap(),
+            &r.build_bytes_vec().unwrap(),
             test_source(),
             std::net::IpAddr::V4(MDNS_V4),
             "enx",
@@ -1118,15 +1188,15 @@ mod tests {
 
     #[test]
     fn query_qu_bit_is_parsed() {
-        let mut q = Message::new(0, MessageType::Query, OpCode::Query);
-        let mut query = Query::query(
-            Name::from_ascii("svc._http._tcp.local.").unwrap(),
-            RecordType::PTR,
-        );
-        query.set_mdns_unicast_response(true);
-        q.add_query(query);
+        let mut q = Packet::new_query(0);
+        q.questions.push(simple_dns::Question::new(
+            simple_dns::Name::new_unchecked("svc._http._tcp.local."),
+            QTYPE::TYPE(TYPE::PTR),
+            QCLASS::CLASS(CLASS::IN),
+            true,
+        ));
         let ev = parse_packet(
-            &q.to_vec().unwrap(),
+            &q.build_bytes_vec().unwrap(),
             test_source(),
             std::net::IpAddr::V4(MDNS_V4),
             "enx",
@@ -1138,16 +1208,20 @@ mod tests {
     }
 
     fn flush_response(flush: bool) -> Event {
-        let mut msg = Message::new(0, MessageType::Response, OpCode::Query);
-        let mut rec = Record::from_rdata(
-            Name::from_ascii("test.local.").unwrap(),
-            120,
-            RData::A(Ipv4Addr::new(192, 168, 1, 10).into()),
+        let mut msg = Packet::new_reply(0);
+        msg.answers.push(
+            ResourceRecord::new(
+                simple_dns::Name::new_unchecked("test.local."),
+                CLASS::IN,
+                120,
+                RData::A(simple_dns::rdata::A {
+                    address: u32::from(Ipv4Addr::new(192, 168, 1, 10)),
+                }),
+            )
+            .with_cache_flush(flush),
         );
-        rec.mdns_cache_flush = flush;
-        msg.add_answer(rec);
         parse_packet(
-            &msg.to_vec().unwrap(),
+            &msg.build_bytes_vec().unwrap(),
             test_source(),
             std::net::IpAddr::V4(MDNS_V4),
             "",
@@ -1158,9 +1232,8 @@ mod tests {
 
     #[test]
     fn response_flush_bit_survives_parse() {
-        // hickory-proto strips the top CLASS bit at decode into
-        // the mdns_cache_flush field; reading dns_class directly always
-        // yields a clear bit (RFC 6762 §10.2).
+        // simple-dns exposes the top CLASS bit natively as
+        // `cache_flush` (RFC 6762 §10.2).
         assert!(flush_response(true).answers[0].flush_bit);
         assert!(!flush_response(false).answers[0].flush_bit);
     }
@@ -1176,20 +1249,26 @@ mod tests {
 
     #[test]
     fn query_ka_flush_bit_survives_parse() {
-        let mut q = Message::new(0, MessageType::Query, OpCode::Query);
-        q.add_query(Query::query(
-            Name::from_ascii("test.local.").unwrap(),
-            RecordType::A,
+        let mut q = Packet::new_query(0);
+        q.questions.push(simple_dns::Question::new(
+            simple_dns::Name::new_unchecked("test.local."),
+            QTYPE::TYPE(TYPE::A),
+            QCLASS::CLASS(CLASS::IN),
+            false,
         ));
-        let mut ka = Record::from_rdata(
-            Name::from_ascii("test.local.").unwrap(),
-            120,
-            RData::A(Ipv4Addr::new(192, 168, 1, 10).into()),
+        q.answers.push(
+            ResourceRecord::new(
+                simple_dns::Name::new_unchecked("test.local."),
+                CLASS::IN,
+                120,
+                RData::A(simple_dns::rdata::A {
+                    address: u32::from(Ipv4Addr::new(192, 168, 1, 10)),
+                }),
+            )
+            .with_cache_flush(true),
         );
-        ka.mdns_cache_flush = true;
-        q.add_answer(ka);
         let ev = parse_packet(
-            &q.to_vec().unwrap(),
+            &q.build_bytes_vec().unwrap(),
             test_source(),
             std::net::IpAddr::V4(MDNS_V4),
             "",
@@ -1229,94 +1308,191 @@ mod tests {
         assert!(!usable_interface(&iface(St::Unknown, true)));
     }
 
-    /// Message bytes with "host.local." at offset 20 for pointer tests.
-    fn msg_with_host_at_20() -> Vec<u8> {
-        let mut msg = vec![0u8; 64];
-        msg[20] = 4;
-        msg[21..25].copy_from_slice(b"host");
-        msg[25] = 5;
-        msg[26..31].copy_from_slice(b"local");
-        msg[31] = 0;
-        msg
-    }
-
-    /// Bitmap covering only A (type 1): window 0, len 1, 0x40.
-    fn a_bitmap() -> Vec<u8> {
-        vec![0, 1, 0x40]
-    }
-
-    fn inline_host_rdata() -> Vec<u8> {
-        let mut r = vec![4];
-        r.extend_from_slice(b"host");
-        r.push(5);
-        r.extend_from_slice(b"local");
-        r.push(0);
-        r.extend(a_bitmap());
-        r
+    #[test]
+    fn instance_names_with_spaces_and_punctuation_reach_the_wire() {
+        // Regression: the old ASCII-only name parser rejected this
+        // instance name, so the SRV refresh was dropped before the
+        // socket and the record expired with nothing on the wire.
+        let name = "pihole [b8:27:eb:9d:87:e1]._workstation._tcp.local";
+        let ev = roundtrip_query(&QueryRequest {
+            name: name.to_string(),
+            record_type: TYPE::SRV,
+            known_answers: Vec::new(),
+            qu: false,
+        });
+        assert_eq!(ev.questions.len(), 1);
+        assert_eq!(ev.questions[0].name, format!("{name}."));
+        assert_eq!(ev.questions[0].rtype, 33);
     }
 
     #[test]
-    fn nsec_inline_name_unchanged() {
-        // Pre-existing rendering must not change: no pointers involved,
-        // so the message context is never consulted.
-        assert_eq!(decode_nsec(&inline_host_rdata(), &[]), "host.local. A");
+    fn utf8_instance_names_survive_the_wire_round_trip() {
+        // A name read off the wire must re-encode to the same bytes, or
+        // the refresh query asks for a name the responder does not own.
+        let name = "Küche._http._tcp.local";
+        let ev = roundtrip_query(&QueryRequest {
+            name: name.to_string(),
+            record_type: TYPE::SRV,
+            known_answers: Vec::new(),
+            qu: false,
+        });
+        assert_eq!(ev.questions[0].name, format!("{name}."));
     }
 
     #[test]
-    fn nsec_pointer_resolves_against_message() {
-        let msg = msg_with_host_at_20();
-        let mut rdata = vec![0xC0, 20];
-        rdata.extend(a_bitmap());
-        assert_eq!(decode_nsec(&rdata, &msg), "host.local. A");
+    fn split_instance_labels_keep_instance_dots_in_one_label() {
+        assert_eq!(
+            split_instance_labels("amzn.dmgr:ABC._amzn-wplay._tcp.local"),
+            ["amzn.dmgr:ABC", "_amzn-wplay", "_tcp", "local"]
+        );
+        // Subtype owners, enumeration, service types, and host names
+        // split on every dot.
+        assert_eq!(
+            split_instance_labels("_printer._sub._http._tcp.local."),
+            ["_printer", "_sub", "_http", "_tcp", "local"]
+        );
+        assert_eq!(
+            split_instance_labels("_services._dns-sd._udp.local"),
+            ["_services", "_dns-sd", "_udp", "local"]
+        );
+        assert_eq!(
+            split_instance_labels("_http._tcp.local"),
+            ["_http", "_tcp", "local"]
+        );
+        assert_eq!(
+            split_instance_labels("FritzBoxRepeater.fritz.box"),
+            ["FritzBoxRepeater", "fritz", "box"]
+        );
+        // Last-match wins: `._tcp.`-like text inside the instance label
+        // still resolves to the real service suffix.
+        assert_eq!(
+            split_instance_labels("foo._tcp.bar._http._tcp.local"),
+            ["foo._tcp.bar", "_http", "_tcp", "local"]
+        );
     }
 
     #[test]
-    fn nsec_prefix_plus_pointer_suffix() {
-        let msg = msg_with_host_at_20();
-        let mut rdata = vec![3];
-        rdata.extend_from_slice(b"sub");
-        rdata.extend([0xC0, 20]);
-        rdata.extend(a_bitmap());
-        assert_eq!(decode_nsec(&rdata, &msg), "sub.host.local. A");
+    fn record_wire_is_expanded_with_class_bits() {
+        // Pins the hex-pane encoding: owner name written out in full (no
+        // compression pointers), type, class with the §10.2 flush bit,
+        // TTL, rdlen, rdata.
+        let rec = ResourceRecord::new(
+            simple_dns::Name::new_unchecked("test.local."),
+            CLASS::IN,
+            120,
+            RData::A(simple_dns::rdata::A {
+                address: u32::from(Ipv4Addr::new(192, 168, 1, 10)),
+            }),
+        )
+        .with_cache_flush(true);
+        let mut want = vec![4];
+        want.extend_from_slice(b"test");
+        want.push(5);
+        want.extend_from_slice(b"local");
+        want.push(0);
+        want.extend([0x00, 0x01]); // A
+        want.extend([0x80, 0x01]); // IN + flush bit
+        want.extend(120u32.to_be_bytes());
+        want.extend([0x00, 0x04]); // rdlen
+        want.extend([192, 168, 1, 10]);
+        assert_eq!(record_wire(&rec), want);
+
+        // Self-referential names are the case compression would fire on:
+        // NSEC next_name == owner must still come back expanded. Under
+        // the compressed builder the second occurrence would be a
+        // pointer, so this fails if the builder choice regresses.
+        let nsec = ResourceRecord::new(
+            simple_dns::Name::new_unchecked("host.local."),
+            CLASS::IN,
+            120,
+            RData::NSEC(simple_dns::rdata::NSEC::from_types(
+                simple_dns::Name::new_unchecked("host.local."),
+                &[TYPE::A],
+            )),
+        );
+        let mut want = vec![4];
+        want.extend_from_slice(b"host");
+        want.push(5);
+        want.extend_from_slice(b"local");
+        want.push(0);
+        want.extend([0x00, 0x2F]); // NSEC
+        want.extend([0x00, 0x01]); // IN, no flush
+        want.extend(120u32.to_be_bytes());
+        want.extend([0x00, 0x0F]); // rdlen
+        want.extend([4]);
+        want.extend_from_slice(b"host");
+        want.push(5);
+        want.extend_from_slice(b"local");
+        want.push(0);
+        want.extend([0x00, 0x01, 0x40]); // window 0, len 1, A bit
+        assert_eq!(record_wire(&nsec), want);
     }
 
     #[test]
-    fn nsec_dangling_pointer_renders_ellipsis() {
-        let msg = vec![0u8; 64];
-        let mut rdata = vec![0xC0, 200];
-        rdata.extend(a_bitmap());
-        assert_eq!(decode_nsec(&rdata, &msg), "… A");
+    fn known_answers_with_spaces_are_sent() {
+        let ev = roundtrip_query(&QueryRequest {
+            name: "_http._tcp.local".to_string(),
+            record_type: TYPE::PTR,
+            known_answers: vec![KnownAnswer {
+                target: "Denon AVR-X1400H._http._tcp.local".to_string(),
+                ttl: 4000,
+                iface: String::new(),
+            }],
+            qu: false,
+        });
+        assert_eq!(ev.query_kas.len(), 1);
+        assert_eq!(ev.query_kas[0].rdata, "Denon AVR-X1400H._http._tcp.local.");
     }
 
     #[test]
-    fn nsec_pointer_loop_terminates() {
-        let mut msg = vec![0u8; 64];
-        msg[10] = 0xC0;
-        msg[11] = 10;
-        let mut rdata = vec![0xC0, 10];
-        rdata.extend(a_bitmap());
-        assert_eq!(decode_nsec(&rdata, &msg), "… A");
-    }
-
-    #[test]
-    fn nsec_truncated_rdata_renders_ellipsis() {
-        assert_eq!(decode_nsec(&[4, b't'], &[]), "…");
+    fn oversized_ka_list_truncates_but_keeps_question() {
+        // A dense network must not EMSGSIZE the refresh into silence:
+        // known answers shed to the RFC 6762 §17 cap, question intact.
+        let kas: Vec<KnownAnswer> = (0..2000)
+            .map(|i| KnownAnswer {
+                target: format!("instance-{i:05}._http._tcp.local"),
+                ttl: 120,
+                iface: String::new(),
+            })
+            .collect();
+        let bytes = encode_query(
+            &QueryRequest {
+                name: "_http._tcp.local".to_string(),
+                record_type: TYPE::PTR,
+                known_answers: kas,
+                qu: false,
+            },
+            "",
+        )
+        .expect("query must encode");
+        assert!(bytes.len() <= MAX_QUERY_BYTES);
+        let ev = parse_packet(
+            &bytes,
+            test_source(),
+            std::net::IpAddr::V4(MDNS_V4),
+            "br0",
+            3,
+        )
+        .unwrap();
+        assert_eq!(ev.questions.len(), 1);
+        assert_eq!(ev.questions[0].name, "_http._tcp.local.");
+        assert!(!ev.query_kas.is_empty());
+        assert!(ev.query_kas.len() < 2000);
     }
 
     #[test]
     fn response_nsec_shows_resolved_name_and_iface() {
-        let owner = Name::from_ascii("host.local.").unwrap();
-        let mut msg = Message::new(0, MessageType::Response, OpCode::Query);
-        let nsec = Record::from_rdata(
-            owner,
+        let mut msg = Packet::new_reply(0);
+        msg.answers.push(ResourceRecord::new(
+            simple_dns::Name::new_unchecked("host.local."),
+            CLASS::IN,
             120,
-            RData::Unknown {
-                code: RecordType::NSEC,
-                rdata: hickory_proto::rr::rdata::NULL::with(inline_host_rdata()),
-            },
-        );
-        msg.add_answer(nsec);
-        let raw = msg.to_vec().unwrap();
+            RData::NSEC(simple_dns::rdata::NSEC::from_types(
+                simple_dns::Name::new_unchecked("host.local."),
+                &[TYPE::A],
+            )),
+        ));
+        let raw = msg.build_bytes_vec().unwrap();
         let addr: SocketAddr = "192.168.178.5:5353".parse().unwrap();
         let ev = parse_packet(&raw, addr, std::net::IpAddr::V4(MDNS_V4), "br0", 3).unwrap();
         assert_eq!(ev.answers.len(), 1);
@@ -1326,13 +1502,35 @@ mod tests {
     }
 
     #[test]
+    fn nsec_wire_round_trip_preserves_types() {
+        // Compression pointers in other records must not corrupt the
+        // NSEC type bitmaps: the codec parses them natively.
+        let mut msg = Packet::new_reply(0);
+        msg.answers.push(ResourceRecord::new(
+            simple_dns::Name::new_unchecked("host.local."),
+            CLASS::IN,
+            120,
+            RData::NSEC(simple_dns::rdata::NSEC::from_types(
+                simple_dns::Name::new_unchecked("host.local."),
+                &[TYPE::A, TYPE::TXT],
+            )),
+        ));
+        let raw = msg.build_bytes_vec().unwrap();
+        let ev =
+            parse_packet(&raw, test_source(), std::net::IpAddr::V4(MDNS_V4), "br0", 3).unwrap();
+        assert_eq!(ev.answers[0].rdata, "host.local. A TXT");
+    }
+
+    #[test]
     fn packet_context_tags_section_and_destination() {
         use std::net::{IpAddr, Ipv4Addr};
-        let mut msg = Message::new(0, MessageType::Response, OpCode::Query);
-        msg.add_answer(known_answer("a.local.", "x.local.", 120));
-        msg.add_authority(known_answer("b.local.", "x.local.", 120));
-        msg.add_additional(known_answer("c.local.", "x.local.", 120));
-        let raw = msg.to_vec().unwrap();
+        let mut msg = Packet::new_reply(0);
+        msg.answers.push(known_answer("a.local.", "x.local.", 120));
+        msg.name_servers
+            .push(known_answer("b.local.", "x.local.", 120));
+        msg.additional_records
+            .push(known_answer("c.local.", "x.local.", 120));
+        let raw = msg.build_bytes_vec().unwrap();
         let mcast = IpAddr::V4(MDNS_V4);
         let ev = parse_packet(&raw, test_source(), mcast, "br0", 3).unwrap();
         assert_eq!(

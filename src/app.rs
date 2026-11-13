@@ -10,8 +10,8 @@ use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
-use hickory_proto::rr::RecordType;
 use ratatui::layout::Rect;
+use simple_dns::TYPE;
 
 use crate::anomalies;
 use crate::browse;
@@ -930,17 +930,6 @@ impl App {
         out
     }
 
-    fn record_type_from_u16(rtype: u16) -> Option<RecordType> {
-        match rtype {
-            12 => Some(RecordType::PTR),
-            33 => Some(RecordType::SRV),
-            16 => Some(RecordType::TXT),
-            1 => Some(RecordType::A),
-            28 => Some(RecordType::AAAA),
-            _ => None,
-        }
-    }
-
     fn requery_expiring(&mut self) {
         let now = Instant::now();
         // Per-key minimum TTL plus whether any *live* row reached the 80%
@@ -1003,10 +992,10 @@ impl App {
             if count > 0 && now < due {
                 continue;
             }
-            let Some(rt) = Self::record_type_from_u16(key.1) else {
+            let Some(rt) = browse::record_type_from_u16(key.1) else {
                 continue;
             };
-            let ka = if rt == RecordType::PTR {
+            let ka = if rt == TYPE::PTR {
                 if is_enum_name(&key.0) {
                     self.known_enum_answers()
                 } else {
@@ -1142,10 +1131,10 @@ impl App {
             if !due {
                 continue;
             }
-            let Some(rt) = Self::record_type_from_u16(key.1) else {
+            let Some(rt) = browse::record_type_from_u16(key.1) else {
                 continue;
             };
-            let ka = if rt == RecordType::PTR {
+            let ka = if rt == TYPE::PTR {
                 if is_enum_name(&key.0) {
                     self.known_enum_answers()
                 } else {
