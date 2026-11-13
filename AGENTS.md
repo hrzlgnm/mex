@@ -56,7 +56,7 @@ Headless run (no TTY) logs to stderr.
 
 * `cargo fmt` before commit; clippy with `-D warnings` must pass.
 * Prefer editing existing files; no new deps without need
-  (`hickory-proto` uses the `mdns` feature for the QU bit).
+  (`simple-dns` exposes the mDNS QU bit and cache-flush bit natively).
 * Random jitter uses the std-only `rand_u32` helper in `app.rs`.
 
 ## Agent skills

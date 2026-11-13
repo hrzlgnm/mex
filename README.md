@@ -17,7 +17,7 @@ Terminal UI to browse and debug mDNS/DNS-SD on the local link — live
 services, records, queries, and raw packets.
 
 Built with Rust ([ratatui](https://ratatui.rs/), [crossterm](https://github.com/crossterm-rs/crossterm),
-[hickory-proto](https://github.com/hickory-dns/hickory-dns)). Listens
+[simple-dns](https://github.com/balliegojr/simple-dns)). Listens
 passively on UDP port 5353 (IPv4 + IPv6 multicast) and also sends the
 standard browse queries (service enumeration, PTR/SRV/TXT/A/AAAA).
 
