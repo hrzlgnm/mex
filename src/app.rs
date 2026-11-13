@@ -256,13 +256,15 @@ struct ObservedQuery {
 #[derive(Clone, Copy, Debug)]
 pub struct InterestSummary {
     pub timer: TimerKind,
-    pub last_age_secs: Option<u64>,
-    pub last_origin: Option<QueryOrigin>,
     pub next_due_in_secs: Option<u64>,
     /// Whether we ever transmitted or stood down for this interest.
     /// Distinguishes a lapsed local demand ("expired") from a
     /// foreign-only interest we never scheduled (blank DUE).
     pub had_local_demand: bool,
+    /// Instant of our last transmitted query for this interest, if any.
+    pub last_transmitted_at: Option<Instant>,
+    /// Instant of our last §7.3-suppressed query for this interest, if any.
+    pub last_suppressed_at: Option<Instant>,
 }
 
 impl App {
@@ -274,10 +276,6 @@ impl App {
         let view = self.interest_view(&Self::provenance_key(name, rtype));
         InterestSummary {
             timer: view.timer,
-            last_age_secs: view
-                .last_at()
-                .map(|t| now.saturating_duration_since(t).as_secs()),
-            last_origin: view.origin(),
             next_due_in_secs: view
                 .next_due
                 .map(|d| d.saturating_duration_since(now).as_secs()),
@@ -285,6 +283,8 @@ impl App {
                 .state
                 .as_ref()
                 .is_some_and(|s| s.transmitted.is_some() || s.suppressed.is_some()),
+            last_transmitted_at: view.at(QueryOrigin::Transmitted),
+            last_suppressed_at: view.at(QueryOrigin::Suppressed),
         }
     }
 }
@@ -7943,6 +7943,76 @@ mod tests {
             !text.contains("expired"),
             "foreign-only interest has no due:\n{text}"
         );
+    }
+
+    #[test]
+    fn questions_pane_last_self_suppressed() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        select_instance(&mut app, "Test");
+        app.poll_continuous();
+        for svc in &mut app.services {
+            for rec in &mut svc.answers {
+                if rec.rtype == 33 {
+                    rec.received_at = Instant::now() - Duration::from_secs(100);
+                }
+            }
+        }
+        app.requery_expiring();
+        // Overhear a peer's SRV question so the next refresh is suppressed.
+        let ev = query_event(
+            "Test._http._tcp.local.",
+            33,
+            "SRV",
+            false,
+            Vec::new(),
+            remote_source(),
+        );
+        app.ingest_event(&ev);
+        for ((name, rtype), (due, _)) in app.requeries.iter_mut() {
+            if name == "Test._http._tcp.local" && *rtype == 33 {
+                *due = Instant::now() - Duration::from_secs(1);
+            }
+        }
+        app.requery_expiring();
+        let text = questions_pane_text(&app);
+        assert!(
+            text.contains("suppressed"),
+            "suppressed kind shown:\n{text}"
+        );
+    }
+
+    #[test]
+    fn questions_pane_last_self_no_provenance() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        select_instance(&mut app, "Test");
+        // File a self row without recording provenance: LAST must be blank.
+        app.route_own_question("_http._tcp.local.", 12);
+        let text = questions_pane_text(&app);
+        assert!(text.contains("—"), "blank LAST shown:\n{text}");
+        assert!(text.contains("PTR"), "ptr row shown:\n{text}");
+    }
+
+    #[test]
+    fn questions_pane_last_foreign_observed() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        select_instance(&mut app, "Test");
+        let ev = query_event(
+            "_http._tcp.local.",
+            12,
+            "PTR",
+            false,
+            Vec::new(),
+            remote_source(),
+        );
+        app.ingest_event(&ev);
+        let text = questions_pane_text(&app);
+        assert!(text.contains("observed"), "foreign row observed:\n{text}");
     }
 
     #[test]
