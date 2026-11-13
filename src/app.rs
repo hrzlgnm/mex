@@ -1171,13 +1171,19 @@ impl App {
             }
             self.metrics.q_sent_refresh += 1;
             self.metrics.ka_sent += ka.len() as u64;
-            self.note_query(&key.0, key.1, QueryOrigin::Transmitted, now);
-            self.query_tx.send(browse::QueryRequest {
+            if self.query_tx.send(browse::QueryRequest {
                 name: key.0.clone(),
                 record_type: rt,
                 known_answers: ka,
                 qu: false,
-            });
+            }) {
+                self.note_query(&key.0, key.1, QueryOrigin::Transmitted, now);
+            } else {
+                log::warn!(
+                    "mex: dropped refresh query for {} (listener channels closed)",
+                    key.0
+                );
+            }
             self.route_own_question(&key.0, key.1);
             // A refresh query also elicits new answers, so postpone the
             // exponential stream for the same question: otherwise the two
@@ -1449,12 +1455,19 @@ impl App {
                 self.metrics.qu_sent += 1;
             }
             self.metrics.ka_sent += ka.len() as u64;
-            self.query_tx.send(browse::QueryRequest {
+            if self.query_tx.send(browse::QueryRequest {
                 name: send_name.clone(),
                 record_type: rt,
                 known_answers: ka,
                 qu,
-            });
+            }) {
+                self.note_query(&send_name, key.1, QueryOrigin::Transmitted, now);
+            } else {
+                log::warn!(
+                    "mex: dropped continuous query for {} (listener channels closed)",
+                    send_name
+                );
+            }
             self.route_own_question(&send_name, key.1);
             // RFC 6762 §5.2: at least 1s between the first two, then at
             // least doubling, capped at one query per hour. Send using the

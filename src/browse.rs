@@ -177,9 +177,14 @@ pub struct QueryTx {
 }
 
 impl QueryTx {
-    pub fn send(&self, req: QueryRequest) {
-        let _ = self.v4.send(req.clone());
-        let _ = self.v6.send(req);
+    /// Fan out to both transports. Returns `true` when at least one
+    /// listener channel accepted the request — the transport may still
+    /// fail to send (encode error, closed socket), which is logged in
+    /// `send_query` and cannot be reflected here.
+    pub fn send(&self, req: QueryRequest) -> bool {
+        let v4_ok = self.v4.send(req.clone()).is_ok();
+        let v6_ok = self.v6.send(req).is_ok();
+        v4_ok || v6_ok
     }
 }
 
