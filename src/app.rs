@@ -956,7 +956,22 @@ impl App {
             let mut hits = Vec::new();
             let mut matched = false;
             for (j, svc) in self.services.iter().enumerate() {
-                if svc.hostname.trim_end_matches('.').to_lowercase() == host {
+                let selected = svc.hostname.trim_end_matches('.').to_lowercase() == host;
+                let alternate = svc.answers.iter().any(|r| {
+                    if r.rtype != 33 {
+                        return false;
+                    }
+                    let target = r
+                        .rdata
+                        .splitn(4, ' ')
+                        .nth(3)
+                        .unwrap_or("")
+                        .trim()
+                        .trim_end_matches('.')
+                        .to_lowercase();
+                    target == host && r.ttl > r.received_at.elapsed().as_secs() as u32
+                });
+                if selected || alternate {
                     hits.push(j);
                 }
             }
@@ -1735,11 +1750,38 @@ impl App {
             if Self::host_key(&s.hostname) != key {
                 continue;
             }
+            // Collect the live SRV targets for this service so addresses
+            // published under an alternate (non-selected) target are still
+            // surfaced on the selected host.
+            let mut targets = vec![key.to_string()];
+            for r in &s.answers {
+                if r.rtype != 33 {
+                    continue;
+                }
+                if r.ttl <= r.received_at.elapsed().as_secs() as u32 {
+                    continue;
+                }
+                let t = r
+                    .rdata
+                    .splitn(4, ' ')
+                    .nth(3)
+                    .unwrap_or("")
+                    .trim()
+                    .trim_end_matches('.')
+                    .to_lowercase();
+                if !t.is_empty() && !targets.contains(&t) {
+                    targets.push(t);
+                }
+            }
             for rec in &s.answers {
                 if rec.rtype != 1 && rec.rtype != 28 {
                     continue;
                 }
                 if rec.ttl <= rec.received_at.elapsed().as_secs() as u32 {
+                    continue;
+                }
+                let owner = rec.name.trim_end_matches('.').to_lowercase();
+                if !targets.contains(&owner) {
                     continue;
                 }
                 let ip = rec.rdata.trim().to_string();
@@ -4500,8 +4542,60 @@ impl App {
 
         let sv: Vec<&str> = rec.rdata.split_whitespace().collect();
         if sv.len() >= 4 {
-            self.services[idx].port = sv[2].parse().unwrap_or(0);
-            self.services[idx].hostname = sv[3..].join(" ");
+            let new_host = rec
+                .rdata
+                .splitn(4, ' ')
+                .nth(3)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            // Keep a host name stable when several SRVs for the same
+            // instance advertise different targets (e.g. a device reachable
+            // under both a `.local` and a unicast name): once both targets
+            // are known, a refresh of either must not flip the host grouping
+            // back and forth. A genuinely new target (one never seen before
+            // for this instance) still moves the service, and an expired
+            // current host gives way to whatever is live.
+            let current_host = self.services[idx].hostname.clone();
+            let current_norm = current_host.trim_end_matches('.').to_lowercase();
+            let new_norm = new_host.trim_end_matches('.').to_lowercase();
+            let update = if current_host.is_empty() || current_norm == new_norm {
+                true
+            } else {
+                let current_live = self.services[idx].answers.iter().any(|r| {
+                    if r.rtype != 33 {
+                        return false;
+                    }
+                    let target = r
+                        .rdata
+                        .splitn(4, ' ')
+                        .nth(3)
+                        .unwrap_or("")
+                        .trim()
+                        .trim_end_matches('.')
+                        .to_lowercase();
+                    target == current_norm && r.ttl > r.received_at.elapsed().as_secs() as u32
+                });
+                let target_known = self.services[idx].answers.iter().any(|r| {
+                    if r.rtype != 33 {
+                        return false;
+                    }
+                    let target = r
+                        .rdata
+                        .splitn(4, ' ')
+                        .nth(3)
+                        .unwrap_or("")
+                        .trim()
+                        .trim_end_matches('.')
+                        .to_lowercase();
+                    target == new_norm
+                });
+                !current_live || !target_known
+            };
+            if update {
+                self.services[idx].port = sv[2].parse().unwrap_or(0);
+                self.services[idx].hostname = new_host;
+            }
         }
         self.push_record(idx, rec);
         self.services[idx].last_event = Some(ev.clone());
@@ -4623,10 +4717,27 @@ impl App {
     fn handle_addr(&mut self, rec: &browse::RawRecord, ev: &browse::Event) {
         let host = rec.name.trim_end_matches('.').to_lowercase();
         // One hostname backs many services (several SRVs, one host):
-        // file on every match, not just the first.
+        // file on every match, not just the first. A service may also be
+        // reachable under alternate SRV targets, so route addresses for any
+        // live target of the service, not only the selected hostname.
         let mut hits = Vec::new();
         for (i, svc) in self.services.iter().enumerate() {
-            if svc.hostname.trim_end_matches('.').to_lowercase() == host {
+            let selected = svc.hostname.trim_end_matches('.').to_lowercase() == host;
+            let alternate = svc.answers.iter().any(|r| {
+                if r.rtype != 33 {
+                    return false;
+                }
+                let target = r
+                    .rdata
+                    .splitn(4, ' ')
+                    .nth(3)
+                    .unwrap_or("")
+                    .trim()
+                    .trim_end_matches('.')
+                    .to_lowercase();
+                target == host && r.ttl > r.received_at.elapsed().as_secs() as u32
+            });
+            if selected || alternate {
                 hits.push(i);
             }
         }
@@ -7260,6 +7371,92 @@ mod tests {
             .answers
             .iter()
             .any(|r| r.rtype == 1 && r.rdata == "192.168.0.5"));
+    }
+
+    #[test]
+    fn host_name_does_not_flap_on_alternating_srv_targets() {
+        let mut app = App::new().unwrap();
+        ingest(
+            &mut app,
+            &raw_record("_http._tcp.local.", 12, "PTR", "Svc._http._tcp.local.", 120),
+        );
+        ingest(
+            &mut app,
+            &raw_record(
+                "Svc._http._tcp.local.",
+                33,
+                "SRV",
+                "0 0 80 host-a.local.",
+                120,
+            ),
+        );
+        assert_eq!(app.services[0].hostname, "host-a.local.");
+        assert_eq!(app.services[0].port, 80);
+        // A genuinely new target moves the service.
+        ingest(
+            &mut app,
+            &raw_record(
+                "Svc._http._tcp.local.",
+                33,
+                "SRV",
+                "0 0 8080 host-b.local.",
+                120,
+            ),
+        );
+        assert_eq!(app.services[0].hostname, "host-b.local.");
+        assert_eq!(app.services[0].port, 8080);
+        // Refreshing the now-known alternate target must not flip back or
+        // change the selected target's port.
+        ingest(
+            &mut app,
+            &raw_record(
+                "Svc._http._tcp.local.",
+                33,
+                "SRV",
+                "0 0 80 host-a.local.",
+                120,
+            ),
+        );
+        assert_eq!(app.services[0].hostname, "host-b.local.");
+        assert_eq!(app.services[0].port, 8080);
+        ingest(
+            &mut app,
+            &raw_record(
+                "Svc._http._tcp.local.",
+                33,
+                "SRV",
+                "0 0 8080 host-b.local.",
+                120,
+            ),
+        );
+        assert_eq!(app.services[0].hostname, "host-b.local.");
+        assert_eq!(app.services[0].port, 8080);
+        // Addresses published only under the alternate target are still
+        // filed on the service and surfaced on the selected host.
+        ingest(
+            &mut app,
+            &raw_record("host-a.local.", 1, "A", "192.168.1.10", 120),
+        );
+        assert!(app.services[0]
+            .answers
+            .iter()
+            .any(|r| r.rtype == 1 && r.rdata == "192.168.1.10"));
+        assert!(app
+            .host_addresses("host-b.local")
+            .contains(&"192.168.1.10".to_string()));
+        // A refresh after expiry of the alternate-target address is still
+        // routed and displayed.
+        ingest(
+            &mut app,
+            &raw_record("host-a.local.", 1, "A", "192.168.1.10", 0),
+        );
+        ingest(
+            &mut app,
+            &raw_record("host-a.local.", 1, "A", "192.168.1.10", 120),
+        );
+        assert!(app
+            .host_addresses("host-b.local")
+            .contains(&"192.168.1.10".to_string()));
     }
 
     #[test]
