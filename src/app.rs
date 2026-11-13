@@ -365,6 +365,12 @@ fn is_enum_name(name: &str) -> bool {
     name.trim_end_matches('.')
         .eq_ignore_ascii_case(ENUM_SERVICE)
 }
+
+fn srv_target(rdata: &str) -> Option<&str> {
+    let target = rdata.splitn(4, ' ').nth(3)?.trim().trim_end_matches('.');
+    (!target.is_empty()).then_some(target)
+}
+
 /// Maximum interval between continuous queries (RFC 6762 §5.2 steady state).
 const MAX_CONTINUOUS_INTERVAL: Duration = Duration::from_secs(3600);
 /// Local address refresh is unrelated to querying; keep it on its own timer.
@@ -961,16 +967,8 @@ impl App {
                 if rec.rtype != 33 || rec.ttl <= rec.received_at.elapsed().as_secs() as u32 {
                     continue;
                 }
-                let target = rec
-                    .rdata
-                    .splitn(4, ' ')
-                    .nth(3)
-                    .unwrap_or("")
-                    .trim()
-                    .trim_end_matches('.')
-                    .to_lowercase();
-                if !target.is_empty() {
-                    hosts.insert(target);
+                if let Some(target) = srv_target(&rec.rdata) {
+                    hosts.insert(target.to_lowercase());
                 }
             }
             for host in hosts {
@@ -999,6 +997,9 @@ impl App {
             self.packet_count += 1;
             batch.push(ev);
         }
+        let target_changed = batch
+            .iter()
+            .any(|ev| ev.answers.iter().any(|rec| rec.rtype == 33 && rec.ttl > 0));
         for ev in &batch {
             self.note_packet_metrics(ev);
             self.raw_events.push(ev.clone());
@@ -1032,7 +1033,7 @@ impl App {
             self.ingest_event(ev);
         }
 
-        if !batch.is_empty() {
+        if target_changed {
             self.flush_pending_addrs();
         }
     }
@@ -4753,18 +4754,9 @@ impl App {
         for (i, svc) in self.services.iter().enumerate() {
             let selected = svc.hostname.trim_end_matches('.').to_lowercase() == host;
             let alternate = svc.answers.iter().any(|r| {
-                if r.rtype != 33 {
-                    return false;
-                }
-                let target = r
-                    .rdata
-                    .splitn(4, ' ')
-                    .nth(3)
-                    .unwrap_or("")
-                    .trim()
-                    .trim_end_matches('.')
-                    .to_lowercase();
-                target == host && r.ttl > r.received_at.elapsed().as_secs() as u32
+                r.rtype == 33
+                    && r.ttl > r.received_at.elapsed().as_secs() as u32
+                    && srv_target(&r.rdata).is_some_and(|target| target.eq_ignore_ascii_case(&host))
             });
             if selected || alternate {
                 hits.push(i);
@@ -7369,6 +7361,86 @@ mod tests {
                 "pending A records missing on {instance}"
             );
         }
+    }
+
+    #[test]
+    fn unrelated_packet_batch_does_not_flush_pending_addresses() {
+        let mut app = App::new_with(true, None).unwrap();
+        let (tx, rx) = mpsc::channel();
+        app.rx = rx;
+
+        tx.send(event_for(&raw_record(
+            "test.local.",
+            1,
+            "A",
+            "192.168.1.10",
+            120,
+        )))
+        .unwrap();
+        app.drain_events();
+        assert_eq!(app.pending_addrs_count(), 1);
+
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+
+        tx.send(event_for(&raw_record(
+            "unrelated.local.",
+            1,
+            "A",
+            "192.168.1.11",
+            120,
+        )))
+        .unwrap();
+        app.drain_events();
+
+        assert!(app.pending_addrs.contains_key("test.local"));
+
+        tx.send(event_for(&srv_record(120))).unwrap();
+        app.drain_events();
+
+        assert!(!app.pending_addrs.contains_key("test.local"));
+        assert!(has_live_a(&app, "Test"));
+    }
+
+    #[test]
+    fn pending_address_flush_includes_live_alternate_srv_targets() {
+        let mut app = App::new_with(true, None).unwrap();
+        ingest(
+            &mut app,
+            &raw_record("_http._tcp.local.", 12, "PTR", "Svc._http._tcp.local.", 120),
+        );
+        ingest(
+            &mut app,
+            &raw_record(
+                "Svc._http._tcp.local.",
+                33,
+                "SRV",
+                "0 0 80 host-a.local.",
+                120,
+            ),
+        );
+        ingest(
+            &mut app,
+            &raw_record(
+                "Svc._http._tcp.local.",
+                33,
+                "SRV",
+                "0 0 8080 host-b.local.",
+                120,
+            ),
+        );
+        app.pending_addrs.insert(
+            "host-a.local".to_string(),
+            vec![raw_record("host-a.local.", 1, "A", "192.168.1.10", 120)],
+        );
+        app.flush_pending_addrs();
+
+        assert!(app.pending_addrs.is_empty());
+        assert_eq!(app.services[0].hostname, "host-b.local.");
+        assert!(app.services[0]
+            .answers
+            .iter()
+            .any(|r| r.rtype == 1 && r.rdata == "192.168.1.10"));
     }
 
     #[test]
