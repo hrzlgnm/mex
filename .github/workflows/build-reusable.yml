@@ -186,7 +186,6 @@ jobs:
         shell: bash
         env:
           RUSTFLAGS: "-D warnings"
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TARGET: ${{ matrix.target }}
           USE_CROSS: ${{ matrix.use_cross }}
           PROFILE: ${{ inputs.profile }}
