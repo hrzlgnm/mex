@@ -58,6 +58,8 @@ Headless run (no TTY) logs to stderr.
   …): release-please owns the changelog and derives releases from them.
 * Before opening a PR, proofread the title/body plus any new user-facing
   text and run `typos` (CI enforces it via `typos.toml`).
+* When implementing an issue, ensure it is closed by adding `Closes #<issue>`
+  to the PR body, so GitHub auto-closes the linked issue on merge.
 
 ## Conventions
 
