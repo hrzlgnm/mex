@@ -1041,7 +1041,10 @@ pub fn record_type_from_u16(rtype: u16) -> Option<TYPE> {
     }
 }
 
-fn rtype_label(rtype: u16) -> String {
+/// Human label for a numeric record/question type, including QTYPE-only
+/// codes such as ANY (255) that have no `TYPE` counterpart — which is
+/// why this stays keyed by raw u16 instead of the query-type enum.
+pub(crate) fn rtype_label(rtype: u16) -> String {
     match rtype {
         1 => "A".into(),
         28 => "AAAA".into(),

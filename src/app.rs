@@ -136,12 +136,143 @@ struct PendingService {
     answers: Vec<browse::RawRecord>,
     subtypes: Vec<String>,
     questions: Vec<QuestionRow>,
+    /// Rows evicted by the 10-row cap; surfaced in dumps so a capped
+    /// list is never mistaken for a complete packet log.
+    pub questions_dropped: u64,
     last_seen: Instant,
 }
 
 /// One Questions-pane row: (name, type label, querier, seen at, query
 /// packet bytes). `SELF_SOURCE` marks our own inferred sends.
 type QuestionRow = (String, String, std::net::SocketAddr, Instant, Vec<u8>);
+
+/// What the latest query activity for an interest was: we transmitted
+/// it, §7.3 suppression stood in for it, or a remote querier asked it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum QueryOrigin {
+    Transmitted,
+    Suppressed,
+    Observed,
+}
+
+impl QueryOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QueryOrigin::Transmitted => "transmitted",
+            QueryOrigin::Suppressed => "suppressed",
+            QueryOrigin::Observed => "observed",
+        }
+    }
+}
+
+/// Which schedule owns an interest's next query: the TTL refresh
+/// stream, the continuous browse stream, or neither (terminal). Read
+/// from the live `requeries`/`continuous` maps, never stored.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TimerKind {
+    Refresh,
+    Browse,
+    Expired,
+}
+
+impl TimerKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TimerKind::Refresh => "refresh",
+            TimerKind::Browse => "browse",
+            TimerKind::Expired => "expired",
+        }
+    }
+}
+
+/// Lifecycle of an interest's refresh demand: a pending refresh was
+/// sent or suppressed, a fresh answer arrived, or the interest went
+/// quiet with nothing to show for it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InterestStatus {
+    Transmitted,
+    Suppressed,
+    Answered,
+    Abandoned,
+}
+
+impl InterestStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InterestStatus::Transmitted => "transmitted",
+            InterestStatus::Suppressed => "suppressed",
+            InterestStatus::Answered => "answered",
+            InterestStatus::Abandoned => "abandoned",
+        }
+    }
+}
+
+/// Computed per-interest query snapshot for dumps and the TUI: last
+/// query event, refresh attempt count, next deadline, owning timer,
+/// and lifecycle status. Schedules stay authoritative in
+/// `requeries`/`continuous`; nothing here is stored.
+struct InterestView {
+    state: Option<InterestQueryState>,
+    attempt: u8,
+    next_due: Option<Instant>,
+    timer: TimerKind,
+    status: InterestStatus,
+}
+
+impl InterestView {
+    fn origin(&self) -> Option<QueryOrigin> {
+        self.state.as_ref().and_then(|s| s.last().map(|(o, _)| o))
+    }
+
+    fn last_at(&self) -> Option<Instant> {
+        self.state.as_ref().and_then(|s| s.last().map(|(_, t)| t))
+    }
+
+    fn observed(&self) -> Option<&ObservedQuery> {
+        self.state.as_ref().and_then(|s| s.observed.as_ref())
+    }
+}
+
+/// One observed remote question: when, from whom, on which link.
+#[derive(Clone, Debug)]
+struct ObservedQuery {
+    at: Instant,
+    from: std::net::SocketAddr,
+    iface: String,
+}
+
+/// Per-interest query provenance: when we last transmitted, last stood
+/// down to §7.3 suppression, and last saw a remote querier ask. Keyed
+/// like `continuous` by (lowercased name, type) — see
+/// `provenance_key`. Schedules stay authoritative in
+/// `requeries`/`continuous`; this records what *happened* so dumps and
+/// the TUI can tell a sent refresh from suppression and from someone
+/// else's question.
+#[derive(Clone, Debug, Default)]
+struct InterestQueryState {
+    transmitted: Option<Instant>,
+    suppressed: Option<Instant>,
+    observed: Option<ObservedQuery>,
+}
+
+impl InterestQueryState {
+    /// Latest query event and its kind, if any.
+    fn last(&self) -> Option<(QueryOrigin, Instant)> {
+        [
+            (QueryOrigin::Transmitted, self.transmitted),
+            (QueryOrigin::Suppressed, self.suppressed),
+            (QueryOrigin::Observed, self.observed.as_ref().map(|o| o.at)),
+        ]
+        .into_iter()
+        .filter_map(|(o, t)| t.map(|t| (o, t)))
+        .max_by_key(|(_, t)| *t)
+    }
+}
+
+/// How long provenance survives without a live schedule: matches the
+/// service expiry grace so a recently expired interest still reports
+/// its terminal state in dumps.
+const INTEREST_GRACE: Duration = Duration::from_secs(120);
 
 /// Continuous-browse state per (name, type), RFC 6762 §5.2: first query
 /// after 20-120ms, then >=1s, doubling each time, capped at 1/hour.
@@ -368,6 +499,10 @@ pub struct App {
     /// Known answers suppress the responses in between. Answers reset the
     /// schedule via push_record.
     requeries: HashMap<(String, u16), (Instant, u8)>,
+    /// Per-interest query provenance (transmit / suppress / observe),
+    /// keyed like `continuous` by (lowercased name, type) — see
+    /// `provenance_key`. Pruned with dead interests in `evict_expired`.
+    query_history: HashMap<(String, u16), InterestQueryState>,
     /// Enumeration answers learned from `_services._dns-sd._udp.local`
     /// PTR answers: service type -> (original TTL, received_at, ingress
     /// interface). Used as known answers on enumeration requeries
@@ -417,6 +552,7 @@ pub struct ServiceEntry {
     /// Recently seen questions asking for this service:
     /// (name, type, querier, received_at, query packet bytes). Capped.
     pub questions: Vec<QuestionRow>,
+    pub questions_dropped: u64,
     pub last_seen: Instant,
     pub is_active: bool,
     /// Most recent packet that touched this service; the right panes fall
@@ -475,6 +611,7 @@ pub struct EnumEntry {
     pub name: String,
     pub answers: Vec<browse::RawRecord>,
     pub questions: Vec<QuestionRow>,
+    pub questions_dropped: u64,
     pub last_seen: Instant,
     pub last_event: Option<browse::Event>,
 }
@@ -613,6 +750,7 @@ impl App {
             continuous: HashMap::new(),
             known_types: HashSet::new(),
             requeries: HashMap::new(),
+            query_history: HashMap::new(),
             enum_known: HashMap::new(),
             startup_qu_sent: false,
             last_ip_refresh: Instant::now(),
@@ -651,6 +789,7 @@ impl App {
                 name: ENUM_SERVICE.to_string(),
                 answers: Vec::new(),
                 questions: Vec::new(),
+                questions_dropped: 0,
                 last_seen: Instant::now(),
                 last_event: None,
             }],
@@ -1009,6 +1148,7 @@ impl App {
             if self.suppressed_by_overheard(&key, &ka) {
                 self.metrics.suppressed_refresh += 1;
                 self.metrics.suppressed_times.push_back(now);
+                self.note_query(&key.0, key.1, QueryOrigin::Suppressed, now);
                 self.route_own_question(&key.0, key.1);
                 self.postpone_continuous_for_refresh(&key, now);
                 let unanswered = (count + 1).min(4);
@@ -1021,6 +1161,7 @@ impl App {
             }
             self.metrics.q_sent_refresh += 1;
             self.metrics.ka_sent += ka.len() as u64;
+            self.note_query(&key.0, key.1, QueryOrigin::Transmitted, now);
             self.query_tx.send(browse::QueryRequest {
                 name: key.0.clone(),
                 record_type: rt,
@@ -1052,6 +1193,125 @@ impl App {
     /// case via `qname` / the desired-map value.
     fn continuous_key(name: &str, rtype: u16) -> (String, u16) {
         (name.to_lowercase(), rtype)
+    }
+
+    /// Provenance map key: dot-trimmed lowercased name plus type, so
+    /// wire case and trailing dots collapse the way the scheduler keys
+    /// do (RFC 6763 §7).
+    fn provenance_key(name: &str, rtype: u16) -> (String, u16) {
+        (name.trim_end_matches('.').to_lowercase(), rtype)
+    }
+
+    /// Record a query event for an interest: we transmitted it or §7.3
+    /// suppression stood in for it, stamped at action time.
+    fn note_query(&mut self, name: &str, rtype: u16, origin: QueryOrigin, at: Instant) {
+        let entry = self
+            .query_history
+            .entry(Self::provenance_key(name, rtype))
+            .or_default();
+        match origin {
+            QueryOrigin::Transmitted => entry.transmitted = Some(at),
+            QueryOrigin::Suppressed => entry.suppressed = Some(at),
+            QueryOrigin::Observed => {
+                // Observed questions carry their own packet timestamp
+                // and source; use `note_observed` instead.
+            }
+        }
+    }
+
+    /// Record an observed remote question with its packet timestamp,
+    /// querier, and ingress interface, so dumps can identify which link
+    /// and browser asked (RFC 6762 §5.4/§11 context).
+    fn note_observed(&mut self, q: &browse::RawRecord, ev: &browse::Event) {
+        let entry = self
+            .query_history
+            .entry(Self::provenance_key(&q.name, q.rtype))
+            .or_default();
+        entry.observed = Some(ObservedQuery {
+            at: q.received_at,
+            from: ev.source,
+            iface: q.iface.clone(),
+        });
+    }
+
+    /// Whether a live (unexpired, nonzero-TTL) answer row exists for a
+    /// normalized interest key, across services, enumeration, and
+    /// pending instances.
+    fn has_live_answer(&self, key: &(String, u16)) -> bool {
+        let live_row = |rec: &browse::RawRecord| {
+            rec.rtype == key.1
+                && rec.name.trim_end_matches('.').eq_ignore_ascii_case(&key.0)
+                && rec.ttl > 0
+                && Self::remaining_ttl(rec) > 0
+        };
+        self.services
+            .iter()
+            .any(|s| s.answers.iter().any(&live_row))
+            || self
+                .enum_entries
+                .iter()
+                .any(|e| e.answers.iter().any(&live_row))
+            || self
+                .pending_instances
+                .iter()
+                .any(|p| p.answers.iter().any(&live_row))
+    }
+
+    /// Authoritative per-interest snapshot for dumps and the TUI.
+    /// Refresh state wins over the continuous stream (urgent TTL
+    /// maintenance outranks hourly rediscovery); with no schedule the
+    /// interest is terminal. Status distinguishes a pending send from
+    /// suppression, and a quiet interest with live answers (answered)
+    /// from one with nothing left (abandoned).
+    fn interest_view(&self, key: &(String, u16)) -> InterestView {
+        let state = self.query_history.get(key).cloned();
+        let (attempt, refresh_due) = self
+            .requeries
+            .iter()
+            // Refresh keys keep wire case and continuous keys are
+            // lowercased; the provenance key is normalized, so compare
+            // case-insensitively (and dot-trimmed, defensively) like the
+            // postpone path does.
+            .find(|(k, _)| k.0.trim_end_matches('.').eq_ignore_ascii_case(&key.0) && k.1 == key.1)
+            .map(|(_, (due, count))| (*count, Some(*due)))
+            .unwrap_or((0, None));
+        let browse_due = self
+            .continuous
+            .iter()
+            .find(|(k, _)| k.0.trim_end_matches('.').eq_ignore_ascii_case(&key.0) && k.1 == key.1)
+            .map(|(_, e)| e.next_due);
+        let (timer, next_due) = match (refresh_due, browse_due) {
+            (Some(due), _) => (TimerKind::Refresh, Some(due)),
+            (None, Some(due)) => (TimerKind::Browse, Some(due)),
+            (None, None) => (TimerKind::Expired, None),
+        };
+        let last_own = state.as_ref().and_then(|s| {
+            [
+                (QueryOrigin::Transmitted, s.transmitted),
+                (QueryOrigin::Suppressed, s.suppressed),
+            ]
+            .into_iter()
+            .filter_map(|(o, t)| t.map(|t| (o, t)))
+            .max_by_key(|(_, t)| *t)
+            .map(|(o, _)| o)
+        });
+        // Requery entries are only inserted alongside a send or a
+        // suppression decision (never speculatively), so a pending
+        // refresh always has a last own action; the Transmitted arm
+        // below is the defensive fallback, not a reachable default.
+        let status = match (refresh_due.is_some(), last_own) {
+            (true, Some(QueryOrigin::Suppressed)) => InterestStatus::Suppressed,
+            (true, _) => InterestStatus::Transmitted,
+            (false, _) if self.has_live_answer(key) => InterestStatus::Answered,
+            (false, _) => InterestStatus::Abandoned,
+        };
+        InterestView {
+            state,
+            attempt,
+            next_due,
+            timer,
+            status,
+        }
     }
 
     /// Strip a dot-separated suffix case-insensitively, returning the
@@ -1160,6 +1420,7 @@ impl App {
                 let now = Instant::now();
                 self.metrics.suppressed_continuous += 1;
                 self.metrics.suppressed_times.push_back(now);
+                self.note_query(&key.0, key.1, QueryOrigin::Suppressed, now);
                 self.route_own_question(&key.0, key.1);
                 self.advance_continuous(&key, now);
                 continue;
@@ -1170,6 +1431,7 @@ impl App {
                 // no longer depends on it.
             }
             self.metrics.q_sent_continuous += 1;
+            self.note_query(&send_name, key.1, QueryOrigin::Transmitted, now);
             if qu {
                 self.metrics.qu_sent += 1;
             }
@@ -2106,6 +2368,8 @@ impl App {
                 .map(Self::dump_answer_row)
                 .collect(),
             questions: svc.questions.iter().map(Self::dump_question_row).collect(),
+            questions_truncated: svc.questions_dropped > 0,
+            questions_dropped: svc.questions_dropped,
         }
     }
 
@@ -2164,6 +2428,40 @@ impl App {
             "uptime_secs".to_string(),
             self.start_time.elapsed().as_secs(),
         );
+        let now = Instant::now();
+        let mut interest_keys: HashSet<(String, u16)> =
+            self.query_history.keys().cloned().collect();
+        for key in self.requeries.keys() {
+            interest_keys.insert(Self::provenance_key(&key.0, key.1));
+        }
+        for key in self.continuous.keys() {
+            interest_keys.insert(Self::provenance_key(&key.0, key.1));
+        }
+        let mut interest_keys: Vec<(String, u16)> = interest_keys.into_iter().collect();
+        interest_keys.sort();
+        let interests = interest_keys
+            .iter()
+            .map(|key| {
+                let view = self.interest_view(key);
+                dump::DumpInterest {
+                    name: key.0.clone(),
+                    rtype: key.1,
+                    rtype_str: browse::rtype_label(key.1),
+                    timer: view.timer.as_str().to_string(),
+                    status: view.status.as_str().to_string(),
+                    attempt: view.attempt,
+                    next_due_in_secs: view
+                        .next_due
+                        .map(|d| d.saturating_duration_since(now).as_secs()),
+                    last_origin: view.origin().map(|o| o.as_str().to_string()),
+                    last_event_age_secs: view
+                        .last_at()
+                        .map(|t| now.saturating_duration_since(t).as_secs()),
+                    last_observed_from: view.observed().map(|o| o.from.to_string()),
+                    last_observed_iface: view.observed().map(|o| o.iface.clone()),
+                }
+            })
+            .collect();
         let found = self.anomalies();
         metrics.insert("anomalies_total".to_string(), found.len() as u64);
         metrics.insert(
@@ -2201,6 +2499,8 @@ impl App {
                     name: e.name.clone(),
                     answers: e.answers.iter().map(Self::dump_answer_row).collect(),
                     questions: e.questions.iter().map(Self::dump_question_row).collect(),
+                    questions_truncated: e.questions_dropped > 0,
+                    questions_dropped: e.questions_dropped,
                 })
                 .collect(),
             pending: self
@@ -2210,8 +2510,11 @@ impl App {
                     name: format!("{}.{}", p.instance, p.service_type),
                     answers: p.answers.iter().map(Self::dump_answer_row).collect(),
                     questions: p.questions.iter().map(Self::dump_question_row).collect(),
+                    questions_truncated: p.questions_dropped > 0,
+                    questions_dropped: p.questions_dropped,
                 })
                 .collect(),
+            interests,
             anomalies: found
                 .iter()
                 .map(|a| dump::DumpAnomaly {
@@ -3617,12 +3920,14 @@ impl App {
     /// who is asking (and the hex pane can show the query packet).
     /// Enumeration questions file on their selectable enumeration row.
     fn route_question(&mut self, q: &browse::RawRecord, ev: &browse::Event) {
+        self.note_observed(q, ev);
         let name = q.name.trim_end_matches('.').to_lowercase();
         if is_enum_name(&name) {
             for entry in &mut self.enum_entries {
                 if entry.name.to_lowercase() == name {
-                    Self::file_question_row(
+                    Self::file_question_counted(
                         &mut entry.questions,
+                        &mut entry.questions_dropped,
                         q.name.clone(),
                         q.rtype_str.clone(),
                         ev.source,
@@ -3647,8 +3952,10 @@ impl App {
                 .to_lowercase();
             if full == name || host == name || self.services[i].service_type.to_lowercase() == name
             {
-                Self::file_question_row(
-                    &mut self.services[i].questions,
+                let svc = &mut self.services[i];
+                Self::file_question_counted(
+                    &mut svc.questions,
+                    &mut svc.questions_dropped,
                     q.name.clone(),
                     q.rtype_str.clone(),
                     ev.source,
@@ -3661,6 +3968,27 @@ impl App {
 
     /// File one question row, refreshing the timestamp when the same
     /// (name, type, source) asks again. Caps the list at 10 rows.
+    /// Returns true when an old row was evicted, so callers can count
+    /// drops for the dump truncation marker.
+    ///
+    /// Prefer `file_question_counted` at call sites: it files the row
+    /// and bumps the entry's eviction counter in one call.
+    fn file_question_counted(
+        rows: &mut Vec<QuestionRow>,
+        drops: &mut u64,
+        name: String,
+        rtype_str: String,
+        source: std::net::SocketAddr,
+        at: Instant,
+        bytes: Vec<u8>,
+    ) {
+        if Self::file_question_row(rows, name, rtype_str, source, at, bytes) {
+            *drops += 1;
+        }
+    }
+
+    /// Short label for the record types we ever transmit (the only ones
+    /// `route_own_question` can see).
     fn file_question_row(
         rows: &mut Vec<QuestionRow>,
         name: String,
@@ -3668,18 +3996,22 @@ impl App {
         source: std::net::SocketAddr,
         at: Instant,
         bytes: Vec<u8>,
-    ) {
+    ) -> bool {
         match rows
             .iter()
             .position(|(n, t, src, _, _)| n == &name && t == &rtype_str && src == &source)
         {
             Some(pos) => {
                 rows[pos] = (name, rtype_str, source, at, bytes);
+                false
             }
             None => {
                 rows.push((name, rtype_str, source, at, bytes));
                 if rows.len() > 10 {
                     rows.remove(0);
+                    true
+                } else {
+                    false
                 }
             }
         }
@@ -3717,8 +4049,9 @@ impl App {
         if is_enum_name(&key) {
             for entry in &mut self.enum_entries {
                 if entry.name.to_lowercase() == key {
-                    Self::file_question_row(
+                    Self::file_question_counted(
                         &mut entry.questions,
+                        &mut entry.questions_dropped,
                         display.clone(),
                         label.to_string(),
                         SELF_SOURCE,
@@ -3741,8 +4074,10 @@ impl App {
                 .trim_end_matches('.')
                 .to_lowercase();
             if full == key || host == key || self.services[i].service_type.to_lowercase() == key {
-                Self::file_question_row(
-                    &mut self.services[i].questions,
+                let svc = &mut self.services[i];
+                Self::file_question_counted(
+                    &mut svc.questions,
+                    &mut svc.questions_dropped,
                     display.clone(),
                     label.to_string(),
                     SELF_SOURCE,
@@ -3754,8 +4089,9 @@ impl App {
         for p in &mut self.pending_instances {
             let full = format!("{}.{}", p.instance, p.service_type).to_lowercase();
             if full == key || p.service_type.to_lowercase() == key {
-                Self::file_question_row(
+                Self::file_question_counted(
                     &mut p.questions,
+                    &mut p.questions_dropped,
                     display.clone(),
                     label.to_string(),
                     SELF_SOURCE,
@@ -4035,8 +4371,10 @@ impl App {
                     }
                 }
                 for q in p.questions {
-                    Self::file_question_row(
-                        &mut self.services[svc_idx].questions,
+                    let svc = &mut self.services[svc_idx];
+                    Self::file_question_counted(
+                        &mut svc.questions,
+                        &mut svc.questions_dropped,
                         q.0,
                         q.1,
                         q.2,
@@ -4044,6 +4382,9 @@ impl App {
                         q.4,
                     );
                 }
+                // Evicted pending rows never reappear: carry the count so
+                // the dump still marks the promoted list as truncated.
+                self.services[svc_idx].questions_dropped += p.questions_dropped;
                 self.services[svc_idx].last_seen =
                     self.services[svc_idx].last_seen.max(p.last_seen);
                 let answers = p.answers;
@@ -4142,6 +4483,7 @@ impl App {
             answers: Vec::new(),
             subtypes: Vec::new(),
             questions: Vec::new(),
+            questions_dropped: 0,
             last_seen: Instant::now(),
         });
         i
@@ -4165,6 +4507,7 @@ impl App {
             subtypes: Vec::new(),
             answers: Vec::new(),
             questions: Vec::new(),
+            questions_dropped: 0,
             last_seen: now,
             is_active: true,
             last_event: None,
@@ -4332,6 +4675,21 @@ impl App {
         self.requeries
             .retain(|k, _| live.contains(&(k.0.to_lowercase(), k.1)));
         self.continuous.retain(|k, _| live.contains(k));
+        // Provenance outlives short schedule gaps but not dead
+        // interests: keep entries with a live schedule key or a recent
+        // event, so a recently expired interest still reports its
+        // terminal state in dumps.
+        self.query_history.retain(|k, v| {
+            live.contains(k)
+                || [
+                    v.transmitted,
+                    v.suppressed,
+                    v.observed.as_ref().map(|o| o.at),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|t| t.elapsed() < INTEREST_GRACE)
+        });
         // Overheard QM queries are single-use and short-lived (§7.3).
         self.overheard
             .retain(|_, (seen, _, _)| seen.elapsed() < OVERHEARD_WINDOW);
@@ -6396,6 +6754,7 @@ mod tests {
             subtypes: Vec::new(),
             answers: Vec::new(),
             questions: Vec::new(),
+            questions_dropped: 0,
             last_seen: Instant::now(),
             is_active: true,
             last_event: None,
@@ -7001,6 +7360,258 @@ mod tests {
             !app.requeries.contains_key(&key),
             "expired rows must not schedule refresh queries"
         );
+    }
+
+    #[test]
+    fn query_provenance_records_transmit_suppress_observe() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        // Age the SRV into the refresh window so a refresh is due.
+        for svc in &mut app.services {
+            for rec in &mut svc.answers {
+                if rec.rtype == 33 {
+                    rec.received_at = Instant::now() - Duration::from_secs(100);
+                }
+            }
+        }
+        app.requery_expiring();
+        // No overheard query: the SRV refresh is transmitted.
+        let srv_key = ("test._http._tcp.local".to_string(), 33);
+        let prov = app
+            .query_history
+            .get(&srv_key)
+            .expect("provenance recorded");
+        assert!(prov.transmitted.is_some());
+        assert!(matches!(
+            prov.last().map(|(o, _)| o),
+            Some(QueryOrigin::Transmitted)
+        ));
+
+        // A remote QM question for the same key suppresses the next
+        // refresh (§7.3): the KA set is empty on both sides.
+        let ev = query_event(
+            "Test._http._tcp.local.",
+            33,
+            "SRV",
+            false,
+            Vec::new(),
+            remote_source(),
+        );
+        app.ingest_event(&ev);
+        let prov = app.query_history.get(&srv_key).expect("observed recorded");
+        assert!(prov.observed.is_some());
+        // Make the refresh due again: the schedule spaces attempts ~5%
+        // of TTL apart, so without backdating the second run skips it.
+        for ((name, rtype), (due, _)) in app.requeries.iter_mut() {
+            if name == "Test._http._tcp.local" && *rtype == 33 {
+                *due = Instant::now() - Duration::from_secs(1);
+            }
+        }
+        app.requery_expiring();
+        let prov = app.query_history.get(&srv_key).expect("still there");
+        assert!(prov.suppressed.is_some());
+        assert!(matches!(
+            prov.last().map(|(o, _)| o),
+            Some(QueryOrigin::Suppressed)
+        ));
+
+        // An unrelated observed question records observation only.
+        let ev = query_event(
+            "_printer._tcp.local.",
+            12,
+            "PTR",
+            false,
+            Vec::new(),
+            remote_source(),
+        );
+        app.ingest_event(&ev);
+        let prov = app
+            .query_history
+            .get(&("_printer._tcp.local".to_string(), 12))
+            .expect("observed recorded");
+        assert!(prov.observed.is_some());
+        assert!(prov.transmitted.is_none());
+        assert!(prov.suppressed.is_none());
+    }
+
+    #[test]
+    fn query_provenance_prunes_dead_interests() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        // Recent provenance for a live interest survives eviction.
+        app.note_query(
+            "_http._tcp.local",
+            12,
+            QueryOrigin::Transmitted,
+            Instant::now(),
+        );
+        // Stale provenance with no live schedule is dropped.
+        app.query_history.insert(
+            ("gone._tcp.local".to_string(), 12),
+            InterestQueryState {
+                transmitted: Some(Instant::now() - Duration::from_secs(3600)),
+                ..Default::default()
+            },
+        );
+        app.evict_expired();
+        assert!(app
+            .query_history
+            .contains_key(&("_http._tcp.local".to_string(), 12)));
+        assert!(!app
+            .query_history
+            .contains_key(&("gone._tcp.local".to_string(), 12)));
+    }
+
+    #[test]
+    fn interest_view_reports_timer_and_status() {
+        let mut app = App::new().unwrap();
+        // Unknown interest: no schedule, no answers, no history.
+        let view = app.interest_view(&("_http._tcp.local".to_string(), 12));
+        assert_eq!(view.timer, TimerKind::Expired);
+        assert_eq!(view.status, InterestStatus::Abandoned);
+        assert_eq!(view.attempt, 0);
+        assert!(view.next_due.is_none());
+        assert!(view.origin().is_none());
+
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        // Continuous stream exists after a poll; no refresh due yet.
+        app.poll_continuous();
+        let view = app.interest_view(&("_http._tcp.local".to_string(), 12));
+        assert_eq!(view.timer, TimerKind::Browse);
+        assert!(view.next_due.is_some());
+        // Live answers, nothing pending: answered.
+        assert_eq!(view.status, InterestStatus::Answered);
+
+        // Age the SRV into the refresh window: the refresh timer wins
+        // over the continuous stream and the send is recorded.
+        for svc in &mut app.services {
+            for rec in &mut svc.answers {
+                if rec.rtype == 33 {
+                    rec.received_at = Instant::now() - Duration::from_secs(100);
+                }
+            }
+        }
+        app.requery_expiring();
+        let view = app.interest_view(&("test._http._tcp.local".to_string(), 33));
+        assert_eq!(view.timer, TimerKind::Refresh);
+        assert_eq!(view.status, InterestStatus::Transmitted);
+        assert_eq!(view.attempt, 1);
+        assert_eq!(view.origin(), Some(QueryOrigin::Transmitted));
+    }
+
+    #[test]
+    fn dump_reports_interest_query_state_and_truncation() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        // Age the SRV into the refresh window and drive one refresh.
+        for svc in &mut app.services {
+            for rec in &mut svc.answers {
+                if rec.rtype == 33 {
+                    rec.received_at = Instant::now() - Duration::from_secs(100);
+                }
+            }
+        }
+        app.requery_expiring();
+        let dump = app.state_dump();
+        let srv = dump
+            .interests
+            .iter()
+            .find(|i| i.rtype == 33)
+            .expect("srv interest");
+        assert_eq!(srv.timer, "refresh");
+        assert_eq!(srv.status, "transmitted");
+        assert!(srv.attempt >= 1);
+        assert!(srv.next_due_in_secs.is_some());
+        assert_eq!(srv.last_origin.as_deref(), Some("transmitted"));
+
+        // Flood one service question from distinct sources past the cap
+        // (the earlier self SRV refresh already holds one row, so 10 more
+        // pushes evict exactly once).
+        for i in 0..10 {
+            let src: std::net::SocketAddr = format!("192.168.1.{}:5353", 10 + i).parse().unwrap();
+            let mut ev = query_event("_http._tcp.local.", 12, "PTR", false, Vec::new(), src);
+            ev.questions[0].iface = "br0".to_string();
+            app.ingest_event(&ev);
+        }
+        let dump = app.state_dump();
+        let svc = &dump.services[0];
+        assert_eq!(svc.questions.len(), 10);
+        assert!(svc.questions_truncated);
+        assert_eq!(svc.questions_dropped, 1);
+        // The interest records who asked last and on which link.
+        let ptr = dump
+            .interests
+            .iter()
+            .find(|i| i.name == "_http._tcp.local" && i.rtype == 12)
+            .expect("ptr interest");
+        assert_eq!(ptr.last_origin.as_deref(), Some("observed"));
+        assert_eq!(ptr.last_observed_from.as_deref(), Some("192.168.1.19:5353"));
+        assert_eq!(ptr.last_observed_iface.as_deref(), Some("br0"));
+    }
+
+    #[test]
+    fn pihole_cycle_expires_after_four_misses_then_rescues() {
+        // Regression fixture for the observed Pi-hole sequence: repeated
+        // 120s SRV records expiring after unanswered refreshes, then
+        // renewed when another browse elicits the SRV as additional data.
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        let age_srv = |app: &mut App, secs: u64| {
+            for svc in &mut app.services {
+                for rec in &mut svc.answers {
+                    if rec.rtype == 33 {
+                        rec.received_at = Instant::now() - Duration::from_secs(secs);
+                    }
+                }
+            }
+        };
+        age_srv(&mut app, 100);
+        // Four unanswered refreshes: attempts 1-3 stay pending, the
+        // fourth expires the schedule.
+        for expected in 1u8..=4u8 {
+            for ((name, rtype), (due, _)) in app.requeries.iter_mut() {
+                if name == "Test._http._tcp.local" && *rtype == 33 {
+                    *due = Instant::now() - Duration::from_secs(1);
+                }
+            }
+            app.requery_expiring();
+            if expected < 4 {
+                let view = app.interest_view(&("test._http._tcp.local".to_string(), 33));
+                assert_eq!(view.status, InterestStatus::Transmitted);
+                assert_eq!(view.attempt, expected);
+            }
+        }
+        assert!(!app
+            .requeries
+            .keys()
+            .any(|(n, t)| n == "Test._http._tcp.local" && *t == 33));
+        assert_eq!(app.metrics.q_sent_refresh, 4);
+        // Row past TTL with no pending refresh: abandoned, while the
+        // continuous stream stays live for hourly rediscovery (§5.2).
+        age_srv(&mut app, 130);
+        let key = ("test._http._tcp.local".to_string(), 33);
+        let view = app.interest_view(&key);
+        assert_eq!(view.timer, TimerKind::Browse);
+        assert_eq!(view.status, InterestStatus::Abandoned);
+        // Another browser's PTR browse rescues the SRV as additional
+        // data: fresh row, no false self query, provenance intact.
+        let questions_before: usize = app.services.iter().map(|s| s.questions.len()).sum();
+        let mut rescue = event_for(&srv_record(120));
+        rescue.source = remote_source();
+        for rec in &mut rescue.answers {
+            rec.source = remote_source();
+        }
+        app.ingest_event(&rescue);
+        let view = app.interest_view(&key);
+        assert_eq!(view.status, InterestStatus::Answered);
+        assert_eq!(view.attempt, 0);
+        assert_eq!(view.origin(), Some(QueryOrigin::Transmitted));
+        let questions_after: usize = app.services.iter().map(|s| s.questions.len()).sum();
+        assert_eq!(questions_before, questions_after);
     }
 
     #[test]
