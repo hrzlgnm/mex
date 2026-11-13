@@ -4137,7 +4137,24 @@ impl App {
             let full = format!("{}.{}", svc.instance, svc.service_type).to_lowercase();
             let host = svc.hostname.trim_end_matches('.').to_lowercase();
             let inst = svc.instance.to_lowercase();
-            if names.iter().any(|n| *n == full || *n == host || *n == inst) {
+            let alternate = svc.answers.iter().any(|r| {
+                if r.rtype != 33 {
+                    return false;
+                }
+                if r.ttl <= r.received_at.elapsed().as_secs() as u32 {
+                    return false;
+                }
+                let target = r
+                    .rdata
+                    .splitn(4, ' ')
+                    .nth(3)
+                    .unwrap_or("")
+                    .trim()
+                    .trim_end_matches('.')
+                    .to_lowercase();
+                names.contains(&target)
+            });
+            if names.iter().any(|n| *n == full || *n == host || *n == inst) || alternate {
                 hits.push(i);
             }
         }
@@ -4588,7 +4605,7 @@ impl App {
                         .trim()
                         .trim_end_matches('.')
                         .to_lowercase();
-                    target == new_norm
+                    target == new_norm && r.ttl > r.received_at.elapsed().as_secs() as u32
                 });
                 !current_live || !target_known
             };
@@ -7450,11 +7467,51 @@ mod tests {
             &mut app,
             &raw_record("host-a.local.", 1, "A", "192.168.1.10", 0),
         );
+        assert!(!app
+            .host_addresses("host-b.local")
+            .contains(&"192.168.1.10".to_string()));
         ingest(
             &mut app,
             &raw_record("host-a.local.", 1, "A", "192.168.1.10", 120),
         );
         assert!(app
+            .host_addresses("host-b.local")
+            .contains(&"192.168.1.10".to_string()));
+    }
+
+    #[test]
+    fn stale_alternate_target_does_not_route_addr_goodbye() {
+        let mut app = App::new().unwrap();
+        ingest(
+            &mut app,
+            &raw_record("_http._tcp.local.", 12, "PTR", "Svc._http._tcp.local.", 120),
+        );
+        ingest(
+            &mut app,
+            &raw_record(
+                "Svc._http._tcp.local.",
+                33,
+                "SRV",
+                "0 0 80 host-b.local.",
+                120,
+            ),
+        );
+        app.services[0].answers.push(raw_record(
+            "Svc._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 80 host-a.local.",
+            0,
+        ));
+        ingest(
+            &mut app,
+            &raw_record("host-a.local.", 1, "A", "192.168.1.10", 0),
+        );
+        assert!(!app.services[0]
+            .answers
+            .iter()
+            .any(|r| r.rtype == 1 && r.rdata == "192.168.1.10"));
+        assert!(!app
             .host_addresses("host-b.local")
             .contains(&"192.168.1.10".to_string()));
     }
