@@ -6,15 +6,19 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use simple_dns::{rdata::RData, Packet, PacketFlag, ResourceRecord, CLASS, QCLASS, QTYPE, TYPE};
+use simple_dns::{
+    rdata::RData, Packet, PacketFlag, Question, ResourceRecord, CLASS, QCLASS, QTYPE, TYPE,
+};
 
 /// Display form of a parsed DNS name: labels joined as UTF-8 (lossy),
-/// with a trailing dot. Labels go on the wire as raw bytes, so this
-/// deliberately does not interpret escapes: a dot inside a DNS-SD
-/// instance label (RFC 6763 §4.1.1) renders as a plain separator, the
-/// same ambiguous-but-stable form the old codec produced after
-/// unescaping presentation format. `name_labels` below recovers the
-/// label split for re-encoding.
+/// with a trailing dot. Non-UTF-8 bytes render as U+FFFD (RFC 6762 §16
+/// names are UTF-8); this matches the in-flight instance-name fix and
+/// replaces the old latin-1 byte-as-char rendering. Labels go on the
+/// wire as raw bytes, so this deliberately does not interpret escapes:
+/// a dot inside a DNS-SD instance label (RFC 6763 §4.1.1) renders as a
+/// plain separator, the same ambiguous-but-stable form the old codec
+/// produced after unescaping presentation format. `split_instance_labels`
+/// below recovers the label split for re-encoding.
 fn display_name(name: &simple_dns::Name<'_>) -> String {
     let mut out = String::new();
     for (i, label) in name.get_labels().iter().enumerate() {
@@ -676,13 +680,23 @@ fn known_answers_for_iface<'a>(kas: &'a [KnownAnswer], iface: &str) -> Vec<(&'a 
         .collect()
 }
 
-/// Labels of an unescaped mDNS name. Records are stored unescaped for
-/// display, so a dot inside a DNS-SD instance label (RFC 6763 §4.1.1
-/// allows arbitrary text) is indistinguishable from a separator:
-/// everything left of `<_service>._tcp|_udp` is one instance label.
-/// Subtype owners (`<sub>._sub.<_service>…`), service types, and host
-/// names split on every dot.
-fn name_labels(name: &str) -> Vec<&str> {
+/// Split an unescaped display name into wire labels. Records are stored
+/// unescaped for display, so a dot inside a DNS-SD instance label
+/// (RFC 6763 §4.1.1 allows arbitrary text) is indistinguishable from a
+/// separator: everything left of the LAST `<_service>._tcp|_udp` is one
+/// instance label. Last-match matters: an instance label containing
+/// `._tcp.`-like text (e.g. `foo._tcp.bar._http._tcp.local`) still
+/// resolves to the real service suffix. Subtype owners
+/// (`<sub>._sub.<_service>…`), service types, and host names split on
+/// every dot.
+///
+/// Limits: a host or service name that itself ends in a
+/// `<_service>._tcp|_udp`-shaped suffix (e.g. a host literally named
+/// `x._tcp.example.com`) would mis-split — but such names never appear
+/// as query owners in this browser (queries are only built for live
+/// interests), and re-encoding still yields a valid name, just not the
+/// intended split.
+fn split_instance_labels(name: &str) -> Vec<&str> {
     let name = name.trim_end_matches('.');
     let parts: Vec<&str> = name.split('.').collect();
     let Some(proto) = parts
@@ -708,8 +722,8 @@ fn name_labels(name: &str) -> Vec<&str> {
 /// so instance names with spaces and punctuation (which presentation
 /// parsers reject) encode fine. `None` means the name cannot go on the
 /// wire (empty or over-long label).
-fn mdns_name(name: &str) -> Option<simple_dns::Name<'_>> {
-    let parts = name_labels(name);
+fn wire_name(name: &str) -> Option<simple_dns::Name<'_>> {
+    let parts = split_instance_labels(name);
     if parts.is_empty() {
         return None;
     }
@@ -728,7 +742,7 @@ fn mdns_name(name: &str) -> Option<simple_dns::Name<'_>> {
 /// go on the wire (empty or over-long label); that is logged because the
 /// scheduler has already counted the query as sent.
 fn encode_query(req: &QueryRequest, egress_iface: &str) -> Option<Vec<u8>> {
-    let qname = match mdns_name(&req.name) {
+    let qname = match wire_name(&req.name) {
         Some(n) => n,
         None => {
             log::warn!(
@@ -748,7 +762,7 @@ fn encode_query(req: &QueryRequest, egress_iface: &str) -> Option<Vec<u8>> {
     ));
 
     for (ka_target, ka_ttl) in known_answers_for_iface(&req.known_answers, egress_iface) {
-        let Some(rdata) = mdns_name(ka_target) else {
+        let Some(rdata) = wire_name(ka_target) else {
             log::warn!(
                 "mex: cannot encode known answer {ka_target:?} for {}",
                 req.name
@@ -793,6 +807,12 @@ fn parse_packet(
     let pkt = Packet::parse(raw).ok()?;
     let dst_is_multicast = mdns_multicast_dest(&dst);
     let is_response = pkt.has_flags(PacketFlag::RESPONSE);
+    let ing = Ingress {
+        source,
+        iface,
+        ifindex,
+        dst_is_multicast,
+    };
 
     let mut answers = Vec::new();
 
@@ -818,25 +838,7 @@ fn parse_packet(
                     .map(|r| (RecordSection::Additional, r)),
             )
         {
-            let rtype = u16::from(rec.rdata.type_code());
-            answers.push(RawRecord {
-                name: display_name(&rec.name),
-                rtype,
-                rtype_str: rtype_label(rtype),
-                // simple-dns exposes the top CLASS bit natively as
-                // `cache_flush` (RFC 6762 §10.2).
-                flush_bit: rec.cache_flush,
-                qu: false,
-                ttl: rec.ttl,
-                rdata: rdata_label(&rec.rdata),
-                wire: record_wire(rec),
-                source,
-                iface: iface.to_string(),
-                ifindex,
-                dst_is_multicast,
-                section,
-                received_at: Instant::now(),
-            });
+            answers.push(record_row(rec, record_wire(rec), section, ing));
         }
     }
 
@@ -845,45 +847,13 @@ fn parse_packet(
     let mut query_kas = Vec::new();
     if !is_response {
         for rec in pkt.answers.iter() {
-            let rtype = u16::from(rec.rdata.type_code());
-            query_kas.push(RawRecord {
-                name: display_name(&rec.name),
-                rtype,
-                rtype_str: rtype_label(rtype),
-                flush_bit: rec.cache_flush,
-                qu: false,
-                ttl: rec.ttl,
-                rdata: rdata_label(&rec.rdata),
-                wire: Vec::new(),
-                source,
-                iface: iface.to_string(),
-                ifindex,
-                dst_is_multicast,
-                section: RecordSection::KnownAnswer,
-                received_at: Instant::now(),
-            });
+            query_kas.push(record_row(rec, Vec::new(), RecordSection::KnownAnswer, ing));
         }
     }
 
     let mut questions = Vec::new();
     for q in &pkt.questions {
-        let rtype = u16::from(q.qtype);
-        questions.push(RawRecord {
-            name: display_name(&q.qname),
-            rtype,
-            rtype_str: rtype_label(rtype),
-            flush_bit: false,
-            qu: q.unicast_response,
-            ttl: 0,
-            rdata: String::new(),
-            wire: Vec::new(),
-            source,
-            iface: iface.to_string(),
-            ifindex,
-            dst_is_multicast,
-            section: RecordSection::Question,
-            received_at: Instant::now(),
-        });
+        questions.push(question_row(q, ing));
     }
 
     Some(Event {
@@ -895,16 +865,92 @@ fn parse_packet(
     })
 }
 
+/// Per-packet ingress context threaded into every row so the three
+/// record/question pushes share one construction path.
+#[derive(Clone, Copy)]
+struct Ingress<'a> {
+    source: SocketAddr,
+    iface: &'a str,
+    ifindex: u32,
+    dst_is_multicast: bool,
+}
+
+fn record_row(
+    rec: &ResourceRecord<'_>,
+    wire: Vec<u8>,
+    section: RecordSection,
+    ing: Ingress<'_>,
+) -> RawRecord {
+    let rtype = u16::from(rec.rdata.type_code());
+    RawRecord {
+        name: display_name(&rec.name),
+        rtype,
+        rtype_str: rtype_label(rtype),
+        // simple-dns exposes the top CLASS bit natively as
+        // `cache_flush` (RFC 6762 §10.2).
+        flush_bit: rec.cache_flush,
+        qu: false,
+        ttl: rec.ttl,
+        rdata: rdata_label(&rec.rdata),
+        wire,
+        source: ing.source,
+        iface: ing.iface.to_string(),
+        ifindex: ing.ifindex,
+        dst_is_multicast: ing.dst_is_multicast,
+        section,
+        received_at: Instant::now(),
+    }
+}
+
+fn question_row(q: &Question<'_>, ing: Ingress<'_>) -> RawRecord {
+    let rtype = u16::from(q.qtype);
+    RawRecord {
+        name: display_name(&q.qname),
+        rtype,
+        rtype_str: rtype_label(rtype),
+        flush_bit: false,
+        qu: q.unicast_response,
+        ttl: 0,
+        rdata: String::new(),
+        wire: Vec::new(),
+        source: ing.source,
+        iface: ing.iface.to_string(),
+        ifindex: ing.ifindex,
+        dst_is_multicast: ing.dst_is_multicast,
+        section: RecordSection::Question,
+        received_at: Instant::now(),
+    }
+}
+
 /// Standalone wire encoding of one record for the hex pane. simple-dns
 /// only serializes whole packets, so the record is wrapped in a minimal
-/// reply and the 12-byte header is stripped. Names are written expanded
-/// (no compression), matching the old per-record encoding.
+/// reply and the 12-byte header is stripped. This deliberately uses the
+/// uncompressed builder (`build_bytes_vec`, never `*_compressed`), so
+/// names are written expanded with no compression pointers — matching
+/// the old per-record encoding and keeping the slice self-contained.
 fn record_wire(rec: &ResourceRecord<'_>) -> Vec<u8> {
     let mut pkt = Packet::new_reply(0);
     pkt.answers.push(rec.clone());
     match pkt.build_bytes_vec() {
         Ok(bytes) => bytes.get(12..).unwrap_or_default().to_vec(),
         Err(_) => Vec::new(),
+    }
+}
+
+/// The record types this browser maintains interest in (RFC 6762 §5.2:
+/// no queries without active interest). Single source of truth for the
+/// u16 wire code → query type mapping; the scheduler and the refresh
+/// pass share it. Kept separate from `rtype_label` on purpose: the label
+/// map must stay keyed by raw u16 because it also renders QTYPE-only
+/// codes such as ANY (255), which have no `TYPE` counterpart.
+pub fn record_type_from_u16(rtype: u16) -> Option<TYPE> {
+    match rtype {
+        12 => Some(TYPE::PTR),
+        33 => Some(TYPE::SRV),
+        16 => Some(TYPE::TXT),
+        1 => Some(TYPE::A),
+        28 => Some(TYPE::AAAA),
+        _ => None,
     }
 }
 
@@ -1015,7 +1061,7 @@ mod tests {
         "192.168.178.60:5353".parse().unwrap()
     }
 
-    fn parse_encoded(req: &QueryRequest) -> Event {
+    fn roundtrip_query(req: &QueryRequest) -> Event {
         let bytes = encode_query(req, "").expect("query must encode");
         parse_packet(&bytes, test_source(), std::net::IpAddr::V4(MDNS_V4), "", 0).unwrap()
     }
@@ -1225,7 +1271,7 @@ mod tests {
         // instance name, so the SRV refresh was dropped before the
         // socket and the record expired with nothing on the wire.
         let name = "pihole [b8:27:eb:9d:87:e1]._workstation._tcp.local";
-        let ev = parse_encoded(&QueryRequest {
+        let ev = roundtrip_query(&QueryRequest {
             name: name.to_string(),
             record_type: TYPE::SRV,
             known_answers: Vec::new(),
@@ -1241,7 +1287,7 @@ mod tests {
         // A name read off the wire must re-encode to the same bytes, or
         // the refresh query asks for a name the responder does not own.
         let name = "Küche._http._tcp.local";
-        let ev = parse_encoded(&QueryRequest {
+        let ev = roundtrip_query(&QueryRequest {
             name: name.to_string(),
             record_type: TYPE::SRV,
             known_answers: Vec::new(),
@@ -1251,31 +1297,97 @@ mod tests {
     }
 
     #[test]
-    fn name_labels_keep_instance_dots_in_one_label() {
+    fn split_instance_labels_keep_instance_dots_in_one_label() {
         assert_eq!(
-            name_labels("amzn.dmgr:ABC._amzn-wplay._tcp.local"),
+            split_instance_labels("amzn.dmgr:ABC._amzn-wplay._tcp.local"),
             ["amzn.dmgr:ABC", "_amzn-wplay", "_tcp", "local"]
         );
         // Subtype owners, enumeration, service types, and host names
         // split on every dot.
         assert_eq!(
-            name_labels("_printer._sub._http._tcp.local."),
+            split_instance_labels("_printer._sub._http._tcp.local."),
             ["_printer", "_sub", "_http", "_tcp", "local"]
         );
         assert_eq!(
-            name_labels("_services._dns-sd._udp.local"),
+            split_instance_labels("_services._dns-sd._udp.local"),
             ["_services", "_dns-sd", "_udp", "local"]
         );
-        assert_eq!(name_labels("_http._tcp.local"), ["_http", "_tcp", "local"]);
         assert_eq!(
-            name_labels("FritzBoxRepeater.fritz.box"),
+            split_instance_labels("_http._tcp.local"),
+            ["_http", "_tcp", "local"]
+        );
+        assert_eq!(
+            split_instance_labels("FritzBoxRepeater.fritz.box"),
             ["FritzBoxRepeater", "fritz", "box"]
+        );
+        // Last-match wins: `._tcp.`-like text inside the instance label
+        // still resolves to the real service suffix.
+        assert_eq!(
+            split_instance_labels("foo._tcp.bar._http._tcp.local"),
+            ["foo._tcp.bar", "_http", "_tcp", "local"]
         );
     }
 
     #[test]
+    fn record_wire_is_expanded_with_class_bits() {
+        // Pins the hex-pane encoding: owner name written out in full (no
+        // compression pointers), type, class with the §10.2 flush bit,
+        // TTL, rdlen, rdata.
+        let rec = ResourceRecord::new(
+            simple_dns::Name::new_unchecked("test.local."),
+            CLASS::IN,
+            120,
+            RData::A(simple_dns::rdata::A {
+                address: u32::from(Ipv4Addr::new(192, 168, 1, 10)),
+            }),
+        )
+        .with_cache_flush(true);
+        let mut want = vec![4];
+        want.extend_from_slice(b"test");
+        want.push(5);
+        want.extend_from_slice(b"local");
+        want.push(0);
+        want.extend([0x00, 0x01]); // A
+        want.extend([0x80, 0x01]); // IN + flush bit
+        want.extend(120u32.to_be_bytes());
+        want.extend([0x00, 0x04]); // rdlen
+        want.extend([192, 168, 1, 10]);
+        assert_eq!(record_wire(&rec), want);
+
+        // Self-referential names are the case compression would fire on:
+        // NSEC next_name == owner must still come back expanded. Under
+        // the compressed builder the second occurrence would be a
+        // pointer, so this fails if the builder choice regresses.
+        let nsec = ResourceRecord::new(
+            simple_dns::Name::new_unchecked("host.local."),
+            CLASS::IN,
+            120,
+            RData::NSEC(simple_dns::rdata::NSEC::from_types(
+                simple_dns::Name::new_unchecked("host.local."),
+                &[TYPE::A],
+            )),
+        );
+        let mut want = vec![4];
+        want.extend_from_slice(b"host");
+        want.push(5);
+        want.extend_from_slice(b"local");
+        want.push(0);
+        want.extend([0x00, 0x2F]); // NSEC
+        want.extend([0x00, 0x01]); // IN, no flush
+        want.extend(120u32.to_be_bytes());
+        want.extend([0x00, 0x0F]); // rdlen
+        want.extend([4]);
+        want.extend_from_slice(b"host");
+        want.push(5);
+        want.extend_from_slice(b"local");
+        want.push(0);
+        want.extend([0x00, 0x01, 0x40]); // window 0, len 1, A bit
+        assert_eq!(record_wire(&nsec), want);
+    }
+
+    #[test]
     fn known_answers_with_spaces_are_sent() {
-        let ev = parse_encoded(&QueryRequest {
+        let ev = roundtrip_query(&QueryRequest {
             name: "_http._tcp.local".to_string(),
             record_type: TYPE::PTR,
             known_answers: vec![KnownAnswer {

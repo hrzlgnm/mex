@@ -930,17 +930,6 @@ impl App {
         out
     }
 
-    fn record_type_from_u16(rtype: u16) -> Option<TYPE> {
-        match rtype {
-            12 => Some(TYPE::PTR),
-            33 => Some(TYPE::SRV),
-            16 => Some(TYPE::TXT),
-            1 => Some(TYPE::A),
-            28 => Some(TYPE::AAAA),
-            _ => None,
-        }
-    }
-
     fn requery_expiring(&mut self) {
         let now = Instant::now();
         // Per-key minimum TTL plus whether any *live* row reached the 80%
@@ -1003,7 +992,7 @@ impl App {
             if count > 0 && now < due {
                 continue;
             }
-            let Some(rt) = Self::record_type_from_u16(key.1) else {
+            let Some(rt) = browse::record_type_from_u16(key.1) else {
                 continue;
             };
             let ka = if rt == TYPE::PTR {
@@ -1142,7 +1131,7 @@ impl App {
             if !due {
                 continue;
             }
-            let Some(rt) = Self::record_type_from_u16(key.1) else {
+            let Some(rt) = browse::record_type_from_u16(key.1) else {
                 continue;
             };
             let ka = if rt == TYPE::PTR {
