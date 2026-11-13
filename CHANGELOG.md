@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.0](https://github.com/hrzlgnm/mex/compare/v0.14.0...v0.15.0) (2026-11-13)
+
+
+### Features
+
+* add --log-level command line switch ([#160](https://github.com/hrzlgnm/mex/issues/160)) ([b3028d0](https://github.com/hrzlgnm/mex/commit/b3028d0913ae7275c28adf7ff1eb7e8f7876c0cd))
+
 ## [0.14.0](https://github.com/hrzlgnm/mex/compare/v0.13.0...v0.14.0) (2026-11-13)
 
 
