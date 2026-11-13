@@ -1086,23 +1086,16 @@ mod tests {
         ttl: u32,
         flush: bool,
     ) -> RawRecord {
-        RawRecord {
-            name: name.to_string(),
+        rec_with(
+            name,
             rtype,
-            rtype_str: rtype_str.to_string(),
-            flush_bit: flush,
-            qu: false,
-            invalid_utf8: false,
+            rtype_str,
+            rdata,
             ttl,
-            rdata: rdata.to_string(),
-            wire: Vec::new(),
-            source: test_source(),
-            iface: String::new(),
-            ifindex: 0,
-            dst_is_multicast: true,
-            section: crate::browse::RecordSection::Answer,
-            received_at: Instant::now(),
-        }
+            flush,
+            true,
+            crate::browse::RecordSection::Answer,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
