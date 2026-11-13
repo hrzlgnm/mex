@@ -320,7 +320,7 @@ fn partition_anomaly_keys(found: &[crate::anomalies::Anomaly]) -> AnomalyMarks {
             continue;
         };
         let name = name.trim_end_matches('.').to_lowercase();
-        if !crate::anomalies::is_ttl_kind(a.kind) {
+        if !a.kind.is_ttl() {
             if let Some(rdata) = a.rdata.as_ref() {
                 content.insert((
                     name,
@@ -952,7 +952,7 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
     let question_keys: HashSet<(String, u16, String)> = app
         .anomalies()
         .into_iter()
-        .filter(|a| a.kind == "unicast-question")
+        .filter(|a| a.kind == crate::anomalies::AnomalyKind::UnicastQuestion)
         .filter(|a| a.is_surfaced())
         .filter_map(|a| {
             let rtype = a.rtype?;
@@ -1204,9 +1204,9 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
                 let scope = crate::anomalies::visible_scope(a, &identity_count);
                 // No severity word: the level icon already carries it.
                 let head = if scope.is_empty() {
-                    a.kind.to_string()
+                    a.kind.as_str().to_string()
                 } else {
-                    format!("{} {scope}", a.kind)
+                    format!("{} {scope}", a.kind.as_str())
                 };
                 Line::from(vec![
                     Span::styled(
@@ -1567,7 +1567,10 @@ mod tests {
     #[test]
     fn partition_anomaly_keys_splits_ttl_from_content() {
         use crate::anomalies::{Anomaly, Severity};
-        let finding = |kind: &'static str, severity: Severity, rdata: Option<&str>| -> Anomaly {
+        let finding = |kind: crate::anomalies::AnomalyKind,
+                       severity: Severity,
+                       rdata: Option<&str>|
+         -> Anomaly {
             Anomaly {
                 kind,
                 severity,
@@ -1583,10 +1586,26 @@ mod tests {
             }
         };
         let found = vec![
-            finding("shared-flush", Severity::Warning, Some("192.168.1.2")),
-            finding("ttl-low", Severity::Warning, Some("192.168.1.2")),
-            finding("ttl-unstable", Severity::Warning, None),
-            finding("ttl-high", Severity::Info, Some("192.168.1.2")),
+            finding(
+                crate::anomalies::AnomalyKind::SharedFlush,
+                Severity::Warning,
+                Some("192.168.1.2"),
+            ),
+            finding(
+                crate::anomalies::AnomalyKind::TtlLow,
+                Severity::Warning,
+                Some("192.168.1.2"),
+            ),
+            finding(
+                crate::anomalies::AnomalyKind::TtlUnstable,
+                Severity::Warning,
+                None,
+            ),
+            finding(
+                crate::anomalies::AnomalyKind::TtlHigh,
+                Severity::Info,
+                Some("192.168.1.2"),
+            ),
         ];
         let (content, ttl, unstable) = partition_anomaly_keys(&found);
         assert_eq!(content.len(), 1);

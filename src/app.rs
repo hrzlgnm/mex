@@ -2170,7 +2170,11 @@ impl App {
             };
             kv(
                 &mut rows,
-                &format!("{} {}", Self::anomaly_level_icon(a.severity), a.kind),
+                &format!(
+                    "{} {}",
+                    Self::anomaly_level_icon(a.severity),
+                    a.kind.as_str()
+                ),
                 value,
             );
         }
@@ -2697,7 +2701,7 @@ impl App {
             anomalies: found
                 .iter()
                 .map(|a| dump::DumpAnomaly {
-                    kind: a.kind.to_string(),
+                    kind: a.kind.as_str().to_string(),
                     severity: a.severity.as_str().to_string(),
                     service: a.service.clone(),
                     record_name: a.record_name.clone(),
@@ -5242,7 +5246,7 @@ impl App {
         let src = key.source.to_string();
         found
             .iter()
-            .filter(|a| anomalies::is_question_kind(a.kind))
+            .filter(|a| a.kind.is_question())
             .filter(|a| a.is_surfaced())
             .filter(|a| a.service == id)
             .filter(|a| a.rtype == Some(rtype))
@@ -5283,7 +5287,7 @@ impl App {
                 // match every row of the same name and type. Narrowed to
                 // that kind on purpose — a future rdata-less finding of
                 // another kind must not silently span rows.
-                None => a.kind == "ttl-unstable",
+                None => a.kind == anomalies::AnomalyKind::TtlUnstable,
             })
             .cloned()
             .collect()
@@ -6199,7 +6203,7 @@ mod tests {
         let item = app
             .anomalies()
             .into_iter()
-            .find(|a| a.kind == "unicast-question")
+            .find(|a| a.kind == anomalies::AnomalyKind::UnicastQuestion)
             .expect("expected routed SOA question leak");
         assert_eq!(item.service, "Test._http._tcp.local");
         assert_eq!(item.severity, crate::anomalies::Severity::Error);
@@ -6651,7 +6655,9 @@ mod tests {
         assert!(app.services.is_empty());
         assert!(app.pending_instances.is_empty());
         assert!(
-            app.anomalies().iter().all(|a| a.kind != "type-format"),
+            app.anomalies()
+                .iter()
+                .all(|a| a.kind != anomalies::AnomalyKind::TypeFormat),
             "reverse name must not flag"
         );
     }
@@ -8412,7 +8418,10 @@ mod tests {
         ingest(&mut app, &bad);
         assert!(app.services.is_empty());
         assert!(!app.pending_instances.is_empty());
-        assert!(app.anomalies().iter().any(|a| a.kind == "shared-flush"));
+        assert!(app
+            .anomalies()
+            .iter()
+            .any(|a| a.kind == anomalies::AnomalyKind::SharedFlush));
     }
 
     #[test]
@@ -8427,7 +8436,7 @@ mod tests {
         let found = app.anomalies();
         let a = found
             .iter()
-            .find(|a| a.kind == "shared-flush")
+            .find(|a| a.kind == anomalies::AnomalyKind::SharedFlush)
             .expect("finding");
         let icon = App::anomaly_level_icon(a.severity);
         let rows = app.metrics_rows();
@@ -9150,7 +9159,7 @@ mod tests {
         let all = app.anomalies();
         let base = all
             .iter()
-            .find(|a| a.kind == "ttl-mismatch")
+            .find(|a| a.kind == anomalies::AnomalyKind::TtlMismatch)
             .expect("base mismatch still analyzed");
         assert_eq!(
             base.severity,
@@ -9451,16 +9460,16 @@ mod tests {
     }
 
     /// Finding kinds in pane order.
-    fn kinds(found: &[PaneAnomaly]) -> Vec<&str> {
-        found.iter().map(|p| p.anomaly.kind).collect()
+    fn kinds(found: &[PaneAnomaly]) -> Vec<&'static str> {
+        found.iter().map(|p| p.anomaly.kind.as_str()).collect()
     }
 
     /// Kinds of the entries marked as the cursor's own finding.
-    fn matched(found: &[PaneAnomaly]) -> Vec<&str> {
+    fn matched(found: &[PaneAnomaly]) -> Vec<&'static str> {
         found
             .iter()
             .filter(|p| p.cursor_match)
-            .map(|p| p.anomaly.kind)
+            .map(|p| p.anomaly.kind.as_str())
             .collect()
     }
 
