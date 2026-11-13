@@ -53,6 +53,11 @@ pub struct DumpService {
     pub last_seen_age_secs: u64,
     pub answers: Vec<DumpAnswer>,
     pub questions: Vec<DumpQuestion>,
+    /// The questions list is capped; when rows were evicted, this marks
+    /// the list as incomplete and counts the dropped rows so consumers
+    /// do not mistake it for a complete packet log.
+    pub questions_truncated: bool,
+    pub questions_dropped: u64,
 }
 
 /// Unresolved group: enumeration row or pending instance.
@@ -61,6 +66,39 @@ pub struct RawGroup {
     pub name: String,
     pub answers: Vec<DumpAnswer>,
     pub questions: Vec<DumpQuestion>,
+    pub questions_truncated: bool,
+    pub questions_dropped: u64,
+}
+
+/// Authoritative per-interest query state: the latest query event,
+/// refresh attempt count, next deadline, owning timer, and lifecycle
+/// status. Rows here survive Questions-pane caps; the pane shows
+/// transient observations, this section shows the schedule truth.
+#[derive(serde::Serialize)]
+pub struct DumpInterest {
+    pub name: String,
+    pub rtype: u16,
+    pub rtype_str: String,
+    /// Owning schedule: `refresh`, `browse`, or `expired`.
+    pub timer: String,
+    /// Lifecycle: `transmitted`, `suppressed`, `answered`, or `abandoned`.
+    pub status: String,
+    /// Unanswered refresh count (0 when no refresh is pending).
+    pub attempt: u8,
+    pub next_due_in_secs: Option<u64>,
+    /// Kind of the latest query event, if any.
+    pub last_origin: Option<String>,
+    pub last_event_age_secs: Option<u64>,
+    /// Per-origin ages: the latest event alone cannot distinguish a
+    /// transmitted refresh later re-asked by a neighbor from the
+    /// reverse order once the schedule clears.
+    pub last_transmitted_age_secs: Option<u64>,
+    pub last_suppressed_age_secs: Option<u64>,
+    pub last_observed_age_secs: Option<u64>,
+    /// Querier and ingress link of the latest observed remote question,
+    /// if any — the only provenance event with a network source.
+    pub last_observed_from: Option<String>,
+    pub last_observed_iface: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -88,6 +126,8 @@ pub struct StateDump {
     pub metrics: BTreeMap<String, u64>,
     pub enum_groups: Vec<RawGroup>,
     pub pending: Vec<RawGroup>,
+    /// Authoritative per-interest query state (uncapped).
+    pub interests: Vec<DumpInterest>,
     pub anomalies: Vec<DumpAnomaly>,
 }
 

@@ -177,9 +177,14 @@ pub struct QueryTx {
 }
 
 impl QueryTx {
-    pub fn send(&self, req: QueryRequest) {
-        let _ = self.v4.send(req.clone());
-        let _ = self.v6.send(req);
+    /// Fan out to both transports. Returns `true` when at least one
+    /// listener channel accepted the request — the transport may still
+    /// fail to send (encode error, closed socket), which is logged in
+    /// `send_query` and cannot be reflected here.
+    pub fn send(&self, req: QueryRequest) -> bool {
+        let v4_ok = self.v4.send(req.clone()).is_ok();
+        let v6_ok = self.v6.send(req).is_ok();
+        v4_ok || v6_ok
     }
 }
 
@@ -937,8 +942,12 @@ fn parse_packet(
     }
 
     let mut questions = Vec::new();
-    for q in &pkt.questions {
-        questions.push(question_row(q, ing));
+    // RFC 6762 §6: responses MUST NOT carry questions, and received
+    // ones MUST be silently ignored — never filed as observed queries.
+    if !is_response {
+        for q in &pkt.questions {
+            questions.push(question_row(q, ing));
+        }
     }
 
     Some(Event {
@@ -1041,7 +1050,10 @@ pub fn record_type_from_u16(rtype: u16) -> Option<TYPE> {
     }
 }
 
-fn rtype_label(rtype: u16) -> String {
+/// Human label for a numeric record/question type, including QTYPE-only
+/// codes such as ANY (255) that have no `TYPE` counterpart — which is
+/// why this stays keyed by raw u16 instead of the query-type enum.
+pub(crate) fn rtype_label(rtype: u16) -> String {
     match rtype {
         1 => "A".into(),
         28 => "AAAA".into(),
@@ -1656,6 +1668,35 @@ mod tests {
         .unwrap();
         assert!(!ev.answers[0].invalid_utf8);
         assert_eq!(ev.answers[0].name, "Küche._http._tcp.local.");
+    }
+
+    #[test]
+    fn response_questions_are_ignored_per_rfc6762_s6() {
+        // RFC 6762 §6: responses MUST NOT contain questions; received
+        // ones are silently ignored, never filed as observed queries.
+        let mut msg = Packet::new_reply(0);
+        msg.questions.push(simple_dns::Question::new(
+            simple_dns::Name::new_unchecked("svc._http._tcp.local."),
+            QTYPE::TYPE(TYPE::PTR),
+            QCLASS::CLASS(CLASS::IN),
+            false,
+        ));
+        msg.answers.push(known_answer(
+            "svc._http._tcp.local.",
+            "Inst.svc._http._tcp.local.",
+            120,
+        ));
+        let ev = parse_packet(
+            &msg.build_bytes_vec().unwrap(),
+            test_source(),
+            std::net::IpAddr::V4(MDNS_V4),
+            "br0",
+            3,
+        )
+        .unwrap();
+        assert!(ev.questions.is_empty());
+        assert_eq!(ev.answers.len(), 1);
+        assert_eq!(ev.query_kas.len(), 0);
     }
 
     #[test]
