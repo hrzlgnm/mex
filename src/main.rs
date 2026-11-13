@@ -61,6 +61,15 @@ impl MexLogger {
     }
 }
 
+/// Last retained log write failure, if any. Global because the logger
+/// is a leaked static and cannot be downcast through `dyn log::Log`.
+static LAST_LOG_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Take the last retained write failure, if any.
+pub fn take_log_error() -> Option<String> {
+    LAST_LOG_ERROR.lock().ok().and_then(|mut e| e.take())
+}
+
 impl log::Log for MexLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
         if self.file.is_some() {
@@ -83,11 +92,8 @@ impl log::Log for MexLogger {
         if let Some(f) = &self.file {
             if let Ok(mut f) = f.lock() {
                 if let Err(e) = f.write_line(&line) {
-                    // TUI mode has no stderr to spend (terminal
-                    // corruption); headless mode must hear that logging
-                    // is broken, or failures stay silent.
-                    if self.stderr {
-                        eprintln!("mex: log write failed: {e}");
+                    if let Ok(mut le) = LAST_LOG_ERROR.lock() {
+                        *le = Some(format!("log write failed: {e}"));
                     }
                 }
             }
@@ -100,8 +106,6 @@ impl log::Log for MexLogger {
     fn flush(&self) {}
 }
 
-/// Per-file cap (5 MiB) and generations kept (3): at most ~20 MiB of
-/// logs, polite for a link-local debug tool that runs for days.
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 const KEEP_LOG_GENERATIONS: u32 = 3;
 
@@ -164,11 +168,11 @@ impl RotatingLog {
         Ok(())
     }
 
-    /// Shift generations down (`mex.log` → `.1` → `.2` …) and reopen a
+    /// Shift generations down (`mex.log` -> `.1` -> `.2` ...) and reopen a
     /// fresh live file. Missing generations are skipped; rename targets
     /// are removed first for Windows, where rename will not replace.
     fn rotate(&mut self) -> std::io::Result<()> {
-        // Close before renaming: Windows refuses to rename an open file.
+        // Close before renaming: Windows cannot rename an open file.
         self.file.take();
         for i in (1..=self.keep).rev() {
             let from = if i == 1 {
@@ -262,7 +266,10 @@ fn main() -> Result<()> {
     };
     let mut terminal = ui::try_init()?;
     let has_tui = terminal.is_some();
-    init_logging(args.log_file.as_deref(), has_tui)?;
+    if let Err(e) = init_logging(args.log_file.as_deref(), has_tui) {
+        ui::try_restore(has_tui)?;
+        return Err(e);
+    }
     let mut app = if args.passive {
         app::App::new_with(true, interfaces)?
     } else if let Some(sel) = interfaces {
