@@ -49,6 +49,8 @@ Headless run (no TTY) logs to stderr.
 
 * Changes land via pull requests against `main`; never push to `main` directly.
 * Create branches from `origin/main` (`git fetch origin` first).
+* Each branch/PR carries one logical change. Never mix unrelated edits
+  (code, CI, docs, deps) in one branch — split them into separate PRs.
 * Commit messages must follow Conventional Commits (`feat:`, `fix:`, `docs:`,
   …): release-please owns the changelog and derives releases from them.
 * Before opening a PR, proofread the title/body plus any new user-facing
