@@ -1312,6 +1312,46 @@ impl App {
             || self.pending_addrs.iter().any(|(_, r)| live_row(r))
     }
 
+    /// Earliest point at which the refresh scan will trigger for an
+    /// interest: 80% of TTL past each live row's receipt, minimum
+    /// across rows. Matches the scan's coverage exactly (services +
+    /// enumeration answers, browsable types only) so the projection
+    /// never predicts a refresh the scheduler would not send. `None`
+    /// in passive mode: a passive browser transmits nothing, so no
+    /// refresh is ever due.
+    fn next_refresh_due(&self, key: &(String, u16)) -> Option<Instant> {
+        if self.passive {
+            return None;
+        }
+        let deadline = |rec: &browse::RawRecord| {
+            if rec.ttl == 0 {
+                return None;
+            }
+            match rec.rtype {
+                12 | 33 | 16 | 1 | 28 => {}
+                _ => return None,
+            }
+            if rec.rtype != key.1
+                || !rec.name.trim_end_matches('.').eq_ignore_ascii_case(&key.0)
+                || rec.received_at.elapsed().as_secs() as u32 > rec.ttl
+            {
+                return None;
+            }
+            // Earliest whole second satisfying the scan's trigger.
+            Some(rec.received_at + Duration::from_secs((rec.ttl as u64 * 4).div_ceil(5)))
+        };
+        let earliest = self
+            .services
+            .iter()
+            .flat_map(|s| s.answers.iter())
+            .chain(self.enum_entries.iter().flat_map(|e| e.answers.iter()))
+            .filter_map(deadline)
+            .min()?;
+        // A row already past 80% with no entry yet fires on the next
+        // tick: clamp to now instead of showing a stale past deadline.
+        Some(earliest.max(Instant::now()))
+    }
+
     /// Authoritative per-interest snapshot for dumps and the TUI.
     /// Refresh state wins over the continuous stream (urgent TTL
     /// maintenance outranks hourly rediscovery); with no schedule the
@@ -1338,8 +1378,19 @@ impl App {
             .map(|(_, e)| e.next_due);
         let (timer, next_due) = match (refresh_due, browse_due) {
             (Some(due), _) => (TimerKind::Refresh, Some(due)),
-            (None, Some(due)) => (TimerKind::Browse, Some(due)),
-            (None, None) => (TimerKind::Expired, None),
+            (None, Some(due)) => match self.next_refresh_due(&key) {
+                // Projected refresh beats the browse stream: the
+                // earlier maintenance owns DUE.
+                Some(proj) if proj < due => (TimerKind::Refresh, Some(proj)),
+                _ => (TimerKind::Browse, Some(due)),
+            },
+            // No schedule at all, but live rows would still trigger one:
+            // the scheduler fires regardless of continuous membership
+            // (except passive mode, which never transmits).
+            (None, None) => match self.next_refresh_due(&key) {
+                Some(proj) => (TimerKind::Refresh, Some(proj)),
+                None => (TimerKind::Expired, None),
+            },
         };
         let last_own = state.as_ref().and_then(|s| {
             [
@@ -7849,6 +7900,39 @@ mod tests {
             !text.contains("expired"),
             "foreign-only interest has no due:\n{text}"
         );
+    }
+
+    #[test]
+    fn projected_refresh_beats_backed_off_browse() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        app.poll_continuous();
+        // Back the continuous stream off to hourly: the projected
+        // refresh at receipt + 80% TTL must own DUE instead.
+        let key = ("test._http._tcp.local".to_string(), 33);
+        app.continuous.get_mut(&key).unwrap().next_due = Instant::now() + Duration::from_secs(3600);
+        let view = app.interest_view(&key);
+        assert_eq!(view.timer, TimerKind::Refresh);
+        let secs = view
+            .next_due
+            .unwrap()
+            .saturating_duration_since(Instant::now())
+            .as_secs();
+        assert!((90..=96).contains(&secs), "due {secs}s out of window");
+    }
+
+    #[test]
+    fn passive_browser_projects_no_refresh() {
+        let mut app = App::new_with(true, None).unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        // Live answers, but a passive browser transmits nothing: no
+        // schedule, no projection, no false refresh countdown.
+        let view = app.interest_view(&("test._http._tcp.local".to_string(), 33));
+        assert_eq!(view.timer, TimerKind::Expired);
+        assert_eq!(view.status, InterestStatus::Answered);
+        assert!(view.next_due.is_none());
     }
 
     #[test]
