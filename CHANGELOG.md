@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.15.1](https://github.com/hrzlgnm/mex/compare/v0.15.0...v0.15.1) (2026-11-13)
+
+
+### Bug Fixes
+
+* keep DUE blank on foreign question rows ([#170](https://github.com/hrzlgnm/mex/issues/170)) ([ba6a107](https://github.com/hrzlgnm/mex/commit/ba6a10710fed780f5e399b7fa3bf6aa0ac933501))
+* make Questions pane LAST reflect the row's own query activity ([#163](https://github.com/hrzlgnm/mex/issues/163)) ([20e7d08](https://github.com/hrzlgnm/mex/commit/20e7d086715b3999168fd33cdaa311e731e0ed3b))
+
+
+### Dependencies
+
+* lock file maintenance ([#171](https://github.com/hrzlgnm/mex/issues/171)) ([9c04d2e](https://github.com/hrzlgnm/mex/commit/9c04d2e7e15251fe6c9cbe82caee0cd798c81f0c))
+
+
+### Documentation
+
+* require agents to work in a fresh worktree from main ([#164](https://github.com/hrzlgnm/mex/issues/164)) ([e6c0a72](https://github.com/hrzlgnm/mex/commit/e6c0a72c23714a96befbc49f18b48c703ded0833))
+* require Closes #&lt;issue&gt; ref on PRs implementing an issue ([#169](https://github.com/hrzlgnm/mex/issues/169)) ([9affc81](https://github.com/hrzlgnm/mex/commit/9affc8136891ab1e53ede8542fbe7e4a88be3181))
+
+
+### Code Refactoring
+
+* use AnomalyKind enum instead of string kinds ([#167](https://github.com/hrzlgnm/mex/issues/167)) ([05eb609](https://github.com/hrzlgnm/mex/commit/05eb609ea437bb586b934c53c2159d6f4b5fe896))
+
 ## [0.15.0](https://github.com/hrzlgnm/mex/compare/v0.14.0...v0.15.0) (2026-11-13)
 
 
