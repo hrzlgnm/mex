@@ -937,8 +937,12 @@ fn parse_packet(
     }
 
     let mut questions = Vec::new();
-    for q in &pkt.questions {
-        questions.push(question_row(q, ing));
+    // RFC 6762 §6: responses MUST NOT carry questions, and received
+    // ones MUST be silently ignored — never filed as observed queries.
+    if !is_response {
+        for q in &pkt.questions {
+            questions.push(question_row(q, ing));
+        }
     }
 
     Some(Event {
@@ -1659,6 +1663,35 @@ mod tests {
         .unwrap();
         assert!(!ev.answers[0].invalid_utf8);
         assert_eq!(ev.answers[0].name, "Küche._http._tcp.local.");
+    }
+
+    #[test]
+    fn response_questions_are_ignored_per_rfc6762_s6() {
+        // RFC 6762 §6: responses MUST NOT contain questions; received
+        // ones are silently ignored, never filed as observed queries.
+        let mut msg = Packet::new_reply(0);
+        msg.questions.push(simple_dns::Question::new(
+            simple_dns::Name::new_unchecked("svc._http._tcp.local."),
+            QTYPE::TYPE(TYPE::PTR),
+            QCLASS::CLASS(CLASS::IN),
+            false,
+        ));
+        msg.answers.push(known_answer(
+            "svc._http._tcp.local.",
+            "Inst.svc._http._tcp.local.",
+            120,
+        ));
+        let ev = parse_packet(
+            &msg.build_bytes_vec().unwrap(),
+            test_source(),
+            std::net::IpAddr::V4(MDNS_V4),
+            "br0",
+            3,
+        )
+        .unwrap();
+        assert!(ev.questions.is_empty());
+        assert_eq!(ev.answers.len(), 1);
+        assert_eq!(ev.query_kas.len(), 0);
     }
 
     #[test]

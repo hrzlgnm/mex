@@ -231,6 +231,16 @@ impl InterestView {
     fn observed(&self) -> Option<&ObservedQuery> {
         self.state.as_ref().and_then(|s| s.observed.as_ref())
     }
+
+    /// Timestamp of the latest event of one origin, if any.
+    fn at(&self, origin: QueryOrigin) -> Option<Instant> {
+        let s = self.state.as_ref()?;
+        match origin {
+            QueryOrigin::Transmitted => s.transmitted,
+            QueryOrigin::Suppressed => s.suppressed,
+            QueryOrigin::Observed => s.observed.as_ref().map(|o| o.at),
+        }
+    }
 }
 
 /// One observed remote question: when, from whom, on which link.
@@ -1239,8 +1249,9 @@ impl App {
     /// pending instances.
     fn has_live_answer(&self, key: &(String, u16)) -> bool {
         let live_row = |rec: &browse::RawRecord| {
-            rec.rtype == key.1
-                && rec.name.trim_end_matches('.').eq_ignore_ascii_case(&key.0)
+            // Canonical key comparison (not ASCII-only): `É` and `é`
+            // must hit the same interest.
+            Self::provenance_key(&rec.name, rec.rtype).0 == key.0
                 && rec.ttl > 0
                 && Self::remaining_ttl(rec) > 0
         };
@@ -1255,6 +1266,7 @@ impl App {
                 .pending_instances
                 .iter()
                 .any(|p| p.answers.iter().any(&live_row))
+            || self.pending_addrs.iter().any(|(_, r)| live_row(r))
     }
 
     /// Authoritative per-interest snapshot for dumps and the TUI.
@@ -1264,21 +1276,22 @@ impl App {
     /// suppression, and a quiet interest with live answers (answered)
     /// from one with nothing left (abandoned).
     fn interest_view(&self, key: &(String, u16)) -> InterestView {
-        let state = self.query_history.get(key).cloned();
+        // Canonicalize once: map keys keep wire case or are lowercased
+        // depending on the map, and eq_ignore_ascii_case only folds
+        // a-z, so compare through `provenance_key` everywhere (`É`
+        // and `é` must hit the same interest).
+        let key = Self::provenance_key(&key.0, key.1);
+        let state = self.query_history.get(&key).cloned();
         let (attempt, refresh_due) = self
             .requeries
             .iter()
-            // Refresh keys keep wire case and continuous keys are
-            // lowercased; the provenance key is normalized, so compare
-            // case-insensitively (and dot-trimmed, defensively) like the
-            // postpone path does.
-            .find(|(k, _)| k.0.trim_end_matches('.').eq_ignore_ascii_case(&key.0) && k.1 == key.1)
+            .find(|(k, _)| Self::provenance_key(&k.0, k.1) == key)
             .map(|(_, (due, count))| (*count, Some(*due)))
             .unwrap_or((0, None));
         let browse_due = self
             .continuous
             .iter()
-            .find(|(k, _)| k.0.trim_end_matches('.').eq_ignore_ascii_case(&key.0) && k.1 == key.1)
+            .find(|(k, _)| Self::provenance_key(&k.0, k.1) == key)
             .map(|(_, e)| e.next_due);
         let (timer, next_due) = match (refresh_due, browse_due) {
             (Some(due), _) => (TimerKind::Refresh, Some(due)),
@@ -1302,7 +1315,7 @@ impl App {
         let status = match (refresh_due.is_some(), last_own) {
             (true, Some(QueryOrigin::Suppressed)) => InterestStatus::Suppressed,
             (true, _) => InterestStatus::Transmitted,
-            (false, _) if self.has_live_answer(key) => InterestStatus::Answered,
+            (false, _) if self.has_live_answer(&key) => InterestStatus::Answered,
             (false, _) => InterestStatus::Abandoned,
         };
         InterestView {
@@ -2437,6 +2450,31 @@ impl App {
         for key in self.continuous.keys() {
             interest_keys.insert(Self::provenance_key(&key.0, key.1));
         }
+        // Answer-only interests (e.g. passive captures, answers without
+        // any observed query): provenance and schedules know nothing
+        // about them, but the dump must still list what was retained.
+        // Origin stays absent rather than invented.
+        let mut answer_key = |name: &str, rtype: u16| {
+            interest_keys.insert(Self::provenance_key(name, rtype));
+        };
+        for svc in &self.services {
+            for rec in &svc.answers {
+                answer_key(&rec.name, rec.rtype);
+            }
+        }
+        for entry in &self.enum_entries {
+            for rec in &entry.answers {
+                answer_key(&rec.name, rec.rtype);
+            }
+        }
+        for p in &self.pending_instances {
+            for rec in &p.answers {
+                answer_key(&rec.name, rec.rtype);
+            }
+        }
+        for (_, rec) in &self.pending_addrs {
+            answer_key(&rec.name, rec.rtype);
+        }
         let mut interest_keys: Vec<(String, u16)> = interest_keys.into_iter().collect();
         interest_keys.sort();
         let interests = interest_keys
@@ -2456,6 +2494,15 @@ impl App {
                     last_origin: view.origin().map(|o| o.as_str().to_string()),
                     last_event_age_secs: view
                         .last_at()
+                        .map(|t| now.saturating_duration_since(t).as_secs()),
+                    last_transmitted_age_secs: view
+                        .at(QueryOrigin::Transmitted)
+                        .map(|t| now.saturating_duration_since(t).as_secs()),
+                    last_suppressed_age_secs: view
+                        .at(QueryOrigin::Suppressed)
+                        .map(|t| now.saturating_duration_since(t).as_secs()),
+                    last_observed_age_secs: view
+                        .at(QueryOrigin::Observed)
                         .map(|t| now.saturating_duration_since(t).as_secs()),
                     last_observed_from: view.observed().map(|o| o.from.to_string()),
                     last_observed_iface: view.observed().map(|o| o.iface.clone()),
@@ -7526,6 +7573,9 @@ mod tests {
         assert!(srv.attempt >= 1);
         assert!(srv.next_due_in_secs.is_some());
         assert_eq!(srv.last_origin.as_deref(), Some("transmitted"));
+        assert!(srv.last_transmitted_age_secs.is_some());
+        assert!(srv.last_suppressed_age_secs.is_none());
+        assert!(srv.last_observed_age_secs.is_none());
 
         // Flood one service question from distinct sources past the cap
         // (the earlier self SRV refresh already holds one row, so 10 more
@@ -7548,6 +7598,8 @@ mod tests {
             .find(|i| i.name == "_http._tcp.local" && i.rtype == 12)
             .expect("ptr interest");
         assert_eq!(ptr.last_origin.as_deref(), Some("observed"));
+        assert!(ptr.last_observed_age_secs.is_some());
+        assert!(ptr.last_transmitted_age_secs.is_none());
         assert_eq!(ptr.last_observed_from.as_deref(), Some("192.168.1.19:5353"));
         assert_eq!(ptr.last_observed_iface.as_deref(), Some("br0"));
     }
@@ -7612,6 +7664,62 @@ mod tests {
         assert_eq!(view.origin(), Some(QueryOrigin::Transmitted));
         let questions_after: usize = app.services.iter().map(|s| s.questions.len()).sum();
         assert_eq!(questions_before, questions_after);
+    }
+
+    #[test]
+    fn dump_lists_answer_only_interests() {
+        // Passive mode files answers without any query activity: the
+        // authoritative interests section must still list them, with
+        // origin absent rather than invented.
+        let mut app = App::new_with(true, None).unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        let dump = app.state_dump();
+        let ptr = dump
+            .interests
+            .iter()
+            .find(|i| i.name == "_http._tcp.local" && i.rtype == 12)
+            .expect("ptr interest listed");
+        assert_eq!(ptr.status, "answered");
+        assert!(ptr.last_origin.is_none());
+        let srv = dump
+            .interests
+            .iter()
+            .find(|i| i.name == "test._http._tcp.local" && i.rtype == 33)
+            .expect("srv interest listed");
+        assert_eq!(srv.status, "answered");
+    }
+
+    #[test]
+    fn pending_addrs_count_as_live_answers() {
+        let mut app = App::new().unwrap();
+        // An A record arrives before any SRV names the host: parked in
+        // pending_addrs, still a live answer for the interest.
+        let mut rec = raw_record("lonely.local.", 1, "A", "192.168.1.9", 120);
+        rec.source = remote_source();
+        ingest(&mut app, &rec);
+        assert_eq!(app.pending_addrs.len(), 1);
+        let view = app.interest_view(&("lonely.local".to_string(), 1));
+        assert_eq!(view.status, InterestStatus::Answered);
+    }
+
+    #[test]
+    fn provenance_lookup_folds_non_ascii_case() {
+        let mut app = App::new().unwrap();
+        // A requery entry keyed in wire case (U+00C9 É, U+00E9 é) must
+        // be found through its lowercase form (U+00E9 é): explicit
+        // code points keep the test independent of the editor's
+        // composed/decomposed accent handling, which to_lowercase does
+        // not normalize away.
+        let wire_case = "\u{00C9}tag\u{00E9}._http._tcp.local";
+        let lower_case = "\u{00E9}tag\u{00E9}._http._tcp.local";
+        app.requeries.insert(
+            (wire_case.to_string(), 12),
+            (Instant::now() + Duration::from_secs(60), 2),
+        );
+        let view = app.interest_view(&(lower_case.to_string(), 12));
+        assert_eq!(view.timer, TimerKind::Refresh);
+        assert_eq!(view.attempt, 2);
     }
 
     #[test]

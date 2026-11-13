@@ -89,6 +89,12 @@ pub struct DumpInterest {
     /// Kind of the latest query event, if any.
     pub last_origin: Option<String>,
     pub last_event_age_secs: Option<u64>,
+    /// Per-origin ages: the latest event alone cannot distinguish a
+    /// transmitted refresh later re-asked by a neighbor from the
+    /// reverse order once the schedule clears.
+    pub last_transmitted_age_secs: Option<u64>,
+    pub last_suppressed_age_secs: Option<u64>,
+    pub last_observed_age_secs: Option<u64>,
     /// Querier and ingress link of the latest observed remote question,
     /// if any — the only provenance event with a network source.
     pub last_observed_from: Option<String>,
