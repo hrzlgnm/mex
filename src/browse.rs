@@ -134,6 +134,13 @@ pub struct RawRecord {
     pub received_at: Instant,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordField {
+    pub label: String,
+    pub start: usize,
+    pub end: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct Event {
     pub answers: Vec<RawRecord>,
@@ -1032,6 +1039,133 @@ fn record_wire(rec: &ResourceRecord<'_>) -> Vec<u8> {
         Ok(bytes) => bytes.get(12..).unwrap_or_default().to_vec(),
         Err(_) => Vec::new(),
     }
+}
+
+pub fn record_fields(wire: &[u8], rtype: u16) -> Vec<RecordField> {
+    let Some(owner_end) = wire_name_end(wire, 0) else {
+        return whole_record_field(wire);
+    };
+    let Some(type_end) = owner_end.checked_add(2) else {
+        return whole_record_field(wire);
+    };
+    let Some(class_end) = type_end.checked_add(2) else {
+        return whole_record_field(wire);
+    };
+    let Some(ttl_end) = class_end.checked_add(4) else {
+        return whole_record_field(wire);
+    };
+    let Some(length_end) = ttl_end.checked_add(2) else {
+        return whole_record_field(wire);
+    };
+    let Some(header) = wire.get(owner_end..length_end) else {
+        return whole_record_field(wire);
+    };
+    let rdata_len = u16::from_be_bytes([header[8], header[9]]) as usize;
+    let rdata_end = length_end.saturating_add(rdata_len);
+    if rdata_end != wire.len() {
+        return whole_record_field(wire);
+    }
+
+    let mut fields = vec![
+        record_field("Owner name", 0, owner_end),
+        record_field("Record type", owner_end, type_end),
+        record_field("Class / cache-flush", type_end, class_end),
+        record_field("TTL", class_end, ttl_end),
+        record_field("RDATA length", ttl_end, length_end),
+        record_field("RDATA", length_end, rdata_end),
+    ];
+
+    let data_fields = match rtype {
+        1 if rdata_len == 4 => vec![record_field("IPv4 address", length_end, rdata_end)],
+        28 if rdata_len == 16 => vec![record_field("IPv6 address", length_end, rdata_end)],
+        2 | 5 | 12 => wire_name_end(wire, length_end)
+            .filter(|end| *end == rdata_end)
+            .map(|end| {
+                let label = match rtype {
+                    2 => "Name server",
+                    5 => "Canonical name",
+                    _ => "PTR target",
+                };
+                vec![record_field(label, length_end, end)]
+            })
+            .unwrap_or_default(),
+        33 if rdata_len >= 7 => {
+            let target_start = length_end + 6;
+            wire_name_end(wire, target_start)
+                .filter(|end| *end == rdata_end)
+                .map(|end| {
+                    vec![
+                        record_field("Priority", length_end, length_end + 2),
+                        record_field("Weight", length_end + 2, length_end + 4),
+                        record_field("Port", length_end + 4, target_start),
+                        record_field("Target", target_start, end),
+                    ]
+                })
+                .unwrap_or_default()
+        }
+        16 => txt_string_fields(wire, length_end, rdata_end),
+        _ => Vec::new(),
+    };
+    fields.extend(data_fields);
+    fields
+}
+
+fn record_field(label: &str, start: usize, end: usize) -> RecordField {
+    RecordField {
+        label: label.to_string(),
+        start,
+        end,
+    }
+}
+
+fn whole_record_field(wire: &[u8]) -> Vec<RecordField> {
+    if wire.is_empty() {
+        Vec::new()
+    } else {
+        vec![record_field("Record", 0, wire.len())]
+    }
+}
+
+fn wire_name_end(wire: &[u8], start: usize) -> Option<usize> {
+    let mut offset = start;
+    loop {
+        let length = *wire.get(offset)?;
+        if length & 0xc0 != 0 {
+            return None;
+        }
+        offset += 1;
+        if length == 0 {
+            return Some(offset);
+        }
+        if length > 63 {
+            return None;
+        }
+        offset = offset.checked_add(length as usize)?;
+        if offset > wire.len() {
+            return None;
+        }
+    }
+}
+
+fn txt_string_fields(wire: &[u8], start: usize, end: usize) -> Vec<RecordField> {
+    let mut fields = Vec::new();
+    let mut offset = start;
+    while offset < end {
+        let Some(length) = wire.get(offset).copied().map(usize::from) else {
+            return Vec::new();
+        };
+        let string_end = offset.saturating_add(1).saturating_add(length);
+        if string_end > end {
+            return Vec::new();
+        }
+        fields.push(record_field(
+            &format!("TXT string {}", fields.len() + 1),
+            offset,
+            string_end,
+        ));
+        offset = string_end;
+    }
+    fields
 }
 
 /// The record types this browser maintains interest in (RFC 6762 §5.2:
