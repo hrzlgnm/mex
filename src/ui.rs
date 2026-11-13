@@ -966,15 +966,35 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
     // Cells plus row style first: LAST/DUE widths size to content
     // (like SOURCE below) instead of clipping long states.
     let mut body: Vec<(Vec<String>, Style)> = Vec::new();
-    for (name, rtype, source, _, _) in target.ordered_questions() {
+    for (name, rtype, source, seen_at, _) in target.ordered_questions() {
         // Latest event and owning timer for this interest, from the
         // authoritative per-interest state (app.rs): rows stay dumb.
+        let self_row = *source == crate::app::SELF_SOURCE;
         let (last_txt, due_txt) = match crate::anomalies::rtype_from_str(rtype) {
             Some(t) => {
                 let s = app.interest_summary(name, t);
-                let last = match (s.last_age_secs, s.last_origin) {
-                    (Some(a), Some(o)) => format!("{} {}", fmt_qage(a), o.as_str()),
-                    _ => "—".to_string(),
+                let now = std::time::Instant::now();
+                let last = if self_row {
+                    // Our own send or §7.3 suppression: never "observed".
+                    if let (Some(a), Some(b)) =
+                        (s.last_transmitted_age_secs, s.last_suppressed_age_secs)
+                    {
+                        if b < a {
+                            format!("{} suppressed", fmt_qage(b))
+                        } else {
+                            format!("{} transmitted", fmt_qage(a))
+                        }
+                    } else if let Some(a) = s.last_transmitted_age_secs {
+                        format!("{} transmitted", fmt_qage(a))
+                    } else if let Some(b) = s.last_suppressed_age_secs {
+                        format!("{} suppressed", fmt_qage(b))
+                    } else {
+                        "—".to_string()
+                    }
+                } else {
+                    // Foreign querier: this row is an observation.
+                    let age = now.saturating_duration_since(*seen_at).as_secs();
+                    format!("{} observed", fmt_qage(age))
                 };
                 let due = match (s.timer, s.next_due_in_secs) {
                     (crate::app::TimerKind::Refresh, Some(d)) => {
@@ -996,7 +1016,6 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
         // Questions asked from this host's own addresses (including our
         // own looped-back queries) get the same highlight as local answers.
         // Our own inferred sends render as `self`.
-        let self_row = *source == crate::app::SELF_SOURCE;
         let style = if self_row || app.is_local_source(source) {
             local_style
         } else {

@@ -256,13 +256,15 @@ struct ObservedQuery {
 #[derive(Clone, Copy, Debug)]
 pub struct InterestSummary {
     pub timer: TimerKind,
-    pub last_age_secs: Option<u64>,
-    pub last_origin: Option<QueryOrigin>,
     pub next_due_in_secs: Option<u64>,
     /// Whether we ever transmitted or stood down for this interest.
     /// Distinguishes a lapsed local demand ("expired") from a
     /// foreign-only interest we never scheduled (blank DUE).
     pub had_local_demand: bool,
+    /// Age of our last transmitted query for this interest, if any.
+    pub last_transmitted_age_secs: Option<u64>,
+    /// Age of our last §7.3-suppressed query for this interest, if any.
+    pub last_suppressed_age_secs: Option<u64>,
 }
 
 impl App {
@@ -274,10 +276,6 @@ impl App {
         let view = self.interest_view(&Self::provenance_key(name, rtype));
         InterestSummary {
             timer: view.timer,
-            last_age_secs: view
-                .last_at()
-                .map(|t| now.saturating_duration_since(t).as_secs()),
-            last_origin: view.origin(),
             next_due_in_secs: view
                 .next_due
                 .map(|d| d.saturating_duration_since(now).as_secs()),
@@ -285,6 +283,12 @@ impl App {
                 .state
                 .as_ref()
                 .is_some_and(|s| s.transmitted.is_some() || s.suppressed.is_some()),
+            last_transmitted_age_secs: view
+                .at(QueryOrigin::Transmitted)
+                .map(|t| now.saturating_duration_since(t).as_secs()),
+            last_suppressed_age_secs: view
+                .at(QueryOrigin::Suppressed)
+                .map(|t| now.saturating_duration_since(t).as_secs()),
         }
     }
 }
