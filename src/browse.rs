@@ -12,8 +12,12 @@ use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
 use hickory_proto::serialize::binary::BinEncodable;
 
+/// Undo hickory's presentation escaping. Octal escapes are raw label
+/// bytes, so they are collected and decoded together as UTF-8 (RFC 6762
+/// §16) rather than one character per byte.
 fn unescape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
+    let mut utf8 = [0u8; 4];
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
         if c == '\\' {
@@ -29,16 +33,16 @@ fn unescape(s: &str) -> String {
             }
             if !octal.is_empty() {
                 if let Ok(byte) = u8::from_str_radix(&octal, 8) {
-                    out.push(byte as char);
+                    out.push(byte);
                 }
             } else if let Some(next) = chars.next() {
-                out.push(next);
+                out.extend_from_slice(next.encode_utf8(&mut utf8).as_bytes());
             }
         } else {
-            out.push(c);
+            out.extend_from_slice(c.encode_utf8(&mut utf8).as_bytes());
         }
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 use socket2::{Domain, SockAddr};
 use socket_pktinfo::PktInfoUdpSocket;
@@ -1143,6 +1147,20 @@ mod tests {
         assert_eq!(ev.questions.len(), 1);
         assert_eq!(ev.questions[0].name, format!("{name}."));
         assert_eq!(ev.questions[0].rtype, 33);
+    }
+
+    #[test]
+    fn utf8_instance_names_survive_the_wire_round_trip() {
+        // A name read off the wire must re-encode to the same bytes, or
+        // the refresh query asks for a name the responder does not own.
+        let name = "Küche._http._tcp.local";
+        let ev = parse_encoded(&QueryRequest {
+            name: name.to_string(),
+            record_type: RecordType::SRV,
+            known_answers: Vec::new(),
+            qu: false,
+        });
+        assert_eq!(ev.questions[0].name, format!("{name}."));
     }
 
     #[test]
