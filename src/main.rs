@@ -27,9 +27,14 @@ struct Args {
     )]
     interfaces: Option<Vec<String>>,
 
-    /// Write log output to this file (appended). Without it, headless
-    /// mode logs warnings to stderr and TUI mode discards logs.
-    #[arg(long, value_name = "PATH")]
+    /// Override the default log file. Appended; rotated past 5 MiB
+    /// with 3 backups kept.
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Override the default log file",
+        long_help = "Override the default log file (state-dir mex.log on Linux, ~/Library/Logs/mex on macOS, %LOCALAPPDATA%\\mex\\logs on Windows). Appended; rotated past 5 MiB with 3 backups kept. Without it, both modes log to the default file; headless mode additionally logs warnings to stderr, TUI mode without a usable log directory discards logs."
+    )]
     log_file: Option<String>,
 }
 
@@ -39,12 +44,12 @@ struct Args {
 /// file installs no logger at all — writing to the terminal would
 /// corrupt the interface.
 struct MexLogger {
-    file: Option<std::sync::Mutex<std::fs::File>>,
+    file: Option<std::sync::Mutex<RotatingLog>>,
     stderr: bool,
 }
 
 impl MexLogger {
-    fn install(file: Option<std::fs::File>, stderr: bool) {
+    fn install(file: Option<RotatingLog>, stderr: bool) {
         let logger = Box::leak(Box::new(MexLogger {
             file: file.map(std::sync::Mutex::new),
             stderr,
@@ -77,7 +82,14 @@ impl log::Log for MexLogger {
         );
         if let Some(f) = &self.file {
             if let Ok(mut f) = f.lock() {
-                let _ = std::io::Write::write_all(&mut *f, line.as_bytes());
+                if let Err(e) = f.write_line(&line) {
+                    // TUI mode has no stderr to spend (terminal
+                    // corruption); headless mode must hear that logging
+                    // is broken, or failures stay silent.
+                    if self.stderr {
+                        eprintln!("mex: log write failed: {e}");
+                    }
+                }
             }
         }
         if self.stderr {
@@ -88,23 +100,155 @@ impl log::Log for MexLogger {
     fn flush(&self) {}
 }
 
-/// Install logging before the app runs: `--log-file` wins in both
-/// modes (single sink, appended); otherwise headless mode logs
-/// warnings to stderr (AGENTS.md) and TUI mode discards logs.
-fn init_logging(log_file: Option<&str>, has_tui: bool) -> Result<()> {
-    match (log_file, has_tui) {
-        (Some(path), _) => {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .map_err(|e| anyhow::anyhow!("cannot open log file {path}: {e}"))?;
-            MexLogger::install(Some(file), false);
+/// Per-file cap (5 MiB) and generations kept (3): at most ~20 MiB of
+/// logs, polite for a link-local debug tool that runs for days.
+const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+const KEEP_LOG_GENERATIONS: u32 = 3;
+
+/// Size-based log rotation: `mex.log` plus `mex.log.1..N` backups.
+struct RotatingLog {
+    /// `None` only while closed for renaming: Windows cannot rename an
+    /// open file, so `rotate` drops the handle first.
+    file: Option<std::fs::File>,
+    path: std::path::PathBuf,
+    written: u64,
+    max_bytes: u64,
+    keep: u32,
+}
+
+impl RotatingLog {
+    fn open(path: &std::path::Path, max_bytes: u64, keep: u32) -> std::io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
         }
-        (None, false) => MexLogger::install(None, true),
-        (None, true) => {}
+        let mut log = Self {
+            file: Some(Self::append(path)?),
+            path: path.to_path_buf(),
+            written: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+            max_bytes,
+            keep,
+        };
+        if log.written >= max_bytes {
+            log.rotate()?;
+        }
+        Ok(log)
     }
-    Ok(())
+
+    fn append(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    }
+
+    /// Backup path `mex.log.N` for generation `n`.
+    fn backup_path(&self, n: u32) -> std::path::PathBuf {
+        let mut name = self.path.file_name().unwrap_or_default().to_os_string();
+        name.push(format!(".{n}"));
+        self.path.with_file_name(name)
+    }
+
+    /// Append one line, rotating first when it would exceed the cap, so
+    /// the live file stays bounded.
+    fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+        if self.written + line.len() as u64 > self.max_bytes {
+            self.rotate()?;
+        }
+        if let Some(f) = self.file.as_mut() {
+            use std::io::Write;
+            f.write_all(line.as_bytes())?;
+            self.written += line.len() as u64;
+        }
+        Ok(())
+    }
+
+    /// Shift generations down (`mex.log` → `.1` → `.2` …) and reopen a
+    /// fresh live file. Missing generations are skipped; rename targets
+    /// are removed first for Windows, where rename will not replace.
+    fn rotate(&mut self) -> std::io::Result<()> {
+        // Close before renaming: Windows refuses to rename an open file.
+        self.file.take();
+        for i in (1..=self.keep).rev() {
+            let from = if i == 1 {
+                self.path.clone()
+            } else {
+                self.backup_path(i - 1)
+            };
+            if from.exists() {
+                let to = self.backup_path(i);
+                let _ = std::fs::remove_file(&to);
+                std::fs::rename(&from, &to)?;
+            }
+        }
+        self.file = Some(Self::append(&self.path)?);
+        self.written = 0;
+        Ok(())
+    }
+}
+
+/// Default log directory: XDG state dir on Linux
+/// (`$XDG_STATE_HOME/mex`, else `~/.local/state/mex`), `~/Library/Logs`
+/// on macOS, `%LOCALAPPDATA%` on Windows, temp dir as a last resort.
+fn default_log_dir() -> std::path::PathBuf {
+    #[cfg(target_os = "windows")]
+    if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
+        return std::path::PathBuf::from(dir).join("mex").join("logs");
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(home) = std::env::var_os("HOME") {
+        return std::path::PathBuf::from(home)
+            .join("Library")
+            .join("Logs")
+            .join("mex");
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    if let Some(state) = std::env::var_os("XDG_STATE_HOME") {
+        if !state.is_empty() {
+            return std::path::PathBuf::from(state).join("mex");
+        }
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    if let Some(home) = std::env::var_os("HOME") {
+        return std::path::PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("mex");
+    }
+    std::env::temp_dir().join("mex")
+}
+
+/// Install logging before the app runs: an explicit `--log-file`
+/// overrides the default `mex.log` in the platform log directory;
+/// headless mode also keeps stderr warnings. A bad explicit path fails
+/// fast; an unusable default directory degrades to stderr-only
+/// (headless) or silent (TUI, where printing would corrupt the UI).
+fn init_logging(log_file: Option<&str>, has_tui: bool) -> Result<()> {
+    let (path, stderr) = match log_file {
+        Some(p) => (std::path::PathBuf::from(p), false),
+        None => (default_log_dir().join("mex.log"), !has_tui),
+    };
+    match RotatingLog::open(&path, MAX_LOG_BYTES, KEEP_LOG_GENERATIONS) {
+        Ok(log) => {
+            MexLogger::install(Some(log), stderr);
+            Ok(())
+        }
+        Err(e) if log_file.is_some() => Err(anyhow::anyhow!(
+            "cannot open log file {}: {e}",
+            path.display()
+        )),
+        Err(e) => {
+            if stderr {
+                eprintln!(
+                    "mex: cannot open log file {}: {e}; continuing with stderr only",
+                    path.display()
+                );
+                MexLogger::install(None, true);
+            }
+            Ok(())
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -166,6 +310,60 @@ mod tests {
         assert!(args.log_file.is_none());
         let args = Args::try_parse_from(["mex", "--log-file", "/tmp/mex.log"]).unwrap();
         assert_eq!(args.log_file.as_deref(), Some("/tmp/mex.log"));
+    }
+
+    #[test]
+    fn default_log_dir_respects_xdg_state_home() {
+        // Scoped env override: no other test reads these vars.
+        let tmp = std::env::temp_dir().join(format!("mex-logdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let old = std::env::var_os("XDG_STATE_HOME");
+        std::env::set_var("XDG_STATE_HOME", &tmp);
+        let dir = super::default_log_dir();
+        match old {
+            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+        assert_eq!(dir, tmp.join("mex"));
+        assert!(dir.ends_with("mex"));
+    }
+
+    #[test]
+    fn rotating_log_caps_size_and_generations() {
+        let dir = std::env::temp_dir().join(format!("mex-logrot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("mex.log");
+        let mut log = super::RotatingLog::open(&path, 200, 2).unwrap();
+        for i in 0..50 {
+            log.write_line(&format!(
+                "line {i:02} with padding to grow fast 0123456789\n"
+            ))
+            .unwrap();
+        }
+        drop(log);
+        // Current file stays under the cap; at most 2 backups exist.
+        assert!(std::fs::metadata(&path).unwrap().len() <= 200,);
+        assert!(dir.join("mex.log.1").exists());
+        assert!(!dir.join("mex.log.3").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotating_log_rotates_oversized_file_at_open() {
+        // Pre-existing file over the cap: rotated away before writing,
+        // exercising the close-before-rename path Windows requires.
+        let dir = std::env::temp_dir().join(format!("mex-logopen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("mex.log");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, vec![b'x'; 300]).unwrap();
+        let mut log = super::RotatingLog::open(&path, 200, 2).unwrap();
+        assert!(dir.join("mex.log.1").exists());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        log.write_line("hello\n").unwrap();
+        drop(log);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
