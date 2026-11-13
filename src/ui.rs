@@ -966,9 +966,7 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
     // Cells plus row style first: LAST/DUE widths size to content
     // (like SOURCE below) instead of clipping long states.
     let mut body: Vec<(Vec<String>, Style)> = Vec::new();
-    for (name, rtype, source, received, _) in target.ordered_questions() {
-        let age = received.elapsed().as_secs();
-        let age_str = fmt_qage(age);
+    for (name, rtype, source, _, _) in target.ordered_questions() {
         // Latest event and owning timer for this interest, from the
         // authoritative per-interest state (app.rs): rows stay dumb.
         let (last_txt, due_txt) = match crate::anomalies::rtype_from_str(rtype) {
@@ -1022,7 +1020,6 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
         body.push((
             vec![
                 type_label,
-                age_str,
                 last_txt,
                 due_txt,
                 question_source_label(source),
@@ -1036,13 +1033,13 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
     // content, so the floor only matters when every cell is blank.
     let last_w = body
         .iter()
-        .map(|(cells, _)| cells[2].len())
+        .map(|(cells, _)| cells[1].len())
         .max()
         .unwrap_or(4)
         .clamp(8, 20) as u16;
     let due_w = body
         .iter()
-        .map(|(cells, _)| cells[3].len())
+        .map(|(cells, _)| cells[2].len())
         .max()
         .unwrap_or(3)
         .clamp(8, 15) as u16;
@@ -1055,7 +1052,6 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
 
     let widths = [
         Constraint::Length(6),
-        Constraint::Length(12),
         Constraint::Length(last_w),
         Constraint::Length(due_w),
         Constraint::Length(
@@ -1067,7 +1063,7 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
                 .unwrap_or(14)
                 .clamp(14, 45) as u16,
         ),
-        Constraint::Min(10),
+        Constraint::Min(20),
     ];
 
     // The Questions table is its own focus stop: light its border when
@@ -1078,7 +1074,7 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
 
     let table = Table::new(rows, widths)
         .header(
-            Row::new(vec!["TYPE", "AGE", "LAST", "DUE", "SOURCE", "QUESTION"]).style(
+            Row::new(vec!["TYPE", "LAST", "DUE", "SOURCE", "QUESTION"]).style(
                 Style::default()
                     .add_modifier(Modifier::BOLD)
                     .fg(Color::Cyan),

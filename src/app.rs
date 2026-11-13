@@ -7837,6 +7837,7 @@ mod tests {
         let text = questions_pane_text(&app);
         assert!(text.contains("LAST"), "header shows LAST:\n{text}");
         assert!(text.contains("DUE"), "header shows DUE:\n{text}");
+        assert!(!text.contains("AGE"), "AGE column removed:\n{text}");
         assert!(text.contains("observed"), "observed kind shown:\n{text}");
         assert!(
             text.contains("transmitted"),
