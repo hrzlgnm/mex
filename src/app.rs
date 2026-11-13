@@ -871,6 +871,12 @@ impl App {
 
             terminal.draw(|f| ui::draw(f, self))?;
 
+            // Surface retained log write failures (terminal-safe: the
+            // popup, not stderr, so the TUI is not corrupted).
+            if let Some(msg) = crate::take_log_error() {
+                self.status_msg = Some((msg, Instant::now()));
+            }
+
             if event::poll(Duration::from_millis(80))? {
                 // Drain everything pending so mouse drags stay smooth at
                 // 12fps instead of handling one event per frame.
@@ -922,6 +928,11 @@ impl App {
                 );
             }
             self.evict_expired();
+            // Surface retained log write failures (stderr is safe here:
+            // no TUI to corrupt).
+            if let Some(msg) = crate::take_log_error() {
+                eprintln!("mex: {msg}");
+            }
             // Short tick like the TUI loop so the RFC 6762 §5.2 20-120ms
             // first-query delay is not quantized to a full second.
             std::thread::sleep(Duration::from_millis(50));
@@ -1332,7 +1343,7 @@ impl App {
                 _ => return None,
             }
             if rec.rtype != key.1
-                || !rec.name.trim_end_matches('.').eq_ignore_ascii_case(&key.0)
+                || Self::provenance_key(&rec.name, rec.rtype).0 != key.0
                 || rec.received_at.elapsed().as_secs() as u32 > rec.ttl
             {
                 return None;

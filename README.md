@@ -64,8 +64,11 @@ mex [OPTIONS]
 Options:
       --passive            Listen only: never transmit queries, just observe announcements
   -i, --interfaces <IFACES>  Network interfaces to use for mDNS discovery (e.g., br0, eth0)
-      --log-file <PATH>    Write log output to this file (appended). Without it, headless
-                           mode logs warnings to stderr and TUI mode discards logs
+      --log-file <PATH>    Override the default log file (state-dir mex.log on Linux,
+                           ~/Library/Logs/mex on macOS, %LOCALAPPDATA%\mex\logs on Windows).
+                           Appended; rotated past 5 MiB with 3 backups kept. Without it,
+                           both modes log to the default file; headless mode additionally
+                           logs warnings to stderr.
   -h, --help               Print help
   -V, --version            Print version
 ```

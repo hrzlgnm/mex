@@ -33,8 +33,11 @@ An explicit selection overrides the default loopback/container skip.
 Without the flag, all usable links are browsed.
 .TP
 .B \-\-log\-file \fIPATH\fR
-Write log output to this file (appended). Without it, headless mode
-logs warnings to stderr and TUI mode discards logs.
+Override the default log file (state-dir mex.log on Linux,
+~/Library/Logs/mex on macOS, %LOCALAPPDATA%\\mex\\logs on Windows).
+Appended; rotated past 5 MiB with 3 backups kept. Without it, both
+modes log to the default file; headless mode additionally logs
+warnings to stderr.
 .TP
 .B \-h, \-\-help
 Display help message and exit.
