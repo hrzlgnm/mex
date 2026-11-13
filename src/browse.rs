@@ -738,9 +738,23 @@ fn wire_name(name: &str) -> Option<simple_dns::Name<'_>> {
     Some(simple_dns::Name::new_with_labels(&labels))
 }
 
-/// Encode one query for an egress interface. `None` means a name cannot
-/// go on the wire (empty or over-long label); that is logged because the
-/// scheduler has already counted the query as sent.
+/// Largest UDP payload we will emit (RFC 6762 §17: packets MUST NOT
+/// exceed 9000 bytes including IP+UDP headers; the 40-byte IPv6 header
+/// is the roomier deduction).
+const MAX_QUERY_BYTES: usize = 9000 - 40 - 8;
+
+/// Encode one query for an egress interface. `None` means the owner name
+/// cannot go on the wire (empty or over-long label); that is logged
+/// because the scheduler has already counted the query as sent.
+///
+/// Names compress against byte-identical repeats (differing-case names
+/// are written in full, so wire case is preserved), which keeps dense
+/// known-answer lists small. If the packet still exceeds
+/// `MAX_QUERY_BYTES`, known answers are shed — never the question — and
+/// the cut is logged: a short refresh still elicits answers, while a
+/// dropped one would lose the refresh silently (EMSGSIZE on send, past
+/// the 65507-byte kernel limit). Full multipacket known-answer
+/// suppression (RFC 6762 §7.2, TC-bit follow-ups) is future work.
 fn encode_query(req: &QueryRequest, egress_iface: &str) -> Option<Vec<u8>> {
     let qname = match wire_name(&req.name) {
         Some(n) => n,
@@ -753,14 +767,7 @@ fn encode_query(req: &QueryRequest, egress_iface: &str) -> Option<Vec<u8>> {
             return None;
         }
     };
-    let mut pkt = Packet::new_query(0);
-    pkt.questions.push(simple_dns::Question::new(
-        qname.clone(),
-        QTYPE::TYPE(req.record_type),
-        QCLASS::CLASS(CLASS::IN),
-        req.qu,
-    ));
-
+    let mut kas = Vec::with_capacity(req.known_answers.len());
     for (ka_target, ka_ttl) in known_answers_for_iface(&req.known_answers, egress_iface) {
         let Some(rdata) = wire_name(ka_target) else {
             log::warn!(
@@ -769,22 +776,58 @@ fn encode_query(req: &QueryRequest, egress_iface: &str) -> Option<Vec<u8>> {
             );
             continue;
         };
+        kas.push((rdata, ka_ttl));
+    }
+
+    let mut bytes = build_query(&qname, req.record_type, req.qu, &kas)?;
+    if bytes.len() > MAX_QUERY_BYTES {
+        let total = kas.len();
+        let mut n = total;
+        while n > 0 {
+            n /= 2;
+            kas.truncate(n);
+            bytes = build_query(&qname, req.record_type, req.qu, &kas)?;
+            if bytes.len() <= MAX_QUERY_BYTES {
+                break;
+            }
+        }
+        log::warn!(
+            "mex: truncated known answers for {} to {} of {total} ({} bytes)",
+            req.name,
+            kas.len(),
+            bytes.len()
+        );
+    }
+    Some(bytes)
+}
+
+/// One query packet: question plus the given known answers, names
+/// compressed. `None` only on codec failure (logged by the caller).
+fn build_query(
+    qname: &simple_dns::Name<'_>,
+    record_type: TYPE,
+    qu: bool,
+    kas: &[(simple_dns::Name<'_>, u32)],
+) -> Option<Vec<u8>> {
+    let mut pkt = Packet::new_query(0);
+    pkt.questions.push(simple_dns::Question::new(
+        qname.clone(),
+        QTYPE::TYPE(record_type),
+        QCLASS::CLASS(CLASS::IN),
+        qu,
+    ));
+    for (rdata, ttl) in kas {
         pkt.answers.push(ResourceRecord::new(
             qname.clone(),
             CLASS::IN,
-            ka_ttl,
-            RData::PTR(rdata.into()),
+            *ttl,
+            RData::PTR(rdata.clone().into()),
         ));
     }
-
-    match pkt.build_bytes_vec() {
+    match pkt.build_bytes_vec_compressed() {
         Ok(bytes) => Some(bytes),
         Err(e) => {
-            log::warn!(
-                "mex: cannot encode {:?} query for {}: {e}",
-                u16::from(req.record_type),
-                req.name
-            );
+            log::warn!("mex: cannot encode query for {qname}: {e}");
             None
         }
     }
@@ -1399,6 +1442,42 @@ mod tests {
         });
         assert_eq!(ev.query_kas.len(), 1);
         assert_eq!(ev.query_kas[0].rdata, "Denon AVR-X1400H._http._tcp.local.");
+    }
+
+    #[test]
+    fn oversized_ka_list_truncates_but_keeps_question() {
+        // A dense network must not EMSGSIZE the refresh into silence:
+        // known answers shed to the RFC 6762 §17 cap, question intact.
+        let kas: Vec<KnownAnswer> = (0..2000)
+            .map(|i| KnownAnswer {
+                target: format!("instance-{i:05}._http._tcp.local"),
+                ttl: 120,
+                iface: String::new(),
+            })
+            .collect();
+        let bytes = encode_query(
+            &QueryRequest {
+                name: "_http._tcp.local".to_string(),
+                record_type: TYPE::PTR,
+                known_answers: kas,
+                qu: false,
+            },
+            "",
+        )
+        .expect("query must encode");
+        assert!(bytes.len() <= MAX_QUERY_BYTES);
+        let ev = parse_packet(
+            &bytes,
+            test_source(),
+            std::net::IpAddr::V4(MDNS_V4),
+            "br0",
+            3,
+        )
+        .unwrap();
+        assert_eq!(ev.questions.len(), 1);
+        assert_eq!(ev.questions[0].name, "_http._tcp.local.");
+        assert!(!ev.query_kas.is_empty());
+        assert!(ev.query_kas.len() < 2000);
     }
 
     #[test]
