@@ -690,10 +690,52 @@ fn known_answers_for_iface<'a>(kas: &'a [KnownAnswer], iface: &str) -> Vec<(&'a 
         .collect()
 }
 
-fn send_query(socket: &PktInfoUdpSocket, req: &QueryRequest, dest: SocketAddr, egress_iface: &str) {
-    let qname = match Name::from_ascii(format!("{}.", req.name)) {
-        Ok(n) => n,
-        Err(_) => return,
+/// Labels of an unescaped mDNS name. Records are stored unescaped for
+/// display, so a dot inside a DNS-SD instance label (RFC 6763 §4.1.1
+/// allows arbitrary text) is indistinguishable from a separator:
+/// everything left of `<_service>._tcp|_udp` is one instance label.
+/// Subtype owners (`<sub>._sub.<_service>…`), service types, and host
+/// names split on every dot.
+fn name_labels(name: &str) -> Vec<&str> {
+    let name = name.trim_end_matches('.');
+    let parts: Vec<&str> = name.split('.').collect();
+    let Some(proto) = parts
+        .iter()
+        .rposition(|l| l.eq_ignore_ascii_case("_tcp") || l.eq_ignore_ascii_case("_udp"))
+    else {
+        return parts;
+    };
+    if proto < 2
+        || !parts[proto - 1].starts_with('_')
+        || parts[proto - 2].eq_ignore_ascii_case("_sub")
+    {
+        return parts;
+    }
+    let service = proto - 1;
+    let instance_len = parts[..service].iter().map(|l| l.len() + 1).sum::<usize>() - 1;
+    let mut labels = vec![&name[..instance_len]];
+    labels.extend_from_slice(&parts[service..]);
+    labels
+}
+
+/// Wire name for an unescaped display name. Labels go in as raw bytes:
+/// `Name::from_ascii` rejects spaces and most punctuation, which DNS-SD
+/// instance names routinely contain (`pihole [b8:27:eb:9d:87:e1]`).
+fn mdns_name(name: &str) -> Option<Name> {
+    Name::from_labels(name_labels(name).into_iter().map(str::as_bytes)).ok()
+}
+
+/// Encode one query for an egress interface. `None` means a name cannot
+/// go on the wire (empty or over-long label); that is logged because the
+/// scheduler has already counted the query as sent.
+fn encode_query(req: &QueryRequest, egress_iface: &str) -> Option<Vec<u8>> {
+    let Some(qname) = mdns_name(&req.name) else {
+        log::warn!(
+            "mex: cannot encode {:?} query name {:?}",
+            req.record_type,
+            req.name
+        );
+        return None;
     };
     let mut msg = Message::new(0, MessageType::Query, OpCode::Query);
     let mut query = Query::query(qname.clone(), req.record_type);
@@ -701,20 +743,36 @@ fn send_query(socket: &PktInfoUdpSocket, req: &QueryRequest, dest: SocketAddr, e
     msg.add_query(query);
 
     for (ka_target, ka_ttl) in known_answers_for_iface(&req.known_answers, egress_iface) {
-        let target = ka_target.trim_end_matches('.');
-        if let Ok(rdata) = Name::from_ascii(format!("{target}.")) {
-            let rec = Record::from_rdata(
-                qname.clone(),
-                ka_ttl,
-                RData::PTR(hickory_proto::rr::rdata::PTR(rdata)),
+        let Some(rdata) = mdns_name(ka_target) else {
+            log::warn!(
+                "mex: cannot encode known answer {ka_target:?} for {}",
+                req.name
             );
-            msg.add_answer(rec);
-        }
+            continue;
+        };
+        msg.add_answer(Record::from_rdata(
+            qname.clone(),
+            ka_ttl,
+            RData::PTR(hickory_proto::rr::rdata::PTR(rdata)),
+        ));
     }
 
-    let bytes = match msg.to_vec() {
-        Ok(b) => b,
-        Err(_) => return,
+    match msg.to_vec() {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            log::warn!(
+                "mex: cannot encode {:?} query for {}: {e}",
+                req.record_type,
+                req.name
+            );
+            None
+        }
+    }
+}
+
+fn send_query(socket: &PktInfoUdpSocket, req: &QueryRequest, dest: SocketAddr, egress_iface: &str) {
+    let Some(bytes) = encode_query(req, egress_iface) else {
+        return;
     };
     let _ = socket.send_to(&bytes, &SockAddr::from(dest));
 }
@@ -1063,6 +1121,67 @@ mod tests {
         // Unknown egress link: keep everything rather than go silent.
         let got = known_answers_for_iface(&kas, "");
         assert_eq!(got, vec![("a.", 100), ("b.", 100)]);
+    }
+
+    fn parse_encoded(req: &QueryRequest) -> Event {
+        let bytes = encode_query(req, "").expect("query must encode");
+        parse_packet(&bytes, test_source(), std::net::IpAddr::V4(MDNS_V4), "", 0).unwrap()
+    }
+
+    #[test]
+    fn instance_names_with_spaces_and_punctuation_reach_the_wire() {
+        // Regression: hickory's ASCII parser rejected this instance name,
+        // so the SRV refresh was dropped before the socket and the record
+        // expired with nothing on the wire.
+        let name = "pihole [b8:27:eb:9d:87:e1]._workstation._tcp.local";
+        let ev = parse_encoded(&QueryRequest {
+            name: name.to_string(),
+            record_type: RecordType::SRV,
+            known_answers: Vec::new(),
+            qu: false,
+        });
+        assert_eq!(ev.questions.len(), 1);
+        assert_eq!(ev.questions[0].name, format!("{name}."));
+        assert_eq!(ev.questions[0].rtype, 33);
+    }
+
+    #[test]
+    fn name_labels_keep_instance_dots_in_one_label() {
+        assert_eq!(
+            name_labels("amzn.dmgr:ABC._amzn-wplay._tcp.local"),
+            ["amzn.dmgr:ABC", "_amzn-wplay", "_tcp", "local"]
+        );
+        // Subtype owners, enumeration, service types, and host names
+        // split on every dot.
+        assert_eq!(
+            name_labels("_printer._sub._http._tcp.local."),
+            ["_printer", "_sub", "_http", "_tcp", "local"]
+        );
+        assert_eq!(
+            name_labels("_services._dns-sd._udp.local"),
+            ["_services", "_dns-sd", "_udp", "local"]
+        );
+        assert_eq!(name_labels("_http._tcp.local"), ["_http", "_tcp", "local"]);
+        assert_eq!(
+            name_labels("FritzBoxRepeater.fritz.box"),
+            ["FritzBoxRepeater", "fritz", "box"]
+        );
+    }
+
+    #[test]
+    fn known_answers_with_spaces_are_sent() {
+        let ev = parse_encoded(&QueryRequest {
+            name: "_http._tcp.local".to_string(),
+            record_type: RecordType::PTR,
+            known_answers: vec![KnownAnswer {
+                target: "Denon AVR-X1400H._http._tcp.local".to_string(),
+                ttl: 4000,
+                iface: String::new(),
+            }],
+            qu: false,
+        });
+        assert_eq!(ev.query_kas.len(), 1);
+        assert_eq!(ev.query_kas[0].rdata, "Denon AVR-X1400H._http._tcp.local.");
     }
 
     #[test]
