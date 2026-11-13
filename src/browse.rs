@@ -1166,27 +1166,18 @@ fn whole_record_field(wire: &[u8]) -> Vec<RecordField> {
 }
 
 fn wire_name_end(wire: &[u8], start: usize) -> Option<usize> {
-    let mut offset = start;
-    loop {
-        let length = *wire.get(offset)?;
-        if length & 0xc0 != 0 {
-            return None;
-        }
-        offset += 1;
-        if length == 0 {
-            return Some(offset);
-        }
-        if length > 63 {
-            return None;
-        }
-        offset = offset.checked_add(length as usize)?;
-        if offset > wire.len() {
-            return None;
-        }
-    }
+    wire_name_end_with_pointers(wire, start, false)
 }
 
 fn packet_name_end(wire: &[u8], start: usize) -> Option<usize> {
+    wire_name_end_with_pointers(wire, start, true)
+}
+
+fn wire_name_end_with_pointers(
+    wire: &[u8],
+    start: usize,
+    allow_compression_pointers: bool,
+) -> Option<usize> {
     let mut offset = start;
     loop {
         let length = *wire.get(offset)?;
@@ -1199,7 +1190,7 @@ fn packet_name_end(wire: &[u8], start: usize) -> Option<usize> {
                 offset = offset.checked_add(length as usize)?;
                 wire.get(start..offset)?;
             }
-            0xc0 => {
+            0xc0 if allow_compression_pointers => {
                 let pointer_end = offset.checked_add(2)?;
                 let pointer = wire.get(offset..pointer_end)?;
                 let target = (usize::from(pointer[0] & 0x3f) << 8) | usize::from(pointer[1]);
