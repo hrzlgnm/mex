@@ -1110,6 +1110,45 @@ pub fn record_fields(wire: &[u8], rtype: u16) -> Vec<RecordField> {
     fields
 }
 
+pub fn question_fields(wire: &[u8], name: &str, rtype_str: &str) -> Option<Vec<RecordField>> {
+    let packet = Packet::parse(wire).ok()?;
+    if packet.has_flags(PacketFlag::RESPONSE) {
+        return None;
+    }
+    let question_count = u16::from_be_bytes(wire.get(4..6)?.try_into().ok()?) as usize;
+    if question_count != packet.questions.len() {
+        return None;
+    }
+
+    let mut selected_index = None;
+    for (index, question) in packet.questions.iter().enumerate() {
+        if display_name(&question.qname).trim_end_matches('.') == name.trim_end_matches('.')
+            && rtype_label(u16::from(question.qtype)) == rtype_str
+            && selected_index.replace(index).is_some()
+        {
+            return None;
+        }
+    }
+    let selected_index = selected_index?;
+
+    let mut offset = 12;
+    for (index, _) in packet.questions.iter().enumerate() {
+        let name_end = packet_name_end(wire, offset)?;
+        let type_end = name_end.checked_add(2)?;
+        let class_end = type_end.checked_add(2)?;
+        wire.get(offset..class_end)?;
+        if index == selected_index {
+            return Some(vec![
+                record_field("QNAME", offset, name_end),
+                record_field("QTYPE", name_end, type_end),
+                record_field("QCLASS / QU", type_end, class_end),
+            ]);
+        }
+        offset = class_end;
+    }
+    None
+}
+
 fn record_field(label: &str, start: usize, end: usize) -> RecordField {
     RecordField {
         label: label.to_string(),
@@ -1143,6 +1182,33 @@ fn wire_name_end(wire: &[u8], start: usize) -> Option<usize> {
         offset = offset.checked_add(length as usize)?;
         if offset > wire.len() {
             return None;
+        }
+    }
+}
+
+fn packet_name_end(wire: &[u8], start: usize) -> Option<usize> {
+    let mut offset = start;
+    loop {
+        let length = *wire.get(offset)?;
+        match length & 0xc0 {
+            0 => {
+                offset = offset.checked_add(1)?;
+                if length == 0 {
+                    return Some(offset);
+                }
+                offset = offset.checked_add(length as usize)?;
+                wire.get(start..offset)?;
+            }
+            0xc0 => {
+                let pointer_end = offset.checked_add(2)?;
+                let pointer = wire.get(offset..pointer_end)?;
+                let target = (usize::from(pointer[0] & 0x3f) << 8) | usize::from(pointer[1]);
+                if target >= offset || target >= wire.len() {
+                    return None;
+                }
+                return Some(pointer_end);
+            }
+            _ => return None,
         }
     }
 }

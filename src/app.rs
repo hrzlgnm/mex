@@ -5464,15 +5464,21 @@ impl App {
             .collect()
     }
 
-    /// Hex dump payload for the hex pane: wire bytes of the selected record,
-    /// or the stored query packet for a selected question row.
-    pub fn selected_record_fields(&self) -> Option<Vec<browse::RecordField>> {
-        let DetailEntry::Record(record) = self.selected_detail_entry()? else {
-            return None;
-        };
-        Some(browse::record_fields(&record.wire, record.rtype))
+    /// Field ranges for the selected record or uniquely matched query question.
+    pub fn selected_detail_fields(&self) -> Option<Vec<browse::RecordField>> {
+        match self.selected_detail_entry()? {
+            DetailEntry::Record(record) => Some(browse::record_fields(&record.wire, record.rtype)),
+            DetailEntry::Question {
+                name,
+                rtype_str,
+                raw,
+                ..
+            } if !raw.is_empty() => browse::question_fields(raw, name, rtype_str),
+            DetailEntry::Question { .. } => None,
+        }
     }
 
+    /// Hex dump payload: selected record bytes or the stored query packet.
     pub fn selected_detail_bytes(&self) -> Option<(Vec<u8>, String)> {
         match self.selected_detail_entry()? {
             DetailEntry::Record(rec) => {
@@ -6677,6 +6683,282 @@ mod tests {
     }
 
     #[test]
+    fn clicking_question_name_highlights_the_selected_question_in_packet() {
+        use ratatui::style::{Color, Modifier};
+
+        let mut app = two_group_app();
+        let mut packet = vec![0x12, 0x34, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0];
+        append_wire_name(&mut packet, "_http._tcp.local.");
+        packet.extend(12u16.to_be_bytes());
+        packet.extend(1u16.to_be_bytes());
+        append_wire_name(&mut packet, "Shell._ssh._tcp.local.");
+        packet.extend(16u16.to_be_bytes());
+        packet.extend(0x8001u16.to_be_bytes());
+
+        select_question_row(&mut app, "Shell._ssh._tcp.local.", "TXT", packet);
+
+        let before = render_to_buffer(&app, 160, 60);
+        let (field_x, field_y) =
+            find_buffer_text(&before, "QNAME").expect("question name field is displayed");
+        let selected_row = app.detail_selected;
+        app.mouse_down(field_x + 1, field_y);
+        assert_eq!(
+            app.detail_selected, selected_row,
+            "clicking a question field should preserve the selected row"
+        );
+
+        let after = render_to_buffer(&app, 160, 60);
+        let (class_x, class_y) = find_buffer_text(&after, "0001 0553 6865")
+            .expect("second question bytes are displayed");
+        for x in [
+            class_x + 5,
+            class_x + 6,
+            class_x + 7,
+            class_x + 8,
+            class_x + 10,
+            class_x + 11,
+            class_x + 12,
+            class_x + 13,
+        ] {
+            assert!(
+                after.cell((x, class_y)).is_some_and(|cell| {
+                    cell.fg == Color::Yellow && cell.modifier.contains(Modifier::UNDERLINED)
+                }),
+                "the selected question name bytes should be highlighted"
+            );
+        }
+        for x in [class_x, class_x + 1, class_x + 2, class_x + 3] {
+            assert_ne!(
+                after.cell((x, class_y)).map(|cell| cell.fg),
+                Some(Color::Yellow),
+                "the preceding QCLASS bytes should not be highlighted"
+            );
+        }
+        let (name_end_x, name_end_y) = find_buffer_text(&after, "6370 056c 6f63 616c 0000 1080 01")
+            .expect("question name end and following fields are displayed");
+        for x in [
+            name_end_x,
+            name_end_x + 1,
+            name_end_x + 2,
+            name_end_x + 3,
+            name_end_x + 5,
+            name_end_x + 6,
+            name_end_x + 7,
+            name_end_x + 8,
+            name_end_x + 10,
+            name_end_x + 11,
+            name_end_x + 12,
+            name_end_x + 13,
+            name_end_x + 15,
+            name_end_x + 16,
+            name_end_x + 17,
+            name_end_x + 18,
+            name_end_x + 20,
+            name_end_x + 21,
+        ] {
+            assert!(
+                after.cell((x, name_end_y)).is_some_and(|cell| {
+                    cell.fg == Color::Yellow && cell.modifier.contains(Modifier::UNDERLINED)
+                }),
+                "all encoded QNAME bytes through its root terminator should be highlighted"
+            );
+        }
+        for x in [
+            name_end_x + 22,
+            name_end_x + 23,
+            name_end_x + 25,
+            name_end_x + 26,
+        ] {
+            assert_ne!(
+                after.cell((x, name_end_y)).map(|cell| cell.fg),
+                Some(Color::Yellow),
+                "QTYPE bytes after QNAME should not be highlighted"
+            );
+        }
+
+        let (field_x, field_y) =
+            find_buffer_text(&after, "QTYPE").expect("question type field is displayed");
+        app.mouse_down(field_x + 1, field_y);
+        let type_selected = render_to_buffer(&app, 160, 60);
+        let (type_x, type_y) = find_buffer_text(&type_selected, "616c 0000 1080 01")
+            .expect("question type bytes are displayed");
+        for x in [type_x + 7, type_x + 8, type_x + 10, type_x + 11] {
+            assert!(
+                type_selected.cell((x, type_y)).is_some_and(|cell| {
+                    cell.fg == Color::Yellow && cell.modifier.contains(Modifier::UNDERLINED)
+                }),
+                "QTYPE bytes should be highlighted"
+            );
+        }
+        for x in [
+            type_x + 5,
+            type_x + 6,
+            type_x + 12,
+            type_x + 13,
+            type_x + 15,
+            type_x + 16,
+        ] {
+            assert_ne!(
+                type_selected.cell((x, type_y)).map(|cell| cell.fg),
+                Some(Color::Yellow),
+                "QNAME and QCLASS bytes should not be highlighted for QTYPE"
+            );
+        }
+
+        let (field_x, field_y) = find_buffer_text(&type_selected, "QCLASS / QU")
+            .expect("question class and QU field is displayed");
+        app.mouse_down(field_x + 1, field_y);
+        let class_selected = render_to_buffer(&app, 160, 60);
+        for x in [type_x + 12, type_x + 13, type_x + 15, type_x + 16] {
+            assert!(
+                class_selected.cell((x, type_y)).is_some_and(|cell| {
+                    cell.fg == Color::Yellow && cell.modifier.contains(Modifier::UNDERLINED)
+                }),
+                "QCLASS and QU bytes should be highlighted"
+            );
+        }
+        for x in [type_x + 7, type_x + 8, type_x + 10, type_x + 11] {
+            assert_ne!(
+                class_selected.cell((x, type_y)).map(|cell| cell.fg),
+                Some(Color::Yellow),
+                "QTYPE bytes should not be highlighted for QCLASS / QU"
+            );
+        }
+
+        app.scroll_hex_edge(false);
+        let scrolled = render_to_buffer(&app, 160, 60);
+        let hex_area = app.hex_rect.get();
+        let title_area = Rect::new(hex_area.x, hex_area.y, hex_area.width, 1);
+        let (title_x, title_y) = find_buffer_text_in_rect(&scrolled, title_area, "QCLASS / QU")
+            .expect("selected question field stays visible while scrolling");
+        assert!(
+            scrolled
+                .cell((title_x, title_y))
+                .is_some_and(|cell| cell.modifier.contains(Modifier::UNDERLINED)),
+            "scrolling should not hide the selected question field label"
+        );
+    }
+
+    #[test]
+    fn clicking_compressed_question_name_highlights_its_pointer_bytes() {
+        use ratatui::style::{Color, Modifier};
+
+        let mut app = two_group_app();
+        let mut packet = vec![0x12, 0x34, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0];
+        append_wire_name(&mut packet, "Shell._ssh._tcp.local.");
+        packet.extend(12u16.to_be_bytes());
+        packet.extend(1u16.to_be_bytes());
+        packet.extend([0xc0, 0x0c]);
+        packet.extend(16u16.to_be_bytes());
+        packet.extend(0x8001u16.to_be_bytes());
+
+        select_question_row(&mut app, "Shell._ssh._tcp.local.", "TXT", packet);
+
+        let before = render_to_buffer(&app, 160, 60);
+        let (field_x, field_y) =
+            find_buffer_text(&before, "QNAME").expect("question name field is displayed");
+        app.mouse_down(field_x + 1, field_y);
+
+        let after = render_to_buffer(&app, 160, 60);
+        let (pointer_x, pointer_y) = find_buffer_text(&after, "01c0 0c00 1080 01")
+            .expect("compressed question and following fields are displayed");
+        for x in [pointer_x + 2, pointer_x + 3, pointer_x + 5, pointer_x + 6] {
+            assert!(
+                after.cell((x, pointer_y)).is_some_and(|cell| {
+                    cell.fg == Color::Yellow && cell.modifier.contains(Modifier::UNDERLINED)
+                }),
+                "the encoded compression pointer should be highlighted"
+            );
+        }
+        for x in [
+            pointer_x,
+            pointer_x + 1,
+            pointer_x + 7,
+            pointer_x + 8,
+            pointer_x + 10,
+            pointer_x + 11,
+            pointer_x + 12,
+            pointer_x + 13,
+            pointer_x + 15,
+            pointer_x + 16,
+        ] {
+            assert_ne!(
+                after.cell((x, pointer_y)).map(|cell| cell.fg),
+                Some(Color::Yellow),
+                "the preceding QCLASS and following QTYPE/QCLASS bytes should stay unhighlighted"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_question_mapping_stays_byte_only() {
+        let mut app = two_group_app();
+        let mut packet = vec![0x12, 0x34, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0];
+        for _ in 0..2 {
+            append_wire_name(&mut packet, "Shell._ssh._tcp.local.");
+            packet.extend(12u16.to_be_bytes());
+            packet.extend(1u16.to_be_bytes());
+        }
+
+        select_question_row(&mut app, "Shell._ssh._tcp.local.", "PTR", packet);
+
+        let buffer = render_to_buffer(&app, 160, 60);
+        assert!(
+            find_buffer_text(&buffer, "QNAME").is_none(),
+            "duplicate matching questions should not guess which wire occurrence is selected"
+        );
+    }
+
+    #[test]
+    fn malformed_question_packet_stays_byte_only() {
+        let mut app = two_group_app();
+        let packet = vec![0x12, 0x34, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 5, b'S', b'h'];
+        select_question_row(&mut app, "Shell._ssh._tcp.local.", "PTR", packet);
+
+        let buffer = render_to_buffer(&app, 160, 60);
+        assert!(
+            find_buffer_text(&buffer, "QNAME").is_none(),
+            "malformed question bytes should not receive guessed field ranges"
+        );
+    }
+
+    #[test]
+    fn own_question_fallback_packet_stays_byte_only() {
+        let mut app = two_group_app();
+        let mut fallback = vec![0x12, 0x34, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        append_wire_name(&mut fallback, "Shell._ssh._tcp.local.");
+        fallback.extend(12u16.to_be_bytes());
+        fallback.extend(1u16.to_be_bytes());
+        let selected_service = match app.display_items().get(app.selected_display) {
+            Some(DisplayItem::Instance { index }) => *index,
+            _ => panic!("expected instance selected"),
+        };
+        app.services[selected_service]
+            .last_event
+            .as_mut()
+            .expect("latest event")
+            .raw_bytes = fallback;
+        app.route_own_question("Shell._ssh._tcp.local.", 12);
+        let raw_count = app
+            .display_detail()
+            .expect("selected service")
+            .ordered_answers()
+            .len();
+        app.detail_selected = raw_count;
+        app.focus = Focus::Questions;
+
+        let buffer = render_to_buffer(&app, 160, 60);
+        assert!(
+            find_buffer_text(&buffer, "(raw packet)").is_some(),
+            "own question should retain the existing raw packet fallback"
+        );
+        assert!(
+            find_buffer_text(&buffer, "QNAME").is_none(),
+            "unrelated fallback packet bytes must not be labeled as the question"
+        );
+    }
+
+    #[test]
     fn clicking_srv_port_highlights_only_the_port_bytes() {
         use ratatui::style::{Color, Modifier};
 
@@ -7424,6 +7706,27 @@ mod tests {
         app.evict_expired();
         select_instance(&mut app, "Shell");
         app
+    }
+
+    fn select_question_row(app: &mut App, name: &str, rtype: &str, packet: Vec<u8>) {
+        let raw_count = app
+            .display_detail()
+            .expect("selected service")
+            .ordered_answers()
+            .len();
+        let selected_service = match app.display_items().get(app.selected_display) {
+            Some(DisplayItem::Instance { index }) => *index,
+            _ => panic!("expected instance selected"),
+        };
+        app.services[selected_service].questions.push((
+            name.to_string(),
+            rtype.to_string(),
+            "192.168.1.99:5353".parse().unwrap(),
+            Instant::now(),
+            packet,
+        ));
+        app.detail_selected = raw_count;
+        app.focus = Focus::Questions;
     }
 
     /// Move the cursor onto the instance row with this name.
