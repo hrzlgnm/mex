@@ -47,6 +47,9 @@ Headless run (no TTY) logs to stderr.
 
 ## Workflow
 
+* Agents must work only in a fresh, separate worktree created from `origin/main`;
+  never edit the primary checkout or reuse a stale worktree. Create the worktree
+  (and fetch `origin` first) before making any changes.
 * Changes land via pull requests against `main`; never push to `main` directly.
 * Create branches from `origin/main` (`git fetch origin` first).
 * Each branch/PR carries one logical change. Never mix unrelated edits
