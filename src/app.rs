@@ -7944,7 +7944,9 @@ mod tests {
             "full kind word shown:\n{text}"
         );
         assert!(text.contains("refresh"), "refresh timer shown:\n{text}");
-        assert!(text.contains("browse"), "browse timer shown:\n{text}");
+        // Foreign rows no longer inherit the interest's browse timer;
+        // only self rows are schedule-driven, and this scenario has no
+        // self PTR row, so "browse" is not rendered here.
         assert!(
             !text.contains("expired"),
             "foreign-only interest has no due:\n{text}"

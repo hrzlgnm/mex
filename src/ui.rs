@@ -999,18 +999,24 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
                     let age = now.saturating_duration_since(*seen_at).as_secs();
                     format!("{} observed", fmt_qage(age))
                 };
-                let due = match (s.timer, s.next_due_in_secs) {
-                    (crate::app::TimerKind::Refresh, Some(d)) => {
-                        format!("{} refresh", fmt_qage(d))
+                // DUE is schedule ownership: only our own inferred sends
+                // (self rows) own a timer. A foreign querier's row never
+                // claims our refresh/browse/expired schedule, even when
+                // the interest itself is one we maintain.
+                let due = if self_row {
+                    match (s.timer, s.next_due_in_secs) {
+                        (crate::app::TimerKind::Refresh, Some(d)) => {
+                            format!("{} refresh", fmt_qage(d))
+                        }
+                        (crate::app::TimerKind::Browse, Some(d)) => {
+                            format!("{} browse", fmt_qage(d))
+                        }
+                        // No schedule: "expired" only for lapsed local demand.
+                        _ if s.had_local_demand => "expired".to_string(),
+                        _ => "—".to_string(),
                     }
-                    (crate::app::TimerKind::Browse, Some(d)) => {
-                        format!("{} browse", fmt_qage(d))
-                    }
-                    // No schedule: "expired" only for lapsed local demand.
-                    // A foreign-only interest was never ours to lose, so
-                    // its DUE stays blank instead of claiming a lapse.
-                    _ if s.had_local_demand => "expired".to_string(),
-                    _ => "—".to_string(),
+                } else {
+                    "—".to_string()
                 };
                 (last, due)
             }
