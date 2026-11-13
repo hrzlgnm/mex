@@ -940,7 +940,6 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
         return;
     };
 
-    let mut rows = Vec::new();
     let dim = Style::default().fg(Color::Gray);
     let local_style = Style::default()
         .fg(Color::Green)
@@ -964,12 +963,35 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
             ))
         })
         .collect();
-    for (name, rtype, source, received, _) in target.ordered_questions() {
-        let age = received.elapsed().as_secs();
-        let age_str = if age >= 60 {
-            format!("{}m{:02}s", age / 60, age % 60)
-        } else {
-            format!("{age}s")
+    // Cells plus row style first: LAST/DUE widths size to content
+    // (like SOURCE below) instead of clipping long states.
+    let mut body: Vec<(Vec<String>, Style)> = Vec::new();
+    for (name, rtype, source, _, _) in target.ordered_questions() {
+        // Latest event and owning timer for this interest, from the
+        // authoritative per-interest state (app.rs): rows stay dumb.
+        let (last_txt, due_txt) = match crate::anomalies::rtype_from_str(rtype) {
+            Some(t) => {
+                let s = app.interest_summary(name, t);
+                let last = match (s.last_age_secs, s.last_origin) {
+                    (Some(a), Some(o)) => format!("{} {}", fmt_qage(a), o.as_str()),
+                    _ => "—".to_string(),
+                };
+                let due = match (s.timer, s.next_due_in_secs) {
+                    (crate::app::TimerKind::Refresh, Some(d)) => {
+                        format!("{} refresh", fmt_qage(d))
+                    }
+                    (crate::app::TimerKind::Browse, Some(d)) => {
+                        format!("{} browse", fmt_qage(d))
+                    }
+                    // No schedule: "expired" only for lapsed local demand.
+                    // A foreign-only interest was never ours to lose, so
+                    // its DUE stays blank instead of claiming a lapse.
+                    _ if s.had_local_demand => "expired".to_string(),
+                    _ => "—".to_string(),
+                };
+                (last, due)
+            }
+            None => ("—".to_string(), "—".to_string()),
         };
         // Questions asked from this host's own addresses (including our
         // own looped-back queries) get the same highlight as local answers.
@@ -995,20 +1017,43 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
         } else {
             rtype.clone()
         };
-        rows.push(
-            Row::new(vec![
-                Cell::from(type_label),
-                Cell::from(age_str),
-                Cell::from(question_source_label(source)),
-                Cell::from(name.clone()),
-            ])
-            .style(style),
-        );
+        body.push((
+            vec![
+                type_label,
+                last_txt,
+                due_txt,
+                question_source_label(source),
+                name.clone(),
+            ],
+            style,
+        ));
     }
+
+    // Content-sized with clamps: headers are shorter than any real
+    // content, so the floor only matters when every cell is blank.
+    let last_w = body
+        .iter()
+        .map(|(cells, _)| cells[1].len())
+        .max()
+        .unwrap_or(4)
+        .clamp(8, 20) as u16;
+    let due_w = body
+        .iter()
+        .map(|(cells, _)| cells[2].len())
+        .max()
+        .unwrap_or(3)
+        .clamp(8, 15) as u16;
+    let rows: Vec<Row> = body
+        .into_iter()
+        .map(|(cells, style)| {
+            Row::new(cells.into_iter().map(Cell::from).collect::<Vec<_>>()).style(style)
+        })
+        .collect();
 
     let widths = [
         Constraint::Length(6),
-        Constraint::Length(12),
+        Constraint::Length(last_w),
+        Constraint::Length(due_w),
         Constraint::Length(
             target
                 .ordered_questions()
@@ -1029,7 +1074,7 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
 
     let table = Table::new(rows, widths)
         .header(
-            Row::new(vec!["TYPE", "AGE", "SOURCE", "QUESTION"]).style(
+            Row::new(vec!["TYPE", "LAST", "DUE", "SOURCE", "QUESTION"]).style(
                 Style::default()
                     .add_modifier(Modifier::BOLD)
                     .fg(Color::Cyan),
@@ -1085,6 +1130,15 @@ fn question_source_label(source: &SocketAddr) -> String {
         format!("{source} (one-shot)")
     } else {
         source.to_string()
+    }
+}
+
+/// Compact age for query cells: `45s`, `3m02s`.
+fn fmt_qage(secs: u64) -> String {
+    if secs >= 60 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
     }
 }
 
