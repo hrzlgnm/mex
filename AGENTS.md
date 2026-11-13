@@ -51,6 +51,8 @@ Headless run (no TTY) logs to stderr.
 * Create branches from `origin/main` (`git fetch origin` first).
 * Commit messages must follow Conventional Commits (`feat:`, `fix:`, `docs:`,
   …): release-please owns the changelog and derives releases from them.
+* Before opening a PR, proofread the title/body plus any new user-facing
+  text and run `typos` (CI enforces it via `typos.toml`).
 
 ## Conventions
 

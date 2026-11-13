@@ -692,10 +692,10 @@ fn known_answers_for_iface<'a>(kas: &'a [KnownAnswer], iface: &str) -> Vec<(&'a 
 ///
 /// Limits: a host or service name that itself ends in a
 /// `<_service>._tcp|_udp`-shaped suffix (e.g. a host literally named
-/// `x._tcp.example.com`) would mis-split — but such names never appear
-/// as query owners in this browser (queries are only built for live
-/// interests), and re-encoding still yields a valid name, just not the
-/// intended split.
+/// `x._tcp.example.com`) would split at the wrong label — but such
+/// names never appear as query owners in this browser (queries are only
+/// built for live interests), and re-encoding still yields a valid
+/// name, just not the intended split.
 fn split_instance_labels(name: &str) -> Vec<&str> {
     let name = name.trim_end_matches('.');
     let parts: Vec<&str> = name.split('.').collect();
