@@ -365,10 +365,17 @@ fn is_enum_name(name: &str) -> bool {
     name.trim_end_matches('.')
         .eq_ignore_ascii_case(ENUM_SERVICE)
 }
+
+fn srv_target(rdata: &str) -> Option<&str> {
+    let target = rdata.splitn(4, ' ').nth(3)?.trim().trim_end_matches('.');
+    (!target.is_empty()).then_some(target)
+}
+
 /// Maximum interval between continuous queries (RFC 6762 §5.2 steady state).
 const MAX_CONTINUOUS_INTERVAL: Duration = Duration::from_secs(3600);
 /// Local address refresh is unrelated to querying; keep it on its own timer.
 const LOCAL_IPS_REFRESH: Duration = Duration::from_secs(10);
+const PENDING_ADDR_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Sentinel querier address marking questions inferred from our own send
 /// path (multicast loop is disabled, so our transmissions never arrive
@@ -582,7 +589,8 @@ pub struct App {
     /// being skipped as noise.
     pub enum_entries: Vec<EnumEntry>,
     pending_instances: Vec<PendingService>,
-    pending_addrs: Vec<(String, browse::RawRecord)>,
+    pending_addrs: HashMap<String, Vec<browse::RawRecord>>,
+    next_pending_addr_prune: Instant,
     pub raw_events: Vec<browse::Event>,
     /// Transient confirmation popup (e.g. state-dump result), shown for
     /// a few seconds and dismissed by any key.
@@ -846,7 +854,8 @@ impl App {
                 last_event: None,
             }],
             pending_instances: Vec::new(),
-            pending_addrs: Vec::new(),
+            pending_addrs: HashMap::new(),
+            next_pending_addr_prune: Instant::now(),
             raw_events: Vec::new(),
             status_msg: None,
             show_metrics: false,
@@ -947,44 +956,39 @@ impl App {
     }
 
     fn flush_pending_addrs(&mut self) {
-        let mut i = 0;
-        while i < self.pending_addrs.len() {
-            let host = self.pending_addrs[i].0.clone();
-            let rec = self.pending_addrs[i].1.clone();
-            // One hostname backs many services (several SRVs, one host):
-            // deliver to every match, not just the first.
-            let mut hits = Vec::new();
-            let mut matched = false;
-            for (j, svc) in self.services.iter().enumerate() {
-                let selected = svc.hostname.trim_end_matches('.').to_lowercase() == host;
-                let alternate = svc.answers.iter().any(|r| {
-                    if r.rtype != 33 {
-                        return false;
-                    }
-                    let target = r
-                        .rdata
-                        .splitn(4, ' ')
-                        .nth(3)
-                        .unwrap_or("")
-                        .trim()
-                        .trim_end_matches('.')
-                        .to_lowercase();
-                    target == host && r.ttl > r.received_at.elapsed().as_secs() as u32
-                });
-                if selected || alternate {
-                    hits.push(j);
+        let mut services_by_host: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, svc) in self.services.iter().enumerate() {
+            let mut hosts = HashSet::new();
+            let selected = svc.hostname.trim_end_matches('.').to_lowercase();
+            if !selected.is_empty() {
+                hosts.insert(selected);
+            }
+            for rec in &svc.answers {
+                if rec.rtype != 33 || rec.ttl <= rec.received_at.elapsed().as_secs() as u32 {
+                    continue;
+                }
+                if let Some(target) = srv_target(&rec.rdata) {
+                    hosts.insert(target.to_lowercase());
                 }
             }
-            for j in hits {
-                self.push_record(j, &rec);
-                matched = true;
-            }
-            if matched {
-                self.pending_addrs.swap_remove(i);
-            } else {
-                i += 1;
+            for host in hosts {
+                services_by_host.entry(host).or_default().push(i);
             }
         }
+
+        for (host, services) in services_by_host {
+            if let Some(records) = self.pending_addrs.remove(&host) {
+                for rec in records {
+                    for &i in &services {
+                        self.push_record(i, &rec);
+                    }
+                }
+            }
+        }
+    }
+
+    fn pending_addrs_count(&self) -> usize {
+        self.pending_addrs.values().map(Vec::len).sum()
     }
 
     fn drain_events(&mut self) {
@@ -993,7 +997,9 @@ impl App {
             self.packet_count += 1;
             batch.push(ev);
         }
-
+        let target_changed = batch
+            .iter()
+            .any(|ev| ev.answers.iter().any(|rec| rec.rtype == 33 && rec.ttl > 0));
         for ev in &batch {
             self.note_packet_metrics(ev);
             self.raw_events.push(ev.clone());
@@ -1026,7 +1032,10 @@ impl App {
         for ev in &batch {
             self.ingest_event(ev);
         }
-        self.flush_pending_addrs();
+
+        if target_changed {
+            self.flush_pending_addrs();
+        }
     }
 
     /// Cumulative per-packet accounting for the metrics overlay.
@@ -1349,7 +1358,7 @@ impl App {
                 .pending_instances
                 .iter()
                 .any(|p| p.answers.iter().any(&live_row))
-            || self.pending_addrs.iter().any(|(_, r)| live_row(r))
+            || self.pending_addrs.values().flatten().any(live_row)
     }
 
     /// Earliest point at which the refresh scan will trigger for an
@@ -1613,7 +1622,6 @@ impl App {
     }
 
     fn send_queries(&mut self) {
-        self.flush_pending_addrs();
         // Passive mode transmits nothing: no QU batch, no continuous
         // stream, no TTL refreshes. Filing received data and the link
         // refresh below still run.
@@ -1944,7 +1952,7 @@ impl App {
             format!(
                 "{} / {}",
                 self.pending_instances.len(),
-                self.pending_addrs.len()
+                self.pending_addrs_count()
             ),
         );
         let (live, expired, goodbye) = self.current_record_liveness();
@@ -2408,8 +2416,7 @@ impl App {
             .iter()
             .flat_map(|e| e.answers.iter())
             .collect();
-        let pending_hosts: HashSet<String> =
-            self.pending_addrs.iter().map(|(h, _)| h.clone()).collect();
+        let pending_hosts: HashSet<String> = self.pending_addrs.keys().cloned().collect();
         // Observed questions flattened with their owning service id, so the
         // analyzer can attribute demand-side leaks the same way it does
         // answer sightings. Unrecognised type labels stay quiet.
@@ -2598,6 +2605,10 @@ impl App {
         metrics.insert("ka_sent".to_string(), m.ka_sent);
         metrics.insert("suppressed_continuous".to_string(), m.suppressed_continuous);
         metrics.insert("suppressed_refresh".to_string(), m.suppressed_refresh);
+        metrics.insert(
+            "pending_addrs".to_string(),
+            self.pending_addrs_count() as u64,
+        );
         metrics.insert("services_current".to_string(), self.services.len() as u64);
         metrics.insert(
             "services_active".to_string(),
@@ -2650,8 +2661,10 @@ impl App {
                 answer_key(&rec.name, rec.rtype);
             }
         }
-        for (_, rec) in &self.pending_addrs {
-            answer_key(&rec.name, rec.rtype);
+        for recs in self.pending_addrs.values() {
+            for rec in recs {
+                answer_key(&rec.name, rec.rtype);
+            }
         }
         let mut interest_keys: Vec<(String, u16)> = interest_keys.into_iter().collect();
         interest_keys.sort();
@@ -4741,25 +4754,25 @@ impl App {
         for (i, svc) in self.services.iter().enumerate() {
             let selected = svc.hostname.trim_end_matches('.').to_lowercase() == host;
             let alternate = svc.answers.iter().any(|r| {
-                if r.rtype != 33 {
-                    return false;
-                }
-                let target = r
-                    .rdata
-                    .splitn(4, ' ')
-                    .nth(3)
-                    .unwrap_or("")
-                    .trim()
-                    .trim_end_matches('.')
-                    .to_lowercase();
-                target == host && r.ttl > r.received_at.elapsed().as_secs() as u32
+                r.rtype == 33
+                    && r.ttl > r.received_at.elapsed().as_secs() as u32
+                    && srv_target(&r.rdata).is_some_and(|target| target.eq_ignore_ascii_case(&host))
             });
             if selected || alternate {
                 hits.push(i);
             }
         }
         if hits.is_empty() {
-            self.pending_addrs.push((host, rec.clone()));
+            let records = self.pending_addrs.entry(host).or_default();
+            if let Some(pending) = records.iter_mut().find(|pending| {
+                pending.rtype == rec.rtype
+                    && pending.rdata == rec.rdata
+                    && pending.source == rec.source
+            }) {
+                *pending = rec.clone();
+            } else {
+                records.push(rec.clone());
+            }
             return;
         }
         for i in hits {
@@ -4952,6 +4965,13 @@ impl App {
     fn evict_expired(&mut self) {
         let grace = Duration::from_secs(120);
         let now = Instant::now();
+        if now >= self.next_pending_addr_prune {
+            self.next_pending_addr_prune = now + PENDING_ADDR_PRUNE_INTERVAL;
+            self.pending_addrs.retain(|_, records| {
+                records.retain(|r| r.ttl > 0 && r.ttl > r.received_at.elapsed().as_secs() as u32);
+                !records.is_empty()
+            });
+        }
         Self::expire_stale_services(&mut self.services);
         let before = self.services.len();
         self.services
@@ -7291,8 +7311,12 @@ mod tests {
             &mut app,
             &raw_record("shared.local.", 1, "A", "192.168.1.10", 120),
         );
+        ingest(
+            &mut app,
+            &raw_record("shared.local.", 1, "A", "192.168.1.11", 120),
+        );
         assert!(app.services.is_empty());
-        assert_eq!(app.pending_addrs.len(), 1);
+        assert_eq!(app.pending_addrs_count(), 2);
         ingest(
             &mut app,
             &raw_record("_http._tcp.local.", 12, "PTR", "One._http._tcp.local.", 120),
@@ -7325,8 +7349,98 @@ mod tests {
         // parked address is still pending until the drain-time flush.
         app.flush_pending_addrs();
         assert!(app.pending_addrs.is_empty());
-        assert!(has_live_a(&app, "One"), "pending A missing on One");
-        assert!(has_live_a(&app, "Two"), "pending A missing on Two");
+        for instance in ["One", "Two"] {
+            let service = app
+                .services
+                .iter()
+                .find(|service| service.instance == instance)
+                .unwrap();
+            assert_eq!(
+                service.answers.iter().filter(|r| r.rtype == 1).count(),
+                2,
+                "pending A records missing on {instance}"
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_packet_batch_does_not_flush_pending_addresses() {
+        let mut app = App::new_with(true, None).unwrap();
+        let (tx, rx) = mpsc::channel();
+        app.rx = rx;
+
+        tx.send(event_for(&raw_record(
+            "test.local.",
+            1,
+            "A",
+            "192.168.1.10",
+            120,
+        )))
+        .unwrap();
+        app.drain_events();
+        assert_eq!(app.pending_addrs_count(), 1);
+
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+
+        tx.send(event_for(&raw_record(
+            "unrelated.local.",
+            1,
+            "A",
+            "192.168.1.11",
+            120,
+        )))
+        .unwrap();
+        app.drain_events();
+
+        assert!(app.pending_addrs.contains_key("test.local"));
+
+        tx.send(event_for(&srv_record(120))).unwrap();
+        app.drain_events();
+
+        assert!(!app.pending_addrs.contains_key("test.local"));
+        assert!(has_live_a(&app, "Test"));
+    }
+
+    #[test]
+    fn pending_address_flush_includes_live_alternate_srv_targets() {
+        let mut app = App::new_with(true, None).unwrap();
+        ingest(
+            &mut app,
+            &raw_record("_http._tcp.local.", 12, "PTR", "Svc._http._tcp.local.", 120),
+        );
+        ingest(
+            &mut app,
+            &raw_record(
+                "Svc._http._tcp.local.",
+                33,
+                "SRV",
+                "0 0 80 host-a.local.",
+                120,
+            ),
+        );
+        ingest(
+            &mut app,
+            &raw_record(
+                "Svc._http._tcp.local.",
+                33,
+                "SRV",
+                "0 0 8080 host-b.local.",
+                120,
+            ),
+        );
+        app.pending_addrs.insert(
+            "host-a.local".to_string(),
+            vec![raw_record("host-a.local.", 1, "A", "192.168.1.10", 120)],
+        );
+        app.flush_pending_addrs();
+
+        assert!(app.pending_addrs.is_empty());
+        assert_eq!(app.services[0].hostname, "host-b.local.");
+        assert!(app.services[0]
+            .answers
+            .iter()
+            .any(|r| r.rtype == 1 && r.rdata == "192.168.1.10"));
     }
 
     #[test]
@@ -8117,9 +8231,46 @@ mod tests {
         let mut rec = raw_record("lonely.local.", 1, "A", "192.168.1.9", 120);
         rec.source = remote_source();
         ingest(&mut app, &rec);
-        assert_eq!(app.pending_addrs.len(), 1);
+        assert_eq!(app.pending_addrs_count(), 1);
         let view = app.interest_view(&("lonely.local".to_string(), 1));
         assert_eq!(view.status, InterestStatus::Answered);
+    }
+
+    #[test]
+    fn repeated_unmatched_addresses_do_not_accumulate() {
+        let mut app = App::new().unwrap();
+        for _ in 0..8 {
+            ingest(
+                &mut app,
+                &raw_record("lonely.local.", 1, "A", "192.168.1.9", 120),
+            );
+        }
+        assert_eq!(app.pending_addrs_count(), 1);
+    }
+
+    #[test]
+    fn expired_unmatched_addresses_are_evicted() {
+        let mut app = App::new().unwrap();
+        let mut rec = raw_record("lonely.local.", 1, "A", "192.168.1.9", 1);
+        rec.received_at = Instant::now() - Duration::from_secs(2);
+        ingest(&mut app, &rec);
+        assert_eq!(app.pending_addrs_count(), 1);
+
+        app.next_pending_addr_prune = Instant::now();
+        app.evict_expired();
+
+        assert!(app.pending_addrs.is_empty());
+    }
+
+    #[test]
+    fn state_dump_reports_pending_address_count() {
+        let mut app = App::new_with(true, None).unwrap();
+        ingest(
+            &mut app,
+            &raw_record("lonely.local.", 1, "A", "192.168.1.9", 120),
+        );
+
+        assert_eq!(app.state_dump().metrics["pending_addrs"], 1);
     }
 
     #[test]
