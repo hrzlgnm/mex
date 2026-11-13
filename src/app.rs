@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -489,6 +489,8 @@ pub struct App {
     /// Visible rows of the Hex pane (minus borders), recorded during draw
     /// so paging matches the viewport.
     pub hex_viewport: Cell<usize>,
+    /// Currently selected field in the displayed resource record.
+    pub hex_selected_field: Cell<Option<usize>>,
     /// Horizontal split: percent of the body width given to the Hosts pane.
     /// The shared pane borders are the mouse-drag handles.
     pub left_pct: u16,
@@ -511,6 +513,7 @@ pub struct App {
     pub questions_rect: Cell<Rect>,
     pub anomalies_rect: Cell<Rect>,
     pub hex_rect: Cell<Rect>,
+    pub(crate) hex_field_hits: RefCell<Vec<(Rect, usize)>>,
     pub packet_count: u64,
     pub start_time: Instant,
     pub running: bool,
@@ -827,6 +830,7 @@ impl App {
             anomalies_viewport: Cell::new(0),
             hex_offset: Cell::new(0),
             hex_viewport: Cell::new(0),
+            hex_selected_field: Cell::new(None),
             left_pct: 33,
             answers_pct: 30,
             questions_pct: 25,
@@ -840,6 +844,7 @@ impl App {
             questions_rect: Cell::new(Rect::default()),
             anomalies_rect: Cell::new(Rect::default()),
             hex_rect: Cell::new(Rect::default()),
+            hex_field_hits: RefCell::new(Vec::new()),
             detail_svc_key: None,
             detail_enum_key: None,
             detail_anchor: None,
@@ -3198,6 +3203,18 @@ impl App {
             // The hex pane follows the cursor; clicking focuses it so its
             // keys scroll the dump.
             self.focus = Focus::Hex;
+            self.click_hex_field(col, row);
+        }
+    }
+
+    fn click_hex_field(&self, col: u16, row: u16) {
+        if let Some((_, index)) = self
+            .hex_field_hits
+            .borrow()
+            .iter()
+            .find(|(rect, _)| col >= rect.x && col < rect.x + rect.width && row == rect.y)
+        {
+            self.hex_selected_field.set(Some(*index));
         }
     }
 
@@ -3812,6 +3829,8 @@ impl App {
     /// Anomalies pane to the row's finding.
     fn restart_for_new_row(&mut self) {
         self.hex_offset.set(0);
+        self.hex_selected_field.set(None);
+        self.hex_field_hits.borrow_mut().clear();
         self.follow_anomalies_cursor();
     }
 
@@ -3952,6 +3971,8 @@ impl App {
             // to track, so a stale manual offset must not linger.
             self.anomalies_offset.set(0);
             self.anomalies_follow.set(false);
+            self.hex_selected_field.set(None);
+            self.hex_field_hits.borrow_mut().clear();
             return;
         }
         if self.detail_svc_key != svc_key || self.detail_enum_key != enum_key {
@@ -3980,6 +4001,8 @@ impl App {
             (None, Some(_)) => {
                 // Tracked row expired away (capped question list): park on
                 // the last raw record instead of pointing at shifted churn.
+                self.hex_selected_field.set(None);
+                self.hex_field_hits.borrow_mut().clear();
                 let parked = self
                     .display_detail()
                     .map(|d| d.ordered_answers().len().saturating_sub(1))
@@ -5443,6 +5466,13 @@ impl App {
 
     /// Hex dump payload for the hex pane: wire bytes of the selected record,
     /// or the stored query packet for a selected question row.
+    pub fn selected_record_fields(&self) -> Option<Vec<browse::RecordField>> {
+        let DetailEntry::Record(record) = self.selected_detail_entry()? else {
+            return None;
+        };
+        Some(browse::record_fields(&record.wire, record.rtype))
+    }
+
     pub fn selected_detail_bytes(&self) -> Option<(Vec<u8>, String)> {
         match self.selected_detail_entry()? {
             DetailEntry::Record(rec) => {
@@ -6479,6 +6509,380 @@ mod tests {
             }
         }
         (mods, title)
+    }
+
+    fn find_buffer_text(buffer: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16)> {
+        find_buffer_text_in_rect(buffer, buffer.area, needle)
+    }
+
+    fn find_buffer_text_in_rect(
+        buffer: &ratatui::buffer::Buffer,
+        area: Rect,
+        needle: &str,
+    ) -> Option<(u16, u16)> {
+        for y in area.y..area.y.saturating_add(area.height) {
+            let line: String = (area.x..area.x.saturating_add(area.width))
+                .filter_map(|x| buffer.cell((x, y)).map(|cell| cell.symbol()))
+                .collect();
+            if let Some(byte_index) = line.find(needle) {
+                let cell_offset = line[..byte_index].chars().count();
+                return Some((area.x.saturating_add(cell_offset as u16), y));
+            }
+        }
+        None
+    }
+
+    fn append_wire_name(wire: &mut Vec<u8>, name: &str) {
+        for label in name.trim_end_matches('.').split('.') {
+            wire.push(label.len() as u8);
+            wire.extend_from_slice(label.as_bytes());
+        }
+        wire.push(0);
+    }
+
+    fn srv_wire() -> Vec<u8> {
+        let mut wire = Vec::new();
+        append_wire_name(&mut wire, "Shell._ssh._tcp.local.");
+        wire.extend(33u16.to_be_bytes());
+        wire.extend(0x8001u16.to_be_bytes());
+        wire.extend(120u32.to_be_bytes());
+        let mut rdata = vec![0, 0, 0, 0, 0x23, 0x8c];
+        append_wire_name(&mut rdata, "shell.local.");
+        wire.extend((rdata.len() as u16).to_be_bytes());
+        wire.extend(rdata);
+        wire
+    }
+
+    #[test]
+    fn clicking_record_field_highlights_its_wire_bytes() {
+        use ratatui::style::{Color, Modifier};
+
+        let mut app = two_group_app();
+        let record = app
+            .services
+            .iter_mut()
+            .find(|service| service.instance == "Shell")
+            .expect("selected service")
+            .answers
+            .iter_mut()
+            .find(|record| record.rtype == 12)
+            .expect("PTR record");
+        record.wire = vec![
+            0x04, b'_', b's', b's', b'h', 0x04, b'_', b't', b'c', b'p', 0x05, b'l', b'o', b'c',
+            b'a', b'l', 0x00, 0x00, 0x0c, 0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x17, 0x05,
+            b'S', b'h', b'e', b'l', b'l', 0x04, b'_', b's', b's', b'h', 0x04, b'_', b't', b'c',
+            b'p', 0x05, b'l', b'o', b'c', b'a', b'l', 0x00,
+        ];
+        app.services
+            .iter_mut()
+            .find(|service| service.instance == "Shell")
+            .and_then(|service| service.answers.iter_mut().find(|record| record.rtype == 33))
+            .expect("SRV record")
+            .wire = srv_wire();
+        app.detail_selected = 0;
+
+        let before = render_to_buffer(&app, 160, 60);
+        let selected_record = app.detail_selected;
+        let (field_x, field_y) =
+            find_buffer_text(&before, "Owner name").expect("owner field is displayed");
+        app.mouse_down(field_x + 1, field_y);
+        assert_eq!(
+            app.detail_selected, selected_record,
+            "clicking a field should not change the selected record"
+        );
+
+        let after = render_to_buffer(&app, 160, 60);
+        let (label_x, label_y) =
+            find_buffer_text(&after, "Owner name").expect("owner field remains displayed");
+        assert!(
+            after
+                .cell((label_x, label_y))
+                .is_some_and(|cell| cell.modifier.contains(Modifier::UNDERLINED)),
+            "selected field label should be underlined"
+        );
+
+        let (bytes_x, bytes_y) =
+            find_buffer_text(&after, "045f 7373").expect("owner bytes are displayed");
+        assert!(
+            after.cell((bytes_x, bytes_y)).is_some_and(|cell| {
+                cell.fg == Color::Yellow && cell.modifier.contains(Modifier::UNDERLINED)
+            }),
+            "owner bytes should be highlighted"
+        );
+        let ascii_x = bytes_x + 56;
+        assert_eq!(
+            after.cell((ascii_x, bytes_y)).map(|cell| cell.fg),
+            Some(Color::Yellow),
+            "the ASCII column should highlight the same field"
+        );
+        assert_eq!(
+            after.cell((ascii_x + 15, bytes_y)).map(|cell| cell.fg),
+            Some(Color::Yellow),
+            "the final byte in the first dump row should be highlighted"
+        );
+        assert_eq!(
+            after.cell((ascii_x, bytes_y + 1)).map(|cell| cell.fg),
+            Some(Color::Yellow),
+            "the owner terminator should be highlighted in the next ASCII row"
+        );
+        assert_ne!(
+            after.cell((ascii_x + 1, bytes_y + 1)).map(|cell| cell.fg),
+            Some(Color::Yellow),
+            "the record type should not be highlighted in the ASCII column"
+        );
+        let (end_x, end_y) =
+            find_buffer_text(&after, "0000 0c00").expect("owner end and record type are displayed");
+        assert_eq!(
+            after.cell((end_x, end_y)).map(|cell| cell.fg),
+            Some(Color::Yellow),
+            "the owner's terminating byte should be included"
+        );
+        assert_ne!(
+            after.cell((end_x + 2, end_y)).map(|cell| cell.fg),
+            Some(Color::Yellow),
+            "the adjacent record-type byte should not be included"
+        );
+
+        app.scroll_hex_edge(false);
+        let scrolled = render_to_buffer(&app, 160, 60);
+        let hex_area = app.hex_rect.get();
+        let title_area = Rect::new(hex_area.x, hex_area.y, hex_area.width, 1);
+        let (title_x, title_y) = find_buffer_text_in_rect(&scrolled, title_area, "Owner name")
+            .expect("selected field remains in the pane title while scrolling");
+        assert!(
+            scrolled
+                .cell((title_x, title_y))
+                .is_some_and(|cell| cell.modifier.contains(Modifier::UNDERLINED)),
+            "scrolling should not hide the selected field label"
+        );
+
+        let srv = app
+            .services
+            .iter_mut()
+            .find(|service| service.instance == "Shell")
+            .and_then(|service| service.answers.iter_mut().find(|record| record.rtype == 33))
+            .expect("SRV record");
+        srv.wire = srv_wire();
+        app.focus = Focus::Answers;
+        app.move_detail_cursor(1);
+        let after_record_change = render_to_buffer(&app, 160, 60);
+        let (label_x, label_y) = find_buffer_text(&after_record_change, "Owner name")
+            .expect("next record field is displayed");
+        assert!(
+            !after_record_change
+                .cell((label_x, label_y))
+                .is_some_and(|cell| cell.modifier.contains(Modifier::UNDERLINED)),
+            "changing records should clear the prior field selection"
+        );
+    }
+
+    #[test]
+    fn clicking_srv_port_highlights_only_the_port_bytes() {
+        use ratatui::style::{Color, Modifier};
+
+        let mut app = two_group_app();
+        let service = app
+            .services
+            .iter_mut()
+            .find(|service| service.instance == "Shell")
+            .expect("selected service");
+        let record = service
+            .answers
+            .iter_mut()
+            .find(|record| record.rtype == 33)
+            .expect("SRV record");
+        record.wire = srv_wire();
+        app.detail_selected = app
+            .display_detail()
+            .and_then(|detail| {
+                detail
+                    .ordered_answers()
+                    .iter()
+                    .position(|record| record.rtype == 33)
+            })
+            .expect("SRV record position");
+
+        let before = render_to_buffer(&app, 100, 60);
+        let (field_x, field_y) =
+            find_buffer_text(&before, "Port").expect("SRV port field is displayed");
+        app.mouse_down(field_x + 1, field_y);
+
+        let after = render_to_buffer(&app, 100, 60);
+        let (bytes_x, bytes_y) =
+            find_buffer_text(&after, "0023 8c05").expect("SRV port bytes are displayed");
+        for x in [bytes_x + 2, bytes_x + 3, bytes_x + 5, bytes_x + 6] {
+            assert!(
+                after.cell((x, bytes_y)).is_some_and(|cell| {
+                    cell.fg == Color::Yellow && cell.modifier.contains(Modifier::UNDERLINED)
+                }),
+                "each port hex digit should be highlighted"
+            );
+        }
+        assert_ne!(
+            after.cell((bytes_x, bytes_y)).map(|cell| cell.fg),
+            Some(Color::Yellow),
+            "the preceding SRV byte should not be highlighted"
+        );
+        assert_ne!(
+            after.cell((bytes_x + 7, bytes_y)).map(|cell| cell.fg),
+            Some(Color::Yellow),
+            "the following target-name byte should not be highlighted"
+        );
+    }
+
+    #[test]
+    fn clicking_ipv4_address_highlights_its_four_bytes() {
+        use ratatui::style::{Color, Modifier};
+
+        let mut app = two_group_app();
+        let mut wire = Vec::new();
+        append_wire_name(&mut wire, "host.local.");
+        wire.extend(1u16.to_be_bytes());
+        wire.extend(0x8001u16.to_be_bytes());
+        wire.extend(120u32.to_be_bytes());
+        wire.extend(4u16.to_be_bytes());
+        wire.extend([192, 0, 2, 1]);
+        let mut record = raw_record("host.local.", 1, "A", "192.0.2.1", 120);
+        record.wire = wire;
+        app.services
+            .iter_mut()
+            .find(|service| service.instance == "Shell")
+            .expect("selected service")
+            .answers
+            .push(record);
+        app.detail_selected = app
+            .display_detail()
+            .and_then(|detail| {
+                detail
+                    .ordered_answers()
+                    .iter()
+                    .position(|record| record.rtype == 1)
+            })
+            .expect("A record position");
+
+        let before = render_to_buffer(&app, 100, 60);
+        let (field_x, field_y) =
+            find_buffer_text(&before, "IPv4 address").expect("address field is displayed");
+        app.mouse_down(field_x + 1, field_y);
+
+        let after = render_to_buffer(&app, 100, 60);
+        let (bytes_x, bytes_y) =
+            find_buffer_text(&after, "c000 0201").expect("IPv4 address bytes are displayed");
+        for x in [
+            bytes_x,
+            bytes_x + 1,
+            bytes_x + 2,
+            bytes_x + 3,
+            bytes_x + 5,
+            bytes_x + 6,
+            bytes_x + 7,
+            bytes_x + 8,
+        ] {
+            assert!(
+                after.cell((x, bytes_y)).is_some_and(|cell| {
+                    cell.fg == Color::Yellow && cell.modifier.contains(Modifier::UNDERLINED)
+                }),
+                "each IPv4 address hex digit should be highlighted"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_record_data_stays_opaque() {
+        let mut app = two_group_app();
+        let mut wire = Vec::new();
+        append_wire_name(&mut wire, "host.local.");
+        wire.extend(99u16.to_be_bytes());
+        wire.extend(1u16.to_be_bytes());
+        wire.extend(120u32.to_be_bytes());
+        wire.extend(4u16.to_be_bytes());
+        wire.extend([1, 2, 3, 4]);
+        let mut record = raw_record("host.local.", 99, "TYPE99", "01020304", 120);
+        record.wire = wire;
+        app.services
+            .iter_mut()
+            .find(|service| service.instance == "Shell")
+            .expect("selected service")
+            .answers
+            .push(record);
+        app.detail_selected = app
+            .display_detail()
+            .and_then(|detail| {
+                detail
+                    .ordered_answers()
+                    .iter()
+                    .position(|record| record.rtype == 99)
+            })
+            .expect("unknown record position");
+
+        let buffer = render_to_buffer(&app, 160, 60);
+        let hex_area = app.hex_rect.get();
+        assert!(
+            find_buffer_text_in_rect(&buffer, hex_area, "RDATA").is_some(),
+            "unknown record data should remain identifiable as RDATA"
+        );
+        assert!(
+            find_buffer_text_in_rect(&buffer, hex_area, "IPv4 address").is_none(),
+            "unknown record data should not be given invented subfields"
+        );
+        assert!(
+            find_buffer_text_in_rect(&buffer, hex_area, "PTR target").is_none(),
+            "unknown record data should not be interpreted as a known name field"
+        );
+    }
+
+    #[test]
+    fn clicking_txt_string_highlights_its_length_and_data() {
+        use ratatui::style::{Color, Modifier};
+
+        let mut app = two_group_app();
+        let mut record = raw_record("Shell._ssh._tcp.local.", 16, "TXT", "a=1; b=2", 120);
+        let mut wire = Vec::new();
+        append_wire_name(&mut wire, "Shell._ssh._tcp.local.");
+        wire.extend(16u16.to_be_bytes());
+        wire.extend(0x8001u16.to_be_bytes());
+        wire.extend(120u32.to_be_bytes());
+        wire.extend(8u16.to_be_bytes());
+        wire.extend([3, b'a', b'=', b'1', 3, b'b', b'=', b'2']);
+        record.wire = wire;
+        ingest(&mut app, &record);
+        app.detail_selected = app
+            .display_detail()
+            .and_then(|detail| {
+                detail
+                    .ordered_answers()
+                    .iter()
+                    .position(|record| record.rtype == 16)
+            })
+            .expect("TXT record position");
+
+        let before = render_to_buffer(&app, 100, 60);
+        let (field_x, field_y) =
+            find_buffer_text(&before, "TXT string 2").expect("second TXT string is displayed");
+        app.mouse_down(field_x + 1, field_y);
+
+        let after = render_to_buffer(&app, 100, 60);
+        let (bytes_x, bytes_y) =
+            find_buffer_text(&after, "3103 623d").expect("second TXT string bytes are displayed");
+        for x in [
+            bytes_x + 2,
+            bytes_x + 3,
+            bytes_x + 5,
+            bytes_x + 6,
+            bytes_x + 7,
+        ] {
+            assert!(
+                after.cell((x, bytes_y)).is_some_and(|cell| {
+                    cell.fg == Color::Yellow && cell.modifier.contains(Modifier::UNDERLINED)
+                }),
+                "each byte of the second TXT string should be highlighted"
+            );
+        }
+        assert_ne!(
+            after.cell((bytes_x, bytes_y)).map(|cell| cell.fg),
+            Some(Color::Yellow),
+            "the first TXT string should not be highlighted"
+        );
     }
 
     #[test]
