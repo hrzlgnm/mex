@@ -7946,6 +7946,76 @@ mod tests {
     }
 
     #[test]
+    fn questions_pane_last_self_suppressed() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        select_instance(&mut app, "Test");
+        app.poll_continuous();
+        for svc in &mut app.services {
+            for rec in &mut svc.answers {
+                if rec.rtype == 33 {
+                    rec.received_at = Instant::now() - Duration::from_secs(100);
+                }
+            }
+        }
+        app.requery_expiring();
+        // Overhear a peer's SRV question so the next refresh is suppressed.
+        let ev = query_event(
+            "Test._http._tcp.local.",
+            33,
+            "SRV",
+            false,
+            Vec::new(),
+            remote_source(),
+        );
+        app.ingest_event(&ev);
+        for ((name, rtype), (due, _)) in app.requeries.iter_mut() {
+            if name == "Test._http._tcp.local" && *rtype == 33 {
+                *due = Instant::now() - Duration::from_secs(1);
+            }
+        }
+        app.requery_expiring();
+        let text = questions_pane_text(&app);
+        assert!(
+            text.contains("suppressed"),
+            "suppressed kind shown:\n{text}"
+        );
+    }
+
+    #[test]
+    fn questions_pane_last_self_no_provenance() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        select_instance(&mut app, "Test");
+        // File a self row without recording provenance: LAST must be blank.
+        app.route_own_question("_http._tcp.local.", 12);
+        let text = questions_pane_text(&app);
+        assert!(text.contains("—"), "blank LAST shown:\n{text}");
+        assert!(text.contains("PTR"), "ptr row shown:\n{text}");
+    }
+
+    #[test]
+    fn questions_pane_last_foreign_observed() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        select_instance(&mut app, "Test");
+        let ev = query_event(
+            "_http._tcp.local.",
+            12,
+            "PTR",
+            false,
+            Vec::new(),
+            remote_source(),
+        );
+        app.ingest_event(&ev);
+        let text = questions_pane_text(&app);
+        assert!(text.contains("observed"), "foreign row observed:\n{text}");
+    }
+
+    #[test]
     fn projected_refresh_beats_backed_off_browse() {
         let mut app = App::new().unwrap();
         ingest(&mut app, &ptr_record(120));
