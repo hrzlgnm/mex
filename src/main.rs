@@ -6,6 +6,7 @@ mod ui;
 
 use anyhow::Result;
 use clap::Parser;
+use std::str::FromStr;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -36,6 +37,18 @@ struct Args {
         long_help = "Override the default log file (state-dir mex.log on Linux, ~/Library/Logs/mex on macOS, %LOCALAPPDATA%\\mex\\logs on Windows). Appended; rotated past 5 MiB with 3 backups kept. Without it, both modes log to the default file; headless mode additionally logs warnings to stderr, TUI mode without a usable log directory discards logs."
     )]
     log_file: Option<String>,
+
+    /// Minimum log level recorded by every active sink (off, error, warn,
+    /// info, debug, trace). Omitted: file sink keeps `info`, headless
+    /// stderr keeps `warn`.
+    #[arg(
+        long,
+        value_name = "LEVEL",
+        value_parser = parse_log_level,
+        help = "Minimum log level recorded by every active sink",
+        long_help = "Minimum log level recorded by every active sink (off, error, warn, info, debug, trace). When omitted, the file sink records info and above and headless stderr records warn and above, as before. When provided, the chosen level applies to all active sinks."
+    )]
+    log_level: Option<log::LevelFilter>,
 }
 
 /// Minimal log sink with no new dependencies. The file sink (if
@@ -43,21 +56,45 @@ struct Args {
 /// Warn and above so routine traffic stays quiet. TUI mode without a
 /// file installs no logger at all — writing to the terminal would
 /// corrupt the interface.
-struct MexLogger {
+/// Mutable logger state. Held in a global so `init_logging` can reconfigure
+/// thresholds and sinks even after the (process-wide, first-wins) logger has
+/// been installed; this keeps level changes observable in tests.
+struct LoggerState {
     file: Option<std::sync::Mutex<RotatingLog>>,
+    file_level: log::LevelFilter,
     stderr: bool,
+    stderr_level: log::LevelFilter,
 }
 
+static LOGGER_STATE: std::sync::Mutex<LoggerState> = std::sync::Mutex::new(LoggerState {
+    file: None,
+    file_level: log::LevelFilter::Info,
+    stderr: false,
+    stderr_level: log::LevelFilter::Warn,
+});
+
+struct MexLogger;
+
+static LOGGER: MexLogger = MexLogger;
+
 impl MexLogger {
-    fn install(file: Option<RotatingLog>, stderr: bool) {
-        let logger = Box::leak(Box::new(MexLogger {
-            file: file.map(std::sync::Mutex::new),
-            stderr,
-        }));
+    fn install(file: Option<RotatingLog>, stderr: bool, log_level: Option<log::LevelFilter>) {
+        let (file_level, stderr_level) = match log_level {
+            Some(level) => (level, level),
+            None => (log::LevelFilter::Info, log::LevelFilter::Warn),
+        };
+        let max_level = log_level.unwrap_or(log::LevelFilter::Info);
+        if let Ok(mut state) = LOGGER_STATE.lock() {
+            state.file = file.map(std::sync::Mutex::new);
+            state.file_level = file_level;
+            state.stderr = stderr;
+            state.stderr_level = stderr_level;
+        }
         // A test binary shares one process-wide logger: first install
-        // wins, later ones are ignored.
-        let _ = log::set_logger(logger);
-        log::set_max_level(log::LevelFilter::Info);
+        // wins, later ones are ignored, but the state above is always
+        // updated.
+        let _ = log::set_logger(&LOGGER);
+        log::set_max_level(max_level);
     }
 }
 
@@ -72,10 +109,11 @@ pub fn take_log_error() -> Option<String> {
 
 impl log::Log for MexLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        if self.file.is_some() {
-            metadata.level() <= log::Level::Info
+        if let Ok(state) = LOGGER_STATE.lock() {
+            (state.file.is_some() && metadata.level() <= state.file_level)
+                || (state.stderr && metadata.level() <= state.stderr_level)
         } else {
-            self.stderr && metadata.level() <= log::Level::Warn
+            false
         }
     }
 
@@ -89,17 +127,21 @@ impl log::Log for MexLogger {
             record.level(),
             record.args()
         );
-        if let Some(f) = &self.file {
-            if let Ok(mut f) = f.lock() {
-                if let Err(e) = f.write_line(&line) {
-                    if let Ok(mut le) = LAST_LOG_ERROR.lock() {
-                        *le = Some(format!("log write failed: {e}"));
+        if let Ok(state) = LOGGER_STATE.lock() {
+            if state.file.is_some() && record.metadata().level() <= state.file_level {
+                if let Some(f) = &state.file {
+                    if let Ok(mut f) = f.lock() {
+                        if let Err(e) = f.write_line(&line) {
+                            if let Ok(mut le) = LAST_LOG_ERROR.lock() {
+                                *le = Some(format!("log write failed: {e}"));
+                            }
+                        }
                     }
                 }
             }
-        }
-        if self.stderr {
-            eprint!("{line}");
+            if state.stderr && record.metadata().level() <= state.stderr_level {
+                eprint!("{line}");
+            }
         }
     }
 
@@ -228,14 +270,18 @@ fn default_log_dir() -> std::path::PathBuf {
 /// headless mode also keeps stderr warnings. A bad explicit path fails
 /// fast; an unusable default directory degrades to stderr-only
 /// (headless) or silent (TUI, where printing would corrupt the UI).
-fn init_logging(log_file: Option<&str>, has_tui: bool) -> Result<()> {
+fn init_logging(
+    log_file: Option<&str>,
+    has_tui: bool,
+    log_level: Option<log::LevelFilter>,
+) -> Result<()> {
     let (path, stderr) = match log_file {
         Some(p) => (std::path::PathBuf::from(p), false),
         None => (default_log_dir().join("mex.log"), !has_tui),
     };
     match RotatingLog::open(&path, MAX_LOG_BYTES, KEEP_LOG_GENERATIONS) {
         Ok(log) => {
-            MexLogger::install(Some(log), stderr);
+            MexLogger::install(Some(log), stderr, log_level);
             Ok(())
         }
         Err(e) if log_file.is_some() => Err(anyhow::anyhow!(
@@ -248,27 +294,40 @@ fn init_logging(log_file: Option<&str>, has_tui: bool) -> Result<()> {
                     "mex: cannot open log file {}: {e}; continuing with stderr only",
                     path.display()
                 );
-                MexLogger::install(None, true);
+                MexLogger::install(None, true, log_level);
             }
             Ok(())
         }
     }
 }
 
+fn parse_log_level(value: &str) -> Result<log::LevelFilter, String> {
+    log::LevelFilter::from_str(value).map_err(|_| format!("invalid log level: {value}"))
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
-    let interfaces = match args.interfaces {
+    let interfaces = match args.interfaces.as_ref() {
         Some(ifs) => Some(browse::validate_selection(
-            &ifs,
+            ifs,
             &browse::available_interfaces(),
         )?),
         None => None,
     };
     let mut terminal = ui::try_init()?;
     let has_tui = terminal.is_some();
-    if let Err(e) = init_logging(args.log_file.as_deref(), has_tui) {
+    if let Err(e) = init_logging(args.log_file.as_deref(), has_tui, args.log_level) {
         ui::try_restore(has_tui)?;
         return Err(e);
+    }
+    if args.interfaces.is_some() {
+        log::info!("mex: interface selection: {:?}", args.interfaces);
+    }
+    if args.passive {
+        log::info!("mex: passive mode (no queries)");
+    }
+    if has_tui {
+        log::info!("mex: starting in TUI mode");
     }
     let mut app = if args.passive {
         app::App::new_with(true, interfaces)?
@@ -285,6 +344,10 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes tests that reconfigure the process-wide logger, avoiding
+    /// cross-test races on the shared sink state.
+    static TEST_LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn passive_flag_parses() {
@@ -317,6 +380,78 @@ mod tests {
         assert!(args.log_file.is_none());
         let args = Args::try_parse_from(["mex", "--log-file", "/tmp/mex.log"]).unwrap();
         assert_eq!(args.log_file.as_deref(), Some("/tmp/mex.log"));
+    }
+
+    #[test]
+    fn log_level_threshold_filters_file_sink() {
+        let _guard = TEST_LOG_LOCK.lock().unwrap();
+        let mk = |suffix: &str| {
+            std::env::temp_dir().join(format!(
+                "mex-loglevel-{}-{}.log",
+                suffix,
+                std::process::id()
+            ))
+        };
+
+        // warn: error+warn recorded, info dropped.
+        let path = mk("warn");
+        let _ = std::fs::remove_file(&path);
+        super::init_logging(
+            Some(path.to_str().unwrap()),
+            false,
+            Some(log::LevelFilter::Warn),
+        )
+        .unwrap();
+        log::error!("probe-warn-error");
+        log::warn!("probe-warn-warn");
+        log::info!("probe-warn-info");
+        let logged = std::fs::read_to_string(&path).unwrap();
+        assert!(logged.contains("probe-warn-error"));
+        assert!(logged.contains("probe-warn-warn"));
+        assert!(!logged.contains("probe-warn-info"));
+
+        // debug: debug recorded, trace not (max level stops it).
+        let path = mk("debug");
+        let _ = std::fs::remove_file(&path);
+        super::init_logging(
+            Some(path.to_str().unwrap()),
+            false,
+            Some(log::LevelFilter::Debug),
+        )
+        .unwrap();
+        log::debug!("probe-debug-debug");
+        log::trace!("probe-debug-trace");
+        let logged = std::fs::read_to_string(&path).unwrap();
+        assert!(logged.contains("probe-debug-debug"));
+        assert!(!logged.contains("probe-debug-trace"));
+
+        // trace: trace recorded.
+        let path = mk("trace");
+        let _ = std::fs::remove_file(&path);
+        super::init_logging(
+            Some(path.to_str().unwrap()),
+            false,
+            Some(log::LevelFilter::Trace),
+        )
+        .unwrap();
+        log::trace!("probe-trace-trace");
+        let logged = std::fs::read_to_string(&path).unwrap();
+        assert!(logged.contains("probe-trace-trace"));
+
+        for suffix in ["warn", "debug", "trace"] {
+            let _ = std::fs::remove_file(mk(suffix));
+        }
+    }
+
+    #[test]
+    fn log_level_flag_parses() {
+        let args = Args::try_parse_from(["mex"]).unwrap();
+        assert!(args.log_level.is_none());
+        let args = Args::try_parse_from(["mex", "--log-level", "debug"]).unwrap();
+        assert_eq!(args.log_level, Some(log::LevelFilter::Debug));
+        let args = Args::try_parse_from(["mex", "--log-level", "TRACE"]).unwrap();
+        assert_eq!(args.log_level, Some(log::LevelFilter::Trace));
+        assert!(Args::try_parse_from(["mex", "--log-level", "nope"]).is_err());
     }
 
     #[test]
@@ -375,10 +510,11 @@ mod tests {
 
     #[test]
     fn file_sink_records_warnings() {
+        let _guard = TEST_LOG_LOCK.lock().unwrap();
         let path = std::env::temp_dir().join(format!("mex-log-test-{}.log", std::process::id()));
         // Unique path per process: parallel `cargo test` runs never share it.
         let _ = std::fs::remove_file(&path);
-        super::init_logging(Some(path.to_str().unwrap()), false).unwrap();
+        super::init_logging(Some(path.to_str().unwrap()), false, None).unwrap();
         log::warn!("sink-probe-xyz");
         log::info!("sink-probe-info-xyz");
         let logged = std::fs::read_to_string(&path).unwrap();

@@ -780,6 +780,11 @@ impl App {
     pub fn new_with(passive: bool, interfaces: Option<HashSet<String>>) -> Result<Self> {
         let (query_tx, rx, drop_stats) = browse::spawn(interfaces.clone())?;
         let link_stats = browse::link_stats(interfaces.as_ref());
+        log::info!(
+            "mex: app created (passive={}, interfaces={:?})",
+            passive,
+            interfaces
+        );
         Ok(Self {
             passive,
             interfaces,
@@ -855,6 +860,7 @@ impl App {
     }
 
     pub fn run(&mut self, terminal: &mut Option<ui::Terminal>) -> Result<()> {
+        log::info!("mex: run started (tui={})", terminal.is_some());
         if let Some(term) = terminal.as_mut() {
             self.run_tui(term)?;
         } else {
@@ -999,6 +1005,9 @@ impl App {
             self.metrics.suppressed_times.pop_front();
         }
 
+        if !batch.is_empty() {
+            log::trace!("mex: drained {} packet(s)", batch.len());
+        }
         for ev in &batch {
             self.ingest_event(ev);
         }
@@ -1176,6 +1185,10 @@ impl App {
         if triggered.is_empty() {
             return;
         }
+        log::debug!(
+            "mex: cache refresh triggered for {} interest(s)",
+            triggered.len()
+        );
         for key in triggered {
             let ttl = ttl_by_key.get(&key).copied().unwrap_or(120);
             // 0-2% random variation so queriers do not stay in lockstep
@@ -1204,6 +1217,7 @@ impl App {
             // RFC 6762 §7.3: another querier just asked the same QM
             // question with no KA we wouldn't send — count ours as sent.
             if self.suppressed_by_overheard(&key, &ka) {
+                log::debug!("mex: suppressed refresh query for {} (overheard)", key.0);
                 self.metrics.suppressed_refresh += 1;
                 self.metrics.suppressed_times.push_back(now);
                 self.note_query(&key.0, key.1, QueryOrigin::Suppressed, now);
@@ -1535,6 +1549,7 @@ impl App {
             // question with no KA we wouldn't send — treat ours as sent.
             // QU elicits unicast and is never suppressed.
             if !qu && self.suppressed_by_overheard(&key, &ka) {
+                log::debug!("mex: suppressed continuous query for {} (overheard)", key.0);
                 let now = Instant::now();
                 self.metrics.suppressed_continuous += 1;
                 self.metrics.suppressed_times.push_back(now);
@@ -1549,6 +1564,11 @@ impl App {
                 // no longer depends on it.
             }
             self.metrics.q_sent_continuous += 1;
+            log::debug!(
+                "mex: sending continuous query for {} (qu={})",
+                send_name,
+                qu
+            );
             self.note_query(&send_name, key.1, QueryOrigin::Transmitted, now);
             if qu {
                 self.metrics.qu_sent += 1;
@@ -3923,6 +3943,12 @@ impl App {
     }
 
     fn ingest_event(&mut self, ev: &browse::Event) {
+        log::trace!(
+            "mex: ingesting packet from {} ({} answer(s), {} question(s))",
+            ev.source,
+            ev.answers.len(),
+            ev.questions.len()
+        );
         for rec in &ev.answers {
             if rec.ttl == 0 {
                 self.mark_goodbye(rec);
@@ -4262,6 +4288,12 @@ impl App {
     }
 
     fn ingest_record(&mut self, rec: &browse::RawRecord, ev: &browse::Event) {
+        log::trace!(
+            "mex: ingesting {} record {} from {}",
+            rec.rtype_str,
+            rec.name,
+            ev.source
+        );
         match rec.rtype {
             12 => self.handle_ptr(rec, ev),
             33 => self.handle_srv(rec, ev),

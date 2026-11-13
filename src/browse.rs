@@ -577,6 +577,7 @@ fn listen(
             .unwrap_or(true)
         {
             last_refresh = Some(Instant::now());
+            log::debug!("mex: refreshing interface list");
             (ifnames, subnets) = link_maps();
             unknown.clear();
             // Joins run unconditionally every pass: they are idempotent,

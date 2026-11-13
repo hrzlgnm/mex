@@ -39,6 +39,12 @@ Appended; rotated past 5 MiB with 3 backups kept. Without it, both
 modes log to the default file; headless mode additionally logs
 warnings to stderr.
 .TP
+.B \-\-log\-level \fILEVEL\fR
+Minimum log level recorded by every active sink (off, error, warn, info,
+debug, trace). When omitted, the file sink records info and above and
+headless stderr records warn and above. When provided, the chosen level
+applies to all active sinks.
+.TP
 .B \-h, \-\-help
 Display help message and exit.
 .TP
