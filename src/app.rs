@@ -7807,10 +7807,22 @@ mod tests {
             remote_source(),
         );
         app.ingest_event(&ev);
+        // Backdate the last transmit past the old fixed column width:
+        // the full kind word must survive, not clip.
+        if let Some(s) = app
+            .query_history
+            .get_mut(&("test._http._tcp.local".to_string(), 33))
+        {
+            s.transmitted = Some(Instant::now() - Duration::from_secs(4000));
+        }
         let text = questions_pane_text(&app);
         assert!(text.contains("LAST"), "header shows LAST:\n{text}");
         assert!(text.contains("DUE"), "header shows DUE:\n{text}");
         assert!(text.contains("observed"), "observed kind shown:\n{text}");
+        assert!(
+            text.contains("transmitted"),
+            "full kind word shown:\n{text}"
+        );
         assert!(text.contains("refresh"), "refresh timer shown:\n{text}");
         assert!(text.contains("browse"), "browse timer shown:\n{text}");
     }

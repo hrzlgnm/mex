@@ -940,7 +940,6 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
         return;
     };
 
-    let mut rows = Vec::new();
     let dim = Style::default().fg(Color::Gray);
     let local_style = Style::default()
         .fg(Color::Green)
@@ -964,6 +963,9 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
             ))
         })
         .collect();
+    // Cells plus row style first: LAST/DUE widths size to content
+    // (like SOURCE below) instead of clipping long states.
+    let mut body: Vec<(Vec<String>, Style)> = Vec::new();
     for (name, rtype, source, received, _) in target.ordered_questions() {
         let age = received.elapsed().as_secs();
         let age_str = fmt_qage(age);
@@ -1013,24 +1015,45 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
         } else {
             rtype.clone()
         };
-        rows.push(
-            Row::new(vec![
-                Cell::from(type_label),
-                Cell::from(age_str),
-                Cell::from(last_txt),
-                Cell::from(due_txt),
-                Cell::from(question_source_label(source)),
-                Cell::from(name.clone()),
-            ])
-            .style(style),
-        );
+        body.push((
+            vec![
+                type_label,
+                age_str,
+                last_txt,
+                due_txt,
+                question_source_label(source),
+                name.clone(),
+            ],
+            style,
+        ));
     }
+
+    // Content-sized with clamps: headers are shorter than any real
+    // content, so the floor only matters when every cell is blank.
+    let last_w = body
+        .iter()
+        .map(|(cells, _)| cells[2].len())
+        .max()
+        .unwrap_or(4)
+        .clamp(8, 20) as u16;
+    let due_w = body
+        .iter()
+        .map(|(cells, _)| cells[3].len())
+        .max()
+        .unwrap_or(3)
+        .clamp(8, 15) as u16;
+    let rows: Vec<Row> = body
+        .into_iter()
+        .map(|(cells, style)| {
+            Row::new(cells.into_iter().map(Cell::from).collect::<Vec<_>>()).style(style)
+        })
+        .collect();
 
     let widths = [
         Constraint::Length(6),
         Constraint::Length(12),
-        Constraint::Length(15),
-        Constraint::Length(14),
+        Constraint::Length(last_w),
+        Constraint::Length(due_w),
         Constraint::Length(
             target
                 .ordered_questions()
