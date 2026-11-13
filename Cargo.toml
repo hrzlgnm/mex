@@ -48,17 +48,30 @@ assets = [
 # `z` vs `3` with LTO: 1.49 vs 1.99 MB (-25%, .text 990 vs 1557 KB).
 # Total shippable gain: 2.55 -> 1.49 MB (-42%); clean build cost +7s (10s -> 17s).
 codegen-units = 1 # one LLVM unit: best optimization, slowest build (default 16)
-lto = true # fat LTO: cross-crate inlining + dead-code elim, e.g. ratatui/simple-dns (-0.34 MB measured)
-opt-level = "z" # min size (O2 + shrink); switch to "3" only if profiling shows a hot loop
-panic = "abort" # no unwind tables: smaller binary, no catch_unwind (unused here)
-debug = true # emit DWARF into split-debug artifacts (mex.pdb / .dSYM / .dwp per platform, each copied best-effort via `|| true`); the binary itself is stripped below, no dbgsym package is produced
-split-debuginfo = "packed" # pack DWARF into .dwp (e.g. ~13 MB mex.dwp in a local Linux release build)
-strip = true # strip symbols from shipped binary (-4.9 MB vs unstripped); split-debug artifacts (if any) sit alongside the binary, never inside it
+# fat LTO: cross-crate inlining + dead-code elim, e.g. ratatui/simple-dns
+# (-0.34 MB measured)
+lto = true
+# min size (O2 + shrink); switch to "3" only if profiling shows a hot loop
+opt-level = "z"
+# no unwind tables: smaller binary, no catch_unwind (unused here)
+panic = "abort"
+# emit DWARF into split-debug artifacts (mex.pdb / .dSYM / .dwp per
+# platform, each copied best-effort via `|| true`); the binary itself is
+# stripped below, no dbgsym package is produced
+debug = true
+# pack DWARF into .dwp (e.g. ~13 MB mex.dwp in a local Linux release build)
+split-debuginfo = "packed"
+# strip symbols from shipped binary (-4.9 MB vs unstripped); split-debug
+# artifacts (if any) sit alongside the binary, never inside it
+strip = true
 
 [dependencies]
 ratatui = "0.30"
 crossterm = "0.29"
-    simple-dns = "0.13" # DNS wire codec only (mex owns sockets/scheduling/suppression): mDNS is first-class here — native cache-flush (§10.2) + unicast-response QU (§5.4) fields, both pinned by browse tests
+# DNS wire codec only (mex owns sockets/scheduling/suppression): mDNS is
+# first-class here — native cache-flush (§10.2) + unicast-response QU
+# (§5.4) fields, both pinned by browse tests
+simple-dns = "0.13"
 socket2 = { version = "0.6", features = ["all"] }
 socket-pktinfo = "0.4"
 log = "0.4"
