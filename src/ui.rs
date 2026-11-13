@@ -966,10 +966,28 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
         .collect();
     for (name, rtype, source, received, _) in target.ordered_questions() {
         let age = received.elapsed().as_secs();
-        let age_str = if age >= 60 {
-            format!("{}m{:02}s", age / 60, age % 60)
-        } else {
-            format!("{age}s")
+        let age_str = fmt_qage(age);
+        // Latest event and owning timer for this interest, from the
+        // authoritative per-interest state (app.rs): rows stay dumb.
+        let (last_txt, due_txt) = match crate::anomalies::rtype_from_str(rtype) {
+            Some(t) => {
+                let s = app.interest_summary(name, t);
+                let last = match (s.last_age_secs, s.last_origin) {
+                    (Some(a), Some(o)) => format!("{} {}", fmt_qage(a), o.as_str()),
+                    _ => "—".to_string(),
+                };
+                let due = match (s.timer, s.next_due_in_secs) {
+                    (crate::app::TimerKind::Refresh, Some(d)) => {
+                        format!("{} refresh", fmt_qage(d))
+                    }
+                    (crate::app::TimerKind::Browse, Some(d)) => {
+                        format!("{} browse", fmt_qage(d))
+                    }
+                    _ => "expired".to_string(),
+                };
+                (last, due)
+            }
+            None => ("—".to_string(), "—".to_string()),
         };
         // Questions asked from this host's own addresses (including our
         // own looped-back queries) get the same highlight as local answers.
@@ -999,6 +1017,8 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
             Row::new(vec![
                 Cell::from(type_label),
                 Cell::from(age_str),
+                Cell::from(last_txt),
+                Cell::from(due_txt),
                 Cell::from(question_source_label(source)),
                 Cell::from(name.clone()),
             ])
@@ -1009,6 +1029,8 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
     let widths = [
         Constraint::Length(6),
         Constraint::Length(12),
+        Constraint::Length(15),
+        Constraint::Length(14),
         Constraint::Length(
             target
                 .ordered_questions()
@@ -1018,7 +1040,7 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
                 .unwrap_or(14)
                 .clamp(14, 45) as u16,
         ),
-        Constraint::Min(20),
+        Constraint::Min(10),
     ];
 
     // The Questions table is its own focus stop: light its border when
@@ -1029,7 +1051,7 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
 
     let table = Table::new(rows, widths)
         .header(
-            Row::new(vec!["TYPE", "AGE", "SOURCE", "QUESTION"]).style(
+            Row::new(vec!["TYPE", "AGE", "LAST", "DUE", "SOURCE", "QUESTION"]).style(
                 Style::default()
                     .add_modifier(Modifier::BOLD)
                     .fg(Color::Cyan),
@@ -1085,6 +1107,15 @@ fn question_source_label(source: &SocketAddr) -> String {
         format!("{source} (one-shot)")
     } else {
         source.to_string()
+    }
+}
+
+/// Compact age for query cells: `45s`, `3m02s`.
+fn fmt_qage(secs: u64) -> String {
+    if secs >= 60 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
     }
 }
 

@@ -64,6 +64,8 @@ mex [OPTIONS]
 Options:
       --passive            Listen only: never transmit queries, just observe announcements
   -i, --interfaces <IFACES>  Network interfaces to use for mDNS discovery (e.g., br0, eth0)
+      --log-file <PATH>    Write log output to this file (appended). Without it, headless
+                           mode logs warnings to stderr and TUI mode discards logs
   -h, --help               Print help
   -V, --version            Print version
 ```

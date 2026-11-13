@@ -251,6 +251,35 @@ struct ObservedQuery {
     iface: String,
 }
 
+/// Render-ready per-interest query summary for the Questions pane.
+/// ui.rs stays rendering-only: all schedule lookups happen here.
+#[derive(Clone, Copy, Debug)]
+pub struct InterestSummary {
+    pub timer: TimerKind,
+    pub last_age_secs: Option<u64>,
+    pub last_origin: Option<QueryOrigin>,
+    pub next_due_in_secs: Option<u64>,
+}
+
+impl App {
+    /// Per-interest summary for the TUI: latest event age/kind plus
+    /// owning timer and its deadline. Unknown names yield an empty
+    /// summary (both cells render blank).
+    pub fn interest_summary(&self, name: &str, rtype: u16) -> InterestSummary {
+        let now = Instant::now();
+        let view = self.interest_view(&Self::provenance_key(name, rtype));
+        InterestSummary {
+            timer: view.timer,
+            last_age_secs: view
+                .last_at()
+                .map(|t| now.saturating_duration_since(t).as_secs()),
+            last_origin: view.origin(),
+            next_due_in_secs: view
+                .next_due
+                .map(|d| d.saturating_duration_since(now).as_secs()),
+        }
+    }
+}
 /// Per-interest query provenance: when we last transmitted, last stood
 /// down to §7.3 suppression, and last saw a remote querier ask. Keyed
 /// like `continuous` by (lowercased name, type) — see
@@ -7733,6 +7762,57 @@ mod tests {
         let view = app.interest_view(&(lower_case.to_string(), 12));
         assert_eq!(view.timer, TimerKind::Refresh);
         assert_eq!(view.attempt, 2);
+    }
+
+    /// Full text of the Questions pane (header + body) for render
+    /// assertions on columns and cell labels.
+    fn questions_pane_text(app: &App) -> String {
+        let buf = render_to_buffer(app, 120, 40);
+        let area = app.questions_rect.get();
+        let mut out = String::new();
+        for y in area.y..(area.y + area.height) {
+            for x in area.x..(area.x + area.width) {
+                if let Some(cell) = buf.cell((x, y)) {
+                    out.push_str(cell.symbol());
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn questions_pane_shows_last_and_due() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        select_instance(&mut app, "Test");
+        // Continuous stream exists (browse timer); SRV refresh due now.
+        app.poll_continuous();
+        for svc in &mut app.services {
+            for rec in &mut svc.answers {
+                if rec.rtype == 33 {
+                    rec.received_at = Instant::now() - Duration::from_secs(100);
+                }
+            }
+        }
+        app.requery_expiring();
+        // An observed PTR question from a peer.
+        let ev = query_event(
+            "_http._tcp.local.",
+            12,
+            "PTR",
+            false,
+            Vec::new(),
+            remote_source(),
+        );
+        app.ingest_event(&ev);
+        let text = questions_pane_text(&app);
+        assert!(text.contains("LAST"), "header shows LAST:\n{text}");
+        assert!(text.contains("DUE"), "header shows DUE:\n{text}");
+        assert!(text.contains("observed"), "observed kind shown:\n{text}");
+        assert!(text.contains("refresh"), "refresh timer shown:\n{text}");
+        assert!(text.contains("browse"), "browse timer shown:\n{text}");
     }
 
     #[test]
