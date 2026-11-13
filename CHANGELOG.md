@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.15.2](https://github.com/hrzlgnm/mex/compare/v0.15.1...v0.15.2) (2026-11-13)
+
+
+### Bug Fixes
+
+* bound pending mDNS address state ([#177](https://github.com/hrzlgnm/mex/issues/177)) ([37d594e](https://github.com/hrzlgnm/mex/commit/37d594e5ae4d409e937da0a914b77fec57f4eb54))
+* stabilize host grouping when a service advertises multiple SRV targets ([#173](https://github.com/hrzlgnm/mex/issues/173)) ([735a821](https://github.com/hrzlgnm/mex/commit/735a821b72377705aed18a4e0912804310cbb3b7))
+
+
+### Dependencies
+
+* lock file maintenance ([#175](https://github.com/hrzlgnm/mex/issues/175)) ([26911c0](https://github.com/hrzlgnm/mex/commit/26911c0b6bb9df20b7d097995dd1d8b109a233db))
+
 ## [0.15.1](https://github.com/hrzlgnm/mex/compare/v0.15.0...v0.15.1) (2026-11-13)
 
 
