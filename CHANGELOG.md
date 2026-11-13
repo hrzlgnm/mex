@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.14.0](https://github.com/hrzlgnm/mex/compare/v0.13.0...v0.14.0) (2026-11-13)
+
+
+### Features
+
+* default log directory with size-based rotation ([#148](https://github.com/hrzlgnm/mex/issues/148)) ([0440173](https://github.com/hrzlgnm/mex/commit/04401731c5fb6e3b6e154652144cb8f3c32317c5))
+* flag non-UTF-8 names as anomaly (RFC 6762 §16) ([#141](https://github.com/hrzlgnm/mex/issues/141)) ([f1e91c5](https://github.com/hrzlgnm/mex/commit/f1e91c5a6ab9caec8f4ee3b7b30b6835fc5e7bbc))
+* LAST/DUE query columns and optional file logging ([#147](https://github.com/hrzlgnm/mex/issues/147)) ([765d016](https://github.com/hrzlgnm/mex/commit/765d016b26728be16a87e74a9c074119d7ae540e))
+* per-interest query provenance and authoritative dump state ([#146](https://github.com/hrzlgnm/mex/issues/146)) ([b17a274](https://github.com/hrzlgnm/mex/commit/b17a274c2a906a86021933fcba98942b74f4981f))
+* port DNS wire codec from hickory-proto to simple-dns ([#140](https://github.com/hrzlgnm/mex/issues/140)) ([bbbdcc6](https://github.com/hrzlgnm/mex/commit/bbbdcc62a9b182c5a489cb55293aa660442fb347))
+
+
+### Bug Fixes
+
+* add top-level permissions to reusable workflows (CKV2_GHA_1) ([#153](https://github.com/hrzlgnm/mex/issues/153)) ([537457c](https://github.com/hrzlgnm/mex/commit/537457cbb04b6c5aa063a68b3f8415e19b3cdd1d))
+
+
+### Dependencies
+
+* lock file maintenance ([#158](https://github.com/hrzlgnm/mex/issues/158)) ([c6609f5](https://github.com/hrzlgnm/mex/commit/c6609f51882ceec6644a6a911085c541c64a23c8))
+
+
+### Documentation
+
+* require one logical change per branch/PR ([#155](https://github.com/hrzlgnm/mex/issues/155)) ([e555ff6](https://github.com/hrzlgnm/mex/commit/e555ff6ae294b2a8cca6459d3df93dd2fc759839))
+* wrap long Cargo.toml comment lines and fix indentation ([#145](https://github.com/hrzlgnm/mex/issues/145)) ([80aaba6](https://github.com/hrzlgnm/mex/commit/80aaba628342c50ce0b5a1fa2df03240facb10f9))
+
+
+### Code Refactoring
+
+* deduplicate rec/rec_with test helpers in anomalies ([#154](https://github.com/hrzlgnm/mex/issues/154)) ([adb20a5](https://github.com/hrzlgnm/mex/commit/adb20a591a9da818a157db23e8997ebde222120f))
+* remove top-level permissions from reusable workflows ([#157](https://github.com/hrzlgnm/mex/issues/157)) ([5b3ed36](https://github.com/hrzlgnm/mex/commit/5b3ed3680d19e5bdb6514bc7e430e29311cf87a8))
+
 ## [0.13.0](https://github.com/hrzlgnm/mex/compare/v0.12.0...v0.13.0) (2026-11-12)
 
 
