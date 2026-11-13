@@ -69,6 +69,9 @@ Options:
                            Appended; rotated past 5 MiB with 3 backups kept. Without it,
                            both modes log to the default file; headless mode additionally
                            logs warnings to stderr.
+      --log-level <LEVEL>  Minimum log level recorded by every active sink
+                           (off, error, warn, info, debug, trace). Default: split
+                           defaults (file info, stderr warn).
   -h, --help               Print help
   -V, --version            Print version
 ```
