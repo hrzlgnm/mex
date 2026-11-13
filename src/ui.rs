@@ -985,7 +985,11 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
                     (crate::app::TimerKind::Browse, Some(d)) => {
                         format!("{} browse", fmt_qage(d))
                     }
-                    _ => "expired".to_string(),
+                    // No schedule: "expired" only for lapsed local demand.
+                    // A foreign-only interest was never ours to lose, so
+                    // its DUE stays blank instead of claiming a lapse.
+                    _ if s.had_local_demand => "expired".to_string(),
+                    _ => "—".to_string(),
                 };
                 (last, due)
             }

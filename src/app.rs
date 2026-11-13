@@ -259,12 +259,16 @@ pub struct InterestSummary {
     pub last_age_secs: Option<u64>,
     pub last_origin: Option<QueryOrigin>,
     pub next_due_in_secs: Option<u64>,
+    /// Whether we ever transmitted or stood down for this interest.
+    /// Distinguishes a lapsed local demand ("expired") from a
+    /// foreign-only interest we never scheduled (blank DUE).
+    pub had_local_demand: bool,
 }
 
 impl App {
-    /// Per-interest summary for the TUI: latest event age/kind plus
-    /// owning timer and its deadline. Unknown names yield an empty
-    /// summary (both cells render blank).
+    /// Per-interest summary for the TUI: latest event age/kind,
+    /// owning timer and deadline, plus whether local demand ever
+    /// existed. Unknown names yield an empty summary with blank cells.
     pub fn interest_summary(&self, name: &str, rtype: u16) -> InterestSummary {
         let now = Instant::now();
         let view = self.interest_view(&Self::provenance_key(name, rtype));
@@ -277,6 +281,10 @@ impl App {
             next_due_in_secs: view
                 .next_due
                 .map(|d| d.saturating_duration_since(now).as_secs()),
+            had_local_demand: view
+                .state
+                .as_ref()
+                .is_some_and(|s| s.transmitted.is_some() || s.suppressed.is_some()),
         }
     }
 }
@@ -7807,6 +7815,17 @@ mod tests {
             remote_source(),
         );
         app.ingest_event(&ev);
+        // An observed-only question for a type we never schedule: no
+        // local demand exists, so DUE must stay blank, not "expired".
+        let mut soa = raw_record("test.local.", 6, "SOA", "", 120);
+        soa.source = remote_source();
+        app.ingest_event(&browse::Event {
+            answers: Vec::new(),
+            questions: vec![soa],
+            query_kas: Vec::new(),
+            raw_bytes: vec![0x01, 0x02],
+            source: remote_source(),
+        });
         // Backdate the last transmit past the old fixed column width:
         // the full kind word must survive, not clip.
         if let Some(s) = app
@@ -7825,6 +7844,10 @@ mod tests {
         );
         assert!(text.contains("refresh"), "refresh timer shown:\n{text}");
         assert!(text.contains("browse"), "browse timer shown:\n{text}");
+        assert!(
+            !text.contains("expired"),
+            "foreign-only interest has no due:\n{text}"
+        );
     }
 
     #[test]
