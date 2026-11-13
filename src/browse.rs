@@ -10,6 +10,42 @@ use simple_dns::{
     rdata::RData, Packet, PacketFlag, Question, ResourceRecord, CLASS, QCLASS, QTYPE, TYPE,
 };
 
+/// Whether a parsed DNS name holds bytes outside UTF-8. Must run on
+/// raw label bytes at parse time: after lossy display a genuine U+FFFD
+/// character and invalid bytes are indistinguishable.
+fn name_has_invalid_utf8(name: &simple_dns::Name<'_>) -> bool {
+    name.get_labels()
+        .iter()
+        .any(|l| std::str::from_utf8(l.as_ref()).is_err())
+}
+
+/// Whether name-valued rdata holds non-UTF-8 bytes: the same set of
+/// variants `rdata_label` renders as names. TXT values and HINFO strings
+/// are excluded on purpose (opaque binary is legitimate there, and they
+/// never become refresh query names).
+fn rdata_has_invalid_utf8(rdata: &RData) -> bool {
+    // Each name-wrapper is its own type, so the arms cannot share one
+    // binding; every arm just asks the same question of its names.
+    match rdata {
+        RData::PTR(n) => name_has_invalid_utf8(n),
+        RData::CNAME(n) => name_has_invalid_utf8(n),
+        RData::NS(n) => name_has_invalid_utf8(n),
+        RData::MD(n) => name_has_invalid_utf8(n),
+        RData::MF(n) => name_has_invalid_utf8(n),
+        RData::MB(n) => name_has_invalid_utf8(n),
+        RData::MG(n) => name_has_invalid_utf8(n),
+        RData::MR(n) => name_has_invalid_utf8(n),
+        RData::NSAP_PTR(n) => name_has_invalid_utf8(n),
+        RData::MX(mx) => name_has_invalid_utf8(&mx.exchange),
+        RData::SOA(soa) => name_has_invalid_utf8(&soa.mname) || name_has_invalid_utf8(&soa.rname),
+        RData::SRV(srv) => name_has_invalid_utf8(&srv.target),
+        RData::SVCB(svcb) => name_has_invalid_utf8(&svcb.target),
+        RData::HTTPS(svcb) => name_has_invalid_utf8(&svcb.target),
+        RData::NSEC(nsec) => name_has_invalid_utf8(&nsec.next_name),
+        _ => false,
+    }
+}
+
 /// Display form of a parsed DNS name: labels joined as UTF-8 (lossy),
 /// with a trailing dot. Non-UTF-8 bytes render as U+FFFD (RFC 6762 §16
 /// names are UTF-8); this matches the in-flight instance-name fix and
@@ -69,6 +105,12 @@ pub struct RawRecord {
     pub rtype_str: String,
     pub flush_bit: bool,
     pub qu: bool,
+    /// Whether any DNS name on this row (owner, question, or name-valued
+    /// rdata) contained non-UTF-8 bytes. mDNS names MUST be precomposed
+    /// UTF-8 (RFC 6762 §16); the display strings are lossy, so this is
+    /// detected at parse time on raw label bytes and surfaced by the
+    /// analyzer instead of failing silently on refresh.
+    pub invalid_utf8: bool,
     pub ttl: u32,
     pub rdata: String,
     /// Standalone wire encoding of this record, captured at parse time so
@@ -933,6 +975,7 @@ fn record_row(
         // `cache_flush` (RFC 6762 §10.2).
         flush_bit: rec.cache_flush,
         qu: false,
+        invalid_utf8: name_has_invalid_utf8(&rec.name) || rdata_has_invalid_utf8(&rec.rdata),
         ttl: rec.ttl,
         rdata: rdata_label(&rec.rdata),
         wire,
@@ -953,6 +996,7 @@ fn question_row(q: &Question<'_>, ing: Ingress<'_>) -> RawRecord {
         rtype_str: rtype_label(rtype),
         flush_bit: false,
         qu: q.unicast_response,
+        invalid_utf8: name_has_invalid_utf8(&q.qname),
         ttl: 0,
         rdata: String::new(),
         wire: Vec::new(),
@@ -1519,6 +1563,99 @@ mod tests {
         let ev =
             parse_packet(&raw, test_source(), std::net::IpAddr::V4(MDNS_V4), "br0", 3).unwrap();
         assert_eq!(ev.answers[0].rdata, "host.local. A TXT");
+    }
+
+    fn name_with_invalid_label() -> simple_dns::Name<'static> {
+        // Wire bytes live outside the packet buffer: leak one label so
+        // the name can be built without borrowing a test local.
+        let raw: &'static [u8] = Box::leak(vec![0xff].into_boxed_slice());
+        let labels: &'static [simple_dns::Label<'static>] = Box::leak(
+            vec![
+                simple_dns::Label::new_unchecked(raw),
+                simple_dns::Label::new_unchecked(&b"local"[..]),
+            ]
+            .into_boxed_slice(),
+        );
+        simple_dns::Name::new_with_labels(labels)
+    }
+
+    #[test]
+    fn non_utf8_owner_and_question_names_are_flagged() {
+        let mut msg = Packet::new_reply(0);
+        msg.answers.push(ResourceRecord::new(
+            name_with_invalid_label(),
+            CLASS::IN,
+            120,
+            RData::A(simple_dns::rdata::A {
+                address: u32::from(Ipv4Addr::new(192, 168, 1, 10)),
+            }),
+        ));
+        let ev = parse_packet(
+            &msg.build_bytes_vec().unwrap(),
+            test_source(),
+            std::net::IpAddr::V4(MDNS_V4),
+            "br0",
+            3,
+        )
+        .unwrap();
+        assert!(ev.answers[0].invalid_utf8);
+        assert!(ev.answers[0].name.contains('�'));
+
+        let mut q = Packet::new_query(0);
+        q.questions.push(simple_dns::Question::new(
+            name_with_invalid_label(),
+            QTYPE::TYPE(TYPE::A),
+            QCLASS::CLASS(CLASS::IN),
+            false,
+        ));
+        let ev = parse_packet(
+            &q.build_bytes_vec().unwrap(),
+            test_source(),
+            std::net::IpAddr::V4(MDNS_V4),
+            "br0",
+            3,
+        )
+        .unwrap();
+        assert!(ev.questions[0].invalid_utf8);
+    }
+
+    #[test]
+    fn non_utf8_rdata_names_are_flagged_and_valid_utf8_is_clean() {
+        let target = name_with_invalid_label();
+        let mut msg = Packet::new_reply(0);
+        msg.answers.push(ResourceRecord::new(
+            simple_dns::Name::new_unchecked("svc._http._tcp.local."),
+            CLASS::IN,
+            120,
+            RData::PTR(target.into()),
+        ));
+        let ev = parse_packet(
+            &msg.build_bytes_vec().unwrap(),
+            test_source(),
+            std::net::IpAddr::V4(MDNS_V4),
+            "br0",
+            3,
+        )
+        .unwrap();
+        assert!(ev.answers[0].invalid_utf8);
+
+        // Precomposed UTF-8 (RFC 6762 §16) is the compliant case: no flag.
+        let mut ok = Packet::new_reply(0);
+        ok.answers.push(known_answer(
+            "Küche._http._tcp.local.",
+            "Küche._http._tcp.local.",
+            120,
+        ));
+        let ev = parse_packet(
+            &ok.build_bytes_vec().unwrap(),
+            test_source(),
+            std::net::IpAddr::V4(MDNS_V4),
+            "br0",
+            3,
+        )
+        .unwrap();
+        assert!(!ev.answers[0].invalid_utf8);
+        assert_eq!(ev.answers[0].name, "Küche._http._tcp.local.");
     }
 
     #[test]

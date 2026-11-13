@@ -677,6 +677,27 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     let rdata = rec.rdata.clone();
     let src = rec.source.to_string();
 
+    // Non-UTF-8 names: mDNS names MUST be precomposed UTF-8
+    // (RFC 6762 §16), so bytes outside UTF-8 come from a non-compliant
+    // sender. The display strings are lossy, and a refresh query built
+    // from them asks for a name the responder does not own — flag the
+    // row so that failure is explained instead of silent.
+    if rec.invalid_utf8 {
+        out.push(Anomaly {
+            kind: "non-utf8-name",
+            severity: Severity::Warning,
+            service: service_id.to_string(),
+            record_name: Some(name.clone()),
+            rtype: Some(rec.rtype),
+            rtype_str: Some(rec.rtype_str.clone()),
+            rdata: Some(rdata.clone()),
+            source: Some(src.clone()),
+            message: "name contains non-UTF-8 bytes".to_string(),
+            rfc: "RFC 6762 §16",
+            requirement: "MUST NOT",
+        });
+    }
+
     // Unicast-only types on mDNS. Definite violations (Error) require
     // confirmed context: a multicast-destination answer section (RFC 6762
     // §3 defines no NS/SOA delegations for .local). The same type via a
@@ -1071,6 +1092,7 @@ mod tests {
             rtype_str: rtype_str.to_string(),
             flush_bit: flush,
             qu: false,
+            invalid_utf8: false,
             ttl,
             rdata: rdata.to_string(),
             wire: Vec::new(),
@@ -1100,6 +1122,7 @@ mod tests {
             rtype_str: rtype_str.to_string(),
             flush_bit: flush,
             qu: false,
+            invalid_utf8: false,
             ttl,
             rdata: rdata.to_string(),
             wire: Vec::new(),
@@ -1371,6 +1394,37 @@ mod tests {
             questions: questions.to_vec(),
         };
         analyze(&snap)
+    }
+
+    #[test]
+    fn non_utf8_name_is_warning_with_rfc_ref() {
+        let mut bad = rec(
+            "Test._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 80 myhost.local.",
+            120,
+            true,
+        );
+        bad.invalid_utf8 = true;
+        let found = analyze_service("Test", "_http._tcp.local", "myhost.local.", &[bad])
+            .into_iter()
+            .find(|a| a.kind == "non-utf8-name")
+            .expect("expected non-utf8-name");
+        assert_eq!(found.severity, Severity::Warning);
+        assert_eq!(found.rfc, "RFC 6762 §16");
+        assert_eq!(found.requirement, "MUST NOT");
+        // A clean row with the same shape stays quiet for this kind.
+        let clean = vec![rec(
+            "Test._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 80 myhost.local.",
+            120,
+            true,
+        )];
+        let found = analyze_service("Test", "_http._tcp.local", "myhost.local.", &clean);
+        assert!(found.iter().all(|a| a.kind != "non-utf8-name"));
     }
 
     #[test]

@@ -1320,6 +1320,7 @@ mod tests {
             rtype_str: "PTR".to_string(),
             flush_bit: false,
             qu: false,
+            invalid_utf8: false,
             ttl: 120,
             rdata: "Test._http._tcp.local.".to_string(),
             wire: Vec::new(),
