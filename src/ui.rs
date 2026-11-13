@@ -1309,49 +1309,54 @@ fn draw_hex_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     // whole latest packet for the service. Tab focuses it; j/k and paging
     // keys then scroll, and the offset resets when the cursor moves.
     app.hex_viewport.set(area.height.saturating_sub(2) as usize);
-    let (dump, title) = if let Some((bytes, title)) = app.selected_detail_bytes() {
-        let fields = app.selected_record_fields().unwrap_or_default();
-        let selected_field = app
-            .hex_selected_field
-            .get()
-            .filter(|index| *index < fields.len());
-        (
-            hex_dump(
-                &bytes,
-                16,
-                area.width.saturating_sub(2) as usize,
-                &fields,
-                selected_field,
-            ),
-            title,
-        )
-    } else if let Some(ev) = app.latest_event_for_selected() {
-        (
-            hex_dump(
-                &ev.raw_bytes,
-                16,
-                area.width.saturating_sub(2) as usize,
-                &[],
+    let (dump, title, selected_field_label) =
+        if let Some((bytes, title)) = app.selected_detail_bytes() {
+            let fields = app.selected_record_fields().unwrap_or_default();
+            let selected_field = app
+                .hex_selected_field
+                .get()
+                .filter(|index| *index < fields.len());
+            let selected_field_label =
+                selected_field.and_then(|index| fields.get(index).map(|field| field.label.clone()));
+            (
+                hex_dump(
+                    &bytes,
+                    16,
+                    area.width.saturating_sub(2) as usize,
+                    &fields,
+                    selected_field,
+                ),
+                title,
+                selected_field_label,
+            )
+        } else if let Some(ev) = app.latest_event_for_selected() {
+            (
+                hex_dump(
+                    &ev.raw_bytes,
+                    16,
+                    area.width.saturating_sub(2) as usize,
+                    &[],
+                    None,
+                ),
+                " Raw Packet ".to_string(),
                 None,
-            ),
-            " Raw Packet ".to_string(),
-        )
-    } else {
-        // In-pane focus cue (the hex pane has no cursor to highlight):
-        // the body text goes bold while focused. The border already
-        // brightens, but that alone is easy to miss when tabbing panes.
-        let empty_style = if app.focus == Focus::Hex {
-            Style::default()
-                .fg(Color::Gray)
-                .add_modifier(Modifier::BOLD)
+            )
         } else {
-            Style::default().fg(Color::Gray)
+            // In-pane focus cue (the hex pane has no cursor to highlight):
+            // the body text goes bold while focused. The border already
+            // brightens, but that alone is easy to miss when tabbing panes.
+            let empty_style = if app.focus == Focus::Hex {
+                Style::default()
+                    .fg(Color::Gray)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let empty = Paragraph::new("No raw packet data available").style(empty_style);
+            frame.render_widget(empty, area);
+            app.hex_field_hits.borrow_mut().clear();
+            return;
         };
-        let empty = Paragraph::new("No raw packet data available").style(empty_style);
-        frame.render_widget(empty, area);
-        app.hex_field_hits.borrow_mut().clear();
-        return;
-    };
 
     let total = dump.lines.len();
     let offset = clamp_scroll(app.hex_offset.get(), total, app.hex_viewport.get());
@@ -1376,6 +1381,19 @@ fn draw_hex_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         format!("{} ↕", title.trim_end())
     } else {
         title
+    };
+    let title = if let Some(label) = selected_field_label {
+        Line::from(vec![
+            Span::styled(
+                format!(" {} ", label),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::UNDERLINED),
+            ),
+            Span::raw(title),
+        ])
+    } else {
+        Line::from(title)
     };
     let para = Paragraph::new(dump.lines)
         .scroll((offset as u16, 0))

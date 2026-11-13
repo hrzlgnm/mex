@@ -6643,6 +6643,19 @@ mod tests {
             "the adjacent record-type byte should not be included"
         );
 
+        app.scroll_hex_edge(false);
+        let scrolled = render_to_buffer(&app, 160, 60);
+        let hex_area = app.hex_rect.get();
+        let title_area = Rect::new(hex_area.x, hex_area.y, hex_area.width, 1);
+        let (title_x, title_y) = find_buffer_text_in_rect(&scrolled, title_area, "Owner name")
+            .expect("selected field remains in the pane title while scrolling");
+        assert!(
+            scrolled
+                .cell((title_x, title_y))
+                .is_some_and(|cell| cell.modifier.contains(Modifier::UNDERLINED)),
+            "scrolling should not hide the selected field label"
+        );
+
         let srv = app
             .services
             .iter_mut()
