@@ -976,20 +976,23 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
                 let now = std::time::Instant::now();
                 let last = if self_row {
                     // Our own send or §7.3 suppression: never "observed".
-                    if let (Some(a), Some(b)) =
-                        (s.last_transmitted_age_secs, s.last_suppressed_age_secs)
-                    {
-                        if b < a {
-                            format!("{} suppressed", fmt_qage(b))
-                        } else {
-                            format!("{} transmitted", fmt_qage(a))
+                    // Compare the original instants (not rounded ages) so
+                    // the newer event wins even within the same second.
+                    let selected = match (s.last_transmitted_at, s.last_suppressed_at) {
+                        (Some(t), Some(u)) if u > t => {
+                            Some((crate::app::QueryOrigin::Suppressed, u))
                         }
-                    } else if let Some(a) = s.last_transmitted_age_secs {
-                        format!("{} transmitted", fmt_qage(a))
-                    } else if let Some(b) = s.last_suppressed_age_secs {
-                        format!("{} suppressed", fmt_qage(b))
-                    } else {
-                        "—".to_string()
+                        (Some(t), Some(_)) => Some((crate::app::QueryOrigin::Transmitted, t)),
+                        (Some(t), None) => Some((crate::app::QueryOrigin::Transmitted, t)),
+                        (None, Some(u)) => Some((crate::app::QueryOrigin::Suppressed, u)),
+                        (None, None) => None,
+                    };
+                    match selected {
+                        Some((origin, at)) => {
+                            let age = now.saturating_duration_since(at).as_secs();
+                            format!("{} {}", fmt_qage(age), origin.as_str())
+                        }
+                        None => "—".to_string(),
                     }
                 } else {
                     // Foreign querier: this row is an observation.
