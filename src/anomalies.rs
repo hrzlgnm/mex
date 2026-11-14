@@ -36,7 +36,6 @@ impl Severity {
 /// Stable machine-readable identifier for an anomaly kind.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum AnomalyKind {
-    MissingAddr,
     UnresolvedSrvTarget,
     UnicastLeak,
     UnicastQuestion,
@@ -56,7 +55,6 @@ pub enum AnomalyKind {
 impl AnomalyKind {
     pub fn as_str(&self) -> &'static str {
         match self {
-            AnomalyKind::MissingAddr => "missing-addr",
             AnomalyKind::UnresolvedSrvTarget => "unresolved-srv-target",
             AnomalyKind::UnicastLeak => "unicast-leak",
             AnomalyKind::UnicastQuestion => "unicast-question",
@@ -113,7 +111,7 @@ impl Ord for AnomalyKind {
 /// a pure snapshot function with no borrows into browser state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Anomaly {
-    /// Stable machine-readable identifier (`missing-addr`, `unicast-leak`, ...).
+    /// Stable machine-readable identifier (`unresolved-srv-target`, `unicast-leak`, ...).
     pub kind: AnomalyKind,
     pub severity: Severity,
     /// Owning service as `instance.service_type`, or `enumeration` for
@@ -323,10 +321,6 @@ pub fn analyze_observations(
                 });
             }
         }
-    }
-
-    for event in events {
-        check_missing_addr_packet(event, now, &mut out);
     }
 
     // Observed questions for unicast-only types: a querier asking
@@ -722,98 +716,6 @@ fn check_unresolved_path(
         rfc: "RFC 6762 §6",
         requirement: "MAY",
     });
-}
-
-fn is_dns_sd_instance_ptr(rec: &RawRecord) -> bool {
-    let fallback;
-    let labels = if rec.owner_labels.is_empty() {
-        fallback = rec
-            .name
-            .trim_end_matches('.')
-            .split('.')
-            .map(|s| s.as_bytes().to_vec())
-            .collect::<Vec<_>>();
-        &fallback
-    } else {
-        &rec.owner_labels
-    };
-    matches!(labels.len(), 3 | 5) && service_type_wire_labels_problem(labels).is_none()
-}
-
-fn check_missing_addr_packet(event: &crate::browse::Event, _now: Instant, out: &mut Vec<Anomaly>) {
-    if event.rcode != Some(0) {
-        return;
-    }
-    for ptr in event.answers.iter().filter(|rec| {
-        rec.rtype == 12
-            && rec.section == crate::browse::RecordSection::Answer
-            && is_live(rec, event.received_at)
-            && is_dns_sd_instance_ptr(rec)
-    }) {
-        let mut missing_hosts = Vec::new();
-        let mut seen_hosts = HashSet::new();
-        for srv in event.answers.iter().filter(|rec| {
-            rec.rtype == 33
-                && rec.name.eq_ignore_ascii_case(&ptr.rdata)
-                && rec.section != crate::browse::RecordSection::Question
-                && is_live(rec, event.received_at)
-        }) {
-            let Some(host) = srv.rdata.split_whitespace().last() else {
-                continue;
-            };
-            if host == "."
-                || event.answers.iter().any(|rec| {
-                    matches!(rec.rtype, 1 | 28)
-                        && rec.section == crate::browse::RecordSection::Additional
-                        && rec.name.eq_ignore_ascii_case(host)
-                        && is_live(rec, event.received_at)
-                })
-            {
-                continue;
-            }
-            let host = host.trim_end_matches('.');
-            if seen_hosts.insert(host.to_lowercase()) {
-                missing_hosts.push(host.to_string());
-            }
-        }
-        if missing_hosts.is_empty() {
-            continue;
-        }
-        let ingress = if !ptr.iface.is_empty() {
-            format!(" on {}", ptr.iface)
-        } else if ptr.ifindex != 0 {
-            format!(" on if#{}", ptr.ifindex)
-        } else {
-            String::new()
-        };
-        out.push(Anomaly {
-            kind: AnomalyKind::MissingAddr,
-            severity: Severity::Info,
-            service: service_id_from_ptr(&ptr.rdata),
-            record_name: Some(ptr.name.clone()),
-            rtype: Some(ptr.rtype),
-            rtype_str: Some(ptr.rtype_str.clone()),
-            rdata: Some(ptr.rdata.clone()),
-            source: Some(event.source.to_string()),
-            message: format!(
-                "PTR response packet from {}{} (Answer) omitted Additional A/AAAA for SRV target{} {}",
-                event.source,
-                ingress,
-                if missing_hosts.len() == 1 { "" } else { "s" },
-                missing_hosts.join(", ")
-            ),
-            rfc: "RFC 6763 §12.1/§12.2",
-            requirement: "SHOULD",
-        });
-    }
-}
-
-fn service_id_from_ptr(target: &str) -> String {
-    let target = target.trim_end_matches('.');
-    let Some((instance, service_type)) = target.split_once('.') else {
-        return target.to_string();
-    };
-    service_id(instance, service_type)
 }
 
 fn check_type_format(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>) {
@@ -2898,8 +2800,6 @@ mod tests {
                     .iter()
                     .any(|a| a.kind == AnomalyKind::UnicastLeak || a.kind == AnomalyKind::TtlLow)
         );
-        // Expired AAAA must not trigger missing-addr either via itself; the
-        // hostname here has no SRV target overlap, and goodbye is excluded.
         assert!(!found.iter().any(|a| a.kind == AnomalyKind::TtlHigh));
     }
 }

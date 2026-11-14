@@ -176,9 +176,25 @@ severity icons as `<icon> <kind>` → `<source>: <service>
 <record>: <message> (<rfc>)`, and `Ctrl+J` state dumps include the
 full list.
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:20f042c5ba0532eb115de2c870573e3a6695e65186fd48e9aab3e4cb8b5f3b33 -->
+
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:99b8b10ef94aed515dbf4960428de6335a89737ddaf7821ee1dcecee9f9052ac -->
+
+Omitting A/AAAA records from PTR/SRV replies is not flagged.
+`unresolved-srv-target` reports outcomes of transmitted address queries for live
+SRV targets on each mDNS interface (warning for explicit negative answers,
+info for inconclusive lookups).
+
+<!-- /coderabbit-ai-generated:v1 -->
+
+<!-- /coderabbit-ai-generated:v1 -->
+
 | Finding | Meaning |
 | --- | --- |
-| `missing-addr` (warning: `.local`, info: otherwise) | hostname with a live SRV record but no live A/AAAA ([RFC 6763 §12](https://www.rfc-editor.org/rfc/rfc6763#section-12), SHOULD) |
 | `type-format` (warning) | malformed service type, subtype, or enumerated type ([RFC 6763 §7](https://www.rfc-editor.org/rfc/rfc6763#section-7), MUST) |
 | `enum-subtype` (warning) | subtype listed in service enumeration instead of a base type ([RFC 6763 §9](https://www.rfc-editor.org/rfc/rfc6763#section-9), SHOULD) |
 | `shared-flush` (error) | shared PTR record with the cache-flush bit set ([RFC 6762 §10.2](https://www.rfc-editor.org/rfc/rfc6762#section-10.2), MUST NOT) |

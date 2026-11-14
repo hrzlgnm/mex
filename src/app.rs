@@ -10790,14 +10790,14 @@ mod tests {
     #[test]
     fn anomalies_for_header_shows_service_level() {
         let mut app = App::new().unwrap();
-        // A cache miss is not a packet-level additional-record finding.
+        // An unqueried target does not establish a resolution failure.
         ingest(&mut app, &ptr_record(4500));
         ingest(&mut app, &srv_record(120));
         app.evict_expired();
         select_instance(&mut app, "Test");
         select_host_header(&mut app, "test.local");
         let found = app.anomalies_for_selected();
-        assert!(found.is_empty(), "no packet evidence was captured");
+        assert!(found.is_empty(), "no address queries were transmitted");
         assert!(
             matched(&found).is_empty(),
             "header marks nothing, got: {found:?}"
@@ -10805,116 +10805,24 @@ mod tests {
     }
 
     #[test]
-    fn missing_addr_requires_a_qualifying_response_packet() {
+    fn omitted_additional_addresses_do_not_report_an_anomaly() {
         let mut app = App::new().unwrap();
-        let (tx, rx) = mpsc::channel();
-        app.rx = rx;
-        let mut ptr = ptr_record(120);
-        ptr.section = browse::RecordSection::Answer;
-        ptr.iface = "br0".to_string();
+        let ptr = ptr_record(4500);
         let mut srv = srv_record(120);
         srv.section = browse::RecordSection::Additional;
-        let mut second_srv = srv_record(120);
-        second_srv.rdata = "0 0 80 backup.local.".to_string();
-        second_srv.section = browse::RecordSection::Additional;
-        tx.send(browse::Event {
-            answers: vec![ptr, srv, second_srv],
-            questions: Vec::new(),
-            query_kas: Vec::new(),
-            rcode: Some(0),
-            received_at: Instant::now(),
-            raw_bytes: Vec::new(),
-            source: test_source(),
-        })
-        .unwrap();
-        app.drain_events();
+        let mut event = event_for(&ptr);
+        event.answers = vec![ptr, srv];
+        ingest_packet(&mut app, event);
 
-        let finding = app
-            .anomalies()
-            .into_iter()
-            .find(|a| a.kind == anomalies::AnomalyKind::MissingAddr)
-            .expect("expected packet-level missing-addr");
-        assert_eq!(finding.severity, anomalies::Severity::Info);
-        assert!(finding.message.contains("Additional"));
-        assert!(finding.message.contains("test.local"));
-        assert!(finding.message.contains("backup.local"));
-        assert!(finding.message.contains("br0"));
-        assert_eq!(finding.rfc, "RFC 6763 §12.1/§12.2");
-    }
+        assert!(app.anomalies().is_empty());
 
-    #[test]
-    fn missing_addr_ignores_service_type_enumeration_ptrs() {
-        let mut app = App::new().unwrap();
-        let mut ptr = raw_record(
-            "_services._dns-sd._udp.local.",
-            12,
-            "PTR",
-            "Test._http._tcp.local.",
-            120,
-        );
-        ptr.section = browse::RecordSection::Answer;
-        let mut srv = srv_record(120);
-        srv.section = browse::RecordSection::Additional;
+        // Resolving the target through a later query is normal, too.
+        mark_address_queries(&mut app, "test.local", Duration::from_secs(2));
         ingest_packet(
             &mut app,
-            browse::Event {
-                answers: vec![ptr, srv],
-                questions: Vec::new(),
-                query_kas: Vec::new(),
-                rcode: Some(0),
-                received_at: Instant::now(),
-                raw_bytes: Vec::new(),
-                source: test_source(),
-            },
+            event_for(&raw_record("test.local.", 1, "A", "192.168.1.10", 120)),
         );
-
-        assert!(!app
-            .anomalies()
-            .iter()
-            .any(|a| a.kind == anomalies::AnomalyKind::MissingAddr));
-    }
-
-    #[test]
-    fn missing_addr_does_not_combine_ptr_and_srv_from_separate_packets() {
-        let mut app = App::new().unwrap();
-        let (tx, rx) = mpsc::channel();
-        app.rx = rx;
-        tx.send(event_for(&ptr_record(120))).unwrap();
-        tx.send(event_for(&srv_record(120))).unwrap();
-        app.drain_events();
-
-        assert!(!app
-            .anomalies()
-            .iter()
-            .any(|a| a.kind == anomalies::AnomalyKind::MissingAddr));
-    }
-
-    #[test]
-    fn missing_addr_is_quiet_when_response_includes_an_additional_address() {
-        let mut app = App::new().unwrap();
-        let mut ptr = ptr_record(120);
-        ptr.section = browse::RecordSection::Answer;
-        let mut srv = srv_record(120);
-        srv.section = browse::RecordSection::Additional;
-        let mut address = raw_record("test.local.", 1, "A", "192.168.1.10", 120);
-        address.section = browse::RecordSection::Additional;
-        ingest_packet(
-            &mut app,
-            browse::Event {
-                answers: vec![ptr, srv, address],
-                questions: Vec::new(),
-                query_kas: Vec::new(),
-                rcode: Some(0),
-                received_at: Instant::now(),
-                raw_bytes: Vec::new(),
-                source: test_source(),
-            },
-        );
-
-        assert!(!app
-            .anomalies()
-            .iter()
-            .any(|a| a.kind == anomalies::AnomalyKind::MissingAddr));
+        assert!(app.anomalies().is_empty());
     }
 
     #[test]
@@ -11318,40 +11226,6 @@ mod tests {
             .iter()
             .any(|a| a.kind == anomalies::AnomalyKind::UnresolvedSrvTarget
                 && a.message.contains("test.local")));
-    }
-
-    #[test]
-    fn selective_enumeration_uses_wire_labels_and_packet_time() {
-        let mut app = App::new().unwrap();
-        let mut ptr = ptr_record(120);
-        ptr.name = "a.b._sub._http._tcp.local.".into();
-        ptr.owner_labels = [b"a.b".as_slice(), b"_sub", b"_http", b"_tcp", b"local"]
-            .into_iter()
-            .map(Vec::from)
-            .collect();
-        let mut srv = srv_record(120);
-        srv.section = browse::RecordSection::Additional;
-        let mut addr = raw_record("test.local.", 1, "A", "192.168.1.10", 1);
-        addr.section = browse::RecordSection::Additional;
-        let at = Instant::now() - Duration::from_secs(5);
-        for rec in [&mut ptr, &mut srv, &mut addr] {
-            rec.received_at = at;
-        }
-        let mut event = event_for(&ptr);
-        event.received_at = at;
-        event.answers = vec![ptr, srv, addr];
-        app.raw_events.push(event.clone());
-        assert!(!app
-            .anomalies()
-            .iter()
-            .any(|a| a.kind == anomalies::AnomalyKind::MissingAddr));
-        app.raw_events.clear();
-        event.answers.pop();
-        app.raw_events.push(event);
-        assert!(app
-            .anomalies()
-            .iter()
-            .any(|a| a.kind == anomalies::AnomalyKind::MissingAddr));
     }
 
     #[test]
