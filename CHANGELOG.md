@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.2](https://github.com/hrzlgnm/mex/compare/v0.16.1...v0.16.2) (2026-11-14)
+
+
+### Bug Fixes
+
+* encode name and version into dump file name ([#190](https://github.com/hrzlgnm/mex/issues/190)) ([4d76ea0](https://github.com/hrzlgnm/mex/commit/4d76ea0e83aba62dc5bda97421d75423e12f0c3b))
+
 ## [0.16.1](https://github.com/hrzlgnm/mex/compare/v0.16.0...v0.16.1) (2026-11-14)
 
 
