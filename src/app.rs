@@ -11006,6 +11006,50 @@ mod tests {
     }
 
     #[test]
+    fn global_srv_target_question_routes_to_global_question() {
+        // A querier asking mDNS for a service's global SRV target lands on
+        // that service as an info-level global-question (RFC 6762 §13).
+        let mut app = App::new().unwrap();
+        ingest(
+            &mut app,
+            &raw_record(
+                "_avmnexus._tcp.local.",
+                12,
+                "PTR",
+                "Fritzel._avmnexus._tcp.local.",
+                4500,
+            ),
+        );
+        ingest(
+            &mut app,
+            &raw_record(
+                "Fritzel._avmnexus._tcp.local.",
+                33,
+                "SRV",
+                "0 0 80 fritz.box.",
+                120,
+            ),
+        );
+        let querier: SocketAddr = "192.168.1.9:5353".parse().unwrap();
+        app.ingest_event(&query_event(
+            "fritz.box.",
+            1,
+            "A",
+            false,
+            Vec::new(),
+            querier,
+        ));
+        let item = app
+            .anomalies()
+            .into_iter()
+            .find(|a| a.kind == anomalies::AnomalyKind::GlobalQuestion)
+            .expect("expected routed global-question");
+        assert_eq!(item.service, "Fritzel._avmnexus._tcp.local");
+        assert_eq!(item.severity, anomalies::Severity::Info);
+        assert_eq!(item.source.as_deref(), Some("192.168.1.9:5353"));
+    }
+
+    #[test]
     fn non_local_srv_target_is_scoped_to_mdns_observation() {
         let mut app = App::new().unwrap();
         ingest(

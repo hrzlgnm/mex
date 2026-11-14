@@ -953,7 +953,7 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
     let question_keys: HashSet<(String, u16, String)> = app
         .anomalies()
         .into_iter()
-        .filter(|a| a.kind == crate::anomalies::AnomalyKind::UnicastQuestion)
+        .filter(|a| a.kind.is_question())
         .filter(|a| a.is_surfaced())
         .filter_map(|a| {
             let rtype = a.rtype?;
