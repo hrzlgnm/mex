@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::browse::RawRecord;
 
@@ -15,7 +15,7 @@ pub fn service_id(instance: &str, service_type: &str) -> String {
 }
 
 /// Severity of an anomaly: errors are clear RFC violations, warnings are
-/// likely misconfigurations, informational notes are SHOULD-level deviations.
+/// likely misconfigurations, informational notes are observations.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Severity {
     Info,
@@ -37,6 +37,7 @@ impl Severity {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum AnomalyKind {
     MissingAddr,
+    UnresolvedSrvTarget,
     UnicastLeak,
     UnicastQuestion,
     TtlLow,
@@ -56,6 +57,7 @@ impl AnomalyKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             AnomalyKind::MissingAddr => "missing-addr",
+            AnomalyKind::UnresolvedSrvTarget => "unresolved-srv-target",
             AnomalyKind::UnicastLeak => "unicast-leak",
             AnomalyKind::UnicastQuestion => "unicast-question",
             AnomalyKind::TtlLow => "ttl-low",
@@ -154,7 +156,7 @@ pub struct Snapshot<'a> {
     pub services: Vec<ServiceView<'a>>,
     pub enum_answers: Vec<&'a RawRecord>,
     /// Lowercased hostnames with a queued address (suppresses
-    /// `missing-addr` false positives while the address is in flight).
+    /// `unresolved-srv-target` while the address is in flight).
     pub pending_hosts: HashSet<String>,
     /// Observed questions flattened across services, pending instances,
     /// and enumeration rows. The owning service id rides along
@@ -173,6 +175,27 @@ pub struct QuestionView<'a> {
     pub source: SocketAddr,
 }
 
+/// One transmitted A/AAAA lookup for a live SRV target.
+#[derive(Clone, Debug)]
+pub struct AddressQueryView {
+    pub service: String,
+    pub hostname: String,
+    pub rtype: u16,
+    pub transmitted_at: Instant,
+    pub interfaces: String,
+}
+
+const ADDRESS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
+
+struct AddressEvidence<'a> {
+    host_has_addr: &'a HashMap<String, bool>,
+    host_addr_latest: &'a HashMap<(String, u16), Instant>,
+    pending_hosts: &'a HashSet<String>,
+    queries: &'a [AddressQueryView],
+    events: &'a [crate::browse::Event],
+    now: Instant,
+}
+
 /// TTLs below this are churn risks; above this are stale-cache risks.
 /// The band between covers both observed bases (120s for SRV/A/AAAA and
 /// 4500s for PTR/TXT/NS/SOA), so normal responders stay quiet.
@@ -188,34 +211,54 @@ fn is_live(rec: &RawRecord, now: Instant) -> bool {
 /// Analyze a snapshot, returning deduped anomalies sorted by severity then kind.
 /// Dedup key is (kind, service, name, type, rdata): the same record seen from
 /// several sources yields one anomaly, keeping the first source for context.
+#[cfg(test)]
 pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
+    analyze_observations(snap, &[], &[])
+}
+
+/// Analyze browser state and retained response packets. Packet-scoped checks
+/// use `events` rather than inferring responder behavior from the cache.
+pub fn analyze_observations(
+    snap: &Snapshot,
+    events: &[crate::browse::Event],
+    address_queries: &[AddressQueryView],
+) -> Vec<Anomaly> {
     let now = Instant::now();
     let mut out: Vec<Anomaly> = Vec::new();
 
-    // Host -> has any live A/AAAA, across all services (one hostname backs
-    // many services, so siblings share fate).
     let mut host_has_addr: HashMap<String, bool> = HashMap::new();
+    let mut host_addr_latest: HashMap<(String, u16), Instant> = HashMap::new();
     for svc in &snap.services {
         for rec in svc.answers {
-            if (rec.rtype == 1 || rec.rtype == 28) && is_live(rec, now) {
-                host_has_addr.insert(rec.name.trim_end_matches('.').to_lowercase(), true);
+            if matches!(rec.rtype, 1 | 28) {
+                let key = rec.name.trim_end_matches('.').to_lowercase();
+                if rec.ttl > 0 {
+                    host_addr_latest
+                        .entry((key.clone(), rec.rtype))
+                        .and_modify(|at| *at = (*at).max(rec.received_at))
+                        .or_insert(rec.received_at);
+                }
+                if is_live(rec, now) {
+                    host_has_addr.insert(key, true);
+                }
             }
         }
     }
 
+    let address_evidence = AddressEvidence {
+        host_has_addr: &host_has_addr,
+        host_addr_latest: &host_addr_latest,
+        pending_hosts: &snap.pending_hosts,
+        queries: address_queries,
+        events,
+        now,
+    };
+
     for svc in &snap.services {
         let service_id = service_id(svc.instance, svc.service_type);
+        check_unresolved_srv_target(svc, &service_id, &address_evidence, &mut out);
         // A retained hostname outlives its SRV (expiry, goodbye): only a
         // live SRV proves the service still claims the host.
-        let has_live_srv = svc.answers.iter().any(|r| r.rtype == 33 && is_live(r, now));
-        check_missing_addr(
-            svc,
-            &service_id,
-            &host_has_addr,
-            &snap.pending_hosts,
-            has_live_srv,
-            &mut out,
-        );
         check_type_format(svc, &service_id, &mut out);
         check_subtypes(svc, &service_id, &mut out);
         for rec in svc.answers {
@@ -281,6 +324,10 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
                 });
             }
         }
+    }
+
+    for event in events {
+        check_missing_addr_packet(event, now, &mut out);
     }
 
     // Observed questions for unicast-only types: a querier asking
@@ -388,52 +435,326 @@ fn normalize_soa_rdata(rdata: String) -> String {
     }
 }
 
-fn check_missing_addr(
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AddressQueryOutcome {
+    NoData,
+    NxDomain,
+    NoResponse,
+    Inconclusive,
+    UnattributedNxDomain,
+    NotQueried,
+    Pending,
+    Answered,
+}
+
+fn check_unresolved_srv_target(
     svc: &ServiceView,
     service_id: &str,
-    host_has_addr: &HashMap<String, bool>,
-    pending_hosts: &HashSet<String>,
-    has_live_srv: bool,
+    evidence: &AddressEvidence<'_>,
     out: &mut Vec<Anomaly>,
 ) {
-    if !has_live_srv {
-        return;
-    }
     let host = svc.hostname.trim_end_matches('.');
     if host.is_empty() {
         return;
     }
-    let key = host.to_lowercase();
-    if host_has_addr.get(&key).copied().unwrap_or(false) {
+    let Some(srv) = svc.answers.iter().find(|rec| {
+        rec.rtype == 33
+            && is_live(rec, evidence.now)
+            && rec
+                .rdata
+                .split_whitespace()
+                .last()
+                .is_some_and(|target| target.trim_end_matches('.').eq_ignore_ascii_case(host))
+    }) else {
+        return;
+    };
+    let host_key = host.to_lowercase();
+    if evidence
+        .host_has_addr
+        .get(&host_key)
+        .copied()
+        .unwrap_or(false)
+        || evidence.pending_hosts.contains(&host_key)
+    {
         return;
     }
-    if pending_hosts.contains(&key) {
+
+    let outcomes: Vec<_> = [1, 28]
+        .into_iter()
+        .map(|rtype| {
+            let query = evidence.queries.iter().filter(|query| {
+                query.service == service_id
+                    && query
+                        .hostname
+                        .trim_end_matches('.')
+                        .eq_ignore_ascii_case(host)
+                    && query.rtype == rtype
+            });
+            let Some(query) = query.max_by_key(|query| query.transmitted_at) else {
+                return (rtype, AddressQueryOutcome::NotQueried, None);
+            };
+            if evidence
+                .host_addr_latest
+                .get(&(host_key.clone(), rtype))
+                .is_some_and(|at| *at > query.transmitted_at)
+            {
+                return (rtype, AddressQueryOutcome::Answered, None);
+            }
+            if let Some(record) = evidence.events.iter().find_map(|event| {
+                event.answers.iter().find(|record| {
+                    event.rcode == Some(3)
+                        && record.rtype == 5
+                        && record.name.trim_end_matches('.').eq_ignore_ascii_case(host)
+                        && record.section == crate::browse::RecordSection::Answer
+                        && record.received_at >= query.transmitted_at
+                        && is_live(record, evidence.now)
+                })
+            }) {
+                return (
+                    rtype,
+                    AddressQueryOutcome::NxDomain,
+                    Some((record.source.to_string(), record.iface.clone())),
+                );
+            }
+            if let Some(record) = evidence.events.iter().find_map(|event| {
+                event.answers.iter().find(|record| {
+                    event.rcode == Some(0)
+                        && record.rtype == 47
+                        && record.name.trim_end_matches('.').eq_ignore_ascii_case(host)
+                        && matches!(
+                            record.section,
+                            crate::browse::RecordSection::Answer
+                                | crate::browse::RecordSection::Authority
+                        )
+                        && record.received_at >= query.transmitted_at
+                        && is_live(record, evidence.now)
+                        && !record
+                            .rdata
+                            .split_whitespace()
+                            .skip(1)
+                            .filter_map(rtype_from_str)
+                            .any(|present| present == rtype)
+                })
+            }) {
+                return (
+                    rtype,
+                    AddressQueryOutcome::NoData,
+                    Some((record.source.to_string(), record.iface.clone())),
+                );
+            }
+            if evidence
+                .events
+                .iter()
+                .any(|event| event.rcode.is_some() && event.received_at >= query.transmitted_at)
+            {
+                let outcome = if evidence.events.iter().any(|event| {
+                    event.rcode == Some(3) && event.received_at >= query.transmitted_at
+                }) {
+                    AddressQueryOutcome::UnattributedNxDomain
+                } else {
+                    AddressQueryOutcome::Inconclusive
+                };
+                return (rtype, outcome, None);
+            }
+            let outcome = if evidence.now.saturating_duration_since(query.transmitted_at)
+                >= ADDRESS_RESPONSE_TIMEOUT
+            {
+                AddressQueryOutcome::NoResponse
+            } else {
+                AddressQueryOutcome::Pending
+            };
+            (rtype, outcome, None)
+        })
+        .collect();
+
+    let interfaces = evidence
+        .queries
+        .iter()
+        .find(|query| {
+            query.service == service_id
+                && query
+                    .hostname
+                    .trim_end_matches('.')
+                    .eq_ignore_ascii_case(host)
+        })
+        .map(|query| query.interfaces.as_str())
+        .unwrap_or_default();
+
+    if outcomes.iter().any(|(_, outcome, _)| {
+        matches!(
+            outcome,
+            AddressQueryOutcome::Pending | AddressQueryOutcome::Answered
+        )
+    }) || !outcomes.iter().any(|(_, outcome, _)| {
+        matches!(
+            outcome,
+            AddressQueryOutcome::NoData
+                | AddressQueryOutcome::NxDomain
+                | AddressQueryOutcome::NoResponse
+                | AddressQueryOutcome::Inconclusive
+                | AddressQueryOutcome::UnattributedNxDomain
+        )
+    }) {
         return;
     }
-    // A retained hostname outlives its SRV (expiry, goodbye): the caller
-    // passes whether a live SRV still claims the host, and only then is a
-    // missing address meaningful. `.local` names must resolve via mDNS, so
-    // a missing address is a Warning; non-`.local` names may resolve via
-    // unicast DNS, so the same observation is only Info (RFC 6763 §12
-    // recommends, not requires, additional address records).
-    let local = host.eq_ignore_ascii_case("local") || host.to_ascii_lowercase().ends_with(".local");
+
+    let (a_outcome, a_context) = (&outcomes[0].1, &outcomes[0].2);
+    let (aaaa_outcome, aaaa_context) = (&outcomes[1].1, &outcomes[1].2);
+    let explicit_negative = matches!(a_outcome, AddressQueryOutcome::NxDomain)
+        || matches!(aaaa_outcome, AddressQueryOutcome::NxDomain)
+        || (matches!(a_outcome, AddressQueryOutcome::NoData)
+            && matches!(aaaa_outcome, AddressQueryOutcome::NoData));
+    let outcome_text = |outcome: AddressQueryOutcome| match outcome {
+        AddressQueryOutcome::NoData => "NODATA",
+        AddressQueryOutcome::NxDomain => "NXDOMAIN",
+        AddressQueryOutcome::NoResponse => "no response",
+        AddressQueryOutcome::Inconclusive => "unattributed mDNS response",
+        AddressQueryOutcome::UnattributedNxDomain => "unattributed NXDOMAIN response",
+        AddressQueryOutcome::NotQueried => "not queried",
+        AddressQueryOutcome::Pending => "pending",
+        AddressQueryOutcome::Answered => "answered",
+    };
+    let source_context = a_context.as_ref().or(aaaa_context.as_ref());
+    let record_name = Some(srv.name.clone());
+    let rdata = Some(srv.rdata.clone());
+    let source = source_context.map(|(source, _)| source.clone());
+    let query_interfaces = if interfaces.is_empty() {
+        String::new()
+    } else {
+        format!(" across mDNS interfaces {interfaces}")
+    };
+    let response_interface = source_context
+        .as_ref()
+        .filter(|(_, iface)| !iface.is_empty())
+        .map(|(_, iface)| format!("; response on {iface}"))
+        .unwrap_or_default();
+    let unicast_note = if host_key != "local" && !host_key.ends_with(".local") {
+        "; unicast DNS may still resolve this target"
+    } else {
+        ""
+    };
+    let message = format!(
+        "A: {}; AAAA: {} for {host} via mDNS{query_interfaces}{response_interface}{}",
+        outcome_text(outcomes[0].1),
+        outcome_text(outcomes[1].1),
+        if explicit_negative {
+            ""
+        } else {
+            "; lookup inconclusive"
+        }
+    ) + unicast_note;
     out.push(Anomaly {
-        kind: AnomalyKind::MissingAddr,
-        severity: if local {
+        kind: AnomalyKind::UnresolvedSrvTarget,
+        severity: if explicit_negative {
             Severity::Warning
         } else {
             Severity::Info
         },
         service: service_id.to_string(),
-        record_name: None,
-        rtype: None,
-        rtype_str: None,
-        rdata: None,
-        source: None,
-        message: format!("no A/AAAA for {host}"),
-        rfc: "RFC 6763 §12",
-        requirement: "SHOULD",
+        record_name,
+        rtype: Some(33),
+        rtype_str: Some("SRV".to_string()),
+        rdata,
+        source,
+        message,
+        rfc: "RFC 6762 §6",
+        requirement: "MAY",
     });
+}
+
+fn is_dns_sd_instance_ptr(name: &str) -> bool {
+    let labels: Vec<_> = name.trim_end_matches('.').split('.').collect();
+    let is_protocol =
+        |label: &str| label.eq_ignore_ascii_case("_tcp") || label.eq_ignore_ascii_case("_udp");
+    match labels.as_slice() {
+        [service, protocol, local] => {
+            service.starts_with('_') && is_protocol(protocol) && local.eq_ignore_ascii_case("local")
+        }
+        [subtype, sub, service, protocol, local] => {
+            subtype.starts_with('_')
+                && sub.eq_ignore_ascii_case("_sub")
+                && service.starts_with('_')
+                && is_protocol(protocol)
+                && local.eq_ignore_ascii_case("local")
+        }
+        _ => false,
+    }
+}
+
+fn check_missing_addr_packet(event: &crate::browse::Event, now: Instant, out: &mut Vec<Anomaly>) {
+    if event.rcode != Some(0) {
+        return;
+    }
+    for ptr in event.answers.iter().filter(|rec| {
+        rec.rtype == 12
+            && rec.section == crate::browse::RecordSection::Answer
+            && is_live(rec, now)
+            && is_dns_sd_instance_ptr(&rec.name)
+    }) {
+        let mut missing_hosts = Vec::new();
+        let mut seen_hosts = HashSet::new();
+        for srv in event.answers.iter().filter(|rec| {
+            rec.rtype == 33
+                && rec.name.eq_ignore_ascii_case(&ptr.rdata)
+                && rec.section != crate::browse::RecordSection::Question
+                && is_live(rec, now)
+        }) {
+            let Some(host) = srv.rdata.split_whitespace().last() else {
+                continue;
+            };
+            if host == "."
+                || event.answers.iter().any(|rec| {
+                    matches!(rec.rtype, 1 | 28)
+                        && rec.section == crate::browse::RecordSection::Additional
+                        && rec.name.eq_ignore_ascii_case(host)
+                        && is_live(rec, now)
+                })
+            {
+                continue;
+            }
+            let host = host.trim_end_matches('.');
+            if seen_hosts.insert(host.to_lowercase()) {
+                missing_hosts.push(host.to_string());
+            }
+        }
+        if missing_hosts.is_empty() {
+            continue;
+        }
+        let ingress = if !ptr.iface.is_empty() {
+            format!(" on {}", ptr.iface)
+        } else if ptr.ifindex != 0 {
+            format!(" on if#{}", ptr.ifindex)
+        } else {
+            String::new()
+        };
+        out.push(Anomaly {
+            kind: AnomalyKind::MissingAddr,
+            severity: Severity::Info,
+            service: service_id_from_ptr(&ptr.rdata),
+            record_name: Some(ptr.name.clone()),
+            rtype: Some(ptr.rtype),
+            rtype_str: Some(ptr.rtype_str.clone()),
+            rdata: Some(ptr.rdata.clone()),
+            source: Some(event.source.to_string()),
+            message: format!(
+                "PTR response packet from {}{} (Answer) omitted Additional A/AAAA for SRV target{} {}",
+                event.source,
+                ingress,
+                if missing_hosts.len() == 1 { "" } else { "s" },
+                missing_hosts.join(", ")
+            ),
+            rfc: "RFC 6763 §12.1/§12.2",
+            requirement: "SHOULD",
+        });
+    }
+}
+
+fn service_id_from_ptr(target: &str) -> String {
+    let target = target.trim_end_matches('.');
+    let Some((instance, service_type)) = target.split_once('.') else {
+        return target.to_string();
+    };
+    service_id(instance, service_type)
 }
 
 fn check_type_format(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>) {
@@ -1321,138 +1642,6 @@ mod tests {
             questions: Vec::new(),
         };
         analyze(&snap)
-    }
-
-    #[test]
-    fn missing_addr_local_is_warning_remote_is_info() {
-        let local = vec![rec(
-            "My._http._tcp.local.",
-            33,
-            "SRV",
-            "0 0 80 myhost.local.",
-            120,
-            true,
-        )];
-        let item = analyze_service("My", "_http._tcp.local", "myhost.local.", &local)
-            .into_iter()
-            .find(|a| a.kind == AnomalyKind::MissingAddr)
-            .expect("expected missing-addr");
-        assert_eq!(item.severity, Severity::Warning);
-        let remote = vec![rec(
-            "My._http._tcp.local.",
-            33,
-            "SRV",
-            "0 0 80 fritz.box.",
-            120,
-            true,
-        )];
-        let item = analyze_service("My", "_http._tcp.local", "fritz.box.", &remote)
-            .into_iter()
-            .find(|a| a.kind == AnomalyKind::MissingAddr)
-            .expect("expected missing-addr");
-        assert_eq!(item.severity, Severity::Info);
-    }
-
-    #[test]
-    fn missing_addr_flags_srv_without_a_or_aaaa() {
-        let answers = vec![
-            rec(
-                "My._http._tcp.local.",
-                12,
-                "PTR",
-                "My._http._tcp.local.",
-                120,
-                false,
-            ),
-            rec(
-                "My._http._tcp.local.",
-                33,
-                "SRV",
-                "0 0 80 myhost.local.",
-                120,
-                true,
-            ),
-        ];
-        let found = analyze_service("My", "_http._tcp.local", "myhost.local.", &answers);
-        assert!(found.iter().any(|a| a.kind == AnomalyKind::MissingAddr));
-    }
-
-    #[test]
-    fn missing_addr_quiet_when_addr_present() {
-        let answers = vec![
-            rec(
-                "My._http._tcp.local.",
-                33,
-                "SRV",
-                "0 0 80 myhost.local.",
-                120,
-                true,
-            ),
-            rec("myhost.local.", 1, "A", "192.168.1.10", 120, true),
-        ];
-        let found = analyze_service("My", "_http._tcp.local", "myhost.local.", &answers);
-        assert!(!found.iter().any(|a| a.kind == AnomalyKind::MissingAddr));
-    }
-
-    #[test]
-    fn missing_addr_suppressed_by_pending() {
-        let answers = vec![rec(
-            "My._http._tcp.local.",
-            33,
-            "SRV",
-            "0 0 80 myhost.local.",
-            120,
-            true,
-        )];
-        let services = vec![ServiceView {
-            instance: "My",
-            service_type: "_http._tcp.local",
-            hostname: "myhost.local.",
-            answers: &answers,
-            subtypes: &[],
-        }];
-        let snap = Snapshot {
-            services,
-            enum_answers: Vec::new(),
-            pending_hosts: HashSet::from(["myhost.local".to_string()]),
-            questions: Vec::new(),
-        };
-        assert!(!analyze(&snap)
-            .iter()
-            .any(|a| a.kind == AnomalyKind::MissingAddr));
-    }
-
-    #[test]
-    fn missing_addr_quiet_without_live_srv() {
-        // Retained hostname after the SRV expired: nothing claims the host
-        // anymore, so a missing address is not an anomaly.
-        let answers = vec![aged(
-            rec(
-                "My._http._tcp.local.",
-                33,
-                "SRV",
-                "0 0 80 myhost.local.",
-                120,
-                true,
-            ),
-            500,
-        )];
-        let found = analyze_service("My", "_http._tcp.local", "myhost.local.", &answers);
-        assert!(!found.iter().any(|a| a.kind == AnomalyKind::MissingAddr));
-    }
-
-    #[test]
-    fn missing_addr_quiet_on_srv_goodbye() {
-        let answers = vec![rec(
-            "My._http._tcp.local.",
-            33,
-            "SRV",
-            "0 0 80 myhost.local.",
-            0,
-            false,
-        )];
-        let found = analyze_service("My", "_http._tcp.local", "myhost.local.", &answers);
-        assert!(!found.iter().any(|a| a.kind == AnomalyKind::MissingAddr));
     }
 
     #[test]
