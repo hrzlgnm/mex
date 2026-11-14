@@ -1226,7 +1226,11 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             rtype_str: Some(rec.rtype_str.clone()),
             rdata: Some(rdata.clone()),
             source: Some(src.clone()),
-            message: format!("TTL {}s, want ~{}s", rec.ttl, expected_base(rec.rtype)),
+            message: format!(
+                "TTL {}s, want ~{}s",
+                rec.ttl,
+                expected_base(rec.rtype, &rec.name)
+            ),
             rfc: "RFC 6762 §10",
             requirement: "SHOULD",
         });
@@ -1240,7 +1244,11 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             rtype_str: Some(rec.rtype_str.clone()),
             rdata: Some(rdata),
             source: Some(src),
-            message: format!("TTL {}s, want ~{}s", rec.ttl, expected_base(rec.rtype)),
+            message: format!(
+                "TTL {}s, want ~{}s",
+                rec.ttl,
+                expected_base(rec.rtype, &rec.name)
+            ),
             rfc: "RFC 6762 §10",
             requirement: "SHOULD",
         });
@@ -1291,15 +1299,16 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         check_srv_target(service_id, rec, out);
     }
 
-    // TXT size only: measure the decoded payload, not the full wire
-    // record (owner name + header). Valueless keys, keys without `=`,
-    // and empty payloads are all valid and never flagged.
+    // TXT size only: RFC 6763 §6.2 sizes the TXT record data, so measure
+    // RDLENGTH (length bytes included), not the full wire record (owner
+    // name + header) nor the lossy `; `-joined display string. Valueless
+    // keys, keys without `=`, and empty payloads are all valid and never
+    // flagged.
     if rec.rtype == 16 {
-        // Encoded length is this plus ~1 length byte per TXT string;
-        // negligible against the threshold, so the decoded length rules.
         // The row shows the payload; the overlay has no record columns,
-        // so the message repeats the observed length.
-        let payload_len = rec.rdata.len();
+        // so the message repeats the observed length. Rows without a
+        // wire encoding fall back to the display length.
+        let payload_len = crate::browse::wire_rdata_len(&rec.wire).unwrap_or(rec.rdata.len());
         if payload_len > TXT_MAX {
             out.push(Anomaly {
                 kind: AnomalyKind::TxtOversize,
@@ -1310,7 +1319,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
                 rtype_str: Some(rec.rtype_str.clone()),
                 rdata: Some(rec.rdata.clone()),
                 source: Some(rec.source.to_string()),
-                message: format!("TXT ~{payload_len}B, max {TXT_MAX}B"),
+                message: format!("TXT {payload_len}B, max {TXT_MAX}B"),
                 rfc: "RFC 6763 §6.2",
                 requirement: "SHOULD NOT",
             });
@@ -1340,6 +1349,16 @@ fn check_srv_target(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         }
     }
     let target = parts[3..].join(" ");
+    // RFC 2782: a target of "." means the service is decidedly not
+    // available at this name. Valid, so only worth a note.
+    if target.trim() == "." {
+        out.push(srv_anomaly_info(
+            service_id,
+            rec,
+            "target \".\": service not available at this name",
+        ));
+        return;
+    }
     let trimmed = target.trim().trim_end_matches('.');
     if trimmed.is_empty() || trimmed == "." {
         out.push(srv_anomaly(service_id, rec, "empty target"));
@@ -1397,11 +1416,13 @@ fn srv_anomaly(service_id: &str, rec: &RawRecord, message: &str) -> Anomaly {
     }
 }
 
-/// Recommended TTL base per type (RFC 6762 §10, SHOULD): 4500s for
-/// shared PTR/TXT, 120s for unique SRV/A/AAAA. Used in TTL messages so
-/// users see observed vs recommended values.
-fn expected_base(rtype: u16) -> u32 {
+/// Recommended TTL base per type (RFC 6762 §10, SHOULD): 120s for
+/// records whose name or rdata is a host name (SRV, A/AAAA, reverse
+/// mapping PTR), 4500s for the rest (service PTR, TXT). Used in TTL
+/// messages so users see observed vs recommended values.
+fn expected_base(rtype: u16, name: &str) -> u32 {
     match rtype {
+        12 if is_reverse_ptr(name) => 120,
         12 | 16 => 4500,
         _ => 120,
     }
@@ -2388,6 +2409,104 @@ mod tests {
         let answers = vec![rec("X._http._tcp.local.", 16, "TXT", &big, 120, true)];
         let found = analyze_service("X", "_http._tcp.local", "", &answers);
         assert!(found.iter().any(|a| a.kind == AnomalyKind::TxtOversize));
+    }
+
+    /// Standalone TXT wire record: uncompressed owner, header, then
+    /// `strings` as length-prefixed character strings.
+    fn txt_wire(owner: &str, strings: &[&[u8]]) -> Vec<u8> {
+        let mut wire = Vec::new();
+        for label in owner.trim_end_matches('.').split('.') {
+            wire.push(label.len() as u8);
+            wire.extend_from_slice(label.as_bytes());
+        }
+        wire.push(0);
+        wire.extend_from_slice(&[0, 16, 0x80, 1, 0, 0, 0x11, 0x94]);
+        let rdata: Vec<u8> = strings
+            .iter()
+            .flat_map(|s| std::iter::once(s.len() as u8).chain(s.iter().copied()))
+            .collect();
+        wire.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        wire.extend_from_slice(&rdata);
+        wire
+    }
+
+    #[test]
+    fn txt_oversize_measures_wire_rdata() {
+        // Non-UTF-8 values display as 3-byte U+FFFD each: the lossy
+        // display string tops 1300 bytes while the wire RDATA does not.
+        let value = vec![0xffu8; 240];
+        let strings: Vec<&[u8]> = vec![&value; 5];
+        let mut small = rec(
+            "X._http._tcp.local.",
+            16,
+            "TXT",
+            &"\u{fffd}".repeat(1200),
+            4500,
+            true,
+        );
+        small.wire = txt_wire("X._http._tcp.local.", &strings);
+        let found = analyze_service("X", "_http._tcp.local", "", &[small]);
+        assert!(
+            !found.iter().any(|a| a.kind == AnomalyKind::TxtOversize),
+            "1205-byte RDATA stays under the limit, got: {found:?}"
+        );
+
+        // Many short strings: the length bytes push RDATA over the limit
+        // although the joined display string is shorter.
+        let short = *b"k=v";
+        let strings: Vec<&[u8]> = vec![&short; 330];
+        let mut big = rec(
+            "X._http._tcp.local.",
+            16,
+            "TXT",
+            &vec!["k=v"; 330].join("; ")[..1290],
+            4500,
+            true,
+        );
+        big.wire = txt_wire("X._http._tcp.local.", &strings);
+        let found = analyze_service("X", "_http._tcp.local", "", &[big]);
+        let item = found
+            .iter()
+            .find(|a| a.kind == AnomalyKind::TxtOversize)
+            .expect("1320-byte RDATA is oversize");
+        assert_eq!(item.message, "TXT 1320B, max 1300B");
+    }
+
+    #[test]
+    fn srv_root_target_is_service_unavailable_note() {
+        // RFC 2782: "." means the service is decidedly not available.
+        let answers = vec![rec("X._http._tcp.local.", 33, "SRV", "0 0 0 .", 120, true)];
+        let found = analyze_service("X", "_http._tcp.local", "", &answers);
+        let item = found
+            .iter()
+            .find(|a| a.kind == AnomalyKind::SrvTarget)
+            .expect("root target note");
+        assert_eq!(item.severity, Severity::Info);
+        assert_eq!((item.rfc, item.requirement), ("RFC 2782", ""));
+        assert!(item.message.contains("not available"), "{}", item.message);
+        assert!(!found
+            .iter()
+            .any(|a| a.kind == AnomalyKind::UnresolvedSrvTarget));
+    }
+
+    #[test]
+    fn reverse_ptr_ttl_wants_host_name_base() {
+        // RFC 6762 §10: reverse mapping PTRs carry a host name in rdata,
+        // so their recommended TTL is 120 s, not 4500 s.
+        let answers = vec![rec(
+            "10.1.168.192.in-addr.arpa.",
+            12,
+            "PTR",
+            "host.local.",
+            7300,
+            true,
+        )];
+        let found = analyze_service("X", "_http._tcp.local", "", &answers);
+        let item = found
+            .iter()
+            .find(|a| a.kind == AnomalyKind::TtlHigh)
+            .expect("ttl-high");
+        assert_eq!(item.message, "TTL 7300s, want ~120s");
     }
 
     #[test]
