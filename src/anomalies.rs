@@ -435,10 +435,8 @@ fn normalize_soa_rdata(rdata: String) -> String {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AddressQueryOutcome {
     NoData,
-    NxDomain,
     NoResponse,
     Inconclusive,
-    UnattributedNxDomain,
     NotQueried,
     Pending,
     ExpiredAnswer,
@@ -536,8 +534,11 @@ fn check_unresolved_path(
     out: &mut Vec<Anomaly>,
 ) {
     let on_path = |record: &RawRecord| interface.is_empty() || record.iface == interface;
+    // RFC 6762 §18.11: responses with a non-zero RCODE MUST be silently
+    // ignored, so they never count as evidence (no NXDOMAIN in mDNS;
+    // negative answers are NSEC, §6.1).
     let matching_response = |event: &crate::browse::Event, at: Instant| {
-        if event.rcode.is_none() || event.received_at < at {
+        if event.rcode != Some(0) || event.received_at < at {
             return false;
         }
         let rows: Vec<_> = event.answers.iter().chain(&event.questions).collect();
@@ -562,23 +563,6 @@ fn check_unresolved_path(
             let Some(query) = query.max_by_key(|query| query.transmitted_at) else {
                 return (rtype, AddressQueryOutcome::NotQueried, None);
             };
-            if let Some(record) = evidence.events.iter().find_map(|event| {
-                event.answers.iter().find(|record| {
-                    event.rcode == Some(3)
-                        && on_path(record)
-                        && record.rtype == 5
-                        && record.name.trim_end_matches('.').eq_ignore_ascii_case(host)
-                        && record.section == crate::browse::RecordSection::Answer
-                        && record.received_at >= query.transmitted_at
-                        && is_live(record, evidence.now)
-                })
-            }) {
-                return (
-                    rtype,
-                    AddressQueryOutcome::NxDomain,
-                    Some((record.source.to_string(), record.iface.clone())),
-                );
-            }
             if let Some(record) = evidence.events.iter().find_map(|event| {
                 event.answers.iter().find(|record| {
                     event.rcode == Some(0)
@@ -618,14 +602,7 @@ fn check_unresolved_path(
                 .iter()
                 .any(|event| matching_response(event, query.transmitted_at))
             {
-                let outcome = if evidence.events.iter().any(|event| {
-                    event.rcode == Some(3) && matching_response(event, query.transmitted_at)
-                }) {
-                    AddressQueryOutcome::UnattributedNxDomain
-                } else {
-                    AddressQueryOutcome::Inconclusive
-                };
-                return (rtype, outcome, None);
+                return (rtype, AddressQueryOutcome::Inconclusive, None);
             }
             let outcome = if evidence.now.saturating_duration_since(query.transmitted_at)
                 >= ADDRESS_RESPONSE_TIMEOUT
@@ -645,10 +622,8 @@ fn check_unresolved_path(
             matches!(
                 outcome,
                 AddressQueryOutcome::NoData
-                    | AddressQueryOutcome::NxDomain
                     | AddressQueryOutcome::NoResponse
                     | AddressQueryOutcome::Inconclusive
-                    | AddressQueryOutcome::UnattributedNxDomain
                     | AddressQueryOutcome::ExpiredAnswer
             )
         })
@@ -658,16 +633,14 @@ fn check_unresolved_path(
 
     let (a_outcome, a_context) = (&outcomes[0].1, &outcomes[0].2);
     let (aaaa_outcome, aaaa_context) = (&outcomes[1].1, &outcomes[1].2);
-    let explicit_negative = matches!(a_outcome, AddressQueryOutcome::NxDomain)
-        || matches!(aaaa_outcome, AddressQueryOutcome::NxDomain)
-        || (matches!(a_outcome, AddressQueryOutcome::NoData)
-            && matches!(aaaa_outcome, AddressQueryOutcome::NoData));
+    // The only explicit negative in mDNS is an NSEC denying both address
+    // types (RFC 6762 §6.1).
+    let explicit_negative = matches!(a_outcome, AddressQueryOutcome::NoData)
+        && matches!(aaaa_outcome, AddressQueryOutcome::NoData);
     let outcome_text = |outcome: AddressQueryOutcome| match outcome {
         AddressQueryOutcome::NoData => "NODATA",
-        AddressQueryOutcome::NxDomain => "NXDOMAIN",
         AddressQueryOutcome::NoResponse => "no response",
         AddressQueryOutcome::Inconclusive => "unattributed mDNS response",
-        AddressQueryOutcome::UnattributedNxDomain => "unattributed NXDOMAIN response",
         AddressQueryOutcome::NotQueried => "not queried",
         AddressQueryOutcome::Pending => "pending",
         AddressQueryOutcome::ExpiredAnswer => "answered; address expired",
