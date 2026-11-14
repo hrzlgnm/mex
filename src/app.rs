@@ -587,6 +587,11 @@ pub struct App {
     pub metrics_hscroll: Cell<usize>,
     /// Cumulative v2 counters (traffic, queries, suppressions).
     pub metrics: MetricsCounters,
+    /// Bumped by anything that can change the list or detail selection
+    /// (ingest, eviction, input); `evict_expired` re-clamps the cursors
+    /// only when it moved past `clamped_gen`, not on every idle tick.
+    state_gen: u64,
+    clamped_gen: Option<u64>,
     /// Cached usable/skipped link snapshot, refreshed on the 10s tick.
     pub link_stats: browse::LinkStats,
     /// Refused-packet accounting from the listener threads (RFC 6762 §11).
@@ -928,6 +933,8 @@ impl App {
             metrics_viewport: Cell::new(0),
             metrics_hscroll: Cell::new(0),
             metrics: MetricsCounters::default(),
+            state_gen: 0,
+            clamped_gen: None,
             link_stats,
             drop_stats,
         })
@@ -1000,7 +1007,7 @@ impl App {
                             }
                         }
                         Event::Mouse(mouse) => self.handle_mouse(&mouse),
-                        Event::Resize(_, _) => {}
+                        Event::Resize(_, _) => self.touch(),
                         _ => {}
                     }
                     if !event::poll(Duration::ZERO)? {
@@ -3026,7 +3033,13 @@ impl App {
         key.code == KeyCode::Char('z') && key.modifiers.contains(KeyModifiers::CONTROL)
     }
 
+    /// Mark selection-relevant state as changed (see `state_gen`).
+    fn touch(&mut self) {
+        self.state_gen = self.state_gen.wrapping_add(1);
+    }
+
     fn handle_key(&mut self, key: &KeyEvent) {
+        self.touch();
         // Ctrl+C quits: raw mode turns it into a key event (no SIGINT).
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.running = false;
@@ -3287,6 +3300,7 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: &MouseEvent) {
+        self.touch();
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.mouse_down(mouse.column, mouse.row);
@@ -4181,6 +4195,7 @@ impl App {
     }
 
     fn ingest_event(&mut self, ev: &browse::Event) {
+        self.touch();
         // RFC 6762 §18.11: messages received with a non-zero RCODE MUST be
         // silently ignored. The raw packet stays in the packet log for
         // inspection, but none of its records or questions reach state.
@@ -5180,7 +5195,11 @@ impl App {
         let before = self.services.len();
         self.services
             .retain(|s| s.is_active || now.duration_since(s.last_seen) < grace);
-        self.metrics.services_expired_total += (before - self.services.len()) as u64;
+        let services_expired = before - self.services.len();
+        self.metrics.services_expired_total += services_expired as u64;
+        if services_expired > 0 {
+            self.touch();
+        }
         self.pending_instances
             .retain(|p| now.duration_since(p.last_seen) < grace);
         // Drop schedules for names that no longer exist, so dead services
@@ -5259,11 +5278,16 @@ impl App {
             // their TTL so the Answers pane stays bounded.
         }
         self.expanded_txt.retain(|k| live_txt.contains(k));
+        let mut enum_rows_pruned = false;
         for entry in &mut self.enum_entries {
+            let before = entry.answers.len();
             entry
                 .answers
                 .retain(|r| r.received_at.elapsed().as_secs() as u32 <= r.ttl.saturating_add(120));
-            entry.questions.retain(|_| true);
+            enum_rows_pruned |= entry.answers.len() != before;
+        }
+        if enum_rows_pruned {
+            self.touch();
         }
         // Expire enumeration known answers at 100% TTL; prune the type
         // cache to live interests so it cannot grow without bound.
@@ -5275,7 +5299,12 @@ impl App {
             .map(|(n, _)| n.clone())
             .collect();
         self.known_types.retain(|t| live_types.contains(t));
-        self.clamp_selection();
+        // Cursor clamping walks the display list and re-sorts the detail
+        // rows; skip it on idle ticks where nothing it reads has changed.
+        if self.clamped_gen != Some(self.state_gen) {
+            self.clamp_selection();
+            self.clamped_gen = Some(self.state_gen);
+        }
     }
 
     fn clamp_selection(&mut self) {
