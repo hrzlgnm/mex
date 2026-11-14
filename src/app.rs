@@ -686,9 +686,9 @@ impl ServiceEntry {
             }
         }
         out.sort_by(|a, b| {
-            (&a.rtype_str, a.source.to_string(), &a.name, &a.rdata).cmp(&(
+            (&a.rtype_str, a.source, &a.name, &a.rdata).cmp(&(
                 &b.rtype_str,
-                b.source.to_string(),
+                b.source,
                 &b.name,
                 &b.rdata,
             ))
@@ -704,10 +704,10 @@ impl ServiceEntry {
     ) -> Vec<&(String, String, std::net::SocketAddr, Instant, Vec<u8>)> {
         let mut out: Vec<_> = self.questions.iter().collect();
         out.sort_by(|a, b| {
-            (&a.1, std::cmp::Reverse(a.3), a.2.to_string(), &a.0).cmp(&(
+            (&a.1, std::cmp::Reverse(a.3), a.2, &a.0).cmp(&(
                 &b.1,
                 std::cmp::Reverse(b.3),
-                b.2.to_string(),
+                b.2,
                 &b.0,
             ))
         });
@@ -744,9 +744,9 @@ impl EnumEntry {
             }
         }
         out.sort_by(|a, b| {
-            (&a.rtype_str, a.source.to_string(), &a.name, &a.rdata).cmp(&(
+            (&a.rtype_str, a.source, &a.name, &a.rdata).cmp(&(
                 &b.rtype_str,
-                b.source.to_string(),
+                b.source,
                 &b.name,
                 &b.rdata,
             ))
@@ -759,10 +759,10 @@ impl EnumEntry {
     ) -> Vec<&(String, String, std::net::SocketAddr, Instant, Vec<u8>)> {
         let mut out: Vec<_> = self.questions.iter().collect();
         out.sort_by(|a, b| {
-            (&a.1, std::cmp::Reverse(a.3), a.2.to_string(), &a.0).cmp(&(
+            (&a.1, std::cmp::Reverse(a.3), a.2, &a.0).cmp(&(
                 &b.1,
                 std::cmp::Reverse(b.3),
-                b.2.to_string(),
+                b.2,
                 &b.0,
             ))
         });
@@ -6026,6 +6026,27 @@ mod tests {
             .ordered_answers()
             .iter()
             .any(|r| r.rtype == 16));
+    }
+
+    #[test]
+    fn ordered_answers_sorts_sources_numerically() {
+        // Same TXT from two responders: rows group by type, then by
+        // source address in numeric (not string) order.
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        for ip in ["10.0.0.10", "10.0.0.2"] {
+            let mut rec = txt_record("a=1");
+            rec.source = format!("{ip}:5353").parse().unwrap();
+            ingest(&mut app, &rec);
+        }
+        let sources: Vec<_> = app.services[0]
+            .ordered_answers()
+            .into_iter()
+            .filter(|r| r.rtype == 16)
+            .map(|r| r.source.to_string())
+            .collect();
+        assert_eq!(sources, ["10.0.0.2:5353", "10.0.0.10:5353"]);
     }
 
     #[test]
