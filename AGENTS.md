@@ -32,7 +32,8 @@ Headless run (no TTY) logs to stderr.
   then ≥1s, doubling each time, capped at 1/hour. No fixed 60s re-poll.
 * Cache refresh (`App::requeries`): re-ask at ~80/85/90/95% of TTL with 0–2%
   random variation; after four misses the record expires at 100% TTL.
-  Hourly is only the cap for unanswered continuous browsing.
+  The refresh itself never goes hourly; hourly is only the
+  continuous-browsing cap.
 * Known-answer suppression is PTR-only (shared records, §7.1): only answers
   with ≥half the original TTL remaining, sent with remaining TTL, scoped to
   the egress interface.
@@ -42,7 +43,8 @@ Headless run (no TTY) logs to stderr.
   `requeries`, `enum_known`, `known_types` to live names.
 * Records show the ingress interface (`%iface` for IPv6 link-local,
   `@iface` otherwise) from IP_PKTINFO.
-* Unique answers (flush bit) dampen the exponential stream to hourly;
+* Unique answers (flush bit) dampen the exponential stream to hourly,
+  also when cached before the interest appeared (e.g. A/AAAA additionals);
   the 80%-TTL refresh takes over.
 
 ## Workflow
