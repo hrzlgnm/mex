@@ -298,6 +298,7 @@ impl App {
 #[derive(Clone, Debug, Default)]
 struct InterestQueryState {
     transmitted: Option<Instant>,
+    transmitted_interfaces: String,
     suppressed: Option<Instant>,
     observed: Option<ObservedQuery>,
 }
@@ -1358,12 +1359,30 @@ impl App {
     /// Record a query event for an interest: we transmitted it or §7.3
     /// suppression stood in for it, stamped at action time.
     fn note_query(&mut self, name: &str, rtype: u16, origin: QueryOrigin, at: Instant) {
+        let mut query_interfaces: Vec<String> = self
+            .link_stats
+            .v4
+            .iter()
+            .map(|(name, _)| name.clone())
+            .chain(self.link_stats.v6.iter().map(|(name, _)| name.clone()))
+            .filter(|name| {
+                self.interfaces
+                    .as_ref()
+                    .is_none_or(|selected| selected.contains(name))
+            })
+            .collect();
+        query_interfaces.sort();
+        query_interfaces.dedup();
+        let query_interfaces = query_interfaces.join(", ");
         let entry = self
             .query_history
             .entry(Self::provenance_key(name, rtype))
             .or_default();
         match origin {
-            QueryOrigin::Transmitted => entry.transmitted = Some(at),
+            QueryOrigin::Transmitted => {
+                entry.transmitted = Some(at);
+                entry.transmitted_interfaces = query_interfaces;
+            }
             QueryOrigin::Suppressed => entry.suppressed = Some(at),
             QueryOrigin::Observed => {
                 // Observed questions carry their own packet timestamp
@@ -2443,7 +2462,6 @@ impl App {
             .map(|s| anomalies::ServiceView {
                 instance: &s.instance,
                 service_type: &s.service_type,
-                hostname: &s.hostname,
                 answers: &s.answers,
                 subtypes: &s.subtypes,
             })
@@ -2456,7 +2474,6 @@ impl App {
             services.push(anomalies::ServiceView {
                 instance: &p.instance,
                 service_type: &p.service_type,
-                hostname: "",
                 answers: &p.answers,
                 subtypes: &p.subtypes,
             });
@@ -2467,42 +2484,35 @@ impl App {
             .flat_map(|e| e.answers.iter())
             .collect();
         let pending_hosts: HashSet<String> = self.pending_addrs.keys().cloned().collect();
-        let mut query_interfaces: Vec<String> = self
-            .interfaces
-            .as_ref()
-            .map(|selected| selected.iter().cloned().collect())
-            .unwrap_or_else(|| {
-                self.link_stats
-                    .v4
-                    .iter()
-                    .map(|(name, _)| name.clone())
-                    .chain(self.link_stats.v6.iter().map(|(name, _)| name.clone()))
-                    .collect()
-            });
-        query_interfaces.sort();
-        query_interfaces.dedup();
-        let query_interfaces = if query_interfaces.is_empty() {
-            "active mDNS links".to_string()
-        } else {
-            query_interfaces.join(", ")
-        };
         let address_queries: Vec<_> = self
             .services
             .iter()
             .flat_map(|service| {
                 let service_id = anomalies::service_id(&service.instance, &service.service_type);
-                let interfaces = query_interfaces.clone();
-                [1, 28].into_iter().filter_map(move |rtype| {
-                    self.query_history
-                        .get(&Self::provenance_key(&service.hostname, rtype))
-                        .and_then(|state| state.transmitted)
-                        .map(|transmitted_at| anomalies::AddressQueryView {
-                            service: service_id.clone(),
-                            hostname: service.hostname.clone(),
-                            rtype,
-                            transmitted_at,
-                            interfaces: interfaces.clone(),
-                        })
+                let mut targets = HashSet::new();
+                for rec in service.answers.iter().filter(|rec| {
+                    rec.rtype == 33
+                        && rec.ttl > 0
+                        && rec.received_at.elapsed().as_secs() <= u64::from(rec.ttl)
+                }) {
+                    if let Some(host) = rec.rdata.split_whitespace().last() {
+                        targets.insert(host.trim_end_matches('.').to_lowercase());
+                    }
+                }
+                targets.into_iter().flat_map(move |hostname| {
+                    let service_id = service_id.clone();
+                    [1, 28].into_iter().filter_map(move |rtype| {
+                        self.query_history
+                            .get(&Self::provenance_key(&hostname, rtype))
+                            .and_then(|state| state.transmitted.map(|at| (state, at)))
+                            .map(|(state, transmitted_at)| anomalies::AddressQueryView {
+                                service: service_id.clone(),
+                                hostname: hostname.clone(),
+                                rtype,
+                                transmitted_at,
+                                interfaces: state.transmitted_interfaces.clone(),
+                            })
+                    })
                 })
             })
             .collect();
@@ -11205,6 +11215,143 @@ mod tests {
         assert_eq!(finding.severity, anomalies::Severity::Info);
         assert!(finding.message.contains("unattributed NXDOMAIN response"));
         assert!(!finding.message.contains("A: NXDOMAIN"));
+    }
+
+    #[test]
+    fn expired_address_preserves_response_evidence_without_resolving_target() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        mark_address_queries(&mut app, "test.local", Duration::from_secs(10));
+        let mut addr = raw_record("test.local.", 1, "A", "192.168.1.10", 1);
+        addr.received_at = Instant::now() - Duration::from_secs(5);
+        ingest(&mut app, &addr);
+        let found = app.anomalies();
+        let finding = found
+            .iter()
+            .find(|a| a.kind == anomalies::AnomalyKind::UnresolvedSrvTarget)
+            .unwrap();
+        assert!(finding.message.contains("answered; address expired"));
+        assert_eq!(finding.severity, anomalies::Severity::Info);
+    }
+
+    #[test]
+    fn negative_families_on_different_interfaces_do_not_combine() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        mark_address_queries(&mut app, "test.local", Duration::from_secs(2));
+        for state in app.query_history.values_mut() {
+            state.transmitted_interfaces = "br0, eth0".into();
+        }
+        for (iface, bitmap) in [("br0", "AAAA"), ("eth0", "A")] {
+            let mut nsec = raw_record(
+                "test.local.",
+                47,
+                "NSEC",
+                &format!("test.local. {bitmap}"),
+                120,
+            );
+            nsec.iface = iface.into();
+            ingest_packet(&mut app, event_for(&nsec));
+        }
+        let found: Vec<_> = app
+            .anomalies()
+            .into_iter()
+            .filter(|a| a.kind == anomalies::AnomalyKind::UnresolvedSrvTarget)
+            .collect();
+        assert_eq!(found.len(), 2);
+        assert!(found
+            .iter()
+            .all(|a| a.severity == anomalies::Severity::Info));
+        assert!(found.iter().any(|a| a.message.contains("interfaces br0")));
+        assert!(found.iter().any(|a| a.message.contains("interfaces eth0")));
+    }
+
+    #[test]
+    fn unrelated_response_does_not_turn_silence_into_inconclusive_response() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        mark_address_queries(&mut app, "test.local", Duration::from_secs(2));
+        ingest_packet(
+            &mut app,
+            event_for(&raw_record("other.local.", 1, "A", "192.168.1.10", 120)),
+        );
+        let finding = app
+            .anomalies()
+            .into_iter()
+            .find(|a| a.kind == anomalies::AnomalyKind::UnresolvedSrvTarget)
+            .unwrap();
+        assert!(finding.message.contains("A: no response"));
+        assert!(finding.message.contains("AAAA: no response"));
+    }
+
+    #[test]
+    fn query_interfaces_survive_link_changes_and_exclude_inactive_selection() {
+        let mut app = App::new().unwrap();
+        app.interfaces = Some(
+            ["br0".to_string(), "down0".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        app.link_stats.v4 = vec![("br0".into(), "192.168.1.2".parse().unwrap())];
+        app.link_stats.v6.clear();
+        app.note_query("test.local", 1, QueryOrigin::Transmitted, Instant::now());
+        app.link_stats.v4.clear();
+        app.interfaces = None;
+        assert_eq!(
+            app.query_history[&App::provenance_key("test.local", 1)].transmitted_interfaces,
+            "br0"
+        );
+    }
+
+    #[test]
+    fn queried_srv_target_is_analyzed_when_another_host_is_displayed() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        mark_address_queries(&mut app, "test.local", Duration::from_secs(2));
+        app.services[0].hostname = "display.local".into();
+        assert!(app
+            .anomalies()
+            .iter()
+            .any(|a| a.kind == anomalies::AnomalyKind::UnresolvedSrvTarget
+                && a.message.contains("test.local")));
+    }
+
+    #[test]
+    fn selective_enumeration_uses_wire_labels_and_packet_time() {
+        let mut app = App::new().unwrap();
+        let mut ptr = ptr_record(120);
+        ptr.name = "a.b._sub._http._tcp.local.".into();
+        ptr.owner_labels = [b"a.b".as_slice(), b"_sub", b"_http", b"_tcp", b"local"]
+            .into_iter()
+            .map(Vec::from)
+            .collect();
+        let mut srv = srv_record(120);
+        srv.section = browse::RecordSection::Additional;
+        let mut addr = raw_record("test.local.", 1, "A", "192.168.1.10", 1);
+        addr.section = browse::RecordSection::Additional;
+        let at = Instant::now() - Duration::from_secs(5);
+        for rec in [&mut ptr, &mut srv, &mut addr] {
+            rec.received_at = at;
+        }
+        let mut event = event_for(&ptr);
+        event.received_at = at;
+        event.answers = vec![ptr, srv, addr];
+        app.raw_events.push(event.clone());
+        assert!(!app
+            .anomalies()
+            .iter()
+            .any(|a| a.kind == anomalies::AnomalyKind::MissingAddr));
+        app.raw_events.clear();
+        event.answers.pop();
+        app.raw_events.push(event);
+        assert!(app
+            .anomalies()
+            .iter()
+            .any(|a| a.kind == anomalies::AnomalyKind::MissingAddr));
     }
 
     #[test]
