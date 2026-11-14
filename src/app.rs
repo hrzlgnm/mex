@@ -944,20 +944,37 @@ impl App {
     }
 
     fn run_tui(&mut self, terminal: &mut ui::Terminal) -> Result<()> {
+        // Redraw only when something changed: input, new packets, a log
+        // popup, or the wall-clock second ticking over (TTL countdowns,
+        // ages, uptime, popup expiry). The 80ms tick itself stays for
+        // query scheduling; idle ticks skip the costly frame.
+        let mut dirty = true;
+        let mut drawn_sec = None;
         while self.running {
+            let packets_before = self.packet_count;
             self.drain_events();
             self.send_queries();
             self.evict_expired();
-
-            terminal.draw(|f| ui::draw(f, self))?;
+            dirty |= self.packet_count != packets_before;
 
             // Surface retained log write failures (terminal-safe: the
             // popup, not stderr, so the TUI is not corrupted).
             if let Some(msg) = crate::take_log_error() {
                 self.status_msg = Some((msg, Instant::now()));
+                dirty = true;
+            }
+
+            let sec = self.start_time.elapsed().as_secs();
+            if dirty || drawn_sec != Some(sec) {
+                terminal.draw(|f| ui::draw(f, self))?;
+                dirty = false;
+                drawn_sec = Some(sec);
             }
 
             if event::poll(Duration::from_millis(80))? {
+                // Any input may change what is shown (keys, mouse hover,
+                // resize): draw on the next pass.
+                dirty = true;
                 // Drain everything pending so mouse drags stay smooth at
                 // 12fps instead of handling one event per frame.
                 loop {
