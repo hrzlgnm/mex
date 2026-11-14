@@ -169,6 +169,7 @@ carry a `[!N]` badge in the Hosts pane, and the Anomalies pane lists
 every finding for the selected service with a `>` marker on the
 highlighted row's findings. Each line reads
 `<icon> <source>: <kind> <record>: <message> (<rfc>, <requirement>)` —
+the requirement is omitted when the cited text has no RFC 2119 keyword;
 the announcer/querier address leads, the level icon carries the
 severity (no severity word), and enumeration-row findings omit their
 constant scope. The metrics overlay (`m`) lists all findings with
@@ -184,16 +185,16 @@ info for inconclusive lookups).
 | Finding | Meaning |
 | --- | --- |
 | `type-format` (warning) | malformed service type, subtype, or enumerated type ([RFC 6763 §7](https://www.rfc-editor.org/rfc/rfc6763#section-7), MUST) |
-| `enum-subtype` (warning) | subtype listed in service enumeration instead of a base type ([RFC 6763 §9](https://www.rfc-editor.org/rfc/rfc6763#section-9), SHOULD) |
+| `enum-subtype` (warning) | subtype listed in service enumeration instead of a base type ([RFC 6763 §9](https://www.rfc-editor.org/rfc/rfc6763#section-9)) |
 | `shared-flush` (error) | shared PTR record with the cache-flush bit set ([RFC 6762 §10.2](https://www.rfc-editor.org/rfc/rfc6762#section-10.2), MUST NOT) |
-| `no-flush` (warning when confirmed, else info) | unique SRV/TXT record missing the cache-flush bit ([RFC 6762 §10.2](https://www.rfc-editor.org/rfc/rfc6762#section-10.2), SHOULD); confirmed only in a multicast answer |
-| `unicast-leak` (error when confirmed, else warning) | NS/SOA/ANY/MX outside unicast DNS ([RFC 6762 §3](https://www.rfc-editor.org/rfc/rfc6762#section-3)); confirmed only in a multicast answer, otherwise pending capture verification |
+| `no-flush` (warning when confirmed, else info) | unique SRV/TXT record missing the cache-flush bit ([RFC 6762 §10.2](https://www.rfc-editor.org/rfc/rfc6762#section-10.2), MUST); confirmed only in a multicast answer |
+| `unicast-leak` (error when confirmed, else warning) | NS/SOA (no such records in mDNS zones, [RFC 6762 §12](https://www.rfc-editor.org/rfc/rfc6762#section-12)), ANY (a query-only type, [RFC 1035 §3.2.3](https://www.rfc-editor.org/rfc/rfc1035#section-3.2.3), MUST NOT), or MX answered over mDNS; confirmed only in a multicast answer, otherwise pending capture verification |
 | `unicast-question` (error: NS/SOA, warning: MX) | multicast question asking for a unicast-only type ([RFC 6762 §3](https://www.rfc-editor.org/rfc/rfc6762#section-3)); ANY questions are ownership probes and stay quiet; ephemeral-port queriers are tagged one-shot |
-| `ttl-low` / `ttl-high` (warning) | TTL below 10 s (churn risk) or above 7200 s (stale-cache risk) ([RFC 6762 §5.2](https://www.rfc-editor.org/rfc/rfc6762#section-5.2), SHOULD) |
+| `ttl-low` / `ttl-high` (warning) | TTL below 10 s (churn risk) or above 7200 s (stale-cache risk) ([RFC 6762 §10](https://www.rfc-editor.org/rfc/rfc6762#section-10), SHOULD) |
 | `ttl-mismatch` (info) | service PTR at ≤ 120 s instead of the recommended 4500 s base ([RFC 6762 §10](https://www.rfc-editor.org/rfc/rfc6762#section-10), SHOULD) |
-| `ttl-unstable` (warning) | same name and type announced with different TTL bases ([RFC 6762 §5.2](https://www.rfc-editor.org/rfc/rfc6762#section-5.2), SHOULD) |
-| `srv-target` (warning: malformed, info: target needs unicast DNS) | SRV target malformed (MUST) or resolving outside mDNS (MAY) ([RFC 6763 §12](https://www.rfc-editor.org/rfc/rfc6763#section-12)) |
-| `txt-oversize` (warning) | TXT payload over ~1300 B, risking fragmentation ([RFC 6762 §17](https://www.rfc-editor.org/rfc/rfc6762#section-17), SHOULD) |
+| `ttl-unstable` (warning) | same name and type announced with different TTL bases ([RFC 6762 §10](https://www.rfc-editor.org/rfc/rfc6762#section-10)) |
+| `srv-target` (warning: malformed, info: target needs unicast DNS) | SRV target malformed (MUST) or resolving outside mDNS ([RFC 2782](https://www.rfc-editor.org/rfc/rfc2782)) |
+| `txt-oversize` (warning) | TXT payload over ~1300 B, risking fragmentation ([RFC 6763 §6.2](https://www.rfc-editor.org/rfc/rfc6763#section-6.2), SHOULD NOT) |
 
 Reverse-mapping PTRs (`*.in-addr.arpa`, `*.ip6.arpa`) are exempt from
 the shared-record rules: they are unique records. Omitting the flush
