@@ -2889,7 +2889,11 @@ impl App {
     fn save_state_dump_to(&self, dir: &std::path::Path) -> Result<std::path::PathBuf> {
         let json = serde_json::to_string_pretty(&self.state_dump())?;
         let stem = dump::file_stem_iso();
-        let json_path = dir.join(format!("{stem}-mex-dump.json"));
+        let json_path = dir.join(format!(
+            "{stem}-{appname}-{version}.json",
+            appname = env!("CARGO_PKG_NAME"),
+            version = env!("CARGO_PKG_VERSION")
+        ));
         std::fs::write(&json_path, &json)?;
         Ok(json_path)
     }
