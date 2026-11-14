@@ -366,6 +366,16 @@ fn is_enum_name(name: &str) -> bool {
         .eq_ignore_ascii_case(ENUM_SERVICE)
 }
 
+fn same_ptr_target(a: &browse::RawRecord, b: &browse::RawRecord) -> bool {
+    match (&a.ptr_target_labels, &b.ptr_target_labels) {
+        (Some(a), Some(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.eq_ignore_ascii_case(b))
+        }
+        (None, None) => a.rdata.eq_ignore_ascii_case(&b.rdata),
+        _ => false,
+    }
+}
+
 fn subtype_owner_parts(rec: &browse::RawRecord) -> Option<(Vec<u8>, String)> {
     let fallback_labels = if rec.owner_labels.is_empty() {
         rec.name
@@ -709,7 +719,13 @@ impl EnumEntry {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for rec in self.answers.iter().rev() {
-            if seen.insert((&rec.name, rec.rtype, &rec.rdata, rec.source)) {
+            if seen.insert((
+                &rec.name,
+                rec.rtype,
+                &rec.rdata,
+                &rec.ptr_target_labels,
+                rec.source,
+            )) {
                 out.push(rec);
             }
         }
@@ -4186,7 +4202,7 @@ impl App {
                 if let Some(pos) = entry.answers.iter().position(|r| {
                     r.name.eq_ignore_ascii_case(&rec.name)
                         && r.rtype == rec.rtype
-                        && r.rdata.eq_ignore_ascii_case(&rec.rdata)
+                        && same_ptr_target(r, rec)
                         && r.source == rec.source
                 }) {
                     entry.answers[pos] = rec.clone();
@@ -4470,7 +4486,7 @@ impl App {
                 if let Some(pos) = entry.answers.iter().position(|r| {
                     r.name.eq_ignore_ascii_case(&rec.name)
                         && r.rtype == rec.rtype
-                        && r.rdata.eq_ignore_ascii_case(&rec.rdata)
+                        && same_ptr_target(r, rec)
                         && r.source == rec.source
                 }) {
                     entry.answers[pos] = rec.clone();
@@ -7558,6 +7574,56 @@ mod tests {
             ),
         );
         assert_eq!(app.enum_entries[0].answers.len(), 1);
+    }
+
+    #[test]
+    fn enum_subtype_targets_with_lossy_collisions_remain_distinct() {
+        let target = |byte: u8| {
+            let subtype: &'static [u8] = Box::leak(vec![byte].into_boxed_slice());
+            let labels: &'static [simple_dns::Label<'static>] = Box::leak(
+                vec![
+                    simple_dns::Label::new_unchecked(subtype),
+                    simple_dns::Label::new_unchecked(&b"_sub"[..]),
+                    simple_dns::Label::new_unchecked(&b"_http"[..]),
+                    simple_dns::Label::new_unchecked(&b"_tcp"[..]),
+                    simple_dns::Label::new_unchecked(&b"local"[..]),
+                ]
+                .into_boxed_slice(),
+            );
+            simple_dns::Name::new_with_labels(labels)
+        };
+        let mut packet = simple_dns::Packet::new_reply(0);
+        for byte in [0xfe, 0xff] {
+            packet.answers.push(simple_dns::ResourceRecord::new(
+                simple_dns::Name::new_unchecked("_services._dns-sd._udp.local."),
+                simple_dns::CLASS::IN,
+                4500,
+                simple_dns::rdata::RData::PTR(target(byte).into()),
+            ));
+        }
+        let bytes = packet.build_bytes_vec().unwrap();
+        let event = browse::parse_packet(
+            &bytes,
+            test_source(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(224, 0, 0, 251)),
+            "br0",
+            3,
+        )
+        .unwrap();
+        let mut app = App::new().unwrap();
+        app.ingest_event(&event);
+
+        assert_eq!(app.enum_entries[0].answers.len(), 2);
+        assert_eq!(app.enum_entries[0].ordered_answers().len(), 2);
+        let messages: Vec<_> = app
+            .anomalies()
+            .into_iter()
+            .filter(|anomaly| anomaly.kind == anomalies::AnomalyKind::EnumSubtype)
+            .map(|anomaly| anomaly.message)
+            .collect();
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().any(|message| message.contains(r"\xFE")));
+        assert!(messages.iter().any(|message| message.contains(r"\xFF")));
     }
 
     #[test]

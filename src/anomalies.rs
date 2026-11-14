@@ -332,6 +332,11 @@ fn dedup(mut items: Vec<Anomaly>) -> Vec<Anomaly> {
             (AnomalyKind::UnicastLeak, Some(6)) => {
                 anomaly_match_key(6, &a.rdata.clone().unwrap_or_default())
             }
+            (AnomalyKind::EnumSubtype | AnomalyKind::TypeFormat, Some(12))
+                if a.service == ENUMERATION_SERVICE =>
+            {
+                a.message.clone()
+            }
             _ => a.rdata.clone().unwrap_or_default(),
         };
         // Questions carry no rdata: tell queriers apart by source, so each
