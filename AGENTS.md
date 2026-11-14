@@ -42,7 +42,8 @@ Headless run (no TTY) logs to stderr.
   `requeries`, `enum_known`, `known_types` to live names.
 * Records show the ingress interface (`%iface` for IPv6 link-local,
   `@iface` otherwise) from IP_PKTINFO.
-* Unique answers (flush bit) dampen the exponential stream to hourly;
+* Unique answers (flush bit) dampen the exponential stream to hourly,
+  also when cached before the interest appeared (e.g. A/AAAA additionals);
   the 80%-TTL refresh takes over.
 
 ## Workflow

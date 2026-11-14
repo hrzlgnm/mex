@@ -1610,11 +1610,21 @@ impl App {
                 Some(entry) => (now >= entry.next_due, entry.qname.clone()),
                 None => {
                     // RFC 6762 §5.2: first query delayed 20-120ms random.
+                    // A unique answer cached before the interest appeared
+                    // (e.g. A/AAAA shipped as additionals with the SRV)
+                    // means no other answers are forthcoming: start
+                    // dampened, as the flush-bit path would, and let the
+                    // 80%-TTL refresh maintain it.
+                    let (next_due, interval) = if self.has_fresh_unique_answer(&key) {
+                        (now + MAX_CONTINUOUS_INTERVAL, MAX_CONTINUOUS_INTERVAL)
+                    } else {
+                        (now + rand_range(20, 120), Duration::from_secs(1))
+                    };
                     self.continuous.insert(
                         key.clone(),
                         ContinuousQuery {
-                            next_due: now + rand_range(20, 120),
-                            interval: Duration::from_secs(1),
+                            next_due,
+                            interval,
                             qname: qname.clone(),
                         },
                     );
@@ -4221,6 +4231,22 @@ impl App {
 
     /// Advance the exponential stream as if a query had been sent (shared
     /// by real sends and §7.3 suppression).
+    /// Whether a live unique (cache-flush) answer for `key` is cached and
+    /// still before its 80%-TTL refresh window.
+    fn has_fresh_unique_answer(&self, key: &(String, u16)) -> bool {
+        self.services.iter().flat_map(|s| &s.answers).any(|r| {
+            if !r.flush_bit
+                || r.ttl == 0
+                || r.rtype != key.1
+                || !r.name.trim_end_matches('.').eq_ignore_ascii_case(&key.0)
+            {
+                return false;
+            }
+            let elapsed = r.received_at.elapsed().as_secs() as u32;
+            elapsed * 5 < r.ttl * 4
+        })
+    }
+
     fn advance_continuous(&mut self, key: &(String, u16), now: Instant) {
         if let Some(entry) = self.continuous.get_mut(key) {
             let current = entry.interval.max(Duration::from_secs(1));
@@ -5805,6 +5831,61 @@ mod tests {
             .get(&("myhost.local".to_string(), 28))
             .expect("AAAA query interest for the host");
         assert_eq!(qname_aaaa.trim_end_matches('.'), "MyHost.local");
+    }
+
+    /// Ingest PTR + SRV + A/AAAA as one response packet (addresses as
+    /// additionals), with the given cache-flush bit on the addresses.
+    fn ingest_srv_with_addresses(app: &mut App, addr_flush: bool) {
+        let mut a = raw_record("test.local.", 1, "A", "192.168.1.10", 120);
+        a.flush_bit = addr_flush;
+        let mut aaaa = raw_record("test.local.", 28, "AAAA", "fe80::1", 120);
+        aaaa.flush_bit = addr_flush;
+        let mut ev = event_for(&ptr_record(4500));
+        ev.answers.extend([srv_record(120), a, aaaa]);
+        ingest_packet(app, ev);
+    }
+
+    #[test]
+    fn cached_unique_address_skips_initial_query() {
+        let mut app = App::new().unwrap();
+        ingest_srv_with_addresses(&mut app, true);
+        app.poll_continuous();
+        for rtype in [1, 28] {
+            let entry = app
+                .continuous
+                .get(&("test.local".to_string(), rtype))
+                .expect("address interest");
+            assert_eq!(entry.interval, MAX_CONTINUOUS_INTERVAL);
+            assert!(entry.next_due > Instant::now() + Duration::from_secs(3500));
+        }
+    }
+
+    #[test]
+    fn missing_address_still_queried_promptly() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        app.poll_continuous();
+        for rtype in [1, 28] {
+            let entry = app
+                .continuous
+                .get(&("test.local".to_string(), rtype))
+                .expect("address interest");
+            assert_eq!(entry.interval, Duration::from_secs(1));
+            assert!(entry.next_due <= Instant::now() + Duration::from_millis(120));
+        }
+    }
+
+    #[test]
+    fn shared_cached_answer_does_not_dampen() {
+        let mut app = App::new().unwrap();
+        ingest_srv_with_addresses(&mut app, false);
+        app.poll_continuous();
+        let entry = app
+            .continuous
+            .get(&("test.local".to_string(), 1))
+            .expect("address interest");
+        assert_eq!(entry.interval, Duration::from_secs(1));
     }
 
     #[test]
