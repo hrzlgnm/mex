@@ -192,8 +192,8 @@ info for inconclusive lookups).
 | `ttl-low` / `ttl-high` (warning) | TTL below 10 s (churn risk) or above 7200 s (stale-cache risk) ([RFC 6762 §10](https://www.rfc-editor.org/rfc/rfc6762#section-10), SHOULD) |
 | `ttl-mismatch` (info) | service PTR at ≤ 120 s instead of the recommended 4500 s base ([RFC 6762 §10](https://www.rfc-editor.org/rfc/rfc6762#section-10), SHOULD) |
 | `ttl-unstable` (warning) | same name and type announced with different TTL bases ([RFC 6762 §10](https://www.rfc-editor.org/rfc/rfc6762#section-10)) |
-| `srv-target` (warning: malformed, info: target needs unicast DNS) | SRV target malformed (MUST) or resolving outside mDNS ([RFC 2782](https://www.rfc-editor.org/rfc/rfc2782)) |
-| `txt-oversize` (warning) | TXT payload over ~1300 B, risking fragmentation ([RFC 6763 §6.2](https://www.rfc-editor.org/rfc/rfc6763#section-6.2), SHOULD NOT) |
+| `srv-target` (warning: malformed, info: target needs unicast DNS or is `.`) | SRV target malformed (MUST), resolving outside mDNS, or `.` (service decidedly not available) ([RFC 2782](https://www.rfc-editor.org/rfc/rfc2782)) |
+| `txt-oversize` (warning) | TXT RDATA (wire bytes) over 1300 B, risking fragmentation ([RFC 6763 §6.2](https://www.rfc-editor.org/rfc/rfc6763#section-6.2), SHOULD NOT) |
 
 Reverse-mapping PTRs (`*.in-addr.arpa`, `*.ip6.arpa`) are exempt from
 the shared-record rules: they are unique records. Omitting the flush

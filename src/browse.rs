@@ -1205,6 +1205,15 @@ fn whole_record_field(wire: &[u8]) -> Vec<RecordField> {
     }
 }
 
+/// RDLENGTH of a standalone record wire encoding (uncompressed owner,
+/// type, class, TTL, RDLENGTH, RDATA): the exact on-wire RDATA size.
+/// `None` when the encoding is missing or truncated.
+pub(crate) fn wire_rdata_len(wire: &[u8]) -> Option<usize> {
+    let rdlen_at = wire_name_end(wire, 0)?.checked_add(8)?;
+    let rdlen = wire.get(rdlen_at..rdlen_at.checked_add(2)?)?;
+    Some(usize::from(u16::from_be_bytes([rdlen[0], rdlen[1]])))
+}
+
 fn wire_name_end(wire: &[u8], start: usize) -> Option<usize> {
     wire_name_end_with_pointers(wire, start, false)
 }
