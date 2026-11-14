@@ -361,6 +361,12 @@ const ENUM_SERVICE: &str = "_services._dns-sd._udp.local";
 /// Group header for the selectable enumeration row in the Hosts pane.
 pub const ENUM_HOST: &str = "(enumeration)";
 
+/// Whether a response carries a non-zero RCODE, which RFC 6762 §18.11
+/// says MUST be silently ignored on receipt.
+fn has_nonzero_rcode(ev: &browse::Event) -> bool {
+    ev.rcode.is_some_and(|rcode| rcode != 0)
+}
+
 /// The enumeration name (case-insensitive, trailing dot ignored).
 fn is_enum_name(name: &str) -> bool {
     name.trim_end_matches('.')
@@ -1051,6 +1057,7 @@ impl App {
         }
         let target_changed = batch
             .iter()
+            .filter(|ev| !has_nonzero_rcode(ev))
             .any(|ev| ev.answers.iter().any(|rec| rec.rtype == 33 && rec.ttl > 0));
         for ev in &batch {
             self.note_packet_metrics(ev);
@@ -4127,6 +4134,17 @@ impl App {
     }
 
     fn ingest_event(&mut self, ev: &browse::Event) {
+        // RFC 6762 §18.11: messages received with a non-zero RCODE MUST be
+        // silently ignored. The raw packet stays in the packet log for
+        // inspection, but none of its records or questions reach state.
+        if has_nonzero_rcode(ev) {
+            log::debug!(
+                "mex: ignoring response from {} with RCODE {:?}",
+                ev.source,
+                ev.rcode
+            );
+            return;
+        }
         log::trace!(
             "mex: ingesting packet from {} ({} answer(s), {} question(s))",
             ev.source,
@@ -11064,6 +11082,36 @@ mod tests {
             assert!(finding.message.contains("inconclusive"));
             assert!(!finding.message.contains("NXDOMAIN"));
         }
+    }
+
+    #[test]
+    fn nonzero_rcode_response_records_are_not_ingested() {
+        // RFC 6762 §18.11: the whole message is ignored, so an address in
+        // an RCODE 3 reply neither resolves the SRV target nor files a row.
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        mark_address_queries(&mut app, "test.local", Duration::from_secs(2));
+        ingest_packet(
+            &mut app,
+            browse::Event {
+                answers: vec![raw_record("test.local.", 1, "A", "192.168.1.10", 120)],
+                questions: Vec::new(),
+                query_kas: Vec::new(),
+                rcode: Some(3),
+                received_at: Instant::now(),
+                raw_bytes: vec![0x01],
+                source: test_source(),
+            },
+        );
+        assert!(app.services[0].answers.iter().all(|r| r.rtype != 1));
+        assert_eq!(app.raw_events.len(), 1, "packet log keeps the raw packet");
+        let finding = app
+            .anomalies()
+            .into_iter()
+            .find(|a| a.kind.as_str() == "unresolved-srv-target")
+            .expect("target stays unresolved");
+        assert!(finding.message.contains("A: no response"));
     }
 
     #[test]
