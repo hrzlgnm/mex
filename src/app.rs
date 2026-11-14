@@ -4238,12 +4238,12 @@ impl App {
             if !r.flush_bit
                 || r.ttl == 0
                 || r.rtype != key.1
-                || !r.name.trim_end_matches('.').eq_ignore_ascii_case(&key.0)
+                || r.name.trim_end_matches('.').to_lowercase() != key.0
             {
                 return false;
             }
             let elapsed = r.received_at.elapsed().as_secs() as u32;
-            elapsed * 5 < r.ttl * 4
+            u64::from(elapsed) * 5 < u64::from(r.ttl) * 4
         })
     }
 
@@ -5886,6 +5886,31 @@ mod tests {
             .get(&("test.local".to_string(), 1))
             .expect("address interest");
         assert_eq!(entry.interval, Duration::from_secs(1));
+    }
+
+    /// Mutable access to the cached A row of the test service.
+    fn cached_a_row(app: &mut App) -> &mut browse::RawRecord {
+        app.services
+            .iter_mut()
+            .flat_map(|s| s.answers.iter_mut())
+            .find(|r| r.rtype == 1)
+            .expect("cached A row")
+    }
+
+    #[test]
+    fn huge_ttl_unique_answer_does_not_overflow() {
+        let mut app = App::new().unwrap();
+        ingest_srv_with_addresses(&mut app, true);
+        cached_a_row(&mut app).ttl = u32::MAX;
+        assert!(app.has_fresh_unique_answer(&App::continuous_key("test.local", 1)));
+    }
+
+    #[test]
+    fn unique_answer_matches_non_ascii_case() {
+        let mut app = App::new().unwrap();
+        ingest_srv_with_addresses(&mut app, true);
+        cached_a_row(&mut app).name = "Étage.local.".to_string();
+        assert!(app.has_fresh_unique_answer(&App::continuous_key("étage.local", 1)));
     }
 
     #[test]
