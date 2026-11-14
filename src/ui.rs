@@ -1235,7 +1235,11 @@ fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
                         Style::default().fg(Color::White),
                     ),
                     Span::styled(
-                        format!(" ({}, {})", a.rfc, a.requirement),
+                        if a.requirement.is_empty() {
+                            format!(" ({})", a.rfc)
+                        } else {
+                            format!(" ({}, {})", a.rfc, a.requirement)
+                        },
                         Style::default().fg(Color::Gray),
                     ),
                 ])
