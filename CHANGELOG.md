@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.16.0](https://github.com/hrzlgnm/mex/compare/v0.15.2...v0.16.0) (2026-11-14)
+
+
+### Features
+
+* add clickable question fields to the Hex pane ([#183](https://github.com/hrzlgnm/mex/issues/183)) ([66cb178](https://github.com/hrzlgnm/mex/commit/66cb178653f3575173e25652e998def3c9e588bb))
+* add clickable record fields to Hex pane ([#181](https://github.com/hrzlgnm/mex/issues/181)) ([569c4c9](https://github.com/hrzlgnm/mex/commit/569c4c9d9ed7d9b4b376d22248a83b7eb8167ff3))
+
+
+### Documentation
+
+* add Copilot instructions pointing to AGENTS.md ([#184](https://github.com/hrzlgnm/mex/issues/184)) ([183f65e](https://github.com/hrzlgnm/mex/commit/183f65e3897cd7a4ce3d66b2811c4da59adc2ce7))
+
 ## [0.15.2](https://github.com/hrzlgnm/mex/compare/v0.15.1...v0.15.2) (2026-11-13)
 
 
