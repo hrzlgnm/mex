@@ -1,3 +1,6 @@
+// Copyright 2026 hrzlgnm
+// SPDX-License-Identifier: MIT
+
 //! Windows executable metadata: icon plus version info.
 //!
 //! The `winresource` build dependency only exists on Windows

@@ -1,3 +1,6 @@
+// Copyright 2026 hrzlgnm
+// SPDX-License-Identifier: MIT
+
 use std::collections::HashSet;
 use std::io;
 use std::io::IsTerminal;

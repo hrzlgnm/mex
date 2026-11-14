@@ -1,3 +1,6 @@
+// Copyright 2026 hrzlgnm
+// SPDX-License-Identifier: MIT
+
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Instant, SystemTime};
 
