@@ -11026,94 +11026,44 @@ mod tests {
     }
 
     #[test]
-    fn unassociated_nxdomain_response_is_not_attributed_to_srv_target() {
-        let mut app = App::new().unwrap();
-        ingest(&mut app, &ptr_record(4500));
-        ingest(&mut app, &srv_record(120));
-        mark_address_queries(&mut app, "test.local", Duration::from_secs(2));
-        ingest_packet(
-            &mut app,
-            browse::Event {
-                answers: Vec::new(),
-                questions: Vec::new(),
-                query_kas: Vec::new(),
-                rcode: Some(3),
-                received_at: Instant::now(),
-                raw_bytes: Vec::new(),
-                source: test_source(),
-            },
-        );
+    fn nonzero_rcode_responses_are_ignored_for_srv_target() {
+        // RFC 6762 §18.11: responses with a non-zero RCODE MUST be
+        // silently ignored, so an RCODE 3 reply (bare, or carrying a CNAME
+        // for the target in any section) is no evidence: the lookup
+        // stays an inconclusive "no response".
+        let mut cname_answer = raw_record("test.local.", 5, "CNAME", "missing.local.", 120);
+        cname_answer.section = browse::RecordSection::Answer;
+        let mut cname_additional = cname_answer.clone();
+        cname_additional.section = browse::RecordSection::Additional;
+        for answers in [Vec::new(), vec![cname_answer], vec![cname_additional]] {
+            let mut app = App::new().unwrap();
+            ingest(&mut app, &ptr_record(4500));
+            ingest(&mut app, &srv_record(120));
+            mark_address_queries(&mut app, "test.local", Duration::from_secs(2));
+            ingest_packet(
+                &mut app,
+                browse::Event {
+                    answers,
+                    questions: Vec::new(),
+                    query_kas: Vec::new(),
+                    rcode: Some(3),
+                    received_at: Instant::now(),
+                    raw_bytes: Vec::new(),
+                    source: test_source(),
+                },
+            );
 
-        let finding = app
-            .anomalies()
-            .into_iter()
-            .find(|a| a.kind.as_str() == "unresolved-srv-target")
-            .expect("expected an inconclusive address-query outcome");
-        assert_eq!(finding.severity, anomalies::Severity::Info);
-        assert!(finding.message.contains("unattributed NXDOMAIN response"));
-        assert!(finding.message.contains("inconclusive"));
-        assert!(!finding.message.contains("A: NXDOMAIN"));
-    }
-
-    #[test]
-    fn name_attributed_nxdomain_is_reported_as_explicit_negative() {
-        let mut app = App::new().unwrap();
-        ingest(&mut app, &ptr_record(4500));
-        ingest(&mut app, &srv_record(120));
-        mark_address_queries(&mut app, "test.local", Duration::from_secs(2));
-        let cname = raw_record("test.local.", 5, "CNAME", "missing.local.", 120);
-        ingest_packet(
-            &mut app,
-            browse::Event {
-                answers: vec![cname],
-                questions: Vec::new(),
-                query_kas: Vec::new(),
-                rcode: Some(3),
-                received_at: Instant::now(),
-                raw_bytes: Vec::new(),
-                source: test_source(),
-            },
-        );
-
-        let finding = app
-            .anomalies()
-            .into_iter()
-            .find(|a| a.kind.as_str() == "unresolved-srv-target")
-            .expect("expected an address-query outcome");
-        assert_eq!(finding.severity, anomalies::Severity::Warning);
-        assert!(finding.message.contains("A: NXDOMAIN"));
-        assert!(finding.message.contains("AAAA: NXDOMAIN"));
-    }
-
-    #[test]
-    fn additional_cname_does_not_attribute_nxdomain_to_srv_target() {
-        let mut app = App::new().unwrap();
-        ingest(&mut app, &ptr_record(4500));
-        ingest(&mut app, &srv_record(120));
-        mark_address_queries(&mut app, "test.local", Duration::from_secs(2));
-        let mut cname = raw_record("test.local.", 5, "CNAME", "missing.local.", 120);
-        cname.section = browse::RecordSection::Additional;
-        ingest_packet(
-            &mut app,
-            browse::Event {
-                answers: vec![cname],
-                questions: Vec::new(),
-                query_kas: Vec::new(),
-                rcode: Some(3),
-                received_at: Instant::now(),
-                raw_bytes: Vec::new(),
-                source: test_source(),
-            },
-        );
-
-        let finding = app
-            .anomalies()
-            .into_iter()
-            .find(|a| a.kind.as_str() == "unresolved-srv-target")
-            .expect("expected an inconclusive address-query outcome");
-        assert_eq!(finding.severity, anomalies::Severity::Info);
-        assert!(finding.message.contains("unattributed NXDOMAIN response"));
-        assert!(!finding.message.contains("A: NXDOMAIN"));
+            let finding = app
+                .anomalies()
+                .into_iter()
+                .find(|a| a.kind.as_str() == "unresolved-srv-target")
+                .expect("expected an inconclusive address-query outcome");
+            assert_eq!(finding.severity, anomalies::Severity::Info);
+            assert!(finding.message.contains("A: no response"));
+            assert!(finding.message.contains("AAAA: no response"));
+            assert!(finding.message.contains("inconclusive"));
+            assert!(!finding.message.contains("NXDOMAIN"));
+        }
     }
 
     #[test]
