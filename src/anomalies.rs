@@ -1024,21 +1024,13 @@ pub(crate) fn unicast_severity(rtype: u16) -> Option<Severity> {
 /// Citation for a unicast-only answer type: NS/SOA do not exist in mDNS
 /// zones (RFC 6762 §12), ANY is a QTYPE and never an RR type
 /// (RFC 1035 §3.2.3). MX has no mDNS restriction; it stays a heuristic.
+/// None of these texts carries an RFC 2119 keyword (RFC 1035 predates
+/// it), so unicast-leak findings have no requirement level.
 fn unicast_leak_rfc(rtype: u16) -> &'static str {
     match rtype {
         2 | 6 => "RFC 6762 §12",
         255 => "RFC 1035 §3.2.3",
         _ => "RFC 6762 §3",
-    }
-}
-
-/// Requirement level for a unicast-only answer type. §12 states that
-/// NS/SOA records do not exist without an RFC 2119 keyword, so those
-/// findings carry none; MX has no RFC basis at all.
-fn unicast_leak_requirement(rtype: u16) -> &'static str {
-    match rtype {
-        255 => "MUST NOT",
-        _ => "",
     }
 }
 
@@ -1160,7 +1152,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         } else {
             format!("{:?} section", rec.section).to_lowercase()
         };
-        let (severity, message, requirement) = if confirmed {
+        let (severity, message) = if confirmed {
             // The overlay has no record columns, so the message keeps the
             // rtype: it names what is not defined for mDNS.
             let message = if base == Severity::Error {
@@ -1168,7 +1160,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             } else {
                 format!("{} possible unicast leak", rec.rtype_str)
             };
-            (base, message, unicast_leak_requirement(rec.rtype))
+            (base, message)
         } else {
             (
                 Severity::Warning,
@@ -1176,7 +1168,6 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
                     "{} outside multicast answer ({context}); verify",
                     rec.rtype_str
                 ),
-                unicast_leak_requirement(rec.rtype),
             )
         };
         out.push(Anomaly {
@@ -1190,7 +1181,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             source: Some(src.clone()),
             message,
             rfc: unicast_leak_rfc(rec.rtype),
-            requirement,
+            requirement: "",
         });
     }
 
@@ -1223,11 +1214,12 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             requirement: "MUST NOT",
         });
     }
-    // Unique records SHOULD set the cache-flush bit after uniqueness is
-    // established (RFC 6762 §10.2), but only in multicast responses: in
-    // legacy unicast responses and in known-answer sections the bit MUST
-    // NOT be set, so a missing bit there is not anomalous. Promote to
-    // Warning only for confirmed multicast answers; otherwise Info.
+    // Unique records MUST carry the cache-flush bit in responses to port
+    // 5353 (RFC 6762 §10.2), but in legacy unicast responses and in
+    // known-answer sections the bit MUST NOT be set, so a missing bit
+    // there is not anomalous. Promote to Warning (and claim the MUST)
+    // only for confirmed multicast answers; otherwise Info with no
+    // requirement level, since the absence may be compliant.
     // Scoped to SRV/TXT: omitting the bit on A/AAAA is universal practice
     // across embedded stacks, so flagging it is pure noise (removed).
     if matches!(rec.rtype, 33 | 16) && !rec.flush_bit {
@@ -1252,7 +1244,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             source: Some(src.clone()),
             message,
             rfc: "RFC 6762 §10.2",
-            requirement: "MUST",
+            requirement: if confirmed { "MUST" } else { "" },
         });
     }
 
@@ -1671,11 +1663,8 @@ mod tests {
         };
         // §12 states NS/SOA don't exist in mDNS without a 2119 keyword.
         assert_eq!(cite(AnomalyKind::UnicastLeak, 6), ("RFC 6762 §12", ""));
-        // ANY is a QTYPE, never an RR type.
-        assert_eq!(
-            cite(AnomalyKind::UnicastLeak, 255),
-            ("RFC 1035 §3.2.3", "MUST NOT")
-        );
+        // ANY is a QTYPE, never an RR type; RFC 1035 has no 2119 keyword.
+        assert_eq!(cite(AnomalyKind::UnicastLeak, 255), ("RFC 1035 §3.2.3", ""));
         // §10.2: the host MUST set the flush bit on unique RRSet members.
         assert_eq!(cite(AnomalyKind::NoFlush, 33), ("RFC 6762 §10.2", "MUST"));
         // TTL recommendations live in §10, not §5.2 query scheduling.
@@ -2188,6 +2177,7 @@ mod tests {
             .find(|a| a.kind == AnomalyKind::NoFlush)
             .expect("expected finding");
         assert_eq!(item.severity, Severity::Warning);
+        assert_eq!(item.requirement, "MUST");
         // Same record via unicast reply: Info only (bit MUST NOT be set
         // in legacy unicast, so its absence is not a coherency signal).
         let answers = vec![rec_with(
@@ -2206,6 +2196,8 @@ mod tests {
             .find(|a| a.kind == AnomalyKind::NoFlush)
             .expect("expected finding");
         assert_eq!(item.severity, Severity::Info);
+        // The absence may be compliant here: no MUST is claimed.
+        assert_eq!(item.requirement, "");
     }
 
     #[test]
