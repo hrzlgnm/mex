@@ -404,10 +404,16 @@ fn dedup(mut items: Vec<Anomaly>) -> Vec<Anomaly> {
             }
             _ => String::new(),
         };
+        // DNS names compare case-insensitively (RFC 6762 §16): a querier
+        // re-asking the same name in another case is the same question.
+        let name_key = match (a.kind.is_question(), a.record_name.as_deref()) {
+            (true, Some(name)) => name.trim_end_matches('.').to_ascii_lowercase(),
+            (_, name) => name.unwrap_or_default().to_string(),
+        };
         let key = (
             a.kind,
             a.service.clone(),
-            a.record_name.clone().unwrap_or_default(),
+            name_key,
             a.rtype.unwrap_or(0),
             rdata_key,
             source_key,
@@ -1980,6 +1986,21 @@ mod tests {
             "one finding per querier"
         );
         assert!(found.iter().all(|f| f.kind.is_question()));
+    }
+
+    #[test]
+    fn question_findings_dedup_names_case_insensitively() {
+        let found = analyze_questions(&[
+            qview("My._http._tcp.local", "fritz.box.", 6, test_source()),
+            qview("My._http._tcp.local", "FRITZ.Box", 6, test_source()),
+        ]);
+        for kind in [AnomalyKind::GlobalQuestion, AnomalyKind::UnicastQuestion] {
+            assert_eq!(
+                found.iter().filter(|a| a.kind == kind).count(),
+                1,
+                "{kind} must not split on name case, got: {found:?}"
+            );
+        }
     }
 
     #[test]
