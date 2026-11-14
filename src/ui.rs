@@ -18,6 +18,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
+use crate::anomalies::Anomaly;
 use crate::app::{AnomalyScope, App, DisplayItem, DragMode, Focus};
 
 pub type Terminal = ratatui::Terminal<CrosstermBackend<io::Stdout>>;
@@ -101,10 +102,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .constraints([Constraint::Length(3), Constraint::Min(0)])
         .split(frame.area());
 
+    // The analyzer is the costliest derived view; run it once per frame
+    // and share the result with every pane that marks findings.
+    let found = app.anomalies();
     draw_header(frame, chunks[0], app);
-    draw_body(frame, chunks[1], app);
+    draw_body(frame, chunks[1], app, &found);
     if app.show_metrics {
-        draw_metrics_overlay(frame, app);
+        draw_metrics_overlay(frame, app, &found);
     }
     if let Some(text) = app.status_popup() {
         draw_status_popup(frame, text);
@@ -144,7 +148,7 @@ fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     frame.render_widget(header, area);
 }
 
-fn draw_body(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+fn draw_body(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, found: &[Anomaly]) {
     app.body_rect.set(area);
     // No gutter: the abutting pane borders are the drag handles, so no
     // space is lost to divider widgets.
@@ -156,8 +160,8 @@ fn draw_body(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
 
     app.left_rect.set(chunks[0]);
     app.right_rect.set(chunks[1]);
-    draw_service_list(frame, chunks[0], app);
-    draw_detail_panel(frame, chunks[1], app);
+    draw_service_list(frame, chunks[0], app, found);
+    draw_detail_panel(frame, chunks[1], app, found);
 }
 
 /// Centered popup rect covering `pct_x`/`pct_y` percent of `area`.
@@ -192,11 +196,11 @@ fn clamp_scroll(offset: usize, total: usize, viewport: usize) -> usize {
     offset.min(total - viewport)
 }
 
-fn draw_metrics_overlay(frame: &mut Frame, app: &App) {
+fn draw_metrics_overlay(frame: &mut Frame, app: &App, found: &[Anomaly]) {
     let area = centered_rect(80, 85, frame.area());
     frame.render_widget(Clear, area);
 
-    let rows = app.metrics_rows();
+    let rows = app.metrics_rows_in(found);
     let total = rows.len();
     let viewport = (area.height as usize).saturating_sub(4);
     app.metrics_viewport.set(viewport);
@@ -389,11 +393,11 @@ fn short_service_type(label: &str) -> String {
     }
 }
 
-fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, found: &[Anomaly]) {
     app.list_viewport
         .set(area.height.saturating_sub(2) as usize);
     let items = app.display_items();
-    let anomaly_counts = app.anomaly_counts();
+    let anomaly_counts = App::anomaly_counts_in(found);
 
     // An Instance is last in its group if the next row is not another
     // Instance (i.e. next is a Host header or end of list).
@@ -527,7 +531,7 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
     app.list_offset.set(state.offset());
 }
 
-fn draw_detail_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+fn draw_detail_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, found: &[Anomaly]) {
     // Right side: Answers table on top, its questions below with their
     // own captions (age, not TTL), anomalies for the highlighted record
     // next, hex dump of the selected entry at the bottom. The abutting
@@ -555,9 +559,9 @@ fn draw_detail_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
     app.questions_rect.set(panes[1]);
     app.anomalies_rect.set(panes[2]);
     app.hex_rect.set(panes[3]);
-    draw_records_tab(frame, panes[0], app);
-    draw_questions_tab(frame, panes[1], app);
-    draw_anomalies_tab(frame, panes[2], app);
+    draw_records_tab(frame, panes[0], app, found);
+    draw_questions_tab(frame, panes[1], app, found);
+    draw_anomalies_tab(frame, panes[2], app, found);
     draw_hex_tab(frame, panes[3], app);
 }
 
@@ -577,14 +581,14 @@ fn resize_active(app: &App, mode: DragMode) -> bool {
     !app.show_metrics && (app.drag == mode || app.hover.get() == mode)
 }
 
-fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, found: &[Anomaly]) {
     let Some(target) = app.display_detail() else {
         let empty = Paragraph::new("No service selected").style(Style::default().fg(Color::Gray));
         frame.render_widget(empty, area);
         return;
     };
 
-    let (rows, raw_positions) = detail_table_rows(app, &target);
+    let (rows, raw_positions) = detail_table_rows(app, &target, found);
     let total_rows = rows.len();
 
     // Size SOURCE to the longest socket addr so IPv6 fits, clamped to
@@ -749,6 +753,7 @@ fn ttl_cell_color(rem: u32, ttl: u32) -> Option<Color> {
 fn detail_table_rows<'a>(
     app: &'a App,
     target: &'a crate::app::DetailTarget<'a>,
+    found: &[Anomaly],
 ) -> (Vec<Row<'a>>, Vec<usize>) {
     let mut rows = Vec::new();
 
@@ -815,7 +820,7 @@ fn detail_table_rows<'a>(
     // child rows. raw_positions maps each raw record to its table row.
     // Anomalous rows (error/warning only) get a `!` suffix: on the TTL
     // cell when the TTL itself is the problem, otherwise on the type.
-    let (content_keys, ttl_keys, ttl_unstable) = partition_anomaly_keys(&app.anomalies());
+    let (content_keys, ttl_keys, ttl_unstable) = partition_anomaly_keys(found);
     let unique_recs = target.ordered_answers();
     let mut raw_positions = Vec::with_capacity(unique_recs.len());
     for rec in unique_recs {
@@ -934,7 +939,12 @@ fn detail_table_rows<'a>(
     (rows, raw_positions)
 }
 
-fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+fn draw_questions_tab(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    app: &App,
+    found: &[Anomaly],
+) {
     let Some(target) = app.display_detail() else {
         let empty = Paragraph::new("No service selected").style(Style::default().fg(Color::Gray));
         frame.render_widget(empty, area);
@@ -950,17 +960,19 @@ fn draw_questions_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
     // Anomalous question rows (error/warning only) get a `!` suffix on the
     // type, mirroring the Answers table. Keys are (name, type, querier):
     // each leaking querier keeps its own finding, so every row can mark.
-    let question_keys: HashSet<(String, u16, String)> = app
-        .anomalies()
-        .into_iter()
+    let question_keys: HashSet<(String, u16, String)> = found
+        .iter()
         .filter(|a| a.kind.is_question())
         .filter(|a| a.is_surfaced())
         .filter_map(|a| {
             let rtype = a.rtype?;
             Some((
-                a.record_name?.trim_end_matches('.').to_lowercase(),
+                a.record_name
+                    .as_deref()?
+                    .trim_end_matches('.')
+                    .to_lowercase(),
                 rtype,
-                a.source?,
+                a.source.clone()?,
             ))
         })
         .collect();
@@ -1171,14 +1183,19 @@ fn fmt_qage(secs: u64) -> String {
     }
 }
 
-fn draw_anomalies_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+fn draw_anomalies_tab(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    app: &App,
+    found: &[Anomaly],
+) {
     // Findings for the highlighted detail row — or for the displayed
     // service while resting on a header: severity wording and icon,
     // kind, message, and RFC reference per row. Follows the detail
     // cursor and has no cursor of its own; j/k and paging keys scroll.
     app.anomalies_viewport
         .set(area.height.saturating_sub(2) as usize);
-    let findings = app.anomalies_for_selected();
+    let findings = app.anomalies_for_selected_in(found);
     let title = match app.display_detail() {
         Some(target) => format!(" Anomalies: {} ({}) ", target.pane_ident(), findings.len()),
         None => format!(" Anomalies ({}) ", findings.len()),

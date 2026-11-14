@@ -1933,7 +1933,14 @@ impl App {
     /// Rows for the metrics overlay: `(key, value)` with an empty value
     /// marking a section header. Pure snapshot of cumulative counters plus
     /// live state; cheap enough to rebuild every frame.
+    #[cfg(test)]
     pub fn metrics_rows(&self) -> Vec<(String, String)> {
+        self.metrics_rows_in(&self.anomalies())
+    }
+
+    /// `metrics_rows` over a precomputed finding set (see
+    /// `anomaly_counts_in`), so the overlay shares the frame's analyzer run.
+    pub fn metrics_rows_in(&self, found: &[anomalies::Anomaly]) -> Vec<(String, String)> {
         let mut rows: Vec<(String, String)> = Vec::new();
         let section = |rows: &mut Vec<(String, String)>, name: &str| {
             rows.push((name.to_string(), String::new()));
@@ -2268,7 +2275,6 @@ impl App {
         // Anomalies last: the list can be long, and the overlay scrolls
         // (j/k, PgUp/PgDn), so every finding is listed instead of capped.
         section(&mut rows, "Anomalies");
-        let found = self.anomalies();
         let errors = found
             .iter()
             .filter(|a| matches!(a.severity, anomalies::Severity::Error))
@@ -2577,9 +2583,16 @@ impl App {
     /// Per-service anomaly counts keyed by `instance.service_type`
     /// service id. Used for host-list markers and the Answers table
     /// without recomputing per row. Informational notes never count.
+    #[cfg(test)]
     pub fn anomaly_counts(&self) -> HashMap<String, usize> {
+        Self::anomaly_counts_in(&self.anomalies())
+    }
+
+    /// `anomaly_counts` over a precomputed finding set, so a frame runs
+    /// the analyzer once instead of once per pane.
+    pub fn anomaly_counts_in(found: &[anomalies::Anomaly]) -> HashMap<String, usize> {
         let mut counts: HashMap<String, usize> = HashMap::new();
-        for a in self.anomalies() {
+        for a in found {
             if !a.is_surfaced() {
                 continue;
             }
@@ -5509,6 +5522,12 @@ impl App {
     /// (expired or goodbye) yields nothing: the pane names the gone
     /// state instead of any list.
     pub fn anomalies_for_selected(&self) -> Vec<PaneAnomaly> {
+        self.anomalies_for_selected_in(&self.anomalies())
+    }
+
+    /// `anomalies_for_selected` over a precomputed finding set (see
+    /// `anomaly_counts_in`).
+    pub fn anomalies_for_selected_in(&self, found: &[anomalies::Anomaly]) -> Vec<PaneAnomaly> {
         if let Some(DetailEntry::Record(rec)) = self.selected_detail_entry() {
             if record_liveness(rec) != RecordLiveness::Live {
                 return Vec::new();
@@ -5525,19 +5544,18 @@ impl App {
             }
             AnomalyScope::None => return Vec::new(),
         };
-        let found = self.anomalies();
         let row: Vec<anomalies::Anomaly> = match scope {
-            AnomalyScope::Record(rec) => Self::record_anomalies_in(&found, rec, &id),
-            AnomalyScope::Question(key) => Self::question_anomalies_in(&found, key, &id),
+            AnomalyScope::Record(rec) => Self::record_anomalies_in(found, rec, &id),
+            AnomalyScope::Question(key) => Self::question_anomalies_in(found, key, &id),
             _ => Vec::new(),
         };
         found
-            .into_iter()
+            .iter()
             .filter(|a| a.service == id && a.is_surfaced())
             .map(|a| {
-                let cursor_match = row.contains(&a);
+                let cursor_match = row.contains(a);
                 PaneAnomaly {
-                    anomaly: a,
+                    anomaly: a.clone(),
                     cursor_match,
                 }
             })
