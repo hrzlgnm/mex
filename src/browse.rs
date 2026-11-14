@@ -155,6 +155,9 @@ pub struct Event {
     /// as sightings (queries are beliefs, not facts); used only for
     /// duplicate question suppression (§7.3) subset checks.
     pub query_kas: Vec<RawRecord>,
+    /// DNS header response code for a response packet; queries are `None`.
+    pub rcode: Option<u8>,
+    pub received_at: Instant,
     pub raw_bytes: Vec<u8>,
     pub source: SocketAddr,
 }
@@ -974,6 +977,8 @@ pub(crate) fn parse_packet(
         answers,
         questions,
         query_kas,
+        rcode: is_response.then(|| raw.get(3).copied().unwrap_or_default() & 0x0f),
+        received_at: Instant::now(),
         raw_bytes: raw.to_vec(),
         source,
     })
@@ -1950,6 +1955,36 @@ mod tests {
         let unicast: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
         let ev = parse_packet(&raw, test_source(), unicast, "br0", 3).unwrap();
         assert!(ev.answers.iter().all(|r| !r.dst_is_multicast));
+    }
+
+    #[test]
+    fn response_code_is_kept_for_responses_not_queries() {
+        let reply = Packet::new_reply(0);
+        let mut raw = reply.build_bytes_vec().unwrap();
+        raw[3] = (raw[3] & 0xf0) | 3;
+        let response =
+            parse_packet(&raw, test_source(), std::net::IpAddr::V4(MDNS_V4), "br0", 3).unwrap();
+        assert_eq!(response.rcode, Some(3));
+
+        let query = encode_query(
+            &QueryRequest {
+                name: "host.local.".to_string(),
+                record_type: TYPE::A,
+                known_answers: Vec::new(),
+                qu: false,
+            },
+            "br0",
+        )
+        .unwrap();
+        let query = parse_packet(
+            &query,
+            test_source(),
+            std::net::IpAddr::V4(MDNS_V4),
+            "br0",
+            3,
+        )
+        .unwrap();
+        assert_eq!(query.rcode, None);
     }
 
     #[test]

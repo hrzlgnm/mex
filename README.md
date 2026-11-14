@@ -176,9 +176,13 @@ severity icons as `<icon> <kind>` → `<source>: <service>
 <record>: <message> (<rfc>)`, and `Ctrl+J` state dumps include the
 full list.
 
+Omitting A/AAAA records from PTR/SRV replies is not flagged.
+`unresolved-srv-target` reports outcomes of transmitted address queries for live
+SRV targets on each mDNS interface (warning for explicit negative answers,
+info for inconclusive lookups).
+
 | Finding | Meaning |
 | --- | --- |
-| `missing-addr` (warning: `.local`, info: otherwise) | hostname with a live SRV record but no live A/AAAA ([RFC 6763 §12](https://www.rfc-editor.org/rfc/rfc6763#section-12), SHOULD) |
 | `type-format` (warning) | malformed service type, subtype, or enumerated type ([RFC 6763 §7](https://www.rfc-editor.org/rfc/rfc6763#section-7), MUST) |
 | `enum-subtype` (warning) | subtype listed in service enumeration instead of a base type ([RFC 6763 §9](https://www.rfc-editor.org/rfc/rfc6763#section-9), SHOULD) |
 | `shared-flush` (error) | shared PTR record with the cache-flush bit set ([RFC 6762 §10.2](https://www.rfc-editor.org/rfc/rfc6762#section-10.2), MUST NOT) |

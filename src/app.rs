@@ -298,6 +298,7 @@ impl App {
 #[derive(Clone, Debug, Default)]
 struct InterestQueryState {
     transmitted: Option<Instant>,
+    transmitted_interfaces: String,
     suppressed: Option<Instant>,
     observed: Option<ObservedQuery>,
 }
@@ -1358,12 +1359,30 @@ impl App {
     /// Record a query event for an interest: we transmitted it or §7.3
     /// suppression stood in for it, stamped at action time.
     fn note_query(&mut self, name: &str, rtype: u16, origin: QueryOrigin, at: Instant) {
+        let mut query_interfaces: Vec<String> = self
+            .link_stats
+            .v4
+            .iter()
+            .map(|(name, _)| name.clone())
+            .chain(self.link_stats.v6.iter().map(|(name, _)| name.clone()))
+            .filter(|name| {
+                self.interfaces
+                    .as_ref()
+                    .is_none_or(|selected| selected.contains(name))
+            })
+            .collect();
+        query_interfaces.sort();
+        query_interfaces.dedup();
+        let query_interfaces = query_interfaces.join(", ");
         let entry = self
             .query_history
             .entry(Self::provenance_key(name, rtype))
             .or_default();
         match origin {
-            QueryOrigin::Transmitted => entry.transmitted = Some(at),
+            QueryOrigin::Transmitted => {
+                entry.transmitted = Some(at);
+                entry.transmitted_interfaces = query_interfaces;
+            }
             QueryOrigin::Suppressed => entry.suppressed = Some(at),
             QueryOrigin::Observed => {
                 // Observed questions carry their own packet timestamp
@@ -1644,7 +1663,6 @@ impl App {
                 send_name,
                 qu
             );
-            self.note_query(&send_name, key.1, QueryOrigin::Transmitted, now);
             if qu {
                 self.metrics.qu_sent += 1;
             }
@@ -2444,7 +2462,6 @@ impl App {
             .map(|s| anomalies::ServiceView {
                 instance: &s.instance,
                 service_type: &s.service_type,
-                hostname: &s.hostname,
                 answers: &s.answers,
                 subtypes: &s.subtypes,
             })
@@ -2457,7 +2474,6 @@ impl App {
             services.push(anomalies::ServiceView {
                 instance: &p.instance,
                 service_type: &p.service_type,
-                hostname: "",
                 answers: &p.answers,
                 subtypes: &p.subtypes,
             });
@@ -2468,6 +2484,38 @@ impl App {
             .flat_map(|e| e.answers.iter())
             .collect();
         let pending_hosts: HashSet<String> = self.pending_addrs.keys().cloned().collect();
+        let address_queries: Vec<_> = self
+            .services
+            .iter()
+            .flat_map(|service| {
+                let service_id = anomalies::service_id(&service.instance, &service.service_type);
+                let mut targets = HashSet::new();
+                for rec in service.answers.iter().filter(|rec| {
+                    rec.rtype == 33
+                        && rec.ttl > 0
+                        && rec.received_at.elapsed().as_secs() <= u64::from(rec.ttl)
+                }) {
+                    if let Some(host) = rec.rdata.split_whitespace().last() {
+                        targets.insert(host.trim_end_matches('.').to_lowercase());
+                    }
+                }
+                targets.into_iter().flat_map(move |hostname| {
+                    let service_id = service_id.clone();
+                    [1, 28].into_iter().filter_map(move |rtype| {
+                        self.query_history
+                            .get(&Self::provenance_key(&hostname, rtype))
+                            .and_then(|state| state.transmitted.map(|at| (state, at)))
+                            .map(|(state, transmitted_at)| anomalies::AddressQueryView {
+                                service: service_id.clone(),
+                                hostname: hostname.clone(),
+                                rtype,
+                                transmitted_at,
+                                interfaces: state.transmitted_interfaces.clone(),
+                            })
+                    })
+                })
+            })
+            .collect();
         // Observed questions flattened with their owning service id, so the
         // analyzer can attribute demand-side leaks the same way it does
         // answer sightings. Unrecognised type labels stay quiet.
@@ -2499,7 +2547,7 @@ impl App {
             pending_hosts,
             questions,
         };
-        anomalies::analyze(&snap)
+        anomalies::analyze_observations(&snap, &self.raw_events, &address_queries)
     }
 
     /// Per-service anomaly counts keyed by `instance.service_type`
@@ -5637,6 +5685,8 @@ mod tests {
             answers: vec![rec.clone()],
             questions: Vec::new(),
             query_kas: Vec::new(),
+            rcode: Some(0),
+            received_at: Instant::now(),
             raw_bytes: Vec::new(),
             source: test_source(),
         }
@@ -5645,6 +5695,26 @@ mod tests {
     fn ingest(app: &mut App, rec: &browse::RawRecord) {
         let ev = event_for(rec);
         app.ingest_event(&ev);
+    }
+
+    fn ingest_packet(app: &mut App, event: browse::Event) {
+        let (tx, rx) = mpsc::channel();
+        app.rx = rx;
+        tx.send(event).unwrap();
+        app.drain_events();
+    }
+
+    fn mark_address_queries(app: &mut App, hostname: &str, age: Duration) {
+        let sent_at = Instant::now() - age;
+        for rtype in [1, 28] {
+            app.query_history.insert(
+                App::provenance_key(hostname, rtype),
+                InterestQueryState {
+                    transmitted: Some(sent_at),
+                    ..InterestQueryState::default()
+                },
+            );
+        }
     }
 
     fn live_ptr_rows(app: &App) -> Vec<browse::RawRecord> {
@@ -6527,6 +6597,8 @@ mod tests {
             answers: Vec::new(),
             questions: vec![q],
             query_kas: Vec::new(),
+            rcode: None,
+            received_at: Instant::now(),
             raw_bytes: vec![0x01, 0x02],
             source: querier,
         });
@@ -7714,6 +7786,8 @@ mod tests {
             answers: vec![rec],
             questions: vec![],
             query_kas: vec![],
+            rcode: Some(0),
+            received_at: Instant::now(),
             raw_bytes: vec![],
             source: test_source(),
         };
@@ -9282,6 +9356,8 @@ mod tests {
             answers: Vec::new(),
             questions: vec![soa],
             query_kas: Vec::new(),
+            rcode: None,
+            received_at: Instant::now(),
             raw_bytes: vec![0x01, 0x02],
             source: remote_source(),
         });
@@ -9508,6 +9584,8 @@ mod tests {
             answers: Vec::new(),
             questions: vec![q],
             query_kas: kas,
+            rcode: None,
+            received_at: Instant::now(),
             raw_bytes: Vec::new(),
             source,
         }
@@ -9633,6 +9711,8 @@ mod tests {
             answers: vec![rec],
             questions: Vec::new(),
             query_kas: Vec::new(),
+            rcode: Some(0),
+            received_at: Instant::now(),
             raw_bytes: vec![0u8; 100],
             source: test_source(),
         };
@@ -9687,6 +9767,8 @@ mod tests {
                 received_at: Instant::now(),
             }],
             query_kas: vec![ptr_record(120)],
+            rcode: Some(0),
+            received_at: Instant::now(),
             raw_bytes: Vec::new(),
             source: remote_source(),
         };
@@ -10473,7 +10555,7 @@ mod tests {
         let found = app.anomalies_for_selected();
         assert_eq!(
             kinds(&found),
-            ["shared-flush", "missing-addr"],
+            ["shared-flush"],
             "pane lists the full service, got: {found:?}"
         );
         assert_eq!(matched(&found), ["shared-flush"]);
@@ -10491,7 +10573,7 @@ mod tests {
             .display_detail()
             .and_then(|d| App::identity_at_detail(&d, srv_idx));
         let found = app.anomalies_for_selected();
-        assert_eq!(kinds(&found), ["shared-flush", "missing-addr"]);
+        assert_eq!(kinds(&found), ["shared-flush"]);
         assert!(
             matched(&found).is_empty(),
             "healthy row marks nothing, got: {found:?}"
@@ -10501,9 +10583,8 @@ mod tests {
     #[test]
     fn anomalies_pane_marks_ttl_base_mismatch_in_list() {
         let mut app = App::new().unwrap();
-        // Short PTR base is a SHOULD-level note (Info, overlay-only), so
-        // the pane lists only the surfaced missing-addr while the full
-        // set still holds the informational base-mismatch.
+        // The pane excludes informational findings; the full set still
+        // holds the informational base-mismatch.
         ingest(&mut app, &ptr_record(120));
         ingest(&mut app, &srv_record(120));
         app.evict_expired();
@@ -10520,11 +10601,7 @@ mod tests {
             .display_detail()
             .and_then(|d| App::identity_at_detail(&d, ptr_idx));
         let found = app.anomalies_for_selected();
-        assert_eq!(
-            kinds(&found),
-            ["missing-addr"],
-            "pane lists only surfaced findings, got: {found:?}"
-        );
+        assert!(found.is_empty(), "pane hides informational findings");
         let all = app.anomalies();
         let base = all
             .iter()
@@ -10668,12 +10745,11 @@ mod tests {
                 .display_detail()
                 .and_then(|d| App::identity_at_detail(&d, idx));
             let found = app.anomalies_for_selected();
-            // Every question row sees the full service list: both
-            // queriers' findings plus the service-level missing-addr
-            // (no A records here), each marked only on its own row.
+            // Every question row sees both querier findings, each marked
+            // only on its own row.
             assert_eq!(
                 kinds(&found),
-                ["unicast-question", "unicast-question", "missing-addr"],
+                ["unicast-question", "unicast-question"],
                 "pane lists the full service, got: {found:?}"
             );
             let marked: Vec<_> = found
@@ -10714,23 +10790,442 @@ mod tests {
     #[test]
     fn anomalies_for_header_shows_service_level() {
         let mut app = App::new().unwrap();
-        // SRV claims test.local but no address exists: service-level
-        // missing-addr with no row identity of its own.
+        // An unqueried target does not establish a resolution failure.
         ingest(&mut app, &ptr_record(4500));
         ingest(&mut app, &srv_record(120));
         app.evict_expired();
         select_instance(&mut app, "Test");
         select_host_header(&mut app, "test.local");
         let found = app.anomalies_for_selected();
-        assert_eq!(
-            kinds(&found),
-            ["missing-addr"],
-            "header shows the service list, got: {found:?}"
-        );
+        assert!(found.is_empty(), "no address queries were transmitted");
         assert!(
             matched(&found).is_empty(),
             "header marks nothing, got: {found:?}"
         );
+    }
+
+    #[test]
+    fn omitted_additional_addresses_do_not_report_an_anomaly() {
+        let mut app = App::new().unwrap();
+        let ptr = ptr_record(4500);
+        let mut srv = srv_record(120);
+        srv.section = browse::RecordSection::Additional;
+        let mut event = event_for(&ptr);
+        event.answers = vec![ptr, srv];
+        ingest_packet(&mut app, event);
+
+        assert!(app.anomalies().is_empty());
+
+        // Resolving the target through a later query is normal, too.
+        mark_address_queries(&mut app, "test.local", Duration::from_secs(2));
+        ingest_packet(
+            &mut app,
+            event_for(&raw_record("test.local.", 1, "A", "192.168.1.10", 120)),
+        );
+        assert!(app.anomalies().is_empty());
+    }
+
+    #[test]
+    fn unanswered_address_queries_are_inconclusive() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        mark_address_queries(&mut app, "test.local", Duration::from_secs(2));
+
+        let findings = app.anomalies();
+        let finding = findings
+            .iter()
+            .find(|a| a.kind.as_str() == "unresolved-srv-target")
+            .unwrap_or_else(|| panic!("expected an address-query outcome: {findings:?}"));
+        assert_eq!(finding.severity, anomalies::Severity::Info);
+        assert!(finding.message.contains("A: no response"));
+        assert!(finding.message.contains("AAAA: no response"));
+        assert!(finding.message.contains("inconclusive"));
+        assert!(!finding.message.contains("NODATA"));
+        assert!(!finding.message.contains("NXDOMAIN"));
+    }
+
+    #[test]
+    fn empty_mdns_response_is_inconclusive_not_a_timeout_or_nodata() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        mark_address_queries(&mut app, "test.local", Duration::from_secs(2));
+        ingest_packet(
+            &mut app,
+            browse::Event {
+                answers: Vec::new(),
+                questions: Vec::new(),
+                query_kas: Vec::new(),
+                rcode: Some(0),
+                received_at: Instant::now(),
+                raw_bytes: Vec::new(),
+                source: test_source(),
+            },
+        );
+
+        let finding = app
+            .anomalies()
+            .into_iter()
+            .find(|a| a.kind.as_str() == "unresolved-srv-target")
+            .expect("expected an inconclusive address-query outcome");
+        assert_eq!(finding.severity, anomalies::Severity::Info);
+        assert!(finding.message.contains("unattributed mDNS response"));
+        assert!(!finding.message.contains("no response"));
+        assert!(!finding.message.contains("NODATA"));
+    }
+
+    #[test]
+    fn address_queries_remain_pending_during_the_response_window() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        mark_address_queries(&mut app, "test.local", Duration::ZERO);
+
+        assert!(!app
+            .anomalies()
+            .iter()
+            .any(|a| a.kind.as_str() == "unresolved-srv-target"));
+    }
+
+    #[test]
+    fn explicit_nsec_negative_answers_are_distinguished_from_silence() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        mark_address_queries(&mut app, "test.local", Duration::from_secs(2));
+        let mut nsec = raw_record("test.local.", 47, "NSEC", "test.local. PTR SRV", 120);
+        nsec.iface = "br0".to_string();
+        ingest_packet(
+            &mut app,
+            browse::Event {
+                answers: vec![nsec],
+                questions: Vec::new(),
+                query_kas: Vec::new(),
+                rcode: Some(0),
+                received_at: Instant::now(),
+                raw_bytes: Vec::new(),
+                source: test_source(),
+            },
+        );
+        let finding = app
+            .anomalies()
+            .into_iter()
+            .find(|a| a.kind.as_str() == "unresolved-srv-target")
+            .expect("expected an address-query outcome");
+        assert_eq!(
+            finding.severity,
+            anomalies::Severity::Warning,
+            "{finding:?}"
+        );
+        assert!(finding.message.contains("A: NODATA"));
+        assert!(finding.message.contains("AAAA: NODATA"));
+        assert!(finding.message.contains("br0"));
+        assert!(!finding.message.contains("inconclusive"));
+    }
+
+    #[test]
+    fn one_nodata_family_does_not_prove_the_srv_target_unresolvable() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        mark_address_queries(&mut app, "test.local", Duration::from_secs(2));
+        let nsec = raw_record("test.local.", 47, "NSEC", "test.local. AAAA PTR SRV", 120);
+        ingest_packet(
+            &mut app,
+            browse::Event {
+                answers: vec![nsec],
+                questions: Vec::new(),
+                query_kas: Vec::new(),
+                rcode: Some(0),
+                received_at: Instant::now(),
+                raw_bytes: Vec::new(),
+                source: test_source(),
+            },
+        );
+
+        let finding = app
+            .anomalies()
+            .into_iter()
+            .find(|a| a.kind.as_str() == "unresolved-srv-target")
+            .expect("expected an address-query outcome");
+        assert_eq!(finding.severity, anomalies::Severity::Info);
+        assert!(finding.message.contains("A: NODATA"));
+        assert!(finding.message.contains("AAAA: unattributed mDNS response"));
+        assert!(finding.message.contains("inconclusive"));
+    }
+
+    #[test]
+    fn one_observed_address_family_resolves_the_srv_target() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        mark_address_queries(&mut app, "test.local", Duration::from_secs(2));
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 28, "AAAA", "fe80::1", 120),
+        );
+
+        assert!(!app
+            .anomalies()
+            .iter()
+            .any(|a| a.kind.as_str() == "unresolved-srv-target"));
+    }
+
+    #[test]
+    fn expired_selected_target_does_not_report_against_a_live_alternate() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        let mut alternate = srv_record(120);
+        alternate.rdata = "0 0 80 backup.local.".to_string();
+        ingest(&mut app, &alternate);
+
+        let expired_at = Instant::now() - Duration::from_secs(2);
+        for rec in &mut app.services[0].answers {
+            if rec.rtype == 33 && rec.rdata.ends_with("backup.local.") {
+                rec.ttl = 1;
+                rec.received_at = expired_at;
+            }
+        }
+        mark_address_queries(&mut app, "backup.local", Duration::from_secs(2));
+
+        assert!(!app
+            .anomalies()
+            .iter()
+            .any(|a| a.kind.as_str() == "unresolved-srv-target"));
+    }
+
+    #[test]
+    fn non_local_srv_target_is_scoped_to_mdns_observation() {
+        let mut app = App::new().unwrap();
+        ingest(
+            &mut app,
+            &raw_record(
+                "_avmnexus._tcp.local.",
+                12,
+                "PTR",
+                "Fritzel._avmnexus._tcp.local.",
+                4500,
+            ),
+        );
+        ingest(
+            &mut app,
+            &raw_record(
+                "Fritzel._avmnexus._tcp.local.",
+                33,
+                "SRV",
+                "0 0 80 fritz.box.",
+                120,
+            ),
+        );
+        mark_address_queries(&mut app, "fritz.box", Duration::from_secs(2));
+
+        let finding = app
+            .anomalies()
+            .into_iter()
+            .find(|a| {
+                a.kind.as_str() == "unresolved-srv-target"
+                    && a.service == "Fritzel._avmnexus._tcp.local"
+            })
+            .expect("expected mDNS address-query outcome");
+        assert_eq!(finding.severity, anomalies::Severity::Info);
+        assert!(finding.message.contains("fritz.box"));
+        assert!(finding.message.contains("unicast DNS may still resolve"));
+    }
+
+    #[test]
+    fn unassociated_nxdomain_response_is_not_attributed_to_srv_target() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        mark_address_queries(&mut app, "test.local", Duration::from_secs(2));
+        ingest_packet(
+            &mut app,
+            browse::Event {
+                answers: Vec::new(),
+                questions: Vec::new(),
+                query_kas: Vec::new(),
+                rcode: Some(3),
+                received_at: Instant::now(),
+                raw_bytes: Vec::new(),
+                source: test_source(),
+            },
+        );
+
+        let finding = app
+            .anomalies()
+            .into_iter()
+            .find(|a| a.kind.as_str() == "unresolved-srv-target")
+            .expect("expected an inconclusive address-query outcome");
+        assert_eq!(finding.severity, anomalies::Severity::Info);
+        assert!(finding.message.contains("unattributed NXDOMAIN response"));
+        assert!(finding.message.contains("inconclusive"));
+        assert!(!finding.message.contains("A: NXDOMAIN"));
+    }
+
+    #[test]
+    fn name_attributed_nxdomain_is_reported_as_explicit_negative() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        mark_address_queries(&mut app, "test.local", Duration::from_secs(2));
+        let cname = raw_record("test.local.", 5, "CNAME", "missing.local.", 120);
+        ingest_packet(
+            &mut app,
+            browse::Event {
+                answers: vec![cname],
+                questions: Vec::new(),
+                query_kas: Vec::new(),
+                rcode: Some(3),
+                received_at: Instant::now(),
+                raw_bytes: Vec::new(),
+                source: test_source(),
+            },
+        );
+
+        let finding = app
+            .anomalies()
+            .into_iter()
+            .find(|a| a.kind.as_str() == "unresolved-srv-target")
+            .expect("expected an address-query outcome");
+        assert_eq!(finding.severity, anomalies::Severity::Warning);
+        assert!(finding.message.contains("A: NXDOMAIN"));
+        assert!(finding.message.contains("AAAA: NXDOMAIN"));
+    }
+
+    #[test]
+    fn additional_cname_does_not_attribute_nxdomain_to_srv_target() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        mark_address_queries(&mut app, "test.local", Duration::from_secs(2));
+        let mut cname = raw_record("test.local.", 5, "CNAME", "missing.local.", 120);
+        cname.section = browse::RecordSection::Additional;
+        ingest_packet(
+            &mut app,
+            browse::Event {
+                answers: vec![cname],
+                questions: Vec::new(),
+                query_kas: Vec::new(),
+                rcode: Some(3),
+                received_at: Instant::now(),
+                raw_bytes: Vec::new(),
+                source: test_source(),
+            },
+        );
+
+        let finding = app
+            .anomalies()
+            .into_iter()
+            .find(|a| a.kind.as_str() == "unresolved-srv-target")
+            .expect("expected an inconclusive address-query outcome");
+        assert_eq!(finding.severity, anomalies::Severity::Info);
+        assert!(finding.message.contains("unattributed NXDOMAIN response"));
+        assert!(!finding.message.contains("A: NXDOMAIN"));
+    }
+
+    #[test]
+    fn expired_address_preserves_response_evidence_without_resolving_target() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        mark_address_queries(&mut app, "test.local", Duration::from_secs(10));
+        let mut addr = raw_record("test.local.", 1, "A", "192.168.1.10", 1);
+        addr.received_at = Instant::now() - Duration::from_secs(5);
+        ingest(&mut app, &addr);
+        let found = app.anomalies();
+        let finding = found
+            .iter()
+            .find(|a| a.kind == anomalies::AnomalyKind::UnresolvedSrvTarget)
+            .unwrap();
+        assert!(finding.message.contains("answered; address expired"));
+        assert_eq!(finding.severity, anomalies::Severity::Info);
+    }
+
+    #[test]
+    fn negative_families_on_different_interfaces_do_not_combine() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        mark_address_queries(&mut app, "test.local", Duration::from_secs(2));
+        for state in app.query_history.values_mut() {
+            state.transmitted_interfaces = "br0, eth0".into();
+        }
+        for (iface, bitmap) in [("br0", "AAAA"), ("eth0", "A")] {
+            let mut nsec = raw_record(
+                "test.local.",
+                47,
+                "NSEC",
+                &format!("test.local. {bitmap}"),
+                120,
+            );
+            nsec.iface = iface.into();
+            ingest_packet(&mut app, event_for(&nsec));
+        }
+        let found: Vec<_> = app
+            .anomalies()
+            .into_iter()
+            .filter(|a| a.kind == anomalies::AnomalyKind::UnresolvedSrvTarget)
+            .collect();
+        assert_eq!(found.len(), 2);
+        assert!(found
+            .iter()
+            .all(|a| a.severity == anomalies::Severity::Info));
+        assert!(found.iter().any(|a| a.message.contains("interfaces br0")));
+        assert!(found.iter().any(|a| a.message.contains("interfaces eth0")));
+    }
+
+    #[test]
+    fn unrelated_response_does_not_turn_silence_into_inconclusive_response() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        mark_address_queries(&mut app, "test.local", Duration::from_secs(2));
+        ingest_packet(
+            &mut app,
+            event_for(&raw_record("other.local.", 1, "A", "192.168.1.10", 120)),
+        );
+        let finding = app
+            .anomalies()
+            .into_iter()
+            .find(|a| a.kind == anomalies::AnomalyKind::UnresolvedSrvTarget)
+            .unwrap();
+        assert!(finding.message.contains("A: no response"));
+        assert!(finding.message.contains("AAAA: no response"));
+    }
+
+    #[test]
+    fn query_interfaces_survive_link_changes_and_exclude_inactive_selection() {
+        let mut app = App::new().unwrap();
+        app.interfaces = Some(
+            ["br0".to_string(), "down0".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        app.link_stats.v4 = vec![("br0".into(), "192.168.1.2".parse().unwrap())];
+        app.link_stats.v6.clear();
+        app.note_query("test.local", 1, QueryOrigin::Transmitted, Instant::now());
+        app.link_stats.v4.clear();
+        app.interfaces = None;
+        assert_eq!(
+            app.query_history[&App::provenance_key("test.local", 1)].transmitted_interfaces,
+            "br0"
+        );
+    }
+
+    #[test]
+    fn queried_srv_target_is_analyzed_when_another_host_is_displayed() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        mark_address_queries(&mut app, "test.local", Duration::from_secs(2));
+        app.services[0].hostname = "display.local".into();
+        assert!(app
+            .anomalies()
+            .iter()
+            .any(|a| a.kind == anomalies::AnomalyKind::UnresolvedSrvTarget
+                && a.message.contains("test.local")));
     }
 
     #[test]
