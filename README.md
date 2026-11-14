@@ -136,7 +136,7 @@ browsed as before.
 | `+` / `-` | fold / unfold host (Hosts) |
 | `*` | collapse all host groups / unfold all |
 | `Ctrl+↑/↓`, `Ctrl+k`, `Shift+↑/↓`, `J` / `K` | scroll Answers viewport freely (Hex viewport when Hex focused) |
-| `Ctrl+J` | dump mex state to JSON, `<timestamp>-mex-<version>.json` (experimental; tokens, public URLs/hosts redacted) |
+| `Ctrl+J` | dump mex state to JSON, `<timestamp>-mex-<version>.json` (experimental; redaction is heuristic, review before sharing) |
 | `m` | metrics overlay (traffic, discovery, queries, links) |
 | `q` / `Esc` / `Ctrl+C` | quit (`m` / `Esc` closes the overlay first) |
 | `Ctrl+Z` (unix) | suspend to shell (`fg` resumes) |
