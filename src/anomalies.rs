@@ -238,7 +238,17 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
         // Answers table marks it).
         if rec.rtype == 12 {
             let target = rec.rdata.trim_end_matches('.');
-            if let Some(reason) = service_type_problem(target) {
+            let target_labels = rec.ptr_target_labels.as_deref();
+            let type_problem = target_labels
+                .map(service_type_wire_labels_problem)
+                .unwrap_or_else(|| service_type_problem(target));
+            let subtype = target_labels
+                .map(is_subtype_wire_labels)
+                .unwrap_or_else(|| is_subtype_target(target));
+            let target_display = target_labels
+                .map(display_type_target)
+                .unwrap_or_else(|| target.to_string());
+            if let Some(reason) = type_problem {
                 out.push(Anomaly {
                     kind: AnomalyKind::TypeFormat,
                     severity: Severity::Warning,
@@ -248,11 +258,11 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
                     rtype_str: Some(rec.rtype_str.clone()),
                     rdata: Some(rec.rdata.clone()),
                     source: Some(rec.source.to_string()),
-                    message: format!("bad enumerated type {target}: {reason}"),
+                    message: format!("bad enumerated type {target_display}: {reason}"),
                     rfc: "RFC 6763 §7",
                     requirement: "MUST",
                 });
-            } else if is_subtype_target(target) {
+            } else if subtype {
                 // RFC 6763 §9 enumerates base service types; a subtype
                 // (e.g. _T35._sub._matterd._udp.local) is queried
                 // separately and does not belong in the enumeration list.
@@ -265,7 +275,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
                     rtype_str: Some(rec.rtype_str.clone()),
                     rdata: Some(rec.rdata.clone()),
                     source: Some(rec.source.to_string()),
-                    message: format!("{target} is a subtype; want base type"),
+                    message: format!("{target_display} is a subtype; want base type"),
                     rfc: "RFC 6763 §9",
                     requirement: "SHOULD",
                 });
@@ -454,36 +464,40 @@ fn check_type_format(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>
 /// one verdict and one message. Accepts `subtype._sub._service._tcp`
 /// (RFC 6763 §7.1) as well as plain service types.
 fn service_type_problem(st: &str) -> Option<String> {
-    let parts: Vec<&str> = st.split('.').collect();
-    match parts.as_slice() {
+    let parts: Vec<&[u8]> = st.split('.').map(str::as_bytes).collect();
+    service_type_labels_problem(&parts)
+}
+
+fn service_type_labels_problem(parts: &[&[u8]]) -> Option<String> {
+    match parts {
         [svc, proto, local] => {
-            if let Some(reason) = label_problem(svc) {
+            if let Some(reason) = service_label_problem(svc) {
                 return Some(reason);
             }
-            if !proto.eq_ignore_ascii_case("_tcp") && !proto.eq_ignore_ascii_case("_udp") {
+            if !proto.eq_ignore_ascii_case(b"_tcp") && !proto.eq_ignore_ascii_case(b"_udp") {
                 return Some("protocol must be _tcp or _udp".to_string());
             }
-            if !local.eq_ignore_ascii_case("local") {
+            if !local.eq_ignore_ascii_case(b"local") {
                 return Some("must end in .local".to_string());
             }
             None
         }
         [sub, sub_kw, svc, proto, local] => {
-            if let Some(reason) = subtype_problem(sub.as_bytes()) {
+            if let Some(reason) = subtype_problem(sub) {
                 return Some(format!("subtype {reason}"));
             }
-            if !sub_kw.eq_ignore_ascii_case("_sub") {
+            if !sub_kw.eq_ignore_ascii_case(b"_sub") {
                 return Some(
                     "expected _service._tcp.local or subtype._sub._service._tcp.local".to_string(),
                 );
             }
-            if let Some(reason) = label_problem(svc) {
+            if let Some(reason) = service_label_problem(svc) {
                 return Some(reason);
             }
-            if !proto.eq_ignore_ascii_case("_tcp") && !proto.eq_ignore_ascii_case("_udp") {
+            if !proto.eq_ignore_ascii_case(b"_tcp") && !proto.eq_ignore_ascii_case(b"_udp") {
                 return Some("protocol must be _tcp or _udp".to_string());
             }
-            if !local.eq_ignore_ascii_case("local") {
+            if !local.eq_ignore_ascii_case(b"local") {
                 return Some("must end in .local".to_string());
             }
             None
@@ -492,12 +506,47 @@ fn service_type_problem(st: &str) -> Option<String> {
     }
 }
 
+fn service_type_wire_labels_problem(labels: &[Vec<u8>]) -> Option<String> {
+    service_type_labels_problem(&labels.iter().map(Vec::as_slice).collect::<Vec<_>>())
+}
+
+fn service_label_problem(label: &[u8]) -> Option<String> {
+    match std::str::from_utf8(label) {
+        Ok(label) => label_problem(label),
+        Err(_) => Some("service label must be ASCII".to_string()),
+    }
+}
+
 /// Whether an enumeration target is a subtype (`subtype._sub._svc._tcp.local`).
-/// Valid subtypes pass `service_type_problem` but still don't belong in
+/// Valid subtypes pass service-type validation but still don't belong in
 /// `_services._dns-sd._udp.local` (RFC 6763 §9 lists base types).
 fn is_subtype_target(st: &str) -> bool {
-    let parts: Vec<&str> = st.split('.').collect();
-    matches!(parts.as_slice(), [_, sub_kw, _, _, _] if sub_kw.eq_ignore_ascii_case("_sub"))
+    let parts: Vec<&[u8]> = st.split('.').map(str::as_bytes).collect();
+    is_subtype_labels(&parts)
+}
+
+fn is_subtype_wire_labels(labels: &[Vec<u8>]) -> bool {
+    is_subtype_labels(&labels.iter().map(Vec::as_slice).collect::<Vec<_>>())
+}
+
+fn is_subtype_labels(labels: &[&[u8]]) -> bool {
+    matches!(labels, [_, sub_kw, _, _, _] if sub_kw.eq_ignore_ascii_case(b"_sub"))
+}
+
+fn display_type_target(labels: &[Vec<u8>]) -> String {
+    let is_subtype = is_subtype_wire_labels(labels);
+    labels
+        .iter()
+        .enumerate()
+        .map(|(index, label)| {
+            if index == 0 && is_subtype {
+                display_subtype(label)
+            } else {
+                String::from_utf8_lossy(label).into_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// Why an underscore-led service label is invalid, if it is.
@@ -551,7 +600,7 @@ pub(crate) fn display_subtype(subtype: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut display = String::new();
     for &byte in subtype {
-        if (0x20..=0x7e).contains(&byte) && byte != b'\\' {
+        if (0x20..=0x7e).contains(&byte) && byte != b'\\' && byte != b'.' {
             display.push(char::from(byte));
         } else if byte == b'\\' {
             display.push_str("\\\\");
@@ -1206,6 +1255,13 @@ mod tests {
                 .split('.')
                 .map(|label| label.as_bytes().to_vec())
                 .collect(),
+            ptr_target_labels: (rtype == 12).then(|| {
+                rdata
+                    .trim_end_matches('.')
+                    .split('.')
+                    .map(|label| label.as_bytes().to_vec())
+                    .collect()
+            }),
             rtype,
             rtype_str: rtype_str.to_string(),
             flush_bit: flush,
@@ -2381,6 +2437,54 @@ mod tests {
         assert!(!analyze(&snap)
             .iter()
             .any(|a| a.kind == AnomalyKind::TypeFormat));
+    }
+
+    #[test]
+    fn enumeration_subtype_validates_raw_octets_not_lossy_display() {
+        let label: &'static [u8] = Box::leak(b"uuid.\xff".to_vec().into_boxed_slice());
+        let labels: &'static [simple_dns::Label<'static>] = Box::leak(
+            vec![
+                simple_dns::Label::new_unchecked(label),
+                simple_dns::Label::new_unchecked(&b"_sub"[..]),
+                simple_dns::Label::new_unchecked(&b"_http"[..]),
+                simple_dns::Label::new_unchecked(&b"_tcp"[..]),
+                simple_dns::Label::new_unchecked(&b"local"[..]),
+            ]
+            .into_boxed_slice(),
+        );
+        let mut packet = simple_dns::Packet::new_reply(0);
+        packet.answers.push(simple_dns::ResourceRecord::new(
+            simple_dns::Name::new_unchecked("_services._dns-sd._udp.local."),
+            simple_dns::CLASS::IN,
+            4500,
+            simple_dns::rdata::RData::PTR(simple_dns::Name::new_with_labels(labels).into()),
+        ));
+        let bytes = packet.build_bytes_vec().unwrap();
+        let event = crate::browse::parse_packet(
+            &bytes,
+            test_source(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(224, 0, 0, 251)),
+            "br0",
+            3,
+        )
+        .unwrap();
+        let subtype = &event.answers[0];
+        let snap = Snapshot {
+            services: Vec::new(),
+            enum_answers: vec![subtype],
+            pending_hosts: HashSet::new(),
+            questions: Vec::new(),
+        };
+
+        let found = analyze(&snap);
+        assert!(found.iter().any(|a| a.kind == AnomalyKind::EnumSubtype));
+        assert!(!found.iter().any(|a| a.kind == AnomalyKind::TypeFormat));
+        assert!(found
+            .iter()
+            .find(|a| a.kind == AnomalyKind::EnumSubtype)
+            .unwrap()
+            .message
+            .contains(r"uuid\x2E\xFF._sub._http._tcp.local"));
     }
 
     #[test]

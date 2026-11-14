@@ -5568,6 +5568,13 @@ mod tests {
                 .split('.')
                 .map(|label| label.as_bytes().to_vec())
                 .collect(),
+            ptr_target_labels: (rtype == 12).then(|| {
+                rdata
+                    .trim_end_matches('.')
+                    .split('.')
+                    .map(|label| label.as_bytes().to_vec())
+                    .collect()
+            }),
             rtype,
             rtype_str: rtype_str.to_string(),
             flush_bit: false,
@@ -9415,6 +9422,7 @@ mod tests {
                 .split('.')
                 .map(|label| label.as_bytes().to_vec())
                 .collect(),
+            ptr_target_labels: None,
             rtype,
             rtype_str: rtype_str.to_string(),
             flush_bit: false,
@@ -9596,6 +9604,7 @@ mod tests {
             questions: vec![browse::RawRecord {
                 name: "_http._tcp.local.".to_string(),
                 owner_labels: vec![b"_http".to_vec(), b"_tcp".to_vec(), b"local".to_vec()],
+                ptr_target_labels: None,
                 rtype: 12,
                 rtype_str: "PTR".to_string(),
                 flush_bit: false,
