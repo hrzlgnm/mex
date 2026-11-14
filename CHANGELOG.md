@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.17.0](https://github.com/hrzlgnm/mex/compare/v0.16.2...v0.17.0) (2026-11-14)
+
+
+### Features
+
+* flag non-.local names queried over mDNS ([#197](https://github.com/hrzlgnm/mex/issues/197)) ([9a5209e](https://github.com/hrzlgnm/mex/commit/9a5209e01263190bfc3ccfa6192819fa172a05a3))
+
+
+### Bug Fixes
+
+* accept "." SRV target, reverse-PTR TTL base, measure TXT on the wire ([#195](https://github.com/hrzlgnm/mex/issues/195)) ([2c23340](https://github.com/hrzlgnm/mex/commit/2c23340bd49f9997ad19c20534b6c1afc9143f4b))
+* avoid u32 overflow in 80%-TTL refresh window checks ([#202](https://github.com/hrzlgnm/mex/issues/202)) ([7ca6623](https://github.com/hrzlgnm/mex/commit/7ca662308cc3d29b4f51f316e933976a8486916f))
+* correct anomaly RFC citations and requirement levels ([#192](https://github.com/hrzlgnm/mex/issues/192)) ([f4f0d04](https://github.com/hrzlgnm/mex/commit/f4f0d041f244477dab78aeb6af8cdc0470cd4e5e))
+* silently ignore mDNS responses with non-zero RCODE ([#194](https://github.com/hrzlgnm/mex/issues/194)) ([b02fbac](https://github.com/hrzlgnm/mex/commit/b02fbace6fa7847cbf45cd2092cb9fe1aec1f62d))
+* skip first query when a unique answer is already cached ([#201](https://github.com/hrzlgnm/mex/issues/201)) ([696a1aa](https://github.com/hrzlgnm/mex/commit/696a1aa05f2db784b06b61f0e4589c8a95f710ae))
+* stop flagging RFC-compliant mDNS questions and MX ([#193](https://github.com/hrzlgnm/mex/issues/193)) ([3ccfd5c](https://github.com/hrzlgnm/mex/commit/3ccfd5c18017bcfc1b2b5bef60e74475fd8ba99b))
+
+
+### Performance Improvements
+
+* re-clamp cursors only when selection state changed ([#207](https://github.com/hrzlgnm/mex/issues/207)) ([3d7cd46](https://github.com/hrzlgnm/mex/commit/3d7cd465f30aa8ee22e6233530cd8fd0ea82128c))
+* redraw the TUI only when something changed ([#206](https://github.com/hrzlgnm/mex/issues/206)) ([b27ea42](https://github.com/hrzlgnm/mex/commit/b27ea42f5cac21d882285ba35550ed8c9c2706d2))
+* run the anomaly analyzer once per frame ([#205](https://github.com/hrzlgnm/mex/issues/205)) ([36d873f](https://github.com/hrzlgnm/mex/commit/36d873f4ab6d31f32905b4ed2541f4c3d362e18b))
+* sort detail rows by SocketAddr instead of formatted strings ([#204](https://github.com/hrzlgnm/mex/issues/204)) ([6f300e9](https://github.com/hrzlgnm/mex/commit/6f300e9fde40af98383703fe142bf44834bf5874))
+
+
+### Dependencies
+
+* update rust crate nix to 0.32 ([#200](https://github.com/hrzlgnm/mex/issues/200)) ([ea89341](https://github.com/hrzlgnm/mex/commit/ea89341a8d12c1b49231883914680bbb3cf6a8ee))
+
+
+### Documentation
+
+* agents to claude ([#198](https://github.com/hrzlgnm/mex/issues/198)) ([9ca7b9f](https://github.com/hrzlgnm/mex/commit/9ca7b9f2b90736f8c6cbb22648a821b35b12d68b))
+
 ## [0.16.2](https://github.com/hrzlgnm/mex/compare/v0.16.1...v0.16.2) (2026-11-14)
 
 
