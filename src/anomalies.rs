@@ -127,6 +127,8 @@ pub struct Anomaly {
     pub rfc: &'static str,
     /// RFC obligation level: `MUST`, `MUST NOT`, `SHOULD`, `SHOULD NOT`,
     /// or `MAY`. Separates violations from recommendation deviations.
+    /// Empty when the cited text carries no RFC 2119 keyword (descriptive
+    /// statements and heuristics); views then show the citation alone.
     pub requirement: &'static str,
 }
 
@@ -317,7 +319,7 @@ pub fn analyze_observations(
                     source: Some(rec.source.to_string()),
                     message: format!("{target_display} is a subtype; want base type"),
                     rfc: "RFC 6763 §9",
-                    requirement: "SHOULD",
+                    requirement: "",
                 });
             }
         }
@@ -713,8 +715,8 @@ fn check_unresolved_path(
         rdata,
         source,
         message,
-        rfc: "RFC 6762 §6",
-        requirement: "MAY",
+        rfc: "RFC 6762 §6.1",
+        requirement: "",
     });
 }
 
@@ -765,7 +767,7 @@ fn service_type_labels_problem(parts: &[&[u8]]) -> Option<String> {
                 return Some("protocol must be _tcp or _udp".to_string());
             }
             if !local.eq_ignore_ascii_case(b"local") {
-                return Some("must end in .local".to_string());
+                return Some("must end in .local (RFC 6762 §3)".to_string());
             }
             None
         }
@@ -785,7 +787,7 @@ fn service_type_labels_problem(parts: &[&[u8]]) -> Option<String> {
                 return Some("protocol must be _tcp or _udp".to_string());
             }
             if !local.eq_ignore_ascii_case(b"local") {
-                return Some("must end in .local".to_string());
+                return Some("must end in .local (RFC 6762 §3)".to_string());
             }
             None
         }
@@ -1019,6 +1021,19 @@ pub(crate) fn unicast_severity(rtype: u16) -> Option<Severity> {
     }
 }
 
+/// Citation for a unicast-only answer type: NS/SOA do not exist in mDNS
+/// zones (RFC 6762 §12), ANY is a QTYPE and never an RR type
+/// (RFC 1035 §3.2.3). MX has no mDNS restriction; it stays a heuristic.
+/// None of these texts carries an RFC 2119 keyword (RFC 1035 predates
+/// it), so unicast-leak findings have no requirement level.
+fn unicast_leak_rfc(rtype: u16) -> &'static str {
+    match rtype {
+        2 | 6 => "RFC 6762 §12",
+        255 => "RFC 1035 §3.2.3",
+        _ => "RFC 6762 §3",
+    }
+}
+
 /// Verdict for observed *questions*. Same as answers, except QTYPE ANY
 /// (255) is excluded: probes for unique ownership use QTYPE ANY
 /// (RFC 6762 §8.1, §6.1), so ANY questions are routine demand, while ANY
@@ -1137,7 +1152,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         } else {
             format!("{:?} section", rec.section).to_lowercase()
         };
-        let (severity, message, requirement) = if confirmed {
+        let (severity, message) = if confirmed {
             // The overlay has no record columns, so the message keeps the
             // rtype: it names what is not defined for mDNS.
             let message = if base == Severity::Error {
@@ -1145,11 +1160,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             } else {
                 format!("{} possible unicast leak", rec.rtype_str)
             };
-            let requirement = match base {
-                Severity::Error => "MUST NOT",
-                _ => "SHOULD NOT",
-            };
-            (base, message, requirement)
+            (base, message)
         } else {
             (
                 Severity::Warning,
@@ -1157,7 +1168,6 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
                     "{} outside multicast answer ({context}); verify",
                     rec.rtype_str
                 ),
-                "SHOULD NOT",
             )
         };
         out.push(Anomaly {
@@ -1170,8 +1180,8 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             rdata: Some(rdata.clone()),
             source: Some(src.clone()),
             message,
-            rfc: "RFC 6762 §3",
-            requirement,
+            rfc: unicast_leak_rfc(rec.rtype),
+            requirement: "",
         });
     }
 
@@ -1204,11 +1214,12 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             requirement: "MUST NOT",
         });
     }
-    // Unique records SHOULD set the cache-flush bit after uniqueness is
-    // established (RFC 6762 §10.2), but only in multicast responses: in
-    // legacy unicast responses and in known-answer sections the bit MUST
-    // NOT be set, so a missing bit there is not anomalous. Promote to
-    // Warning only for confirmed multicast answers; otherwise Info.
+    // Unique records MUST carry the cache-flush bit in responses to port
+    // 5353 (RFC 6762 §10.2), but in legacy unicast responses and in
+    // known-answer sections the bit MUST NOT be set, so a missing bit
+    // there is not anomalous. Promote to Warning (and claim the MUST)
+    // only for confirmed multicast answers; otherwise Info with no
+    // requirement level, since the absence may be compliant.
     // Scoped to SRV/TXT: omitting the bit on A/AAAA is universal practice
     // across embedded stacks, so flagging it is pure noise (removed).
     if matches!(rec.rtype, 33 | 16) && !rec.flush_bit {
@@ -1233,7 +1244,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             source: Some(src.clone()),
             message,
             rfc: "RFC 6762 §10.2",
-            requirement: "SHOULD",
+            requirement: if confirmed { "MUST" } else { "" },
         });
     }
 
@@ -1251,7 +1262,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             rdata: Some(rdata.clone()),
             source: Some(src.clone()),
             message: format!("TTL {}s, want ~{}s", rec.ttl, expected_base(rec.rtype)),
-            rfc: "RFC 6762 §5.2",
+            rfc: "RFC 6762 §10",
             requirement: "SHOULD",
         });
     } else if rec.ttl > TTL_HIGH {
@@ -1265,7 +1276,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             rdata: Some(rdata),
             source: Some(src),
             message: format!("TTL {}s, want ~{}s", rec.ttl, expected_base(rec.rtype)),
-            rfc: "RFC 6762 §5.2",
+            rfc: "RFC 6762 §10",
             requirement: "SHOULD",
         });
     }
@@ -1335,8 +1346,8 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
                 rdata: Some(rec.rdata.clone()),
                 source: Some(rec.source.to_string()),
                 message: format!("TXT ~{payload_len}B, max {TXT_MAX}B"),
-                rfc: "RFC 6762 §17",
-                requirement: "SHOULD",
+                rfc: "RFC 6763 §6.2",
+                requirement: "SHOULD NOT",
             });
         }
     }
@@ -1400,8 +1411,8 @@ fn srv_anomaly_info(service_id: &str, rec: &RawRecord, message: &str) -> Anomaly
         rdata: Some(rec.rdata.clone()),
         source: Some(rec.source.to_string()),
         message: message.to_string(),
-        rfc: "RFC 6763 §12",
-        requirement: "MAY",
+        rfc: "RFC 2782",
+        requirement: "",
     }
 }
 
@@ -1416,7 +1427,7 @@ fn srv_anomaly(service_id: &str, rec: &RawRecord, message: &str) -> Anomaly {
         rdata: Some(rec.rdata.clone()),
         source: Some(rec.source.to_string()),
         message: message.to_string(),
-        rfc: "RFC 6763 §12",
+        rfc: "RFC 2782",
         requirement: "MUST",
     }
 }
@@ -1487,8 +1498,8 @@ fn check_ttl_stable(svc: &ServiceView, service_id: &str, now: Instant, out: &mut
                 rdata: None,
                 source: None,
                 message: format!("mixed TTL bases {sorted:?}"),
-                rfc: "RFC 6762 §5.2",
-                requirement: "SHOULD",
+                rfc: "RFC 6762 §10",
+                requirement: "",
             });
         }
     }
@@ -1618,6 +1629,51 @@ mod tests {
         assert_eq!(unicast_severity(1), None);
         assert_eq!(unicast_severity(12), None);
         assert_eq!(unicast_severity(5), None);
+    }
+
+    #[test]
+    fn findings_cite_the_rfc_text_that_covers_them() {
+        let answers = vec![
+            rec("host.local.", 6, "SOA", "a b 1 2 3 4 5", 4500, false),
+            rec("host.local.", 255, "ANY", "", 120, false),
+            rec(
+                "My._http._tcp.local.",
+                33,
+                "SRV",
+                "0 0 80 host.local.",
+                3,
+                false,
+            ),
+            rec(
+                "My._http._tcp.local.",
+                16,
+                "TXT",
+                &"k=v".repeat(500),
+                4500,
+                true,
+            ),
+        ];
+        let found = analyze_service("My", "_http._tcp.local", "host.local.", &answers);
+        let cite = |kind: AnomalyKind, rtype: u16| {
+            found
+                .iter()
+                .find(|a| a.kind == kind && a.rtype == Some(rtype))
+                .map(|a| (a.rfc, a.requirement))
+                .unwrap_or_else(|| panic!("missing {kind} for type {rtype}"))
+        };
+        // §12 states NS/SOA don't exist in mDNS without a 2119 keyword.
+        assert_eq!(cite(AnomalyKind::UnicastLeak, 6), ("RFC 6762 §12", ""));
+        // ANY is a QTYPE, never an RR type; RFC 1035 has no 2119 keyword.
+        assert_eq!(cite(AnomalyKind::UnicastLeak, 255), ("RFC 1035 §3.2.3", ""));
+        // §10.2: the host MUST set the flush bit on unique RRSet members.
+        assert_eq!(cite(AnomalyKind::NoFlush, 33), ("RFC 6762 §10.2", "MUST"));
+        // TTL recommendations live in §10, not §5.2 query scheduling.
+        assert_eq!(cite(AnomalyKind::TtlLow, 33), ("RFC 6762 §10", "SHOULD"));
+        // TXT > 1300 bytes is NOT RECOMMENDED (RFC 6763 §6.2).
+        assert_eq!(
+            cite(AnomalyKind::TxtOversize, 16),
+            ("RFC 6763 §6.2", "SHOULD NOT")
+        );
     }
 
     #[test]
@@ -2121,6 +2177,7 @@ mod tests {
             .find(|a| a.kind == AnomalyKind::NoFlush)
             .expect("expected finding");
         assert_eq!(item.severity, Severity::Warning);
+        assert_eq!(item.requirement, "MUST");
         // Same record via unicast reply: Info only (bit MUST NOT be set
         // in legacy unicast, so its absence is not a coherency signal).
         let answers = vec![rec_with(
@@ -2139,6 +2196,8 @@ mod tests {
             .find(|a| a.kind == AnomalyKind::NoFlush)
             .expect("expected finding");
         assert_eq!(item.severity, Severity::Info);
+        // The absence may be compliant here: no MUST is claimed.
+        assert_eq!(item.requirement, "");
     }
 
     #[test]
