@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.16.1](https://github.com/hrzlgnm/mex/compare/v0.16.0...v0.16.1) (2026-11-14)
+
+
+### Bug Fixes
+
+* accept arbitrary RFC 6763 subtype identifiers ([#186](https://github.com/hrzlgnm/mex/issues/186)) ([f80fddb](https://github.com/hrzlgnm/mex/commit/f80fddb5dd0ae5b39345a5c84787034aef378000))
+* distinguish mDNS address outcomes ([#189](https://github.com/hrzlgnm/mex/issues/189)) ([f1b0fc0](https://github.com/hrzlgnm/mex/commit/f1b0fc0fbc0d70e906cee58de86be03957e1f80d))
+
 ## [0.16.0](https://github.com/hrzlgnm/mex/compare/v0.15.2...v0.16.0) (2026-11-14)
 
 
