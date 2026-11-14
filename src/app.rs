@@ -134,7 +134,7 @@ struct PendingService {
     instance: String,
     service_type: String,
     answers: Vec<browse::RawRecord>,
-    subtypes: Vec<String>,
+    subtypes: Vec<Vec<u8>>,
     questions: Vec<QuestionRow>,
     /// Rows evicted by the 10-row cap; surfaced in dumps so a capped
     /// list is never mistaken for a complete packet log.
@@ -364,6 +364,46 @@ pub const ENUM_HOST: &str = "(enumeration)";
 fn is_enum_name(name: &str) -> bool {
     name.trim_end_matches('.')
         .eq_ignore_ascii_case(ENUM_SERVICE)
+}
+
+fn same_ptr_target(a: &browse::RawRecord, b: &browse::RawRecord) -> bool {
+    match (&a.ptr_target_labels, &b.ptr_target_labels) {
+        (Some(a), Some(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.eq_ignore_ascii_case(b))
+        }
+        (None, None) => a.rdata.eq_ignore_ascii_case(&b.rdata),
+        _ => false,
+    }
+}
+
+fn subtype_owner_parts(rec: &browse::RawRecord) -> Option<(Vec<u8>, String)> {
+    let fallback_labels = if rec.owner_labels.is_empty() {
+        rec.name
+            .trim_end_matches('.')
+            .split('.')
+            .map(|label| label.as_bytes().to_vec())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let labels = if rec.owner_labels.is_empty() {
+        fallback_labels.as_slice()
+    } else {
+        rec.owner_labels.as_slice()
+    };
+    let [subtype, sub_keyword, service, protocol, local] = labels else {
+        return None;
+    };
+    if !sub_keyword.as_slice().eq_ignore_ascii_case(b"_sub") {
+        return None;
+    }
+
+    let service_type = [service, protocol, local]
+        .iter()
+        .map(|label| String::from_utf8_lossy(label).into_owned())
+        .collect::<Vec<_>>()
+        .join(".");
+    Some((subtype.clone(), service_type))
 }
 
 fn srv_target(rdata: &str) -> Option<&str> {
@@ -605,7 +645,7 @@ pub struct ServiceEntry {
     pub service_type: String,
     pub hostname: String,
     pub port: u16,
-    pub subtypes: Vec<String>,
+    pub subtypes: Vec<Vec<u8>>,
     pub answers: Vec<browse::RawRecord>,
     /// Recently seen questions asking for this service:
     /// (name, type, querier, received_at, query packet bytes). Capped.
@@ -679,7 +719,13 @@ impl EnumEntry {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for rec in self.answers.iter().rev() {
-            if seen.insert((&rec.name, rec.rtype, &rec.rdata, rec.source)) {
+            if seen.insert((
+                &rec.name,
+                rec.rtype,
+                &rec.rdata,
+                &rec.ptr_target_labels,
+                rec.source,
+            )) {
                 out.push(rec);
             }
         }
@@ -2543,7 +2589,11 @@ impl App {
     }
 
     fn dump_service(&self, svc: &ServiceEntry) -> dump::DumpService {
-        let mut subtypes = svc.subtypes.clone();
+        let mut subtypes: Vec<String> = svc
+            .subtypes
+            .iter()
+            .map(|subtype| anomalies::display_subtype(subtype))
+            .collect();
         subtypes.sort();
         // Public IPv6 literals keep first/last hextet only; identical
         // markers dedup here.
@@ -4152,7 +4202,7 @@ impl App {
                 if let Some(pos) = entry.answers.iter().position(|r| {
                     r.name.eq_ignore_ascii_case(&rec.name)
                         && r.rtype == rec.rtype
-                        && r.rdata.eq_ignore_ascii_case(&rec.rdata)
+                        && same_ptr_target(r, rec)
                         && r.source == rec.source
                 }) {
                     entry.answers[pos] = rec.clone();
@@ -4436,7 +4486,7 @@ impl App {
                 if let Some(pos) = entry.answers.iter().position(|r| {
                     r.name.eq_ignore_ascii_case(&rec.name)
                         && r.rtype == rec.rtype
-                        && r.rdata.eq_ignore_ascii_case(&rec.rdata)
+                        && same_ptr_target(r, rec)
                         && r.source == rec.source
                 }) {
                     entry.answers[pos] = rec.clone();
@@ -4470,10 +4520,8 @@ impl App {
             return;
         }
 
-        if let Some(sub_pos) = st.to_ascii_lowercase().find("._sub.") {
-            let subtype = &st[..sub_pos];
-            let svc_type = &st[sub_pos + 6..];
-            let instance = Self::strip_suffix_ci(target, svc_type).unwrap_or(target);
+        if let Some((subtype, svc_type)) = subtype_owner_parts(rec) {
+            let instance = Self::strip_suffix_ci(target, &svc_type).unwrap_or(target);
             // Late subtype PTRs (arriving after the SRV already promoted
             // the service, the normal passive-mode order) land on the live
             // service directly; otherwise they wait in pending for the SRV
@@ -4481,28 +4529,26 @@ impl App {
             // duplicate entry that only expires via the grace timeout.
             if let Some(idx) = self.services.iter().position(|s| {
                 s.instance.eq_ignore_ascii_case(instance)
-                    && s.service_type.eq_ignore_ascii_case(svc_type)
+                    && s.service_type.eq_ignore_ascii_case(&svc_type)
             }) {
                 if !self.services[idx]
                     .subtypes
                     .iter()
-                    .any(|s| s.eq_ignore_ascii_case(subtype))
+                    .any(|s| s.as_slice().eq_ignore_ascii_case(&subtype))
                 {
-                    self.services[idx].subtypes.push(subtype.to_string());
+                    self.services[idx].subtypes.push(subtype);
                 }
                 self.services[idx].last_event = Some(ev.clone());
                 self.push_record(idx, rec);
                 return;
             }
-            let pi = self.ensure_pending(instance, svc_type);
+            let pi = self.ensure_pending(instance, &svc_type);
             if !self.pending_instances[pi]
                 .subtypes
                 .iter()
-                .any(|s| s.eq_ignore_ascii_case(subtype))
+                .any(|s| s.as_slice().eq_ignore_ascii_case(&subtype))
             {
-                self.pending_instances[pi]
-                    .subtypes
-                    .push(subtype.to_string());
+                self.pending_instances[pi].subtypes.push(subtype);
             }
             self.pending_instances[pi].answers.push(rec.clone());
             return;
@@ -4709,7 +4755,7 @@ impl App {
                     if !self.services[svc_idx]
                         .subtypes
                         .iter()
-                        .any(|s| s.eq_ignore_ascii_case(&sub))
+                        .any(|s| s.as_slice().eq_ignore_ascii_case(&sub))
                     {
                         self.services[svc_idx].subtypes.push(sub);
                     }
@@ -5533,6 +5579,18 @@ mod tests {
     ) -> browse::RawRecord {
         browse::RawRecord {
             name: name.to_string(),
+            owner_labels: name
+                .trim_end_matches('.')
+                .split('.')
+                .map(|label| label.as_bytes().to_vec())
+                .collect(),
+            ptr_target_labels: (rtype == 12).then(|| {
+                rdata
+                    .trim_end_matches('.')
+                    .split('.')
+                    .map(|label| label.as_bytes().to_vec())
+                    .collect()
+            }),
             rtype,
             rtype_str: rtype_str.to_string(),
             flush_bit: false,
@@ -5783,13 +5841,82 @@ mod tests {
                 120,
             ),
         );
-        assert_eq!(app.services[0].subtypes, vec!["_printer".to_string()]);
+        assert_eq!(app.services[0].subtypes, vec![b"_printer".to_vec()]);
         assert!(app.services[0]
             .ordered_answers()
             .iter()
             .any(|r| r.rtype == 12 && r.name == "_printer._sub._http._tcp.local."));
         // No stranded pending entry for the confirmed instance.
         assert!(app.pending_instances.is_empty());
+    }
+
+    #[test]
+    fn subtype_without_underscore_and_restricted_characters_is_valid() {
+        let mut app = App::new().unwrap();
+        ingest(
+            &mut app,
+            &raw_record(
+                "%%0B3BFD96-5017-44DB-96E1-BEC3451F7DE2._sub._googlecast._tcp.local.",
+                12,
+                "PTR",
+                "Google-Home._googlecast._tcp.local.",
+                4500,
+            ),
+        );
+
+        assert_eq!(
+            app.pending_instances[0].subtypes,
+            vec![b"%%0B3BFD96-5017-44DB-96E1-BEC3451F7DE2".to_vec()]
+        );
+        assert!(!app
+            .anomalies()
+            .iter()
+            .any(|a| a.kind == anomalies::AnomalyKind::TypeFormat));
+    }
+
+    #[test]
+    fn subtype_keeps_non_utf8_octets_and_escapes_them_in_service_dump() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+
+        let label: &'static [u8] = Box::leak(vec![0xff, b'%'].into_boxed_slice());
+        let labels: &'static [simple_dns::Label<'static>] = Box::leak(
+            vec![
+                simple_dns::Label::new_unchecked(label),
+                simple_dns::Label::new_unchecked(&b"_sub"[..]),
+                simple_dns::Label::new_unchecked(&b"_http"[..]),
+                simple_dns::Label::new_unchecked(&b"_tcp"[..]),
+                simple_dns::Label::new_unchecked(&b"local"[..]),
+            ]
+            .into_boxed_slice(),
+        );
+        let mut packet = simple_dns::Packet::new_reply(0);
+        packet.answers.push(simple_dns::ResourceRecord::new(
+            simple_dns::Name::new_with_labels(labels),
+            simple_dns::CLASS::IN,
+            4500,
+            simple_dns::rdata::RData::PTR(
+                simple_dns::Name::new_unchecked("Test._http._tcp.local.").into(),
+            ),
+        ));
+        let bytes = packet.build_bytes_vec().unwrap();
+        let event = browse::parse_packet(
+            &bytes,
+            test_source(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(224, 0, 0, 251)),
+            "br0",
+            3,
+        )
+        .unwrap();
+        app.ingest_event(&event);
+
+        assert_eq!(app.services[0].subtypes, vec![vec![0xff, b'%']]);
+        assert_eq!(app.dump_service(&app.services[0]).subtypes, [r"\xFF%"]);
+        assert!(!app
+            .anomalies()
+            .iter()
+            .any(|a| a.kind == anomalies::AnomalyKind::TypeFormat));
     }
 
     #[test]
@@ -7447,6 +7574,56 @@ mod tests {
             ),
         );
         assert_eq!(app.enum_entries[0].answers.len(), 1);
+    }
+
+    #[test]
+    fn enum_subtype_targets_with_lossy_collisions_remain_distinct() {
+        let target = |byte: u8| {
+            let subtype: &'static [u8] = Box::leak(vec![byte].into_boxed_slice());
+            let labels: &'static [simple_dns::Label<'static>] = Box::leak(
+                vec![
+                    simple_dns::Label::new_unchecked(subtype),
+                    simple_dns::Label::new_unchecked(&b"_sub"[..]),
+                    simple_dns::Label::new_unchecked(&b"_http"[..]),
+                    simple_dns::Label::new_unchecked(&b"_tcp"[..]),
+                    simple_dns::Label::new_unchecked(&b"local"[..]),
+                ]
+                .into_boxed_slice(),
+            );
+            simple_dns::Name::new_with_labels(labels)
+        };
+        let mut packet = simple_dns::Packet::new_reply(0);
+        for byte in [0xfe, 0xff] {
+            packet.answers.push(simple_dns::ResourceRecord::new(
+                simple_dns::Name::new_unchecked("_services._dns-sd._udp.local."),
+                simple_dns::CLASS::IN,
+                4500,
+                simple_dns::rdata::RData::PTR(target(byte).into()),
+            ));
+        }
+        let bytes = packet.build_bytes_vec().unwrap();
+        let event = browse::parse_packet(
+            &bytes,
+            test_source(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(224, 0, 0, 251)),
+            "br0",
+            3,
+        )
+        .unwrap();
+        let mut app = App::new().unwrap();
+        app.ingest_event(&event);
+
+        assert_eq!(app.enum_entries[0].answers.len(), 2);
+        assert_eq!(app.enum_entries[0].ordered_answers().len(), 2);
+        let messages: Vec<_> = app
+            .anomalies()
+            .into_iter()
+            .filter(|anomaly| anomaly.kind == anomalies::AnomalyKind::EnumSubtype)
+            .map(|anomaly| anomaly.message)
+            .collect();
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().any(|message| message.contains(r"\xFE")));
+        assert!(messages.iter().any(|message| message.contains(r"\xFF")));
     }
 
     #[test]
@@ -9306,6 +9483,12 @@ mod tests {
     ) -> browse::Event {
         let q = browse::RawRecord {
             name: name.to_string(),
+            owner_labels: name
+                .trim_end_matches('.')
+                .split('.')
+                .map(|label| label.as_bytes().to_vec())
+                .collect(),
+            ptr_target_labels: None,
             rtype,
             rtype_str: rtype_str.to_string(),
             flush_bit: false,
@@ -9486,6 +9669,8 @@ mod tests {
             answers: vec![ptr_record(0)],
             questions: vec![browse::RawRecord {
                 name: "_http._tcp.local.".to_string(),
+                owner_labels: vec![b"_http".to_vec(), b"_tcp".to_vec(), b"local".to_vec()],
+                ptr_target_labels: None,
                 rtype: 12,
                 rtype_str: "PTR".to_string(),
                 flush_bit: false,

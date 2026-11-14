@@ -781,13 +781,14 @@ fn detail_table_rows<'a>(
                 if !seen_sub.insert(sub) {
                     continue;
                 }
+                let subtype = crate::anomalies::display_subtype(sub);
                 rows.push(
                     Row::new(vec![
                         Cell::from("subt"),
                         Cell::from(""),
                         Cell::from(""),
                         Cell::from(""),
-                        Cell::from(sub.clone()),
+                        Cell::from(subtype),
                     ])
                     .style(info_style),
                 );
@@ -1555,6 +1556,13 @@ mod tests {
     fn test_record(iface: &str) -> crate::browse::RawRecord {
         crate::browse::RawRecord {
             name: "_http._tcp.local.".to_string(),
+            owner_labels: vec![b"_http".to_vec(), b"_tcp".to_vec(), b"local".to_vec()],
+            ptr_target_labels: Some(vec![
+                b"Test".to_vec(),
+                b"_http".to_vec(),
+                b"_tcp".to_vec(),
+                b"local".to_vec(),
+            ]),
             rtype: 12,
             rtype_str: "PTR".to_string(),
             flush_bit: false,
