@@ -157,10 +157,11 @@ and surfaces each deviation as an anomaly with a severity:
   in a multicast answer section).
 - **warning** — a likely misconfiguration (e.g. a `.local` service with
   no address records, a subtype listed in service enumeration).
-- **info** — a SHOULD-level deviation or an observation, shown only in the metrics
-  overlay and state dumps (e.g. a PTR re-announced with a 120 s TTL
-  instead of the recommended 4500 s, a unique record missing its
-  cache-flush bit, an SRV target outside `.local`, a question for NS/SOA).
+- **info** — a SHOULD-level deviation or an observation, shown only in
+  the metrics overlay and state dumps (e.g. a PTR re-announced with a
+  120 s TTL instead of the recommended 4500 s, a unique record missing
+  its cache-flush bit, an SRV target outside `.local`, a question for
+  NS/SOA or for a non-`.local` name).
 
 Findings show up in several places: anomalous Answers rows get a `!`
 marker (on the type cell, or on the TTL cell when the TTL itself is
@@ -189,6 +190,7 @@ info for inconclusive lookups).
 | `no-flush` (warning when confirmed, else info) | unique SRV/TXT record missing the cache-flush bit ([RFC 6762 §10.2](https://www.rfc-editor.org/rfc/rfc6762#section-10.2), MUST when confirmed); confirmed only in a multicast answer |
 | `unicast-leak` (error when confirmed, else warning) | NS/SOA (no such records in mDNS zones, [RFC 6762 §12](https://www.rfc-editor.org/rfc/rfc6762#section-12)), ANY (a query-only type, [RFC 1035 §3.2.3](https://www.rfc-editor.org/rfc/rfc1035#section-3.2.3)) answered over mDNS; confirmed only in a multicast answer, otherwise pending capture verification |
 | `unicast-question` (info) | multicast question for NS/SOA, which never exist in mDNS ([RFC 6762 §12](https://www.rfc-editor.org/rfc/rfc6762#section-12)); asking is compliant, since [RFC 6762 §3](https://www.rfc-editor.org/rfc/rfc6762#section-3) requires `.local` queries on multicast; ANY questions are ownership probes and stay quiet; ephemeral-port queriers are tagged one-shot |
+| `global-question` (info) | multicast question for a name outside `.local` and the link-local reverse zones; allowed only as fail-over when no unicast DNS server is available ([RFC 6762 §3](https://www.rfc-editor.org/rfc/rfc6762#section-3), MAY), which SHOULD be opt-in and off by default ([RFC 6762 §13](https://www.rfc-editor.org/rfc/rfc6762#section-13)); any query type; ephemeral-port queriers are tagged one-shot |
 | `ttl-low` / `ttl-high` (warning) | TTL below 10 s (churn risk) or above 7200 s (stale-cache risk) ([RFC 6762 §10](https://www.rfc-editor.org/rfc/rfc6762#section-10), SHOULD) |
 | `ttl-mismatch` (info) | service PTR at ≤ 120 s instead of the recommended 4500 s base ([RFC 6762 §10](https://www.rfc-editor.org/rfc/rfc6762#section-10), SHOULD) |
 | `ttl-unstable` (warning) | same name and type announced with different TTL bases ([RFC 6762 §10](https://www.rfc-editor.org/rfc/rfc6762#section-10)) |
