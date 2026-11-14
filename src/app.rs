@@ -1933,7 +1933,14 @@ impl App {
     /// Rows for the metrics overlay: `(key, value)` with an empty value
     /// marking a section header. Pure snapshot of cumulative counters plus
     /// live state; cheap enough to rebuild every frame.
+    #[cfg(test)]
     pub fn metrics_rows(&self) -> Vec<(String, String)> {
+        self.metrics_rows_in(&self.anomalies())
+    }
+
+    /// `metrics_rows` over a precomputed finding set (see
+    /// `anomaly_counts_in`), so the overlay shares the frame's analyzer run.
+    pub fn metrics_rows_in(&self, found: &[anomalies::Anomaly]) -> Vec<(String, String)> {
         let mut rows: Vec<(String, String)> = Vec::new();
         let section = |rows: &mut Vec<(String, String)>, name: &str| {
             rows.push((name.to_string(), String::new()));
@@ -2268,7 +2275,6 @@ impl App {
         // Anomalies last: the list can be long, and the overlay scrolls
         // (j/k, PgUp/PgDn), so every finding is listed instead of capped.
         section(&mut rows, "Anomalies");
-        let found = self.anomalies();
         let errors = found
             .iter()
             .filter(|a| matches!(a.severity, anomalies::Severity::Error))

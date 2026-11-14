@@ -108,7 +108,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_header(frame, chunks[0], app);
     draw_body(frame, chunks[1], app, &found);
     if app.show_metrics {
-        draw_metrics_overlay(frame, app);
+        draw_metrics_overlay(frame, app, &found);
     }
     if let Some(text) = app.status_popup() {
         draw_status_popup(frame, text);
@@ -196,11 +196,11 @@ fn clamp_scroll(offset: usize, total: usize, viewport: usize) -> usize {
     offset.min(total - viewport)
 }
 
-fn draw_metrics_overlay(frame: &mut Frame, app: &App) {
+fn draw_metrics_overlay(frame: &mut Frame, app: &App, found: &[Anomaly]) {
     let area = centered_rect(80, 85, frame.area());
     frame.render_widget(Clear, area);
 
-    let rows = app.metrics_rows();
+    let rows = app.metrics_rows_in(found);
     let total = rows.len();
     let viewport = (area.height as usize).saturating_sub(4);
     app.metrics_viewport.set(viewport);
