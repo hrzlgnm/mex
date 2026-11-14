@@ -101,6 +101,9 @@ pub enum RecordSection {
 #[derive(Debug, Clone)]
 pub struct RawRecord {
     pub name: String,
+    /// Original owner-name labels, retained so DNS-SD subtype identifiers
+    /// can be handled as wire octets rather than lossy display text.
+    pub owner_labels: Vec<Vec<u8>>,
     pub rtype: u16,
     pub rtype_str: String,
     pub flush_bit: bool,
@@ -901,7 +904,7 @@ fn send_query(socket: &PktInfoUdpSocket, req: &QueryRequest, dest: SocketAddr, e
     let _ = socket.send_to(&bytes, &SockAddr::from(dest));
 }
 
-fn parse_packet(
+pub(crate) fn parse_packet(
     raw: &[u8],
     source: SocketAddr,
     dst: std::net::IpAddr,
@@ -992,6 +995,12 @@ fn record_row(
     let rtype = u16::from(rec.rdata.type_code());
     RawRecord {
         name: display_name(&rec.name),
+        owner_labels: rec
+            .name
+            .get_labels()
+            .iter()
+            .map(|label| label.as_ref().to_vec())
+            .collect(),
         rtype,
         rtype_str: rtype_label(rtype),
         // simple-dns exposes the top CLASS bit natively as
@@ -1015,6 +1024,12 @@ fn question_row(q: &Question<'_>, ing: Ingress<'_>) -> RawRecord {
     let rtype = u16::from(q.qtype);
     RawRecord {
         name: display_name(&q.qname),
+        owner_labels: q
+            .qname
+            .get_labels()
+            .iter()
+            .map(|label| label.as_ref().to_vec())
+            .collect(),
         rtype,
         rtype_str: rtype_label(rtype),
         flush_bit: false,

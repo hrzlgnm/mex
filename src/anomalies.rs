@@ -145,7 +145,7 @@ pub struct ServiceView<'a> {
     pub service_type: &'a str,
     pub hostname: &'a str,
     pub answers: &'a [RawRecord],
-    pub subtypes: &'a [String],
+    pub subtypes: &'a [Vec<u8>],
 }
 
 /// Snapshot input for the analyzer. Built by the caller from live browser
@@ -451,8 +451,8 @@ fn check_type_format(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>
 
 /// Why a service type string is invalid, if it is. `None` means valid.
 /// Split out so confirmed services and enumeration PTR targets share
-/// one verdict and one message. Accepts the `_subtype._sub._service._tcp`
-/// subtype form (RFC 6763 §7.1) as well as plain types.
+/// one verdict and one message. Accepts `subtype._sub._service._tcp`
+/// (RFC 6763 §7.1) as well as plain service types.
 fn service_type_problem(st: &str) -> Option<String> {
     let parts: Vec<&str> = st.split('.').collect();
     match parts.as_slice() {
@@ -469,12 +469,12 @@ fn service_type_problem(st: &str) -> Option<String> {
             None
         }
         [sub, sub_kw, svc, proto, local] => {
-            if let Some(reason) = label_problem(sub) {
+            if let Some(reason) = subtype_problem(sub.as_bytes()) {
                 return Some(format!("subtype {reason}"));
             }
             if !sub_kw.eq_ignore_ascii_case("_sub") {
                 return Some(
-                    "expected _service._tcp.local or _subtype._sub._service._tcp.local".to_string(),
+                    "expected _service._tcp.local or subtype._sub._service._tcp.local".to_string(),
                 );
             }
             if let Some(reason) = label_problem(svc) {
@@ -488,11 +488,11 @@ fn service_type_problem(st: &str) -> Option<String> {
             }
             None
         }
-        _ => Some("expected _service._tcp.local or _subtype._sub._service._tcp.local".to_string()),
+        _ => Some("expected _service._tcp.local or subtype._sub._service._tcp.local".to_string()),
     }
 }
 
-/// Whether an enumeration target is a subtype (`_x._sub._svc._tcp.local`).
+/// Whether an enumeration target is a subtype (`subtype._sub._svc._tcp.local`).
 /// Valid subtypes pass `service_type_problem` but still don't belong in
 /// `_services._dns-sd._udp.local` (RFC 6763 §9 lists base types).
 fn is_subtype_target(st: &str) -> bool {
@@ -500,7 +500,7 @@ fn is_subtype_target(st: &str) -> bool {
     matches!(parts.as_slice(), [_, sub_kw, _, _, _] if sub_kw.eq_ignore_ascii_case("_sub"))
 }
 
-/// Why an underscore-led service/subtype label is invalid, if it is.
+/// Why an underscore-led service label is invalid, if it is.
 /// Structural only: leading underscore, non-empty, containing a letter,
 /// not starting or ending with a hyphen. Charset and length are
 /// deliberately loose: inner underscores and long labels ship in real
@@ -533,11 +533,41 @@ fn label_problem(label: &str) -> Option<String> {
     None
 }
 
-/// Subtype labels registered on a confirmed service share the service
-/// naming rules; a malformed one is a service-level finding.
+fn subtype_problem(subtype: &[u8]) -> Option<String> {
+    if subtype.is_empty() {
+        return Some("subtype is empty".to_string());
+    }
+    if subtype.len() > 63 {
+        return Some(format!(
+            "subtype label exceeds 63 bytes ({} bytes)",
+            subtype.len()
+        ));
+    }
+    None
+}
+
+/// Render subtype octets without losing or disguising non-printable bytes.
+pub(crate) fn display_subtype(subtype: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut display = String::new();
+    for &byte in subtype {
+        if (0x20..=0x7e).contains(&byte) && byte != b'\\' {
+            display.push(char::from(byte));
+        } else if byte == b'\\' {
+            display.push_str("\\\\");
+        } else {
+            display.push_str("\\x");
+            display.push(char::from(HEX[usize::from(byte >> 4)]));
+            display.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    display
+}
+
+/// Subtype identifiers follow RFC 6763 §7.1, not service-label rules.
 fn check_subtypes(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>) {
     for sub in svc.subtypes {
-        if let Some(reason) = label_problem(sub.trim_end_matches('.')) {
+        if let Some(reason) = subtype_problem(sub) {
             out.push(Anomaly {
                 kind: AnomalyKind::TypeFormat,
                 severity: Severity::Warning,
@@ -547,7 +577,7 @@ fn check_subtypes(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>) {
                 rtype_str: None,
                 rdata: None,
                 source: None,
-                message: format!("bad subtype {sub}: {reason}"),
+                message: format!("bad subtype {}: {reason}", display_subtype(sub)),
                 rfc: "RFC 6763 §7.1",
                 requirement: "MUST",
             });
@@ -1171,6 +1201,11 @@ mod tests {
     ) -> RawRecord {
         RawRecord {
             name: name.to_string(),
+            owner_labels: name
+                .trim_end_matches('.')
+                .split('.')
+                .map(|label| label.as_bytes().to_vec())
+                .collect(),
             rtype,
             rtype_str: rtype_str.to_string(),
             flush_bit: flush,
@@ -1209,7 +1244,7 @@ mod tests {
         service_type: &str,
         hostname: &str,
         answers: &[RawRecord],
-        subtypes: &[String],
+        subtypes: &[Vec<u8>],
     ) -> Vec<Anomaly> {
         let services = vec![ServiceView {
             instance,
@@ -2162,15 +2197,26 @@ mod tests {
 
     #[test]
     fn type_format_accepts_valid_subtype_label() {
-        let subtypes = vec!["_printer".to_string()];
+        let subtypes = vec![b"_printer".to_vec()];
         let found = analyze_service_sub("X", "_http._tcp.local", "", &[], &subtypes);
         assert!(!found.iter().any(|a| a.kind == AnomalyKind::TypeFormat));
     }
 
     #[test]
-    fn type_format_flags_bad_subtype_label() {
-        let subtypes = vec!["_80".to_string()];
+    fn type_format_accepts_subtype_with_arbitrary_octets() {
+        let subtypes = vec![b"uuid%group\xff".to_vec()];
         let found = analyze_service_sub("X", "_http._tcp.local", "", &[], &subtypes);
+        assert!(!found.iter().any(|a| a.kind == AnomalyKind::TypeFormat));
+    }
+
+    #[test]
+    fn type_format_accepts_63_byte_subtype_and_rejects_longer_label() {
+        let accepted = vec![b'x'; 63];
+        let found = analyze_service_sub("X", "_http._tcp.local", "", &[], &[accepted]);
+        assert!(!found.iter().any(|a| a.kind == AnomalyKind::TypeFormat));
+
+        let rejected = vec![b'x'; 64];
+        let found = analyze_service_sub("X", "_http._tcp.local", "", &[], &[rejected]);
         assert!(found.iter().any(|a| a.kind == AnomalyKind::TypeFormat));
     }
 
@@ -2359,12 +2405,13 @@ mod tests {
     }
 
     #[test]
-    fn enumeration_ptr_with_bad_subtype_flags_row() {
+    fn enumeration_ptr_with_overlong_subtype_flags_row() {
+        let target = format!("{}._sub._http._tcp.local.", "x".repeat(64));
         let enum_rec = rec(
             "_services._dns-sd._udp.local.",
             12,
             "PTR",
-            "_-bad._sub._http._tcp.local.",
+            &target,
             4500,
             false,
         );
