@@ -1010,20 +1010,20 @@ pub(crate) fn is_reverse_ptr(name: &str) -> bool {
     lower.ends_with(".in-addr.arpa") || lower.ends_with(".ip6.arpa")
 }
 
-/// Shared verdict for unicast-only types observed on multicast: definite
-/// violations (SOA/NS/ANY) are errors, the MX soft case is a warning, and
-/// everything else is `None` (quiet). Used by answer checks.
+/// Verdict for unicast-only types answered on multicast: NS/SOA records
+/// do not exist in mDNS zones (RFC 6762 §12) and ANY is never an RR type,
+/// so all three are errors; everything else is `None` (quiet). MX is not
+/// restricted by RFC 6762 or RFC 6763 and stays quiet.
 pub(crate) fn unicast_severity(rtype: u16) -> Option<Severity> {
     match rtype {
         2 | 6 | 255 => Some(Severity::Error),
-        15 => Some(Severity::Warning),
         _ => None,
     }
 }
 
 /// Citation for a unicast-only answer type: NS/SOA do not exist in mDNS
 /// zones (RFC 6762 §12), ANY is a QTYPE and never an RR type
-/// (RFC 1035 §3.2.3). MX has no mDNS restriction; it stays a heuristic.
+/// (RFC 1035 §3.2.3).
 /// None of these texts carries an RFC 2119 keyword (RFC 1035 predates
 /// it), so unicast-leak findings have no requirement level.
 fn unicast_leak_rfc(rtype: u16) -> &'static str {
@@ -1034,14 +1034,14 @@ fn unicast_leak_rfc(rtype: u16) -> &'static str {
     }
 }
 
-/// Verdict for observed *questions*. Same as answers, except QTYPE ANY
-/// (255) is excluded: probes for unique ownership use QTYPE ANY
-/// (RFC 6762 §8.1, §6.1), so ANY questions are routine demand, while ANY
-/// *answers* are meaningless on the wire and stay flagged.
+/// Verdict for observed *questions*: informational only. RFC 6762 §3
+/// requires every query for a `.local` name to go to the mDNS multicast
+/// group, so asking for NS/SOA there is compliant; §12 only says no such
+/// records exist, so the question can never be answered. QTYPE ANY (255)
+/// stays quiet: probes for unique ownership use it (RFC 6762 §8.1, §6.1).
 pub(crate) fn question_unicast_severity(rtype: u16) -> Option<Severity> {
     match rtype {
-        2 | 6 => Some(Severity::Error),
-        15 => Some(Severity::Warning),
+        2 | 6 => Some(Severity::Info),
         _ => None,
     }
 }
@@ -1087,16 +1087,12 @@ fn check_question(q: &QuestionView, out: &mut Vec<Anomaly>) {
         return;
     };
     let name = q.name.to_string();
-    let requirement = match severity {
-        Severity::Error => "MUST NOT",
-        _ => "SHOULD NOT",
-    };
-    // A stub resolver asking from an ephemeral port explains the leak
+    // A stub resolver asking from an ephemeral port explains the question
     // differently than a full mDNS stack, so the finding says which.
     let message = if is_one_shot_querier(&q.source) {
-        "unicast-only type on multicast (one-shot querier)".to_string()
+        "asks for a type that does not exist in mDNS (one-shot querier)".to_string()
     } else {
-        "unicast-only type on multicast".to_string()
+        "asks for a type that does not exist in mDNS".to_string()
     };
     out.push(Anomaly {
         kind: AnomalyKind::UnicastQuestion,
@@ -1108,8 +1104,8 @@ fn check_question(q: &QuestionView, out: &mut Vec<Anomaly>) {
         rdata: None,
         source: Some(q.source.to_string()),
         message,
-        rfc: "RFC 6762 §3",
-        requirement,
+        rfc: "RFC 6762 §12",
+        requirement: "",
     });
 }
 
@@ -1155,11 +1151,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         let (severity, message) = if confirmed {
             // The overlay has no record columns, so the message keeps the
             // rtype: it names what is not defined for mDNS.
-            let message = if base == Severity::Error {
-                format!("{} not defined for mDNS", rec.rtype_str)
-            } else {
-                format!("{} possible unicast leak", rec.rtype_str)
-            };
+            let message = format!("{} not defined for mDNS", rec.rtype_str);
             (base, message)
         } else {
             (
@@ -1617,15 +1609,14 @@ mod tests {
 
     #[test]
     fn unicast_severity_maps_known_types() {
-        // Single shared verdict for answers and (later) questions: definite
-        // unicast-only violations are errors, the MX soft case is a warning,
-        // everything else is quiet.
+        // Definite unicast-only answers are errors; MX has no mDNS
+        // restriction and stays quiet like everything else.
         use super::unicast_severity;
         use super::Severity;
         assert_eq!(unicast_severity(2), Some(Severity::Error));
         assert_eq!(unicast_severity(6), Some(Severity::Error));
         assert_eq!(unicast_severity(255), Some(Severity::Error));
-        assert_eq!(unicast_severity(15), Some(Severity::Warning));
+        assert_eq!(unicast_severity(15), None);
         assert_eq!(unicast_severity(1), None);
         assert_eq!(unicast_severity(12), None);
         assert_eq!(unicast_severity(5), None);
@@ -1800,8 +1791,11 @@ mod tests {
         let item = found
             .iter()
             .find(|a| a.kind == AnomalyKind::UnicastQuestion)
-            .expect("expected SOA question leak");
-        assert_eq!(item.severity, Severity::Error);
+            .expect("expected SOA question finding");
+        // RFC 6762 §3 requires .local queries on multicast: asking is
+        // compliant, the record just cannot exist (§12).
+        assert_eq!(item.severity, Severity::Info);
+        assert_eq!((item.rfc, item.requirement), ("RFC 6762 §12", ""));
         assert_eq!(item.service, "My._http._tcp.local");
         assert_eq!(item.record_name.as_deref(), Some("fritz.box."));
         assert_eq!(item.rtype, Some(6));
@@ -1868,18 +1862,15 @@ mod tests {
     }
 
     #[test]
-    fn unicast_question_mx_is_warning() {
+    fn unicast_question_mx_is_quiet() {
+        // Neither RFC 6762 nor RFC 6763 restricts MX in mDNS.
         let found = analyze_questions(&[qview(
             "My._http._tcp.local",
             "mail.local.",
             15,
             test_source(),
         )]);
-        let item = found
-            .iter()
-            .find(|a| a.kind == AnomalyKind::UnicastQuestion)
-            .expect("expected MX question leak");
-        assert_eq!(item.severity, Severity::Warning);
+        assert!(!found.iter().any(|a| a.kind == AnomalyKind::UnicastQuestion));
     }
 
     #[test]
@@ -1939,8 +1930,8 @@ mod tests {
     }
 
     #[test]
-    fn unicast_question_ns_is_error_any_is_quiet_probe() {
-        // NS questions have no legitimate multicast use; ANY questions
+    fn unicast_question_ns_is_info_any_is_quiet_probe() {
+        // NS questions can never be answered in mDNS (§12); ANY questions
         // are ownership probes (RFC 6762 §8.1, §6.1) and must stay quiet.
         let found = analyze_questions(&[qview(
             "My._http._tcp.local",
@@ -1951,8 +1942,8 @@ mod tests {
         let item = found
             .iter()
             .find(|a| a.kind == AnomalyKind::UnicastQuestion)
-            .expect("expected NS question leak");
-        assert_eq!(item.severity, Severity::Error);
+            .expect("expected NS question finding");
+        assert_eq!(item.severity, Severity::Info);
         assert_eq!(item.rtype_str.as_deref(), Some("NS"));
         let found = analyze_questions(&[qview(
             "My._http._tcp.local",
@@ -2220,14 +2211,11 @@ mod tests {
     }
 
     #[test]
-    fn mx_leak_is_warning_not_error() {
+    fn mx_answer_is_quiet() {
+        // Neither RFC 6762 nor RFC 6763 restricts MX in mDNS.
         let answers = vec![rec("host.local.", 15, "MX", "10 host.local.", 120, false)];
         let found = analyze_service("My", "_http._tcp.local", "host.local.", &answers);
-        let item = found
-            .iter()
-            .find(|a| a.kind == AnomalyKind::UnicastLeak)
-            .expect("expected leak");
-        assert_eq!(item.severity, Severity::Warning);
+        assert!(!found.iter().any(|a| a.kind == AnomalyKind::UnicastLeak));
     }
 
     #[test]

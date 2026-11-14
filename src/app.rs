@@ -6586,11 +6586,12 @@ mod tests {
     }
 
     #[test]
-    fn unicast_question_reaches_badge_and_display_key() {
+    fn unicast_question_routes_as_info_with_display_key() {
         // End-to-end through the real routing path: an observed SOA
-        // question lands on the service, surfaces as a unicast-question
-        // finding, bumps the service badge, and carries exactly the
-        // (name, type, querier) triple the Questions pane looks up.
+        // question lands on the service as an info-level unicast-question
+        // finding (RFC 6762 §3 makes asking compliant), stays off the
+        // service badge, and carries exactly the (name, type, querier)
+        // triple the Questions pane looks up.
         let mut app = App::new().unwrap();
         ingest(&mut app, &ptr_record(120));
         ingest(&mut app, &srv_record(120));
@@ -6612,14 +6613,14 @@ mod tests {
             .find(|a| a.kind == anomalies::AnomalyKind::UnicastQuestion)
             .expect("expected routed SOA question leak");
         assert_eq!(item.service, "Test._http._tcp.local");
-        assert_eq!(item.severity, crate::anomalies::Severity::Error);
-        assert!(
+        assert_eq!(item.severity, crate::anomalies::Severity::Info);
+        assert_eq!(
             app.anomaly_counts()
                 .get("Test._http._tcp.local")
                 .copied()
-                .unwrap_or(0)
-                >= 1,
-            "service badge must count the question-side finding"
+                .unwrap_or(0),
+            0,
+            "info-level question findings stay off the service badge"
         );
         assert_eq!(
             (
@@ -7904,7 +7905,7 @@ mod tests {
     }
 
     #[test]
-    fn anomalies_pane_keeps_qry_scope_on_enumeration_row() {
+    fn anomalies_pane_omits_info_question_on_enumeration_row() {
         let mut app = App::new().unwrap();
         let stub: SocketAddr = "192.168.1.9:45678".parse().unwrap();
         app.ingest_event(&query_event(
@@ -7926,9 +7927,10 @@ mod tests {
         park_on_question(&mut app, stub);
         let buf = render_to_buffer(&app, 140, 30);
         let text = rect_text(&buf, app.anomalies_rect.get());
+        // Info-level question findings live in the overlay only.
         assert!(
-            text.contains("QRY SOA _services._dns-sd._udp.local"),
-            "pane keeps the QRY scope, got: {text:?}"
+            !text.contains("QRY SOA"),
+            "pane omits info question findings, got: {text:?}"
         );
     }
 
@@ -10698,14 +10700,15 @@ mod tests {
     }
 
     #[test]
-    fn anomalies_for_question_marks_leaking_querier_only() {
+    fn anomalies_for_question_keeps_info_findings_out_of_pane() {
         let mut app = App::new().unwrap();
         ingest(&mut app, &ptr_record(4500));
         ingest(&mut app, &srv_record(120));
         let src_a = remote_source();
         let src_b: SocketAddr = "192.168.1.100:5353".parse().unwrap();
-        // Two queriers ask multicast for unicast-only NS: one finding
-        // each, so every row marks only its own querier.
+        // Two queriers ask multicast for NS: RFC 6762 §3 makes that
+        // compliant, so the info-level findings stay in the overlay and
+        // no question row lists or marks anything.
         app.ingest_event(&query_event(
             "test.local.",
             2,
@@ -10731,11 +10734,15 @@ mod tests {
             .expect("service displayed")
             .ordered_answers()
             .len();
-        for (src, expect_finding) in [
-            (src_a, true),
-            (src_b, true),
-            (crate::app::SELF_SOURCE, false),
-        ] {
+        assert_eq!(
+            app.anomalies()
+                .iter()
+                .filter(|a| a.kind == anomalies::AnomalyKind::UnicastQuestion)
+                .count(),
+            2,
+            "one info finding per querier"
+        );
+        for src in [src_a, src_b, crate::app::SELF_SOURCE] {
             let pos = app
                 .display_detail()
                 .expect("service displayed")
@@ -10749,30 +10756,10 @@ mod tests {
                 .display_detail()
                 .and_then(|d| App::identity_at_detail(&d, idx));
             let found = app.anomalies_for_selected();
-            // Every question row sees both querier findings, each marked
-            // only on its own row.
-            assert_eq!(
-                kinds(&found),
-                ["unicast-question", "unicast-question"],
-                "pane lists the full service, got: {found:?}"
+            assert!(
+                found.is_empty(),
+                "row for {src} lists no info findings, got: {found:?}"
             );
-            let marked: Vec<_> = found
-                .iter()
-                .filter(|p| p.cursor_match)
-                .map(|p| p.anomaly.source.clone())
-                .collect();
-            if expect_finding {
-                assert_eq!(
-                    marked,
-                    vec![Some(src.to_string())],
-                    "row for {src} must mark exactly its own finding, got: {found:?}"
-                );
-            } else {
-                assert!(
-                    marked.is_empty(),
-                    "own inferred send marks nothing, got: {found:?}"
-                );
-            }
         }
     }
 
@@ -11409,7 +11396,9 @@ mod tests {
         // Every stop shows the full service list with only its own
         // findings marked: nothing leaks from the previously
         // highlighted row.
-        let full = ["shared-flush", "unicast-question", "ttl-unstable"];
+        // The NS question is info-level (RFC 6762 §3 makes asking
+        // compliant), so it stays out of the pane.
+        let full = ["shared-flush", "ttl-unstable"];
         let stop = |found: Vec<PaneAnomaly>, marked: &[&str]| {
             assert_eq!(
                 kinds(&found),
@@ -11431,7 +11420,7 @@ mod tests {
             park_on_answer(&mut app, 1, "192.168.1.11"),
             &["ttl-unstable"],
         );
-        stop(park_on_question(&mut app, querier), &["unicast-question"]);
+        stop(park_on_question(&mut app, querier), &[]);
         select_host_header(&mut app, "test.local");
         stop(app.anomalies_for_selected(), &[]);
         // Expire the PTR: its row goes quiet instead of keeping the
@@ -11525,15 +11514,10 @@ mod tests {
         );
         // A new error finding sorts in front without any cursor move:
         // tracking re-anchors to the match instead of hiding it.
-        let querier: SocketAddr = "192.168.1.9:5353".parse().unwrap();
-        app.ingest_event(&query_event(
-            "test.local.",
-            2,
-            "NS",
-            false,
-            Vec::new(),
-            querier,
-        ));
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 2, "NS", "ns1.local.", 120),
+        );
         render_to_buffer(&app, 100, 30);
         let (offset, viewport, at) = visible_match(&app);
         assert_eq!(at, Some(2));
@@ -11546,15 +11530,10 @@ mod tests {
         app.scroll_anomalies(-(offset as isize) - 10);
         assert_eq!(app.anomalies_offset.get(), 0);
         assert!(!app.anomalies_follow.get());
-        let querier2: SocketAddr = "192.168.1.100:5353".parse().unwrap();
-        app.ingest_event(&query_event(
-            "test.local.",
-            2,
-            "NS",
-            false,
-            Vec::new(),
-            querier2,
-        ));
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 2, "NS", "ns2.local.", 120),
+        );
         render_to_buffer(&app, 100, 30);
         assert_eq!(app.anomalies_offset.get(), 0);
     }
