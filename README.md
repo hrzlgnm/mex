@@ -178,7 +178,7 @@ full list.
 
 Omitting A/AAAA records from PTR/SRV replies is not flagged.
 `unresolved-srv-target` reports outcomes of transmitted address queries for live
-SRV targets on each mDNS interface (warning for explicit negative answers,
+SRV targets on each mDNS interface (warning when NSEC denies both A and AAAA,
 info for inconclusive lookups).
 
 | Finding | Meaning |
