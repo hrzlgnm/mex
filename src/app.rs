@@ -1648,8 +1648,12 @@ impl App {
                     // (e.g. A/AAAA shipped as additionals with the SRV)
                     // means no other answers are forthcoming: start
                     // dampened, as the flush-bit path would, and let the
-                    // 80%-TTL refresh maintain it.
+                    // 80%-TTL refresh maintain it. The interest is still
+                    // demand: file its self row now so the Questions pane
+                    // shows it pending (LAST "—", DUE the refresh) instead
+                    // of hiding it until the first refresh fires.
                     let (next_due, interval) = if self.has_fresh_unique_answer(&key) {
+                        self.route_own_question(&qname, key.1, false);
                         (now + MAX_CONTINUOUS_INTERVAL, MAX_CONTINUOUS_INTERVAL)
                     } else {
                         (now + rand_range(20, 120), Duration::from_secs(1))
@@ -5935,6 +5939,33 @@ mod tests {
     }
 
     #[test]
+    fn dampened_address_interest_stays_visible() {
+        let mut app = App::new().unwrap();
+        ingest_srv_with_addresses(&mut app, true);
+        app.poll_continuous();
+        let svc = app
+            .services
+            .iter()
+            .find(|s| s.hostname.trim_end_matches('.') == "test.local")
+            .expect("service");
+        for label in ["A", "AAAA"] {
+            assert!(
+                svc.questions
+                    .iter()
+                    .any(|q| q.0 == "test.local" && q.1 == label && q.2 == SELF_SOURCE),
+                "{label} interest must show as a pending self row"
+            );
+        }
+        // Nothing was sent: no transmitted or suppressed event, and the
+        // refresh owns DUE.
+        let s = app.interest_summary("test.local", 1);
+        assert!(s.last_transmitted_at.is_none());
+        assert!(s.last_suppressed_at.is_none());
+        assert_eq!(s.timer, TimerKind::Refresh);
+        assert!(s.next_due_in_secs.is_some());
+    }
+
+    #[test]
     fn missing_address_still_queried_promptly() {
         let mut app = App::new().unwrap();
         ingest(&mut app, &ptr_record(4500));
@@ -6651,13 +6682,14 @@ mod tests {
         assert!(app.services[0].questions.is_empty());
         app.send_queries();
         assert_eq!(app.metrics.q_sent_refresh, 1);
+        // Dampened interests with cached unique answers file pending
+        // rows too; the refresh send itself files exactly one PTR row.
         let filed: Vec<_> = app.services[0]
             .questions
             .iter()
-            .filter(|q| q.2 == SELF_SOURCE)
+            .filter(|q| q.2 == SELF_SOURCE && q.1 == "PTR")
             .collect();
         assert_eq!(filed.len(), 1);
-        assert_eq!(filed[0].1, "PTR");
     }
 
     #[test]
