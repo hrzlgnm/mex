@@ -888,6 +888,12 @@ fn build_query(
     }
 }
 
+pub(crate) fn inferred_question_packet(name: &str, rtype: u16, qu: bool) -> Option<Vec<u8>> {
+    let qname = wire_name(name)?;
+    let record_type = record_type_from_u16(rtype)?;
+    build_query(&qname, record_type, qu, &[])
+}
+
 fn send_query(socket: &PktInfoUdpSocket, req: &QueryRequest, dest: SocketAddr, egress_iface: &str) {
     let Some(bytes) = encode_query(req, egress_iface) else {
         return;
