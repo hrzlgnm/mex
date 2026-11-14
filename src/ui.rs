@@ -1311,7 +1311,7 @@ fn draw_hex_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     app.hex_viewport.set(area.height.saturating_sub(2) as usize);
     let (dump, title, selected_field_label) =
         if let Some((bytes, title)) = app.selected_detail_bytes() {
-            let fields = app.selected_record_fields().unwrap_or_default();
+            let fields = app.selected_detail_fields().unwrap_or_default();
             let selected_field = app
                 .hex_selected_field
                 .get()

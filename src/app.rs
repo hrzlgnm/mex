@@ -1250,7 +1250,7 @@ impl App {
                 self.metrics.suppressed_refresh += 1;
                 self.metrics.suppressed_times.push_back(now);
                 self.note_query(&key.0, key.1, QueryOrigin::Suppressed, now);
-                self.route_own_question(&key.0, key.1);
+                self.route_own_question(&key.0, key.1, false);
                 self.postpone_continuous_for_refresh(&key, now);
                 let unanswered = (count + 1).min(4);
                 if unanswered >= 4 {
@@ -1275,7 +1275,7 @@ impl App {
                     key.0
                 );
             }
-            self.route_own_question(&key.0, key.1);
+            self.route_own_question(&key.0, key.1, false);
             // A refresh query also elicits new answers, so postpone the
             // exponential stream for the same question: otherwise the two
             // timers can fire on the same tick and emit back-to-back
@@ -1583,7 +1583,7 @@ impl App {
                 self.metrics.suppressed_continuous += 1;
                 self.metrics.suppressed_times.push_back(now);
                 self.note_query(&key.0, key.1, QueryOrigin::Suppressed, now);
-                self.route_own_question(&key.0, key.1);
+                self.route_own_question(&key.0, key.1, false);
                 self.advance_continuous(&key, now);
                 continue;
             }
@@ -1616,7 +1616,7 @@ impl App {
                     send_name
                 );
             }
-            self.route_own_question(&send_name, key.1);
+            self.route_own_question(&send_name, key.1, qu);
             // RFC 6762 §5.2: at least 1s between the first two, then at
             // least doubling, capped at one query per hour. Send using the
             // current interval, then double for the following gap, so the
@@ -4316,19 +4316,21 @@ impl App {
 
     /// File a question we sent ourselves, inferred from the send path:
     /// multicast loop is disabled so our transmissions never arrive as
-    /// events. Same matching as observed questions, marked with the
-    /// `SELF_SOURCE` sentinel; no packet bytes, so the hex pane shows the
-    /// latest event bytes under the same QRY title. Filed for real sends and §7.3
-    /// suppressions alike: both are browse demand. Discovery sends
-    /// precede the service, so matching pending instances park them
-    /// until `handle_srv` moves them over on promotion. Passive mode
-    /// sends nothing, so it files nothing.
-    fn route_own_question(&mut self, name: &str, rtype: u16) {
+    /// events. Store a minimal query packet for the question fields rather
+    /// than reusing unrelated latest-event bytes. Filed for real sends and
+    /// §7.3 suppressions alike: both are browse demand. Discovery sends
+    /// precede the service, so matching pending instances park them until
+    /// `handle_srv` moves them over on promotion. Passive mode sends nothing.
+    fn route_own_question(&mut self, name: &str, rtype: u16, qu: bool) {
         let display = name.trim_end_matches('.').to_string();
         let key = display.to_lowercase();
         let Some(label) = Self::own_rtype_label(rtype) else {
             return;
         };
+        let bytes = browse::inferred_question_packet(name, rtype, qu).unwrap_or_else(|| {
+            log::warn!("mex: cannot encode inferred query packet for {name} TYPE{rtype}");
+            Vec::new()
+        });
         let at = Instant::now();
         if is_enum_name(&key) {
             for entry in &mut self.enum_entries {
@@ -4340,7 +4342,7 @@ impl App {
                         label.to_string(),
                         SELF_SOURCE,
                         at,
-                        Vec::new(),
+                        bytes.clone(),
                     );
                     entry.last_seen = at;
                 }
@@ -4366,7 +4368,7 @@ impl App {
                     label.to_string(),
                     SELF_SOURCE,
                     at,
-                    Vec::new(),
+                    bytes.clone(),
                 );
             }
         }
@@ -4380,7 +4382,7 @@ impl App {
                     label.to_string(),
                     SELF_SOURCE,
                     at,
-                    Vec::new(),
+                    bytes.clone(),
                 );
             }
         }
@@ -5464,15 +5466,21 @@ impl App {
             .collect()
     }
 
-    /// Hex dump payload for the hex pane: wire bytes of the selected record,
-    /// or the stored query packet for a selected question row.
-    pub fn selected_record_fields(&self) -> Option<Vec<browse::RecordField>> {
-        let DetailEntry::Record(record) = self.selected_detail_entry()? else {
-            return None;
-        };
-        Some(browse::record_fields(&record.wire, record.rtype))
+    /// Field ranges for the selected record or uniquely matched query question.
+    pub fn selected_detail_fields(&self) -> Option<Vec<browse::RecordField>> {
+        match self.selected_detail_entry()? {
+            DetailEntry::Record(record) => Some(browse::record_fields(&record.wire, record.rtype)),
+            DetailEntry::Question {
+                name,
+                rtype_str,
+                raw,
+                ..
+            } if !raw.is_empty() => browse::question_fields(raw, name, rtype_str),
+            DetailEntry::Question { .. } => None,
+        }
     }
 
+    /// Hex dump payload: selected record bytes or the stored query packet.
     pub fn selected_detail_bytes(&self) -> Option<(Vec<u8>, String)> {
         match self.selected_detail_entry()? {
             DetailEntry::Record(rec) => {
@@ -5488,15 +5496,13 @@ impl App {
                 name,
                 rtype_str,
                 raw,
-                source: _,
+                source,
             } => {
                 let title = format!(" QRY {rtype_str} {name} ");
+                if *source == SELF_SOURCE {
+                    return Some((raw.to_vec(), format!("{title}(inferred) ")));
+                }
                 if raw.is_empty() {
-                    // Own inferred sends carry no packet bytes: the latest
-                    // event bytes are fallback packet data, not the query
-                    // itself, so the title keeps the QRY identity but marks
-                    // the payload as a raw packet (as the old Raw Packet
-                    // fallback disclosed).
                     let fallback = self
                         .latest_event_for_selected()
                         .map(|ev| ev.raw_bytes.clone())
@@ -6153,28 +6159,47 @@ mod tests {
     fn own_questions_filed_on_type_full_and_host() {
         let mut app = two_group_app();
         // Type-level: only the _http service matches.
-        app.route_own_question("_http._tcp.local.", 12);
+        app.route_own_question("_http._tcp.local.", 12, false);
         assert_eq!(app.services[0].questions.len(), 1);
         assert!(app.services[1].questions.is_empty());
         let q = &app.services[0].questions[0];
         assert_eq!(q.0, "_http._tcp.local");
         assert_eq!(q.1, "PTR");
         assert_eq!(q.2, SELF_SOURCE);
-        assert!(q.4.is_empty());
+        assert!(browse::question_fields(&q.4, &q.0, &q.1).is_some());
         // Full instance name and host name file further rows.
-        app.route_own_question("Test._http._tcp.local.", 33);
-        app.route_own_question("test.local.", 1);
+        app.route_own_question("Test._http._tcp.local.", 33, false);
+        app.route_own_question("test.local.", 1, false);
         assert_eq!(app.services[0].questions.len(), 3);
         // Re-sending refreshes instead of duplicating.
-        app.route_own_question("_http._tcp.local.", 12);
+        app.route_own_question("_http._tcp.local.", 12, false);
         assert_eq!(app.services[0].questions.len(), 3);
         // Enumeration files on its own row, unknown types file nothing.
-        app.route_own_question("_services._dns-sd._udp.local.", 12);
-        app.route_own_question("_http._tcp.local.", 99);
+        app.route_own_question("_services._dns-sd._udp.local.", 12, false);
+        app.route_own_question("_http._tcp.local.", 99, false);
         assert_eq!(app.services[0].questions.len(), 3);
         assert!(app.services[1].questions.is_empty());
         assert_eq!(app.enum_entries.len(), 1);
         assert_eq!(app.enum_entries[0].questions.len(), 1);
+    }
+
+    #[test]
+    fn own_question_packet_preserves_qu_bit() {
+        let mut app = two_group_app();
+        app.route_own_question("Shell._ssh._tcp.local.", 12, true);
+        let question = app
+            .services
+            .iter()
+            .flat_map(|service| &service.questions)
+            .find(|question| question.2 == SELF_SOURCE)
+            .expect("self question was filed");
+        let fields = browse::question_fields(&question.4, &question.0, &question.1)
+            .expect("inferred query packet has question fields");
+        let qclass = fields
+            .iter()
+            .find(|field| field.label == "QCLASS / QU")
+            .expect("question has QCLASS / QU field");
+        assert_eq!(&question.4[qclass.start..qclass.end], &[0x80, 0x01]);
     }
 
     #[test]
@@ -6185,7 +6210,7 @@ mod tests {
         assert!(app.services.is_empty());
         assert_eq!(app.pending_instances.len(), 1);
         // Our continuous stream asks for the pending SRV: parked, not dropped.
-        app.route_own_question("Test._http._tcp.local.", 33);
+        app.route_own_question("Test._http._tcp.local.", 33, false);
         assert!(app.services.is_empty());
         assert_eq!(app.pending_instances[0].questions.len(), 1);
         // The SRV reply promotes the service with the question kept.
@@ -6234,7 +6259,7 @@ mod tests {
                 pkt.clone(),
             ));
         }
-        app.route_own_question("_ssh._tcp.local.", 12);
+        app.route_own_question("_ssh._tcp.local.", 12, false);
         // Seed fallback packet bytes distinct from any question payload:
         // the self row must surface these bytes, marked as fallback.
         let fallback = vec![0xDE, 0xAD, 0xBE, 0xEF];
@@ -6267,8 +6292,9 @@ mod tests {
         let (bytes, title) = app
             .selected_detail_bytes()
             .expect("self question has hex payload");
-        assert_eq!(bytes, fallback);
-        assert_eq!(title, " QRY PTR _ssh._tcp.local (raw packet) ");
+        assert_ne!(bytes, fallback);
+        assert!(browse::question_fields(&bytes, "_ssh._tcp.local", "PTR").is_some());
+        assert_eq!(title, " QRY PTR _ssh._tcp.local (inferred) ");
         // Remote row returns its own query packet bytes under the
         // unmarked title.
         app.detail_selected = raws + remote_pos;
@@ -6297,7 +6323,7 @@ mod tests {
             Instant::now(),
             vec![0xAA, 0xBB],
         ));
-        app.route_own_question("_services._dns-sd._udp.local.", 12);
+        app.route_own_question("_services._dns-sd._udp.local.", 12, false);
         let (raws, self_pos) = {
             let target = app.display_detail().expect("enum detail target");
             let raws = target.ordered_answers().len();
@@ -6312,9 +6338,8 @@ mod tests {
         let (bytes, title) = app
             .selected_detail_bytes()
             .expect("self enum question has hex payload");
-        // No packet observed on this target: empty payload, marked title.
-        assert!(bytes.is_empty());
-        assert_eq!(title, " QRY PTR _services._dns-sd._udp.local (raw packet) ");
+        assert!(browse::question_fields(&bytes, "_services._dns-sd._udp.local", "PTR").is_some());
+        assert_eq!(title, " QRY PTR _services._dns-sd._udp.local (inferred) ");
     }
 
     /// Render the full UI into a test buffer at the given size. Shared
@@ -6411,7 +6436,7 @@ mod tests {
     fn questions_table_marks_hex_source_when_hosts_focused() {
         use ratatui::style::Modifier;
         let mut app = two_group_app();
-        app.route_own_question("_ssh._tcp.local.", 12);
+        app.route_own_question("_ssh._tcp.local.", 12, false);
         let (raws, self_pos) = {
             let target = app.display_detail().expect("detail target");
             let raws = target.ordered_answers().len();
@@ -6673,6 +6698,318 @@ mod tests {
                 .cell((label_x, label_y))
                 .is_some_and(|cell| cell.modifier.contains(Modifier::UNDERLINED)),
             "changing records should clear the prior field selection"
+        );
+    }
+
+    #[test]
+    fn clicking_question_name_highlights_the_selected_question_in_packet() {
+        use ratatui::style::{Color, Modifier};
+
+        let mut app = two_group_app();
+        let mut packet = vec![0x12, 0x34, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0];
+        append_wire_name(&mut packet, "_http._tcp.local.");
+        packet.extend(12u16.to_be_bytes());
+        packet.extend(1u16.to_be_bytes());
+        append_wire_name(&mut packet, "Shell._ssh._tcp.local.");
+        packet.extend(16u16.to_be_bytes());
+        packet.extend(0x8001u16.to_be_bytes());
+
+        select_question_row(&mut app, "Shell._ssh._tcp.local.", "TXT", packet);
+
+        let before = render_to_buffer(&app, 160, 60);
+        let (field_x, field_y) =
+            find_buffer_text(&before, "QNAME").expect("question name field is displayed");
+        let selected_row = app.detail_selected;
+        app.mouse_down(field_x + 1, field_y);
+        assert_eq!(
+            app.detail_selected, selected_row,
+            "clicking a question field should preserve the selected row"
+        );
+
+        let after = render_to_buffer(&app, 160, 60);
+        let (class_x, class_y) = find_buffer_text(&after, "0001 0553 6865")
+            .expect("second question bytes are displayed");
+        for x in [
+            class_x + 5,
+            class_x + 6,
+            class_x + 7,
+            class_x + 8,
+            class_x + 10,
+            class_x + 11,
+            class_x + 12,
+            class_x + 13,
+        ] {
+            assert!(
+                after.cell((x, class_y)).is_some_and(|cell| {
+                    cell.fg == Color::Yellow && cell.modifier.contains(Modifier::UNDERLINED)
+                }),
+                "the selected question name bytes should be highlighted"
+            );
+        }
+        for x in [class_x, class_x + 1, class_x + 2, class_x + 3] {
+            assert_ne!(
+                after.cell((x, class_y)).map(|cell| cell.fg),
+                Some(Color::Yellow),
+                "the preceding QCLASS bytes should not be highlighted"
+            );
+        }
+        let (name_end_x, name_end_y) = find_buffer_text(&after, "6370 056c 6f63 616c 0000 1080 01")
+            .expect("question name end and following fields are displayed");
+        for x in [
+            name_end_x,
+            name_end_x + 1,
+            name_end_x + 2,
+            name_end_x + 3,
+            name_end_x + 5,
+            name_end_x + 6,
+            name_end_x + 7,
+            name_end_x + 8,
+            name_end_x + 10,
+            name_end_x + 11,
+            name_end_x + 12,
+            name_end_x + 13,
+            name_end_x + 15,
+            name_end_x + 16,
+            name_end_x + 17,
+            name_end_x + 18,
+            name_end_x + 20,
+            name_end_x + 21,
+        ] {
+            assert!(
+                after.cell((x, name_end_y)).is_some_and(|cell| {
+                    cell.fg == Color::Yellow && cell.modifier.contains(Modifier::UNDERLINED)
+                }),
+                "all encoded QNAME bytes through its root terminator should be highlighted"
+            );
+        }
+        for x in [
+            name_end_x + 22,
+            name_end_x + 23,
+            name_end_x + 25,
+            name_end_x + 26,
+        ] {
+            assert_ne!(
+                after.cell((x, name_end_y)).map(|cell| cell.fg),
+                Some(Color::Yellow),
+                "QTYPE bytes after QNAME should not be highlighted"
+            );
+        }
+
+        let (field_x, field_y) =
+            find_buffer_text(&after, "QTYPE").expect("question type field is displayed");
+        app.mouse_down(field_x + 1, field_y);
+        let type_selected = render_to_buffer(&app, 160, 60);
+        let (type_x, type_y) = find_buffer_text(&type_selected, "616c 0000 1080 01")
+            .expect("question type bytes are displayed");
+        for x in [type_x + 7, type_x + 8, type_x + 10, type_x + 11] {
+            assert!(
+                type_selected.cell((x, type_y)).is_some_and(|cell| {
+                    cell.fg == Color::Yellow && cell.modifier.contains(Modifier::UNDERLINED)
+                }),
+                "QTYPE bytes should be highlighted"
+            );
+        }
+        for x in [
+            type_x + 5,
+            type_x + 6,
+            type_x + 12,
+            type_x + 13,
+            type_x + 15,
+            type_x + 16,
+        ] {
+            assert_ne!(
+                type_selected.cell((x, type_y)).map(|cell| cell.fg),
+                Some(Color::Yellow),
+                "QNAME and QCLASS bytes should not be highlighted for QTYPE"
+            );
+        }
+
+        let (field_x, field_y) = find_buffer_text(&type_selected, "QCLASS / QU")
+            .expect("question class and QU field is displayed");
+        app.mouse_down(field_x + 1, field_y);
+        let class_selected = render_to_buffer(&app, 160, 60);
+        for x in [type_x + 12, type_x + 13, type_x + 15, type_x + 16] {
+            assert!(
+                class_selected.cell((x, type_y)).is_some_and(|cell| {
+                    cell.fg == Color::Yellow && cell.modifier.contains(Modifier::UNDERLINED)
+                }),
+                "QCLASS and QU bytes should be highlighted"
+            );
+        }
+        for x in [type_x + 7, type_x + 8, type_x + 10, type_x + 11] {
+            assert_ne!(
+                class_selected.cell((x, type_y)).map(|cell| cell.fg),
+                Some(Color::Yellow),
+                "QTYPE bytes should not be highlighted for QCLASS / QU"
+            );
+        }
+
+        app.scroll_hex_edge(false);
+        let scrolled = render_to_buffer(&app, 160, 60);
+        let hex_area = app.hex_rect.get();
+        let title_area = Rect::new(hex_area.x, hex_area.y, hex_area.width, 1);
+        let (title_x, title_y) = find_buffer_text_in_rect(&scrolled, title_area, "QCLASS / QU")
+            .expect("selected question field stays visible while scrolling");
+        assert!(
+            scrolled
+                .cell((title_x, title_y))
+                .is_some_and(|cell| cell.modifier.contains(Modifier::UNDERLINED)),
+            "scrolling should not hide the selected question field label"
+        );
+    }
+
+    #[test]
+    fn clicking_compressed_question_name_highlights_its_pointer_bytes() {
+        use ratatui::style::{Color, Modifier};
+
+        let mut app = two_group_app();
+        let mut packet = vec![0x12, 0x34, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0];
+        append_wire_name(&mut packet, "Shell._ssh._tcp.local.");
+        packet.extend(12u16.to_be_bytes());
+        packet.extend(1u16.to_be_bytes());
+        packet.extend([0xc0, 0x0c]);
+        packet.extend(16u16.to_be_bytes());
+        packet.extend(0x8001u16.to_be_bytes());
+
+        select_question_row(&mut app, "Shell._ssh._tcp.local.", "TXT", packet);
+
+        let before = render_to_buffer(&app, 160, 60);
+        let (field_x, field_y) =
+            find_buffer_text(&before, "QNAME").expect("question name field is displayed");
+        app.mouse_down(field_x + 1, field_y);
+
+        let after = render_to_buffer(&app, 160, 60);
+        let (pointer_x, pointer_y) = find_buffer_text(&after, "01c0 0c00 1080 01")
+            .expect("compressed question and following fields are displayed");
+        for x in [pointer_x + 2, pointer_x + 3, pointer_x + 5, pointer_x + 6] {
+            assert!(
+                after.cell((x, pointer_y)).is_some_and(|cell| {
+                    cell.fg == Color::Yellow && cell.modifier.contains(Modifier::UNDERLINED)
+                }),
+                "the encoded compression pointer should be highlighted"
+            );
+        }
+        for x in [
+            pointer_x,
+            pointer_x + 1,
+            pointer_x + 7,
+            pointer_x + 8,
+            pointer_x + 10,
+            pointer_x + 11,
+            pointer_x + 12,
+            pointer_x + 13,
+            pointer_x + 15,
+            pointer_x + 16,
+        ] {
+            assert_ne!(
+                after.cell((x, pointer_y)).map(|cell| cell.fg),
+                Some(Color::Yellow),
+                "the preceding QCLASS and following QTYPE/QCLASS bytes should stay unhighlighted"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_question_mapping_stays_byte_only() {
+        let mut app = two_group_app();
+        let mut packet = vec![0x12, 0x34, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0];
+        for _ in 0..2 {
+            append_wire_name(&mut packet, "Shell._ssh._tcp.local.");
+            packet.extend(12u16.to_be_bytes());
+            packet.extend(1u16.to_be_bytes());
+        }
+
+        select_question_row(&mut app, "Shell._ssh._tcp.local.", "PTR", packet);
+
+        let buffer = render_to_buffer(&app, 160, 60);
+        assert!(
+            find_buffer_text(&buffer, "QNAME").is_none(),
+            "duplicate matching questions should not guess which wire occurrence is selected"
+        );
+    }
+
+    #[test]
+    fn malformed_question_packet_stays_byte_only() {
+        let mut app = two_group_app();
+        let packet = vec![0x12, 0x34, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 5, b'S', b'h'];
+        select_question_row(&mut app, "Shell._ssh._tcp.local.", "PTR", packet);
+
+        let buffer = render_to_buffer(&app, 160, 60);
+        assert!(
+            find_buffer_text(&buffer, "QNAME").is_none(),
+            "malformed question bytes should not receive guessed field ranges"
+        );
+    }
+
+    #[test]
+    fn clicking_own_question_field_highlights_its_query_bytes() {
+        use ratatui::style::{Color, Modifier};
+
+        let mut app = two_group_app();
+        let fallback = vec![0xde, 0xad, 0xbe, 0xef];
+        let selected_service = match app.display_items().get(app.selected_display) {
+            Some(DisplayItem::Instance { index }) => *index,
+            _ => panic!("expected instance selected"),
+        };
+        app.services[selected_service]
+            .last_event
+            .as_mut()
+            .expect("latest event")
+            .raw_bytes = fallback;
+        app.route_own_question("Shell._ssh._tcp.local.", 12, false);
+        let raw_count = app
+            .display_detail()
+            .expect("selected service")
+            .ordered_answers()
+            .len();
+        app.detail_selected = raw_count;
+        app.focus = Focus::Questions;
+
+        let before = render_to_buffer(&app, 160, 60);
+        assert!(
+            find_buffer_text(&before, "(inferred)").is_some(),
+            "own question bytes should be identified as inferred"
+        );
+        let (field_x, field_y) =
+            find_buffer_text(&before, "QNAME").expect("own question name field is displayed");
+        let selected_row = app.detail_selected;
+        app.mouse_down(field_x + 1, field_y);
+        assert_eq!(
+            app.detail_selected, selected_row,
+            "clicking an own question field should preserve its selected row"
+        );
+
+        let after = render_to_buffer(&app, 160, 60);
+        let (label_x, label_y) =
+            find_buffer_text(&after, "QNAME").expect("own question field remains displayed");
+        assert!(
+            after
+                .cell((label_x, label_y))
+                .is_some_and(|cell| cell.modifier.contains(Modifier::UNDERLINED)),
+            "clicking the own question field should mark its label"
+        );
+        let (name_x, name_y) = find_buffer_text(&after, "0553 6865")
+            .expect("generated packet's QNAME bytes should be displayed");
+        for x in [
+            name_x,
+            name_x + 1,
+            name_x + 2,
+            name_x + 3,
+            name_x + 5,
+            name_x + 6,
+            name_x + 7,
+            name_x + 8,
+        ] {
+            assert!(
+                after.cell((x, name_y)).is_some_and(|cell| {
+                    cell.fg == Color::Yellow && cell.modifier.contains(Modifier::UNDERLINED)
+                }),
+                "clicking an own question should highlight the generated query's QNAME"
+            );
+        }
+        assert!(
+            find_buffer_text(&after, "dead beef").is_none(),
+            "unrelated fallback bytes must not replace the own question packet"
         );
     }
 
@@ -6973,7 +7310,7 @@ mod tests {
         app.ingest_event(&ev);
         assert_eq!(app.enum_entries[0].questions.len(), 1);
         assert!(app.services.iter().all(|s| s.questions.is_empty()));
-        app.route_own_question("_services._dns-sd._udp.local.", 12);
+        app.route_own_question("_services._dns-sd._udp.local.", 12, false);
         assert_eq!(app.enum_entries[0].questions.len(), 2);
         assert_eq!(app.enum_entries[0].questions[1].2, SELF_SOURCE);
     }
@@ -7217,7 +7554,7 @@ mod tests {
     #[test]
     fn metrics_queriers_exclude_self() {
         let mut app = two_group_app();
-        app.route_own_question("_http._tcp.local.", 12);
+        app.route_own_question("_http._tcp.local.", 12, false);
         let row = app
             .metrics_rows()
             .into_iter()
@@ -7424,6 +7761,27 @@ mod tests {
         app.evict_expired();
         select_instance(&mut app, "Shell");
         app
+    }
+
+    fn select_question_row(app: &mut App, name: &str, rtype: &str, packet: Vec<u8>) {
+        let raw_count = app
+            .display_detail()
+            .expect("selected service")
+            .ordered_answers()
+            .len();
+        let selected_service = match app.display_items().get(app.selected_display) {
+            Some(DisplayItem::Instance { index }) => *index,
+            _ => panic!("expected instance selected"),
+        };
+        app.services[selected_service].questions.push((
+            name.to_string(),
+            rtype.to_string(),
+            "192.168.1.99:5353".parse().unwrap(),
+            Instant::now(),
+            packet,
+        ));
+        app.detail_selected = raw_count;
+        app.focus = Focus::Questions;
     }
 
     /// Move the cursor onto the instance row with this name.
@@ -8822,7 +9180,7 @@ mod tests {
         ingest(&mut app, &srv_record(120));
         select_instance(&mut app, "Test");
         // File a self row without recording provenance: LAST must be blank.
-        app.route_own_question("_http._tcp.local.", 12);
+        app.route_own_question("_http._tcp.local.", 12, false);
         let text = questions_pane_text(&app);
         assert!(text.contains("—"), "blank LAST shown:\n{text}");
         assert!(text.contains("PTR"), "ptr row shown:\n{text}");
@@ -10099,7 +10457,7 @@ mod tests {
             src_b,
         ));
         // Our own inferred send for a multicast type stays quiet.
-        app.route_own_question("test.local", 1);
+        app.route_own_question("test.local", 1, false);
         app.evict_expired();
         select_instance(&mut app, "Test");
         let raws = app
