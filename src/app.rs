@@ -430,6 +430,13 @@ const PENDING_ADDR_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 pub const SELF_SOURCE: std::net::SocketAddr =
     std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
 
+/// Whether a record `elapsed` seconds old has reached its 80%-TTL refresh
+/// window (RFC 6762 §5.2). Widened to u64: TTLs are unbounded u32 from the
+/// wire, so `ttl * 4` would overflow for TTLs of 2^30 s or more.
+fn in_refresh_window(elapsed: u32, ttl: u32) -> bool {
+    u64::from(elapsed) * 5 >= u64::from(ttl) * 4
+}
+
 /// Cache-refresh spacing: 5% of the TTL plus 0-2% random variation, so
 /// queries land at ~80/85/90/95% with 80-82/85-87/90-92/95-97% jitter
 /// (RFC 6762 §5.2). No 1s floor: the >=1s rule governs the continuous
@@ -1248,7 +1255,7 @@ impl App {
                 .entry(key.clone())
                 .and_modify(|t| *t = (*t).min(rec.ttl))
                 .or_insert(rec.ttl);
-            if elapsed * 5 >= rec.ttl * 4 {
+            if in_refresh_window(elapsed, rec.ttl) {
                 triggered.insert(key);
             }
         };
@@ -4243,7 +4250,7 @@ impl App {
                 return false;
             }
             let elapsed = r.received_at.elapsed().as_secs() as u32;
-            u64::from(elapsed) * 5 < u64::from(r.ttl) * 4
+            !in_refresh_window(elapsed, r.ttl)
         })
     }
 
@@ -4600,7 +4607,7 @@ impl App {
                         return false;
                     }
                     let elapsed = r.received_at.elapsed().as_secs() as u32;
-                    elapsed <= r.ttl && elapsed * 5 >= r.ttl * 4
+                    elapsed <= r.ttl && in_refresh_window(elapsed, r.ttl)
                 });
                 if !still_expiring {
                     self.requeries.remove(&key);
@@ -5060,7 +5067,7 @@ impl App {
                     return false;
                 }
                 let elapsed = r.received_at.elapsed().as_secs() as u32;
-                elapsed <= r.ttl && elapsed * 5 >= r.ttl * 4
+                elapsed <= r.ttl && in_refresh_window(elapsed, r.ttl)
             });
             if !still_expiring {
                 self.requeries.remove(&key);
@@ -9050,6 +9057,19 @@ mod tests {
         assert_eq!(entry.interval, Duration::from_secs(4));
         assert!(entry.next_due > Instant::now() + Duration::from_secs(1));
         assert!(entry.next_due <= Instant::now() + Duration::from_secs(2));
+    }
+
+    #[test]
+    fn huge_ttl_does_not_overflow_refresh_window() {
+        // TTLs come unbounded from the wire; caching and refreshing a
+        // record with TTL >= 2^30 s must not overflow (debug panic).
+        assert!(!in_refresh_window(0, u32::MAX));
+        assert!(in_refresh_window(u32::MAX, u32::MAX));
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(u32::MAX));
+        ingest(&mut app, &srv_record(u32::MAX));
+        ingest(&mut app, &srv_record(u32::MAX));
+        app.requery_expiring();
     }
 
     #[test]
