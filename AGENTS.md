@@ -32,7 +32,8 @@ Headless run (no TTY) logs to stderr.
   then ≥1s, doubling each time, capped at 1/hour. No fixed 60s re-poll.
 * Cache refresh (`App::requeries`): re-ask at ~80/85/90/95% of TTL with 0–2%
   random variation; after four misses the record expires at 100% TTL.
-  Hourly is only the cap for unanswered continuous browsing.
+  The refresh itself never goes hourly; hourly is only the
+  continuous-browsing cap.
 * Known-answer suppression is PTR-only (shared records, §7.1): only answers
   with ≥half the original TTL remaining, sent with remaining TTL, scoped to
   the egress interface.
