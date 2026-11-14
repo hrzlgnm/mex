@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.1](https://github.com/hrzlgnm/mex/compare/v0.17.0...v0.17.1) (2026-11-14)
+
+
+### Bug Fixes
+
+* show dampened A/AAAA interests as pending in the Questions pane ([#210](https://github.com/hrzlgnm/mex/issues/210)) ([e3fcba5](https://github.com/hrzlgnm/mex/commit/e3fcba5ef66ffaebcdd1b0cea068db0f48a96591))
+
 ## [0.17.0](https://github.com/hrzlgnm/mex/compare/v0.16.2...v0.17.0) (2026-11-14)
 
 
