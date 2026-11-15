@@ -924,6 +924,45 @@ fn finding_scope(a: &Anomaly) -> String {
     }
 }
 
+/// Session-wide finding list with question findings collapsed: one
+/// observed question files on every service whose instance, type or
+/// host name it asks for (e.g. `fritz.box A` lands on each service whose
+/// SRV target is `fritz.box`), so the analyzer emits one finding per
+/// such service. Per-service panes need that fan-out; global views
+/// (metrics overlay, state dump) list the question once instead. Each
+/// kept finding comes with the other services it also filed on, in
+/// order. Non-question findings pass through untouched.
+pub(crate) fn collapse_questions(found: &[Anomaly]) -> Vec<(&Anomaly, Vec<&str>)> {
+    type Key<'a> = (AnomalyKind, String, Option<u16>, Option<&'a str>, &'a str);
+    let mut out: Vec<(&Anomaly, Vec<&str>)> = Vec::with_capacity(found.len());
+    let mut seen: HashMap<Key<'_>, usize> = HashMap::new();
+    for a in found {
+        if !a.kind.is_question() {
+            out.push((a, Vec::new()));
+            continue;
+        }
+        let key = (
+            a.kind,
+            a.record_name
+                .as_deref()
+                .unwrap_or_default()
+                .trim_end_matches('.')
+                .to_lowercase(),
+            a.rtype,
+            a.source.as_deref(),
+            a.message.as_str(),
+        );
+        match seen.get(&key) {
+            Some(&i) => out[i].1.push(a.service.as_str()),
+            None => {
+                seen.insert(key, out.len());
+                out.push((a, Vec::new()));
+            }
+        }
+    }
+    out
+}
+
 /// How many findings share each pointed-to row identity, keyed by
 /// lowercased `(record name, type)`: rows whose identity repeats name
 /// their rdata so identical findings tell apart. Shared by the pane

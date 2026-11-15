@@ -109,6 +109,11 @@ pub struct DumpAnomaly {
     pub kind: String,
     pub severity: String,
     pub service: String,
+    /// Further services the same question finding filed on (one observed
+    /// question routes to every service whose name it asks for). Listed
+    /// once in the dump; omitted when the finding has a single service.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub also_services: Vec<String>,
     pub record_name: Option<String>,
     pub rtype: Option<u16>,
     pub rtype_str: Option<String>,

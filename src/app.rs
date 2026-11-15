@@ -2306,19 +2306,22 @@ impl App {
         // Anomalies last: the list can be long, and the overlay scrolls
         // (j/k, PgUp/PgDn), so every finding is listed instead of capped.
         section(&mut rows, "Anomalies");
-        let errors = found
+        // One question filed on several services is one finding here:
+        // the overlay is session-wide, not per service.
+        let collapsed = anomalies::collapse_questions(found);
+        let errors = collapsed
             .iter()
-            .filter(|a| matches!(a.severity, anomalies::Severity::Error))
+            .filter(|(a, _)| matches!(a.severity, anomalies::Severity::Error))
             .count();
-        let warnings = found
+        let warnings = collapsed
             .iter()
-            .filter(|a| matches!(a.severity, anomalies::Severity::Warning))
+            .filter(|(a, _)| matches!(a.severity, anomalies::Severity::Warning))
             .count();
-        let infos = found.len().saturating_sub(errors + warnings);
+        let infos = collapsed.len().saturating_sub(errors + warnings);
         kv(
             &mut rows,
             "summary",
-            if found.is_empty() {
+            if collapsed.is_empty() {
                 "none".to_string()
             } else {
                 format!("{errors} error · {warnings} warning · {infos} info")
@@ -2326,8 +2329,13 @@ impl App {
         );
         // Row identities already claimed in this overlay: repeated
         // identities name their rdata, mirroring the Anomalies pane.
-        let identity_count = anomalies::identity_counts(found.iter());
-        for a in found.iter() {
+        let identity_count = anomalies::identity_counts(collapsed.iter().map(|(a, _)| *a));
+        for (a, also) in &collapsed {
+            let service = if also.is_empty() {
+                a.service.clone()
+            } else {
+                format!("{} (+{} more)", a.service, also.len())
+            };
             // `<source> <service> <scope> <text>`; unsourced findings omit
             // the source slot, and the key's icon carries the level. The
             // scope helper omits constant/absent row identities and names
@@ -2345,8 +2353,8 @@ impl App {
             // colon sits before the message when no scope intervenes.
             let sep = if scope.is_empty() { ":" } else { "" };
             let value = match a.source.as_deref() {
-                Some(src) => format!("{src}: {}{sep} {scoped} ({})", a.service, a.rfc),
-                _ => format!("{}{sep} {scoped} ({})", a.service, a.rfc),
+                Some(src) => format!("{src}: {service}{sep} {scoped} ({})", a.rfc),
+                _ => format!("{service}{sep} {scoped} ({})", a.rfc),
             };
             kv(
                 &mut rows,
@@ -2871,20 +2879,23 @@ impl App {
                 }
             })
             .collect();
-        let found = self.anomalies();
+        let all = self.anomalies();
+        // The dump is session-wide: a question filed on several services
+        // is listed once, naming the other services in `also_services`.
+        let found = anomalies::collapse_questions(&all);
         metrics.insert("anomalies_total".to_string(), found.len() as u64);
         metrics.insert(
             "anomalies_error".to_string(),
             found
                 .iter()
-                .filter(|a| matches!(a.severity, anomalies::Severity::Error))
+                .filter(|(a, _)| matches!(a.severity, anomalies::Severity::Error))
                 .count() as u64,
         );
         metrics.insert(
             "anomalies_warning".to_string(),
             found
                 .iter()
-                .filter(|a| matches!(a.severity, anomalies::Severity::Warning))
+                .filter(|(a, _)| matches!(a.severity, anomalies::Severity::Warning))
                 .count() as u64,
         );
         metrics.insert(
@@ -2926,10 +2937,11 @@ impl App {
             interests,
             anomalies: found
                 .iter()
-                .map(|a| dump::DumpAnomaly {
+                .map(|(a, also)| dump::DumpAnomaly {
                     kind: a.kind.as_str().to_string(),
                     severity: a.severity.as_str().to_string(),
                     service: a.service.clone(),
+                    also_services: also.iter().map(|s| s.to_string()).collect(),
                     record_name: a.record_name.clone(),
                     rtype: a.rtype,
                     rtype_str: a.rtype_str.clone(),
@@ -11252,6 +11264,58 @@ mod tests {
             .anomalies()
             .iter()
             .any(|a| a.kind.as_str() == "unresolved-srv-target"));
+    }
+
+    #[test]
+    fn shared_target_question_is_listed_once_in_global_views() {
+        // One `fritz.box A` question files on both services pointing at
+        // fritz.box: each pane keeps its finding, the dump and the metrics
+        // overlay list it once and name the other service.
+        let mut app = App::new().unwrap();
+        for svc in ["_fbox._tcp.local.", "_tr064._tcp.local."] {
+            let instance = format!("Fritzel.{svc}");
+            ingest(&mut app, &raw_record(svc, 12, "PTR", &instance, 4500));
+            ingest(
+                &mut app,
+                &raw_record(&instance, 33, "SRV", "0 0 49000 fritz.box.", 120),
+            );
+        }
+        let querier: SocketAddr = "192.168.1.9:5353".parse().unwrap();
+        app.ingest_event(&query_event(
+            "fritz.box.",
+            1,
+            "A",
+            false,
+            Vec::new(),
+            querier,
+        ));
+
+        let per_service: Vec<_> = app
+            .anomalies()
+            .into_iter()
+            .filter(|a| a.kind == anomalies::AnomalyKind::GlobalQuestion)
+            .map(|a| a.service)
+            .collect();
+        assert_eq!(per_service.len(), 2, "each service keeps its finding");
+
+        let dump = app.state_dump();
+        let dumped: Vec<_> = dump
+            .anomalies
+            .iter()
+            .filter(|a| a.kind == "global-question")
+            .collect();
+        assert_eq!(dumped.len(), 1, "dump lists the question once");
+        assert_eq!(dumped[0].also_services.len(), 1);
+        assert_ne!(dumped[0].also_services[0], dumped[0].service);
+        assert_eq!(dump.metrics["anomalies_total"], dump.anomalies.len() as u64);
+
+        let overlay: Vec<_> = app
+            .metrics_rows()
+            .into_iter()
+            .filter(|(k, _)| k.ends_with("global-question"))
+            .collect();
+        assert_eq!(overlay.len(), 1, "overlay lists the question once");
+        assert!(overlay[0].1.contains("(+1 more)"), "got: {}", overlay[0].1);
     }
 
     #[test]
