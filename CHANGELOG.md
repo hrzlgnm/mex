@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.18.0](https://github.com/hrzlgnm/mex/compare/v0.17.2...v0.18.0) (2026-11-15)
+
+
+### Features
+
+* rework unicast-leak into unicast-style-response ([#220](https://github.com/hrzlgnm/mex/issues/220)) ([a5df25c](https://github.com/hrzlgnm/mex/commit/a5df25c322f3e15610f21d77a853e8bebb3ee396))
+
+
+### Bug Fixes
+
+* flag missing flush bit in unicast replies to port 5353 ([#219](https://github.com/hrzlgnm/mex/issues/219)) ([912dc31](https://github.com/hrzlgnm/mex/commit/912dc314c901d545258c2199be0674fed8efce1e))
+* list each question finding once in global anomaly views ([#217](https://github.com/hrzlgnm/mex/issues/217)) ([a5d9874](https://github.com/hrzlgnm/mex/commit/a5d98746dd9cf0e436755dfc0f8699c461695c6c))
+* report NS/SOA outside mDNS domains as info, not an error ([#218](https://github.com/hrzlgnm/mex/issues/218)) ([56ac85d](https://github.com/hrzlgnm/mex/commit/56ac85d076aa553c5d087f4ca33e4ad11675beee))
+
+
+### Dependencies
+
+* update dtolnay/rust-toolchain digest to 3900882 ([#214](https://github.com/hrzlgnm/mex/issues/214)) ([6057667](https://github.com/hrzlgnm/mex/commit/6057667aa052e0e688ed3184ec880e4cc5186325))
+* update ghcr.io/hrzlgnm/mdns-browser-arch-aur-builder:v1 docker digest to 09fea71 ([#215](https://github.com/hrzlgnm/mex/issues/215)) ([ee76b0f](https://github.com/hrzlgnm/mex/commit/ee76b0f00058fefab6092a28fccb1604b3138199))
+
+
+### Code Refactoring
+
+* drop the global-question anomaly ([#222](https://github.com/hrzlgnm/mex/issues/222)) ([90b0e24](https://github.com/hrzlgnm/mex/commit/90b0e242d8d016b0207531df46859f8643f4f39d))
+
 ## [0.17.2](https://github.com/hrzlgnm/mex/compare/v0.17.1...v0.17.2) (2026-11-15)
 
 
