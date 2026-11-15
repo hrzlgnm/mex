@@ -360,7 +360,9 @@ fn rand_range(lo_ms: u64, hi_ms: u64) -> Duration {
     Duration::from_millis(lo_ms + (rand_u32() as u64 % span))
 }
 
-const ENUM_SERVICE: &str = "_services._dns-sd._udp.local";
+/// DNS-SD service type enumeration name (RFC 6763 §9), without the
+/// trailing root dot.
+pub(crate) const ENUM_SERVICE: &str = "_services._dns-sd._udp.local";
 /// Group header for the selectable enumeration row in the Hosts pane.
 pub const ENUM_HOST: &str = "(enumeration)";
 
