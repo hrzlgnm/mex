@@ -4527,8 +4527,11 @@ impl App {
     /// precede the service, so matching pending instances park them until
     /// `handle_srv` moves them over on promotion. Passive mode sends nothing.
     fn route_own_question(&mut self, name: &str, rtype: u16, qu: bool) {
-        let display = name.trim_end_matches('.').to_string();
-        let key = display.to_lowercase();
+        // Display in the same fully-qualified form as observed questions
+        // (`display_name` adds the root dot); match on the dot-less key.
+        let bare = name.trim_end_matches('.');
+        let display = format!("{bare}.");
+        let key = bare.to_lowercase();
         let Some(label) = Self::own_rtype_label(rtype) else {
             return;
         };
@@ -5952,7 +5955,7 @@ mod tests {
             assert!(
                 svc.questions
                     .iter()
-                    .any(|q| q.0 == "test.local" && q.1 == label && q.2 == SELF_SOURCE),
+                    .any(|q| q.0 == "test.local." && q.1 == label && q.2 == SELF_SOURCE),
                 "{label} interest must show as a pending self row"
             );
         }
@@ -6614,7 +6617,7 @@ mod tests {
         assert_eq!(app.services[0].questions.len(), 1);
         assert!(app.services[1].questions.is_empty());
         let q = &app.services[0].questions[0];
-        assert_eq!(q.0, "_http._tcp.local");
+        assert_eq!(q.0, "_http._tcp.local.");
         assert_eq!(q.1, "PTR");
         assert_eq!(q.2, SELF_SOURCE);
         assert!(browse::question_fields(&q.4, &q.0, &q.1).is_some());
@@ -6704,7 +6707,7 @@ mod tests {
                 _ => panic!("expected instance selected"),
             };
             app.services[sel_idx].questions.push((
-                "_ssh._tcp.local".to_string(),
+                "_ssh._tcp.local.".to_string(),
                 "PTR".to_string(),
                 remote,
                 Instant::now(),
@@ -6746,7 +6749,7 @@ mod tests {
             .expect("self question has hex payload");
         assert_ne!(bytes, fallback);
         assert!(browse::question_fields(&bytes, "_ssh._tcp.local", "PTR").is_some());
-        assert_eq!(title, " QRY PTR _ssh._tcp.local (inferred) ");
+        assert_eq!(title, " QRY PTR _ssh._tcp.local. (inferred) ");
         // Remote row returns its own query packet bytes under the
         // unmarked title.
         app.detail_selected = raws + remote_pos;
@@ -6754,7 +6757,7 @@ mod tests {
             .selected_detail_bytes()
             .expect("remote question has hex payload");
         assert_eq!(rbytes, pkt);
-        assert_eq!(remote_title, " QRY PTR _ssh._tcp.local ");
+        assert_eq!(remote_title, " QRY PTR _ssh._tcp.local. ");
     }
 
     #[test]
@@ -6769,7 +6772,7 @@ mod tests {
         app.clamp_selection();
         let remote: std::net::SocketAddr = "192.168.1.99:5353".parse().unwrap();
         app.enum_entries[0].questions.push((
-            "_services._dns-sd._udp.local".to_string(),
+            "_services._dns-sd._udp.local.".to_string(),
             "PTR".to_string(),
             remote,
             Instant::now(),
@@ -6791,7 +6794,7 @@ mod tests {
             .selected_detail_bytes()
             .expect("self enum question has hex payload");
         assert!(browse::question_fields(&bytes, "_services._dns-sd._udp.local", "PTR").is_some());
-        assert_eq!(title, " QRY PTR _services._dns-sd._udp.local (inferred) ");
+        assert_eq!(title, " QRY PTR _services._dns-sd._udp.local. (inferred) ");
     }
 
     /// Render the full UI into a test buffer at the given size. Shared
