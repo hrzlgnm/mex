@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.2](https://github.com/hrzlgnm/mex/compare/v0.17.1...v0.17.2) (2026-11-15)
+
+
+### Bug Fixes
+
+* show own questions with a trailing root dot like observed ones ([#212](https://github.com/hrzlgnm/mex/issues/212)) ([650efed](https://github.com/hrzlgnm/mex/commit/650efedeb664d0918b6fecaba75eb3310467fa48))
+
 ## [0.17.1](https://github.com/hrzlgnm/mex/compare/v0.17.0...v0.17.1) (2026-11-14)
 
 
