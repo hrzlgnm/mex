@@ -42,7 +42,6 @@ pub enum AnomalyKind {
     UnresolvedSrvTarget,
     UnicastStyleResponse,
     UnicastQuestion,
-    GlobalQuestion,
     TtlLow,
     TtlHigh,
     TtlMismatch,
@@ -62,7 +61,6 @@ impl AnomalyKind {
             AnomalyKind::UnresolvedSrvTarget => "unresolved-srv-target",
             AnomalyKind::UnicastStyleResponse => "unicast-style-response",
             AnomalyKind::UnicastQuestion => "unicast-question",
-            AnomalyKind::GlobalQuestion => "global-question",
             AnomalyKind::TtlLow => "ttl-low",
             AnomalyKind::TtlHigh => "ttl-high",
             AnomalyKind::TtlMismatch => "ttl-mismatch",
@@ -90,10 +88,7 @@ impl AnomalyKind {
 
     /// Whether this is a demand-side (observed question) finding.
     pub fn is_question(self) -> bool {
-        matches!(
-            self,
-            AnomalyKind::UnicastQuestion | AnomalyKind::GlobalQuestion
-        )
+        matches!(self, AnomalyKind::UnicastQuestion)
     }
 }
 
@@ -409,9 +404,7 @@ fn dedup(mut items: Vec<Anomaly>) -> Vec<Anomaly> {
         // the same rdata via multicast vs unicast (or answer vs
         // authority) is a different verdict and must not collapse.
         let source_key = match a.kind {
-            AnomalyKind::UnicastQuestion | AnomalyKind::GlobalQuestion => {
-                a.source.clone().unwrap_or_default()
-            }
+            AnomalyKind::UnicastQuestion => a.source.clone().unwrap_or_default(),
             _ => String::new(),
         };
         let context_key = match a.kind {
@@ -1186,20 +1179,12 @@ fn check_question(q: &QuestionView, out: &mut Vec<Anomaly>) {
         requirement,
         response: None,
     };
-    // RFC 6762 §3: names outside .local (and the link-local reverse
-    // zones, §4) MAY go to mDNS only when no conventional DNS server is
-    // available; §13: that fail-over SHOULD be opt-in and off by
-    // default. Type-independent: an A query for a global name is the
-    // same case as an SOA one. Info: the querier may have opted in.
-    if !is_mdns_domain(q.name) {
-        out.push(finding(
-            AnomalyKind::GlobalQuestion,
-            Severity::Info,
-            format!("non-.local name queried over mDNS{one_shot}"),
-            "RFC 6762 §13",
-            "SHOULD",
-        ));
-    }
+    // Questions for names outside the mDNS domains are not flagged: the
+    // only ones filed here ask for a service's SRV target (e.g.
+    // `fritz.box`), which DNS-SD browsers (mex, avahi) legitimately
+    // resolve over mDNS on the link that advertised it (RFC 6762 §3
+    // allows it). The §13 fail-over case, global names typed by a user,
+    // never matches a service and so never reaches the analyzer.
     if let Some(severity) = question_unicast_severity(q.rtype) {
         out.push(finding(
             AnomalyKind::UnicastQuestion,
@@ -2116,33 +2101,22 @@ mod tests {
     }
 
     #[test]
-    fn global_question_flags_non_local_names_of_any_type() {
-        // RFC 6762 §3 MAY / §13 SHOULD be opt-in: type-independent, so a
-        // plain A query for a global name flags just like SOA does.
+    fn questions_for_global_names_are_not_flagged_as_such() {
+        // Resolving a global SRV target over mDNS is ordinary DNS-SD: an
+        // A query for fritz.box stays quiet.
         let found =
             analyze_questions(&[qview("My._http._tcp.local", "fritz.box.", 1, test_source())]);
-        let item = found
-            .iter()
-            .find(|a| a.kind == AnomalyKind::GlobalQuestion)
-            .expect("expected global-question");
-        assert_eq!(item.severity, Severity::Info);
-        assert_eq!((item.rfc, item.requirement), ("RFC 6762 §13", "SHOULD"));
-        assert_eq!(item.message, "non-.local name queried over mDNS");
-        assert!(!found.iter().any(|a| a.kind == AnomalyKind::UnicastQuestion));
-
-        // SOA for a global name: both findings, each with its own reason.
+        assert!(found.is_empty(), "got: {found:?}");
+        // SOA for it only flags the unicast-only type.
         let stub: SocketAddr = "192.168.1.9:45678".parse().unwrap();
         let found = analyze_questions(&[qview("My._http._tcp.local", "fritz.box.", 6, stub)]);
-        let mut kinds: Vec<_> = found.iter().map(|a| a.kind.as_str()).collect();
-        kinds.sort_unstable();
-        assert_eq!(kinds, ["global-question", "unicast-question"]);
-        assert!(found
-            .iter()
-            .all(|a| a.message.ends_with("(one-shot querier)")));
+        let kinds: Vec<_> = found.iter().map(|a| a.kind.as_str()).collect();
+        assert_eq!(kinds, ["unicast-question"]);
+        assert!(found[0].message.ends_with("(one-shot querier)"));
     }
 
     #[test]
-    fn global_question_quiet_for_mdns_domains() {
+    fn mdns_domains_cover_local_and_link_local_reverse_zones() {
         for name in [
             "host.local.",
             "HOST.LOCAL",
@@ -2152,11 +2126,7 @@ mod tests {
             "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.e.f.ip6.arpa.",
             "b.e.f.ip6.arpa.",
         ] {
-            let found = analyze_questions(&[qview("My._http._tcp.local", name, 1, test_source())]);
-            assert!(
-                !found.iter().any(|a| a.kind == AnomalyKind::GlobalQuestion),
-                "{name} is an mDNS domain, got: {found:?}"
-            );
+            assert!(is_mdns_domain(name), "{name} is an mDNS domain");
         }
         // Lookalikes outside the zones are global.
         for name in ["notlocal.", "10.1.168.192.in-addr.arpa.", "c.e.f.ip6.arpa."] {
@@ -2165,21 +2135,21 @@ mod tests {
     }
 
     #[test]
-    fn global_question_self_and_per_querier() {
+    fn unicast_question_self_and_per_querier() {
         let zelf: SocketAddr = "0.0.0.0:0".parse().unwrap();
-        let found = analyze_questions(&[qview("My._http._tcp.local", "fritz.box.", 1, zelf)]);
+        let found = analyze_questions(&[qview("My._http._tcp.local", "host.local.", 6, zelf)]);
         assert!(found.is_empty(), "own sends stay quiet, got: {found:?}");
         let a: SocketAddr = "192.168.1.9:5353".parse().unwrap();
         let b: SocketAddr = "192.168.1.10:5353".parse().unwrap();
         let found = analyze_questions(&[
-            qview("My._http._tcp.local", "fritz.box.", 1, a),
-            qview("My._http._tcp.local", "fritz.box.", 1, a),
-            qview("My._http._tcp.local", "fritz.box.", 1, b),
+            qview("My._http._tcp.local", "host.local.", 6, a),
+            qview("My._http._tcp.local", "host.local.", 6, a),
+            qview("My._http._tcp.local", "host.local.", 6, b),
         ]);
         assert_eq!(
             found
                 .iter()
-                .filter(|f| f.kind == AnomalyKind::GlobalQuestion)
+                .filter(|f| f.kind == AnomalyKind::UnicastQuestion)
                 .count(),
             2,
             "one finding per querier"
@@ -2193,13 +2163,14 @@ mod tests {
             qview("My._http._tcp.local", "fritz.box.", 6, test_source()),
             qview("My._http._tcp.local", "FRITZ.Box", 6, test_source()),
         ]);
-        for kind in [AnomalyKind::GlobalQuestion, AnomalyKind::UnicastQuestion] {
-            assert_eq!(
-                found.iter().filter(|a| a.kind == kind).count(),
-                1,
-                "{kind} must not split on name case, got: {found:?}"
-            );
-        }
+        assert_eq!(
+            found
+                .iter()
+                .filter(|a| a.kind == AnomalyKind::UnicastQuestion)
+                .count(),
+            1,
+            "unicast-question must not split on name case, got: {found:?}"
+        );
     }
 
     #[test]

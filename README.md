@@ -162,7 +162,7 @@ and surfaces each deviation as an anomaly with a severity:
   the metrics overlay and state dumps (e.g. a PTR re-announced with a
   120 s TTL instead of the recommended 4500 s, a unique record missing
   its cache-flush bit, an SRV target outside `.local`, a question for
-  NS/SOA or for a non-`.local` name).
+  NS/SOA).
 
 Findings show up in several places: anomalous Answers rows get a `!`
 marker (on the type cell, or on the TTL cell when the TTL itself is
@@ -193,7 +193,6 @@ info for inconclusive lookups).
 | `no-flush` (warning when confirmed, else info) | unique SRV/TXT record missing the cache-flush bit ([RFC 6762 §10.2](https://www.rfc-editor.org/rfc/rfc6762#section-10.2), MUST when confirmed); confirmed in the answer or additional section of any response mex receives, including unicast replies, since mex only listens on port 5353 and so never gets legacy unicast responses ([RFC 6762 §6.7](https://www.rfc-editor.org/rfc/rfc6762#section-6.7)) |
 | `unicast-style-response` (error, warning or info) | an mDNS response carrying unicast DNS-style records, one finding per record, naming its section: ANY is error (a query type, never a record type, [RFC 1035 §3.2.3](https://www.rfc-editor.org/rfc/rfc1035#section-3.2.3)); SOA in the Authority section is a warning (a unicast-style negative answer, where mDNS uses NSEC, [RFC 6762 §6.1](https://www.rfc-editor.org/rfc/rfc6762#section-6.1)); other SOA is a warning for names in mDNS domains (`.local` and the link-local reverse zones; mDNS zones have none, [RFC 6762 §12](https://www.rfc-editor.org/rfc/rfc6762#section-12)) and info for names outside them, such as a router's `fritz.box` zone ([RFC 6762 §3](https://www.rfc-editor.org/rfc/rfc6762#section-3)); NS is info (no meaning in mDNS); known answers are always info. State dumps add `section` and, when a question for the same name was seen up to 1 s before, `in_response_to` (`name TYPE`) and `in_response_to_own` (whether this mex instance asked) |
 | `unicast-question` (info) | multicast question for NS/SOA, which never exist in mDNS ([RFC 6762 §12](https://www.rfc-editor.org/rfc/rfc6762#section-12)); asking is compliant, since [RFC 6762 §3](https://www.rfc-editor.org/rfc/rfc6762#section-3) requires `.local` queries on multicast; ANY questions are ownership probes and stay quiet; ephemeral-port queriers are tagged one-shot |
-| `global-question` (info) | multicast question for a name outside `.local` and the link-local reverse zones; allowed only as fail-over when no unicast DNS server is available ([RFC 6762 §3](https://www.rfc-editor.org/rfc/rfc6762#section-3), MAY), which SHOULD be opt-in and off by default ([RFC 6762 §13](https://www.rfc-editor.org/rfc/rfc6762#section-13)); any query type; ephemeral-port queriers are tagged one-shot |
 | `ttl-low` / `ttl-high` (warning) | TTL below 10 s (churn risk) or above 7200 s (stale-cache risk) ([RFC 6762 §10](https://www.rfc-editor.org/rfc/rfc6762#section-10), SHOULD) |
 | `ttl-mismatch` (info) | service PTR at ≤ 120 s instead of the recommended 4500 s base ([RFC 6762 §10](https://www.rfc-editor.org/rfc/rfc6762#section-10), SHOULD) |
 | `ttl-unstable` (warning) | same name and type announced with different TTL bases ([RFC 6762 §10](https://www.rfc-editor.org/rfc/rfc6762#section-10)) |
