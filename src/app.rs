@@ -2712,7 +2712,13 @@ impl App {
         dump::DumpQuestion {
             name: q.0.clone(),
             rtype_str: q.1.clone(),
-            source: q.2.to_string(),
+            // Own inferred sends carry the `SELF_SOURCE` sentinel; spell
+            // it `self` as the Questions pane does, not `0.0.0.0:0`.
+            source: if q.2 == SELF_SOURCE {
+                "self".to_string()
+            } else {
+                q.2.to_string()
+            },
             received_at: dump::instant_to_iso(q.3),
             age_secs: q.3.elapsed().as_secs(),
         }
@@ -6521,6 +6527,27 @@ mod tests {
             txt.rdata,
             "id=*REDACTED*; external_url=*REDACTED*; fn=Schreibtisch"
         );
+    }
+
+    #[test]
+    fn dump_question_row_labels_self_source() {
+        let now = Instant::now();
+        let own = (
+            "_http._tcp.local".to_string(),
+            "PTR".to_string(),
+            SELF_SOURCE,
+            now,
+            Vec::new(),
+        );
+        assert_eq!(App::dump_question_row(&own).source, "self");
+        let remote = (
+            "_http._tcp.local".to_string(),
+            "PTR".to_string(),
+            "192.168.1.5:5353".parse().unwrap(),
+            now,
+            Vec::new(),
+        );
+        assert_eq!(App::dump_question_row(&remote).source, "192.168.1.5:5353");
     }
 
     #[test]
