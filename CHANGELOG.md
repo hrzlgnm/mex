@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.18.2](https://github.com/hrzlgnm/mex/compare/v0.18.1...v0.18.2) (2026-11-15)
+
+
+### Code Refactoring
+
+* derive the program name from CARGO_PKG_NAME ([#233](https://github.com/hrzlgnm/mex/issues/233)) ([fb75373](https://github.com/hrzlgnm/mex/commit/fb7537367ab8ebd8a680bc104ad272d09d9cea03))
+* render Questions DUE labels from TimerKind ([#232](https://github.com/hrzlgnm/mex/issues/232)) ([6a21a6c](https://github.com/hrzlgnm/mex/commit/6a21a6c34fc7ca42edfc58bb292aa7f04394f095))
+
 ## [0.18.1](https://github.com/hrzlgnm/mex/compare/v0.18.0...v0.18.1) (2026-11-15)
 
 
