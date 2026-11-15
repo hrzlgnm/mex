@@ -1041,7 +1041,9 @@ pub(crate) fn is_reverse_ptr(name: &str) -> bool {
 /// Verdict for unicast-only types answered on multicast: NS/SOA records
 /// do not exist in mDNS zones (RFC 6762 §12) and ANY is never an RR type,
 /// so all three are errors; everything else is `None` (quiet). MX is not
-/// restricted by RFC 6762 or RFC 6763 and stays quiet.
+/// restricted by RFC 6762 or RFC 6763 and stays quiet. `check_record`
+/// lowers NS/SOA owned by names outside the mDNS domains to Info: §12
+/// says nothing about those zones.
 pub(crate) fn unicast_severity(rtype: u16) -> Option<Severity> {
     match rtype {
         2 | 6 | 255 => Some(Severity::Error),
@@ -1205,6 +1207,11 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     // unicast reply or a non-answer section is only a Warning pending
     // capture verification — the destination/section is named so users
     // can tell which case they have.
+    // §12 only covers the mDNS domains: NS/SOA for a name outside them
+    // (e.g. a router answering `fritz.box`, its real unicast zone, to a
+    // query for that name sent over mDNS, which §3 allows) is unicast
+    // zone data in an mDNS reply, not a record that cannot exist. Info,
+    // cited to §3, with no requirement level.
     if let Some(base) = unicast_severity(rec.rtype) {
         let confirmed = rec.dst_is_multicast && rec.section == crate::browse::RecordSection::Answer;
         let context = if !rec.dst_is_multicast {
@@ -1212,7 +1219,13 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         } else {
             format!("{:?} section", rec.section).to_lowercase()
         };
-        let (severity, message) = if confirmed {
+        let global = matches!(rec.rtype, 2 | 6) && !is_mdns_domain(&rec.name);
+        let (severity, message) = if global {
+            (
+                Severity::Info,
+                format!("{} for non-mDNS name in mDNS reply", rec.rtype_str),
+            )
+        } else if confirmed {
             // The overlay has no record columns, so the message keeps the
             // rtype: it names what is not defined for mDNS.
             let message = format!("{} not defined for mDNS", rec.rtype_str);
@@ -1236,7 +1249,11 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             rdata: Some(rdata.clone()),
             source: Some(src.clone()),
             message,
-            rfc: unicast_leak_rfc(rec.rtype),
+            rfc: if global {
+                "RFC 6762 §3"
+            } else {
+                unicast_leak_rfc(rec.rtype)
+            },
             requirement: "",
         });
     }
@@ -1750,6 +1767,51 @@ mod tests {
             cite(AnomalyKind::TxtOversize, 16),
             ("RFC 6763 §6.2", "SHOULD NOT")
         );
+    }
+
+    #[test]
+    fn unicast_leak_ns_soa_for_global_name_is_info() {
+        // A router answering a query for its own unicast zone over mDNS:
+        // §12 does not cover fritz.box, so this is an observation only.
+        let answers = vec![
+            rec("fritz.box.", 2, "NS", "fritz.box.", 10, false),
+            rec(
+                "fritz.box.",
+                6,
+                "SOA",
+                "fritz.box. admin.fritz.box. 1794738133 21600 1800 43200 10",
+                10,
+                false,
+            ),
+        ];
+        let found = analyze_service("Fritzel", "_fbox._tcp.local", "fritz.box.", &answers);
+        let leaks: Vec<_> = found
+            .iter()
+            .filter(|a| a.kind == AnomalyKind::UnicastLeak)
+            .collect();
+        assert_eq!(leaks.len(), 2);
+        for item in leaks {
+            assert_eq!(item.severity, Severity::Info);
+            assert_eq!(item.rfc, "RFC 6762 §3");
+            assert_eq!(item.requirement, "");
+            assert!(item.message.contains("non-mDNS name"), "{}", item.message);
+        }
+        // The same SOA owned by a .local name stays an error (§12).
+        let answers = vec![rec(
+            "host.local.",
+            6,
+            "SOA",
+            "host.local. admin 1 2 3 4 5",
+            120,
+            false,
+        )];
+        let found = analyze_service("My", "_http._tcp.local", "host.local.", &answers);
+        let item = found
+            .iter()
+            .find(|a| a.kind == AnomalyKind::UnicastLeak)
+            .expect("expected SOA leak");
+        assert_eq!(item.severity, Severity::Error);
+        assert_eq!(item.rfc, "RFC 6762 §12");
     }
 
     #[test]
