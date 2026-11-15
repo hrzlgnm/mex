@@ -453,6 +453,12 @@ fn refresh_step(ttl_secs: u32, jitter_pct: u32) -> Duration {
 /// §7.3). Checked only when our query is due, so this is the window for
 /// near-simultaneous queries from multiple queriers.
 const OVERHEARD_WINDOW: Duration = Duration::from_secs(2);
+
+/// How long after a question a unicast-style response is still
+/// attributed to it. RFC 6762 §6 delays responses by at most ~500ms
+/// (aggregation), so 1s covers every compliant responder without
+/// reaching back to an unrelated earlier question.
+const TRIGGER_WINDOW: Duration = Duration::from_secs(1);
 /// Packet arrival times older than this are dropped from the rate window.
 const METRICS_WINDOW: Duration = Duration::from_secs(300);
 
@@ -2586,8 +2592,8 @@ impl App {
             })
             .collect();
         // Observed questions flattened with their owning service id, so the
-        // analyzer can attribute demand-side leaks the same way it does
-        // answer sightings. Unrecognised type labels stay quiet.
+        // analyzer can attribute demand-side unicast-type questions the
+        // same way it does answer sightings. Unrecognised type labels stay quiet.
         let mut questions: Vec<anomalies::QuestionView<'_>> = Vec::new();
         for s in &self.services {
             Self::push_question_views(
@@ -2956,6 +2962,17 @@ impl App {
                     message: a.message.clone(),
                     rfc: a.rfc.to_string(),
                     requirement: a.requirement.to_string(),
+                    section: a.response.as_ref().map(|r| r.section.as_str().to_string()),
+                    in_response_to: a
+                        .response
+                        .as_ref()
+                        .and_then(|r| r.trigger.as_ref())
+                        .map(|t| t.question.clone()),
+                    in_response_to_own: a
+                        .response
+                        .as_ref()
+                        .and_then(|r| r.trigger.as_ref())
+                        .map(|t| t.own),
                 })
                 .collect(),
         }
@@ -4238,12 +4255,54 @@ impl App {
                 self.ingest_goodbye(rec, ev);
                 continue;
             }
-            self.ingest_record(rec, ev);
+            // Unicast-style records (NS/SOA/ANY) remember the question
+            // that most likely triggered them, so findings can tell a
+            // reply to our own query from one to someone else's.
+            if matches!(rec.rtype, 2 | 6 | 255) {
+                let mut rec = rec.clone();
+                rec.trigger = self.response_trigger(&rec);
+                self.ingest_record(&rec, ev);
+            } else {
+                self.ingest_record(rec, ev);
+            }
         }
         for q in &ev.questions {
             self.note_overheard(q, ev);
             self.route_question(q, ev);
         }
+    }
+
+    /// The question a response record most likely answered: the latest
+    /// question for its owner name, any type, ours (transmitted) or a
+    /// remote querier's (observed), at most `TRIGGER_WINDOW` before the
+    /// record arrived. mDNS responses carry no question section
+    /// (RFC 6762 §6), so timing is all there is. Provenance keeps only the
+    /// latest timestamp per interest, which is why this runs at ingest.
+    fn response_trigger(&self, rec: &browse::RawRecord) -> Option<browse::QueryTrigger> {
+        let name = Self::provenance_key(&rec.name, rec.rtype).0;
+        self.query_history
+            .iter()
+            .filter(|((n, _), _)| *n == name)
+            .flat_map(|((_, rtype), state)| {
+                [
+                    (state.transmitted, true),
+                    (state.observed.as_ref().map(|o| o.at), false),
+                ]
+                .into_iter()
+                .filter_map(move |(at, own)| at.map(|at| (at, own, *rtype)))
+            })
+            .filter(|(at, _, _)| {
+                *at <= rec.received_at && rec.received_at.duration_since(*at) <= TRIGGER_WINDOW
+            })
+            .max_by_key(|(at, _, _)| *at)
+            .map(|(_, own, rtype)| browse::QueryTrigger {
+                question: format!(
+                    "{}. {}",
+                    rec.name.trim_end_matches('.'),
+                    browse::rtype_label(rtype)
+                ),
+                own,
+            })
     }
 
     /// Record an overheard QM question for duplicate question suppression
@@ -5639,8 +5698,8 @@ impl App {
     }
 
     /// Row-identity match for one observed question row within a
-    /// precomputed finding set: the demand-side leak attributed to its
-    /// querier. Own inferred sends (`SELF_SOURCE`, port 0) never match a
+    /// precomputed finding set: the demand-side unicast-type question
+    /// attributed to its querier. Own inferred sends (`SELF_SOURCE`, port 0) never match a
     /// finding, and unrecognised type labels stay quiet.
     fn question_anomalies_in(
         found: &[anomalies::Anomaly],
@@ -5794,6 +5853,7 @@ mod tests {
             dst_is_multicast: true,
             section: browse::RecordSection::Answer,
             received_at: Instant::now(),
+            trigger: None,
         }
     }
 
@@ -6877,7 +6937,7 @@ mod tests {
             .anomalies()
             .into_iter()
             .find(|a| a.kind == anomalies::AnomalyKind::UnicastQuestion)
-            .expect("expected routed SOA question leak");
+            .expect("expected routed SOA unicast question");
         assert_eq!(item.service, "Test._http._tcp.local");
         assert_eq!(item.severity, crate::anomalies::Severity::Info);
         assert_eq!(
@@ -9864,6 +9924,7 @@ mod tests {
             dst_is_multicast: true,
             section: browse::RecordSection::Question,
             received_at: Instant::now(),
+            trigger: None,
         };
         browse::Event {
             answers: Vec::new(),
@@ -10050,6 +10111,7 @@ mod tests {
                 dst_is_multicast: true,
                 section: browse::RecordSection::Question,
                 received_at: Instant::now(),
+                trigger: None,
             }],
             query_kas: vec![ptr_record(120)],
             rcode: Some(0),
@@ -11267,6 +11329,93 @@ mod tests {
     }
 
     #[test]
+    fn unicast_style_response_names_its_triggering_question() {
+        // The Fritzbox answers a `fritz.box` address query over mDNS with
+        // SOA. The finding names that question and whether we asked it.
+        fn fritz_app() -> App {
+            let mut app = App::new().unwrap();
+            ingest(
+                &mut app,
+                &raw_record(
+                    "_fbox._tcp.local.",
+                    12,
+                    "PTR",
+                    "Fritzel._fbox._tcp.local.",
+                    4500,
+                ),
+            );
+            ingest(
+                &mut app,
+                &raw_record(
+                    "Fritzel._fbox._tcp.local.",
+                    33,
+                    "SRV",
+                    "0 0 49000 fritz.box.",
+                    120,
+                ),
+            );
+            app
+        }
+        fn soa_trigger(app: &mut App) -> Option<browse::QueryTrigger> {
+            ingest(
+                app,
+                &raw_record(
+                    "fritz.box.",
+                    6,
+                    "SOA",
+                    "fritz.box. admin.fritz.box. 1 2 3 4 10",
+                    10,
+                ),
+            );
+            let found = app.anomalies();
+            let item = found
+                .iter()
+                .find(|a| a.kind == anomalies::AnomalyKind::UnicastStyleResponse)
+                .expect("expected unicast-style response");
+            item.response.as_ref().and_then(|r| r.trigger.clone())
+        }
+
+        // Our own address query, just sent.
+        let mut app = fritz_app();
+        mark_address_queries(&mut app, "fritz.box", Duration::from_millis(200));
+        let trigger = soa_trigger(&mut app).expect("own query attributed");
+        assert!(trigger.own);
+        assert!(
+            trigger.question.starts_with("fritz.box. "),
+            "{}",
+            trigger.question
+        );
+        let dump = app.state_dump();
+        let row = dump
+            .anomalies
+            .iter()
+            .find(|a| a.kind == "unicast-style-response")
+            .expect("dumped");
+        assert_eq!(row.section.as_deref(), Some("answer"));
+        assert_eq!(row.in_response_to_own, Some(true));
+
+        // A remote querier's question.
+        let mut app = fritz_app();
+        let querier: SocketAddr = "192.168.1.9:5353".parse().unwrap();
+        app.ingest_event(&query_event(
+            "fritz.box.",
+            1,
+            "A",
+            false,
+            Vec::new(),
+            querier,
+        ));
+        let trigger = soa_trigger(&mut app).expect("remote query attributed");
+        assert!(!trigger.own);
+        assert_eq!(trigger.question, "fritz.box. A");
+
+        // A question long before the response is not its trigger.
+        let mut app = fritz_app();
+        mark_address_queries(&mut app, "fritz.box", Duration::from_secs(5));
+        assert_eq!(soa_trigger(&mut app), None);
+    }
+
+    #[test]
     fn shared_target_question_is_listed_once_in_global_views() {
         // One `fritz.box A` question files on both services pointing at
         // fritz.box: each pane keeps its finding, the dump and the metrics
@@ -11869,10 +12018,7 @@ mod tests {
         );
         // A new error finding sorts in front without any cursor move:
         // tracking re-anchors to the match instead of hiding it.
-        ingest(
-            &mut app,
-            &raw_record("test.local.", 2, "NS", "ns1.local.", 120),
-        );
+        ingest(&mut app, &raw_record("test.local.", 255, "ANY", "x1", 120));
         render_to_buffer(&app, 100, 30);
         let (offset, viewport, at) = visible_match(&app);
         assert_eq!(at, Some(2));
@@ -11885,10 +12031,7 @@ mod tests {
         app.scroll_anomalies(-(offset as isize) - 10);
         assert_eq!(app.anomalies_offset.get(), 0);
         assert!(!app.anomalies_follow.get());
-        ingest(
-            &mut app,
-            &raw_record("test.local.", 2, "NS", "ns2.local.", 120),
-        );
+        ingest(&mut app, &raw_record("test.local.", 255, "ANY", "x2", 120));
         render_to_buffer(&app, 100, 30);
         assert_eq!(app.anomalies_offset.get(), 0);
     }

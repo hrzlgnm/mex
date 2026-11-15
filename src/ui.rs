@@ -962,7 +962,7 @@ fn draw_questions_tab(
     // By type, newest first — same grouping as the Answers table.
     // Anomalous question rows (error/warning only) get a `!` suffix on the
     // type, mirroring the Answers table. Keys are (name, type, querier):
-    // each leaking querier keeps its own finding, so every row can mark.
+    // each querier keeps its own finding, so every row can mark.
     let question_keys: HashSet<(String, u16, String)> = found
         .iter()
         .filter(|a| a.kind.is_question())
@@ -1601,6 +1601,7 @@ mod tests {
             dst_is_multicast: true,
             section: crate::browse::RecordSection::Answer,
             received_at: Instant::now(),
+            trigger: None,
         }
     }
 
@@ -1778,6 +1779,7 @@ mod tests {
                 message: "test".to_string(),
                 rfc: "RFC 6762 §5.2",
                 requirement: "SHOULD",
+                response: None,
             }
         };
         let found = vec![

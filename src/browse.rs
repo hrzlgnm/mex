@@ -101,6 +101,19 @@ pub enum RecordSection {
     Question,
 }
 
+impl RecordSection {
+    /// Stable lowercase label for dumps and messages.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RecordSection::Answer => "answer",
+            RecordSection::Authority => "authority",
+            RecordSection::Additional => "additional",
+            RecordSection::KnownAnswer => "known-answer",
+            RecordSection::Question => "question",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RawRecord {
     pub name: String,
@@ -137,14 +150,30 @@ pub struct RawRecord {
     /// False means the packet was unicast to us; that holds for queries
     /// (question and known-answer rows) as well as responses. Since the
     /// sockets listen on 5353, a unicast response is a QU reply, never a
-    /// legacy unicast one (RFC 6762 §6.7). The analyzer treats it as
-    /// unconfirmed context for unicast-leak verdicts, and only names
-    /// unicast replies in no-flush messages.
+    /// legacy unicast one (RFC 6762 §6.7). The analyzer only uses it to
+    /// name unicast replies in finding messages, never for severity.
     pub dst_is_multicast: bool,
     /// Which DNS section carried the record. Responses merge answer /
     /// authority / additional sections; known answers ride in queries.
     pub section: RecordSection,
     pub received_at: Instant,
+    /// The question this response most likely answered, stamped at ingest
+    /// for unicast-style records (NS/SOA/ANY) only; `None` elsewhere or
+    /// when no matching question was seen shortly before.
+    pub trigger: Option<QueryTrigger>,
+}
+
+/// The question a response most likely answered: the latest question for
+/// the record's owner name, of any type, seen shortly before the response
+/// arrived. mDNS responses carry no question section (RFC 6762 §6), so
+/// this is a timing heuristic, good enough to tell responses to our own
+/// queries from responses to someone else's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryTrigger {
+    /// `name TYPE`, e.g. `fritz.box. A`.
+    pub question: String,
+    /// Whether this mex instance sent it (vs. a remote querier).
+    pub own: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1042,6 +1071,7 @@ fn record_row(
         dst_is_multicast: ing.dst_is_multicast,
         section,
         received_at: Instant::now(),
+        trigger: None,
     }
 }
 
@@ -1070,6 +1100,7 @@ fn question_row(q: &Question<'_>, ing: Ingress<'_>) -> RawRecord {
         dst_is_multicast: ing.dst_is_multicast,
         section: RecordSection::Question,
         received_at: Instant::now(),
+        trigger: None,
     }
 }
 
