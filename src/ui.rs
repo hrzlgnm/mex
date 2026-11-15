@@ -1601,6 +1601,7 @@ mod tests {
             dst_is_multicast: true,
             section: crate::browse::RecordSection::Answer,
             received_at: Instant::now(),
+            trigger: None,
         }
     }
 
@@ -1778,6 +1779,7 @@ mod tests {
                 message: "test".to_string(),
                 rfc: "RFC 6762 §5.2",
                 requirement: "SHOULD",
+                response: None,
             }
         };
         let found = vec![

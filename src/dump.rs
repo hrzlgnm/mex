@@ -122,6 +122,19 @@ pub struct DumpAnomaly {
     pub message: String,
     pub rfc: String,
     pub requirement: String,
+    /// DNS section that carried the flagged record (`answer`,
+    /// `authority`, `additional`, `known-answer`), for findings whose
+    /// verdict depends on it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
+    /// The question the flagged response most likely answered
+    /// (`name TYPE`), when one was seen shortly before it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_response_to: Option<String>,
+    /// Whether this mex instance sent that question, so findings it
+    /// caused itself can be filtered out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_response_to_own: Option<bool>,
 }
 
 #[derive(serde::Serialize)]

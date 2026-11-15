@@ -138,6 +138,17 @@ pub struct Anomaly {
     /// Empty when the cited text carries no RFC 2119 keyword (descriptive
     /// statements and heuristics); views then show the citation alone.
     pub requirement: &'static str,
+    /// Response context for record-level findings whose verdict depends
+    /// on where and why the record arrived (unicast-style responses):
+    /// the DNS section, and the question it most likely answered.
+    pub response: Option<ResponseContext>,
+}
+
+/// Where a flagged record sat in its response and what asked for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResponseContext {
+    pub section: crate::browse::RecordSection,
+    pub trigger: Option<crate::browse::QueryTrigger>,
 }
 
 impl Anomaly {
@@ -311,6 +322,7 @@ pub fn analyze_observations(
                     message: format!("bad enumerated type {target_display}: {reason}"),
                     rfc: "RFC 6763 §7",
                     requirement: "MUST",
+                    response: None,
                 });
             } else if subtype {
                 // RFC 6763 §9 enumerates base service types; a subtype
@@ -328,6 +340,7 @@ pub fn analyze_observations(
                     message: format!("{target_display} is a subtype; want base type"),
                     rfc: "RFC 6763 §9",
                     requirement: "",
+                    response: None,
                 });
             }
         }
@@ -706,6 +719,7 @@ fn check_unresolved_path(
         message,
         rfc: "RFC 6762 §6.1",
         requirement: "",
+        response: None,
     });
 }
 
@@ -733,6 +747,7 @@ fn check_type_format(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>
             message: format!("bad type {st}: {reason}"),
             rfc: "RFC 6763 §7",
             requirement: "MUST",
+            response: None,
         });
     }
 }
@@ -907,6 +922,7 @@ fn check_subtypes(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>) {
                 message: format!("bad subtype {}: {reason}", display_subtype(sub)),
                 rfc: "RFC 6763 §7.1",
                 requirement: "MUST",
+                response: None,
             });
         }
     }
@@ -1038,29 +1054,65 @@ pub(crate) fn is_reverse_ptr(name: &str) -> bool {
     lower.ends_with(".in-addr.arpa") || lower.ends_with(".ip6.arpa")
 }
 
-/// Verdict for unicast-only types answered on multicast: NS/SOA records
-/// do not exist in mDNS zones (RFC 6762 §12) and ANY is never an RR type,
-/// so all three are errors; everything else is `None` (quiet). MX is not
-/// restricted by RFC 6762 or RFC 6763 and stays quiet. `check_record`
-/// lowers NS/SOA owned by names outside the mDNS domains to Info: §12
-/// says nothing about those zones.
-pub(crate) fn unicast_severity(rtype: u16) -> Option<Severity> {
-    match rtype {
-        2 | 6 | 255 => Some(Severity::Error),
-        _ => None,
-    }
+/// Verdict for a unicast-style record in an mDNS response, by type,
+/// section and owner domain: `(severity, reason, rfc, requirement)`, or
+/// `None` for types with no mDNS restriction (MX included: neither
+/// RFC 6762 nor RFC 6763 restricts it).
+///
+/// * ANY is a QTYPE and never an RR type (RFC 1035 §3.2.3): Error.
+/// * NS has no role in mDNS; §12 states there are none in mDNS domains,
+///   but no rule forbids sending one: Info.
+/// * SOA in the Authority section is a unicast-style negative answer;
+///   mDNS denies records with NSEC (§6.1): Warning. §6.1's MUST is about
+///   sending the NSEC, which a per-record check cannot see, so no
+///   requirement level is claimed.
+/// * SOA elsewhere: for mDNS-domain names §12 states there is none
+///   (Warning, no 2119 keyword); for other names (a router answering for
+///   its unicast zone, e.g. `fritz.box`, which §3 allows to be asked)
+///   it is real zone data: Info.
+///
+/// Known answers ride in queries, not responses, so they are capped at
+/// Info.
+pub(crate) fn unicast_style_verdict(
+    rtype: u16,
+    section: crate::browse::RecordSection,
+    mdns_name: bool,
+) -> Option<(Severity, &'static str, &'static str, &'static str)> {
+    use crate::browse::RecordSection;
+    let (severity, reason, rfc) = match rtype {
+        255 => (
+            Severity::Error,
+            "a query type, never a record type",
+            "RFC 1035 §3.2.3",
+        ),
+        2 if mdns_name => (Severity::Info, "no meaning in mDNS", "RFC 6762 §12"),
+        2 => (Severity::Info, "no meaning in mDNS", "RFC 6762 §3"),
+        6 if section == RecordSection::Authority => (
+            Severity::Warning,
+            "mDNS uses NSEC for negative answers",
+            "RFC 6762 §6.1",
+        ),
+        6 if mdns_name => (Severity::Warning, "mDNS zones have no SOA", "RFC 6762 §12"),
+        6 => (Severity::Info, "unicast zone data", "RFC 6762 §3"),
+        _ => return None,
+    };
+    let severity = if section == RecordSection::KnownAnswer {
+        Severity::Info
+    } else {
+        severity
+    };
+    Some((severity, reason, rfc, ""))
 }
 
-/// Citation for a unicast-only answer type: NS/SOA do not exist in mDNS
-/// zones (RFC 6762 §12), ANY is a QTYPE and never an RR type
-/// (RFC 1035 §3.2.3).
-/// None of these texts carries an RFC 2119 keyword (RFC 1035 predates
-/// it), so unicast-style-response findings have no requirement level.
-fn unicast_style_response_rfc(rtype: u16) -> &'static str {
-    match rtype {
-        2 | 6 => "RFC 6762 §12",
-        255 => "RFC 1035 §3.2.3",
-        _ => "RFC 6762 §3",
+/// Section name as shown in finding messages (`Authority section`).
+fn section_title(section: crate::browse::RecordSection) -> &'static str {
+    use crate::browse::RecordSection;
+    match section {
+        RecordSection::Answer => "Answer",
+        RecordSection::Authority => "Authority",
+        RecordSection::Additional => "Additional",
+        RecordSection::KnownAnswer => "Known-Answer",
+        RecordSection::Question => "Question",
     }
 }
 
@@ -1132,6 +1184,7 @@ fn check_question(q: &QuestionView, out: &mut Vec<Anomaly>) {
         message,
         rfc,
         requirement,
+        response: None,
     };
     // RFC 6762 §3: names outside .local (and the link-local reverse
     // zones, §4) MAY go to mDNS only when no conventional DNS server is
@@ -1198,45 +1251,32 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             message: "name contains non-UTF-8 bytes".to_string(),
             rfc: "RFC 6762 §16",
             requirement: "MUST NOT",
+            response: None,
         });
     }
 
-    // Unicast-only types on mDNS. Definite violations (Error) require
-    // confirmed context: a multicast-destination answer section (RFC 6762
-    // §3 defines no NS/SOA delegations for .local). The same type via a
-    // unicast reply or a non-answer section is only a Warning pending
-    // capture verification — the destination/section is named so users
-    // can tell which case they have.
-    // §12 only covers the mDNS domains: NS/SOA for a name outside them
-    // (e.g. a router answering `fritz.box`, its real unicast zone, to a
-    // query for that name sent over mDNS, which §3 allows) is unicast
-    // zone data in an mDNS reply, not a record that cannot exist. Info,
-    // cited to §3, with no requirement level.
-    if let Some(base) = unicast_severity(rec.rtype) {
-        let confirmed = rec.dst_is_multicast && rec.section == crate::browse::RecordSection::Answer;
-        let context = if !rec.dst_is_multicast {
-            "unicast reply".to_string()
+    // Unicast-style records in an mDNS response: one finding per record,
+    // the verdict set by type, section and owner domain (see
+    // `unicast_style_verdict`). Unicast replies to 5353 are mDNS
+    // responses too (RFC 6762 §6.7), so the destination only shows in the
+    // message. The section and the question that most likely triggered
+    // the response travel in `response`, so dumps can sort these from
+    // real answers and from replies to our own queries.
+    if let Some((severity, reason, rfc, requirement)) =
+        unicast_style_verdict(rec.rtype, rec.section, is_mdns_domain(&rec.name))
+    {
+        let section = section_title(rec.section);
+        let unicast = if rec.dst_is_multicast {
+            ""
         } else {
-            format!("{:?} section", rec.section).to_lowercase()
+            "; unicast reply"
         };
-        let global = matches!(rec.rtype, 2 | 6) && !is_mdns_domain(&rec.name);
-        let (severity, message) = if global {
-            (
-                Severity::Info,
-                format!("{} for non-mDNS name in mDNS reply", rec.rtype_str),
-            )
-        } else if confirmed {
-            // The overlay has no record columns, so the message keeps the
-            // rtype: it names what is not defined for mDNS.
-            let message = format!("{} not defined for mDNS", rec.rtype_str);
-            (base, message)
+        let message = if rec.rtype == 255 {
+            format!("ANY record in {section} section ({reason}){unicast}")
         } else {
-            (
-                Severity::Warning,
-                format!(
-                    "{} outside multicast answer ({context}); verify",
-                    rec.rtype_str
-                ),
+            format!(
+                "unicast DNS-style answer over mDNS: {} in {section} section ({reason}){unicast}",
+                rec.rtype_str
             )
         };
         out.push(Anomaly {
@@ -1249,12 +1289,12 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             rdata: Some(rdata.clone()),
             source: Some(src.clone()),
             message,
-            rfc: if global {
-                "RFC 6762 §3"
-            } else {
-                unicast_style_response_rfc(rec.rtype)
-            },
-            requirement: "",
+            rfc,
+            requirement,
+            response: Some(ResponseContext {
+                section: rec.section,
+                trigger: rec.trigger.clone(),
+            }),
         });
     }
 
@@ -1285,6 +1325,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             message,
             rfc: "RFC 6762 §10.2",
             requirement: "MUST NOT",
+            response: None,
         });
     }
     // Unique records MUST carry the cache-flush bit in responses to port
@@ -1323,6 +1364,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             message,
             rfc: "RFC 6762 §10.2",
             requirement: if confirmed { "MUST" } else { "" },
+            response: None,
         });
     }
 
@@ -1346,6 +1388,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             ),
             rfc: "RFC 6762 §10",
             requirement: "SHOULD",
+            response: None,
         });
     } else if rec.ttl > TTL_HIGH {
         out.push(Anomaly {
@@ -1364,6 +1407,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             ),
             rfc: "RFC 6762 §10",
             requirement: "SHOULD",
+            response: None,
         });
     }
 
@@ -1404,6 +1448,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             message,
             rfc: "RFC 6762 §10",
             requirement: "SHOULD",
+            response: None,
         });
     }
 
@@ -1435,6 +1480,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
                 message: format!("TXT {payload_len}B, max {TXT_MAX}B"),
                 rfc: "RFC 6763 §6.2",
                 requirement: "SHOULD NOT",
+                response: None,
             });
         }
     }
@@ -1510,6 +1556,7 @@ fn srv_anomaly_info(service_id: &str, rec: &RawRecord, message: &str) -> Anomaly
         message: message.to_string(),
         rfc: "RFC 2782",
         requirement: "",
+        response: None,
     }
 }
 
@@ -1526,6 +1573,7 @@ fn srv_anomaly(service_id: &str, rec: &RawRecord, message: &str) -> Anomaly {
         message: message.to_string(),
         rfc: "RFC 2782",
         requirement: "MUST",
+        response: None,
     }
 }
 
@@ -1599,6 +1647,7 @@ fn check_ttl_stable(svc: &ServiceView, service_id: &str, now: Instant, out: &mut
                 message: format!("mixed TTL bases {sorted:?}"),
                 rfc: "RFC 6762 §10",
                 requirement: "",
+                response: None,
             });
         }
     }
@@ -1673,6 +1722,7 @@ mod tests {
             dst_is_multicast,
             section,
             received_at: Instant::now(),
+            trigger: None,
         }
     }
 
@@ -1715,18 +1765,48 @@ mod tests {
     }
 
     #[test]
-    fn unicast_severity_maps_known_types() {
-        // Definite unicast-only answers are errors; MX has no mDNS
-        // restriction and stays quiet like everything else.
-        use super::unicast_severity;
-        use super::Severity;
-        assert_eq!(unicast_severity(2), Some(Severity::Error));
-        assert_eq!(unicast_severity(6), Some(Severity::Error));
-        assert_eq!(unicast_severity(255), Some(Severity::Error));
-        assert_eq!(unicast_severity(15), None);
-        assert_eq!(unicast_severity(1), None);
-        assert_eq!(unicast_severity(12), None);
-        assert_eq!(unicast_severity(5), None);
+    fn unicast_style_verdict_by_type_section_and_domain() {
+        use super::unicast_style_verdict as v;
+        use crate::browse::RecordSection::*;
+        let sev = |rtype, section, mdns| v(rtype, section, mdns).map(|(s, _, rfc, _)| (s, rfc));
+        // ANY is never an RR type, wherever it sits.
+        assert_eq!(
+            sev(255, Answer, true),
+            Some((Severity::Error, "RFC 1035 §3.2.3"))
+        );
+        // NS has no meaning in mDNS, but no rule forbids it.
+        assert_eq!(
+            sev(2, Authority, true),
+            Some((Severity::Info, "RFC 6762 §12"))
+        );
+        assert_eq!(sev(2, Answer, false), Some((Severity::Info, "RFC 6762 §3")));
+        // SOA in Authority is a unicast-style negative answer (§6.1 NSEC),
+        // whatever the owner domain.
+        for mdns in [true, false] {
+            assert_eq!(
+                sev(6, Authority, mdns),
+                Some((Severity::Warning, "RFC 6762 §6.1"))
+            );
+        }
+        // SOA as an answer: none exist in mDNS zones; real data elsewhere.
+        assert_eq!(
+            sev(6, Answer, true),
+            Some((Severity::Warning, "RFC 6762 §12"))
+        );
+        assert_eq!(sev(6, Answer, false), Some((Severity::Info, "RFC 6762 §3")));
+        // Known answers ride in queries: never above Info.
+        assert_eq!(
+            sev(255, KnownAnswer, true).map(|(s, _)| s),
+            Some(Severity::Info)
+        );
+        // No requirement level is ever claimed.
+        assert!([2, 6, 255]
+            .into_iter()
+            .all(|t| v(t, Authority, true).is_some_and(|(_, _, _, req)| req.is_empty())));
+        // Unrestricted types stay quiet, MX included.
+        for rtype in [1, 5, 12, 15, 16, 28, 33, 47] {
+            assert_eq!(v(rtype, Answer, true), None, "type {rtype}");
+        }
     }
 
     #[test]
@@ -1805,9 +1885,13 @@ mod tests {
             assert_eq!(item.severity, Severity::Info);
             assert_eq!(item.rfc, "RFC 6762 §3");
             assert_eq!(item.requirement, "");
-            assert!(item.message.contains("non-mDNS name"), "{}", item.message);
+            assert!(
+                item.message.contains("in Answer section"),
+                "{}",
+                item.message
+            );
         }
-        // The same SOA owned by a .local name stays an error (§12).
+        // The same SOA owned by a .local name: mDNS zones have none (§12).
         let answers = vec![rec(
             "host.local.",
             6,
@@ -1821,7 +1905,7 @@ mod tests {
             .iter()
             .find(|a| a.kind == AnomalyKind::UnicastStyleResponse)
             .expect("expected SOA unicast-style response");
-        assert_eq!(item.severity, Severity::Error);
+        assert_eq!(item.severity, Severity::Warning);
         assert_eq!(item.rfc, "RFC 6762 §12");
     }
 
@@ -1858,7 +1942,7 @@ mod tests {
             .expect("expected enumeration SOA unicast-style response")
             .clone();
         assert_eq!(item.service, "enumeration");
-        assert_eq!(item.severity, Severity::Error);
+        assert_eq!(item.severity, Severity::Warning);
         assert_eq!(
             item.source.as_deref(),
             Some("192.168.1.2:5353"),
@@ -2245,23 +2329,43 @@ mod tests {
                 .count(),
             2
         );
-        assert!(found
-            .iter()
-            .filter(|a| a.kind == AnomalyKind::UnicastStyleResponse)
-            .all(|a| a.severity == Severity::Error));
+        let severity = |rtype| {
+            found
+                .iter()
+                .find(|a| a.kind == AnomalyKind::UnicastStyleResponse && a.rtype == Some(rtype))
+                .map(|a| a.severity)
+        };
+        // SOA: mDNS zones have none (§12). NS: no meaning, not forbidden.
+        assert_eq!(severity(6), Some(Severity::Warning));
+        assert_eq!(severity(2), Some(Severity::Info));
     }
 
     #[test]
-    fn unicast_style_response_downgraded_outside_multicast_answer() {
-        use crate::browse::RecordSection;
-        // Same SOA via unicast reply and via authority section: Warning
-        // pending verification, naming the context for the user.
-        for (mcast, section) in [
-            (false, RecordSection::Answer),
-            (true, RecordSection::Authority),
-            (true, RecordSection::Additional),
+    fn unicast_style_response_names_section_and_unicast_reply() {
+        use crate::browse::{QueryTrigger, RecordSection};
+        // The message names the section and a unicast destination; the
+        // finding carries section and trigger for dumps.
+        for (mcast, section, want) in [
+            (
+                true,
+                RecordSection::Authority,
+                "unicast DNS-style answer over mDNS: SOA in Authority section \
+                 (mDNS uses NSEC for negative answers)",
+            ),
+            (
+                false,
+                RecordSection::Answer,
+                "unicast DNS-style answer over mDNS: SOA in Answer section \
+                 (mDNS zones have no SOA); unicast reply",
+            ),
+            (
+                true,
+                RecordSection::Additional,
+                "unicast DNS-style answer over mDNS: SOA in Additional section \
+                 (mDNS zones have no SOA)",
+            ),
         ] {
-            let answers = vec![rec_with(
+            let mut soa = rec_with(
                 "host.local.",
                 6,
                 "SOA",
@@ -2270,18 +2374,24 @@ mod tests {
                 false,
                 mcast,
                 section,
-            )];
-            let found = analyze_service("My", "_http._tcp.local", "host.local.", &answers);
+            );
+            soa.trigger = Some(QueryTrigger {
+                question: "host.local. A".to_string(),
+                own: true,
+            });
+            let found = analyze_service("My", "_http._tcp.local", "host.local.", &[soa]);
             let item = found
                 .iter()
                 .find(|a| a.kind == AnomalyKind::UnicastStyleResponse)
                 .expect("expected unicast-style response");
+            assert_eq!(item.severity, Severity::Warning, "{section:?}");
+            assert_eq!(item.message, want);
+            let ctx = item.response.as_ref().expect("response context");
+            assert_eq!(ctx.section, section);
             assert_eq!(
-                item.severity,
-                Severity::Warning,
-                "mcast={mcast} section={section:?}"
+                ctx.trigger.as_ref().map(|t| (t.question.as_str(), t.own)),
+                Some(("host.local. A", true))
             );
-            assert!(item.message.contains("; verify"), "got: {}", item.message);
         }
     }
 
@@ -2365,6 +2475,7 @@ mod tests {
                 message: "shared record with flush bit set".to_string(),
                 rfc: "RFC 6762 §10.2",
                 requirement: "MUST NOT",
+                response: None,
             }
         }
         // Same service, same owner and type: the foreign target tells the
