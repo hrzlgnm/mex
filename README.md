@@ -217,10 +217,11 @@ to stderr.
 
 ## Known limitations
 
-**Subtypes of quiet publishers can stay hidden.** DNS-SD has no query
-that lists a service's subtypes, so mex learns one (e.g.
-`_printer._sub._http._tcp`) only from traffic: an announcement, someone
-else's subtype query or answer, or an enumeration that lists it (which
-is non-standard and flagged as `enum-subtype`). Start mex before the
-publisher, or trigger any subtype traffic, and it is picked up and kept
-fresh.
+**Subtypes of quiet publishers can remain hidden.** DNS-SD has no query
+that enumerates a service type's subtypes, so mex learns a subtype (e.g.
+`_printer._sub._http._tcp`) only from traffic: the publisher's
+announcement, another client's subtype query or response, or a service
+enumeration that lists it (non-standard, flagged as `enum-subtype`).
+
+Start mex before the publisher, or trigger subtype traffic. Once seen,
+the subtype is refreshed like any other record.
