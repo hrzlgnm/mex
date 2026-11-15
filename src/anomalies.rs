@@ -40,7 +40,7 @@ impl Severity {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum AnomalyKind {
     UnresolvedSrvTarget,
-    UnicastLeak,
+    UnicastStyleResponse,
     UnicastQuestion,
     GlobalQuestion,
     TtlLow,
@@ -60,7 +60,7 @@ impl AnomalyKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             AnomalyKind::UnresolvedSrvTarget => "unresolved-srv-target",
-            AnomalyKind::UnicastLeak => "unicast-leak",
+            AnomalyKind::UnicastStyleResponse => "unicast-style-response",
             AnomalyKind::UnicastQuestion => "unicast-question",
             AnomalyKind::GlobalQuestion => "global-question",
             AnomalyKind::TtlLow => "ttl-low",
@@ -119,7 +119,7 @@ impl Ord for AnomalyKind {
 /// a pure snapshot function with no borrows into browser state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Anomaly {
-    /// Stable machine-readable identifier (`unresolved-srv-target`, `unicast-leak`, ...).
+    /// Stable machine-readable identifier (`unresolved-srv-target`, `unicast-style-response`, ...).
     pub kind: AnomalyKind,
     pub severity: Severity,
     /// Owning service as `instance.service_type`, or `enumeration` for
@@ -334,8 +334,8 @@ pub fn analyze_observations(
     }
 
     // Observed questions for unicast-only types: a querier asking
-    // multicast for what can only live in unicast is the same leak from
-    // the demand side. Stored rows are already capped and refreshed on
+    // multicast for what can only live in unicast is the demand-side
+    // twin of a unicast-style response. Stored rows are already capped and refreshed on
     // re-ask, so every row on file is worth marking.
     for q in &snap.questions {
         check_question(q, &mut out);
@@ -376,10 +376,10 @@ fn dedup(mut items: Vec<Anomaly>) -> Vec<Anomaly> {
     let mut out = Vec::with_capacity(items.len());
     for a in items.drain(..) {
         // SOA serials churn constantly (one bump per announcement), so two
-        // leaks differing only in serial are the same finding. Normalize
+        // findings differing only in serial are the same finding. Normalize
         // the serial away for the dedup key; the stored rdata keeps it.
         let rdata_key = match (a.kind, a.rtype) {
-            (AnomalyKind::UnicastLeak, Some(6)) => {
+            (AnomalyKind::UnicastStyleResponse, Some(6)) => {
                 anomaly_match_key(6, &a.rdata.clone().unwrap_or_default())
             }
             (AnomalyKind::EnumSubtype | AnomalyKind::TypeFormat, Some(12))
@@ -390,7 +390,7 @@ fn dedup(mut items: Vec<Anomaly>) -> Vec<Anomaly> {
             _ => a.rdata.clone().unwrap_or_default(),
         };
         // Questions carry no rdata: tell queriers apart by source, so each
-        // leaking querier keeps its own finding and every row can mark.
+        // querier keeps its own finding and every row can mark.
         // Answers keep the established behavior (one finding no matter how
         // many sources announce it) — except context-gated kinds, where
         // the same rdata via multicast vs unicast (or answer vs
@@ -402,9 +402,9 @@ fn dedup(mut items: Vec<Anomaly>) -> Vec<Anomaly> {
             _ => String::new(),
         };
         let context_key = match a.kind {
-            AnomalyKind::UnicastLeak | AnomalyKind::NoFlush | AnomalyKind::UnresolvedSrvTarget => {
-                a.message.clone()
-            }
+            AnomalyKind::UnicastStyleResponse
+            | AnomalyKind::NoFlush
+            | AnomalyKind::UnresolvedSrvTarget => a.message.clone(),
             _ => String::new(),
         };
         // DNS names compare case-insensitively (RFC 6762 §16): a querier
@@ -1055,8 +1055,8 @@ pub(crate) fn unicast_severity(rtype: u16) -> Option<Severity> {
 /// zones (RFC 6762 §12), ANY is a QTYPE and never an RR type
 /// (RFC 1035 §3.2.3).
 /// None of these texts carries an RFC 2119 keyword (RFC 1035 predates
-/// it), so unicast-leak findings have no requirement level.
-fn unicast_leak_rfc(rtype: u16) -> &'static str {
+/// it), so unicast-style-response findings have no requirement level.
+fn unicast_style_response_rfc(rtype: u16) -> &'static str {
     match rtype {
         2 | 6 => "RFC 6762 §12",
         255 => "RFC 1035 §3.2.3",
@@ -1107,7 +1107,7 @@ pub(crate) fn rtype_from_str(s: &str) -> Option<u16> {
 }
 
 /// One observed question asking multicast for a unicast-only type: the
-/// demand-side twin of `unicast-leak`. Port 0 can never be a real querier,
+/// demand-side twin of `unicast-style-response`. Port 0 can never be a real querier,
 /// so our own inferred sends stay quiet here, not just in the UI.
 fn check_question(q: &QuestionView, out: &mut Vec<Anomaly>) {
     if q.source.port() == 0 {
@@ -1240,7 +1240,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             )
         };
         out.push(Anomaly {
-            kind: AnomalyKind::UnicastLeak,
+            kind: AnomalyKind::UnicastStyleResponse,
             severity,
             service: service_id.to_string(),
             record_name: Some(name.clone()),
@@ -1252,7 +1252,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
             rfc: if global {
                 "RFC 6762 §3"
             } else {
-                unicast_leak_rfc(rec.rtype)
+                unicast_style_response_rfc(rec.rtype)
             },
             requirement: "",
         });
@@ -1760,9 +1760,15 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {kind} for type {rtype}"))
         };
         // §12 states NS/SOA don't exist in mDNS without a 2119 keyword.
-        assert_eq!(cite(AnomalyKind::UnicastLeak, 6), ("RFC 6762 §12", ""));
+        assert_eq!(
+            cite(AnomalyKind::UnicastStyleResponse, 6),
+            ("RFC 6762 §12", "")
+        );
         // ANY is a QTYPE, never an RR type; RFC 1035 has no 2119 keyword.
-        assert_eq!(cite(AnomalyKind::UnicastLeak, 255), ("RFC 1035 §3.2.3", ""));
+        assert_eq!(
+            cite(AnomalyKind::UnicastStyleResponse, 255),
+            ("RFC 1035 §3.2.3", "")
+        );
         // §10.2: the host MUST set the flush bit on unique RRSet members.
         assert_eq!(cite(AnomalyKind::NoFlush, 33), ("RFC 6762 §10.2", "MUST"));
         // TTL recommendations live in §10, not §5.2 query scheduling.
@@ -1775,7 +1781,7 @@ mod tests {
     }
 
     #[test]
-    fn unicast_leak_ns_soa_for_global_name_is_info() {
+    fn unicast_style_response_ns_soa_for_global_name_is_info() {
         // A router answering a query for its own unicast zone over mDNS:
         // §12 does not cover fritz.box, so this is an observation only.
         let answers = vec![
@@ -1790,12 +1796,12 @@ mod tests {
             ),
         ];
         let found = analyze_service("Fritzel", "_fbox._tcp.local", "fritz.box.", &answers);
-        let leaks: Vec<_> = found
+        let found_rows: Vec<_> = found
             .iter()
-            .filter(|a| a.kind == AnomalyKind::UnicastLeak)
+            .filter(|a| a.kind == AnomalyKind::UnicastStyleResponse)
             .collect();
-        assert_eq!(leaks.len(), 2);
-        for item in leaks {
+        assert_eq!(found_rows.len(), 2);
+        for item in found_rows {
             assert_eq!(item.severity, Severity::Info);
             assert_eq!(item.rfc, "RFC 6762 §3");
             assert_eq!(item.requirement, "");
@@ -1813,25 +1819,25 @@ mod tests {
         let found = analyze_service("My", "_http._tcp.local", "host.local.", &answers);
         let item = found
             .iter()
-            .find(|a| a.kind == AnomalyKind::UnicastLeak)
-            .expect("expected SOA leak");
+            .find(|a| a.kind == AnomalyKind::UnicastStyleResponse)
+            .expect("expected SOA unicast-style response");
         assert_eq!(item.severity, Severity::Error);
         assert_eq!(item.rfc, "RFC 6762 §12");
     }
 
     #[test]
-    fn unicast_leak_flags_any_as_error() {
+    fn unicast_style_response_flags_any_as_error() {
         let answers = vec![rec("host.local.", 255, "ANY", "", 120, false)];
         let found = analyze_service("My", "_http._tcp.local", "host.local.", &answers);
         let item = found
             .iter()
-            .find(|a| a.kind == AnomalyKind::UnicastLeak)
-            .expect("expected ANY leak");
+            .find(|a| a.kind == AnomalyKind::UnicastStyleResponse)
+            .expect("expected ANY unicast-style response");
         assert_eq!(item.severity, Severity::Error);
     }
 
     #[test]
-    fn enumeration_soa_leak_names_service_and_source() {
+    fn enumeration_soa_response_names_service_and_source() {
         let enum_rec = rec(
             "_services._dns-sd._udp.local.",
             6,
@@ -1848,8 +1854,8 @@ mod tests {
         };
         let item = analyze(&snap)
             .iter()
-            .find(|a| a.kind == AnomalyKind::UnicastLeak)
-            .expect("expected enumeration SOA leak")
+            .find(|a| a.kind == AnomalyKind::UnicastStyleResponse)
+            .expect("expected enumeration SOA unicast-style response")
             .clone();
         assert_eq!(item.service, "enumeration");
         assert_eq!(item.severity, Severity::Error);
@@ -1968,7 +1974,7 @@ mod tests {
         let item = found
             .iter()
             .find(|a| a.kind == AnomalyKind::UnicastQuestion)
-            .expect("expected SOA question leak");
+            .expect("expected SOA unicast question");
         assert!(
             item.message.contains("one-shot"),
             "stub resolver should be tagged, got: {}",
@@ -1979,7 +1985,7 @@ mod tests {
         let item = found
             .iter()
             .find(|a| a.kind == AnomalyKind::UnicastQuestion)
-            .expect("expected SOA question leak");
+            .expect("expected SOA unicast question");
         assert!(
             !item.message.contains("one-shot"),
             "compliant querier stays untagged, got: {}",
@@ -1992,7 +1998,7 @@ mod tests {
         let item = found
             .iter()
             .find(|a| a.kind == AnomalyKind::UnicastQuestion)
-            .expect("expected SOA question leak");
+            .expect("expected SOA unicast question");
         assert!(
             !item.message.contains("one-shot"),
             "well-known port stays untagged, got: {}",
@@ -2005,7 +2011,7 @@ mod tests {
         let item = found
             .iter()
             .find(|a| a.kind == AnomalyKind::UnicastQuestion)
-            .expect("expected SOA question leak");
+            .expect("expected SOA unicast question");
         assert!(
             item.message.contains("one-shot"),
             "non-5353 port reads as one-shot, got: {}",
@@ -2197,7 +2203,7 @@ mod tests {
     }
 
     #[test]
-    fn unicast_leak_same_answer_from_two_sources_is_one_finding() {
+    fn unicast_style_response_same_answer_from_two_sources_is_one_finding() {
         // Demand-side findings split per querier, but answer sightings
         // keep the established behavior: one finding no matter how many
         // sources announce it.
@@ -2211,7 +2217,7 @@ mod tests {
         assert_eq!(
             found
                 .iter()
-                .filter(|a| a.kind == AnomalyKind::UnicastLeak)
+                .filter(|a| a.kind == AnomalyKind::UnicastStyleResponse)
                 .count(),
             1,
             "same answer from two sources must stay one finding"
@@ -2219,7 +2225,7 @@ mod tests {
     }
 
     #[test]
-    fn unicast_leak_flags_soa_and_ns() {
+    fn unicast_style_response_flags_soa_and_ns() {
         let answers = vec![
             rec(
                 "host.local.",
@@ -2235,18 +2241,18 @@ mod tests {
         assert_eq!(
             found
                 .iter()
-                .filter(|a| a.kind == AnomalyKind::UnicastLeak)
+                .filter(|a| a.kind == AnomalyKind::UnicastStyleResponse)
                 .count(),
             2
         );
         assert!(found
             .iter()
-            .filter(|a| a.kind == AnomalyKind::UnicastLeak)
+            .filter(|a| a.kind == AnomalyKind::UnicastStyleResponse)
             .all(|a| a.severity == Severity::Error));
     }
 
     #[test]
-    fn unicast_leak_downgraded_outside_multicast_answer() {
+    fn unicast_style_response_downgraded_outside_multicast_answer() {
         use crate::browse::RecordSection;
         // Same SOA via unicast reply and via authority section: Warning
         // pending verification, naming the context for the user.
@@ -2268,8 +2274,8 @@ mod tests {
             let found = analyze_service("My", "_http._tcp.local", "host.local.", &answers);
             let item = found
                 .iter()
-                .find(|a| a.kind == AnomalyKind::UnicastLeak)
-                .expect("expected leak");
+                .find(|a| a.kind == AnomalyKind::UnicastStyleResponse)
+                .expect("expected unicast-style response");
             assert_eq!(
                 item.severity,
                 Severity::Warning,
@@ -2491,7 +2497,9 @@ mod tests {
         // Neither RFC 6762 nor RFC 6763 restricts MX in mDNS.
         let answers = vec![rec("host.local.", 15, "MX", "10 host.local.", 120, false)];
         let found = analyze_service("My", "_http._tcp.local", "host.local.", &answers);
-        assert!(!found.iter().any(|a| a.kind == AnomalyKind::UnicastLeak));
+        assert!(!found
+            .iter()
+            .any(|a| a.kind == AnomalyKind::UnicastStyleResponse));
     }
 
     #[test]
@@ -3118,7 +3126,7 @@ mod tests {
     }
 
     #[test]
-    fn soa_serial_churn_dedups_to_one_leak() {
+    fn soa_serial_churn_dedups_to_one_finding() {
         let answers = vec![
             rec(
                 "host.local.",
@@ -3141,7 +3149,7 @@ mod tests {
         assert_eq!(
             found
                 .iter()
-                .filter(|a| a.kind == AnomalyKind::UnicastLeak)
+                .filter(|a| a.kind == AnomalyKind::UnicastStyleResponse)
                 .count(),
             1,
             "serial-only differences must not multiply findings"
@@ -3172,13 +3180,15 @@ mod tests {
         let answers = vec![old, gone];
         let found = analyze_service("My", "_http._tcp.local", "host.local.", &answers);
         assert!(
-            !found.iter().any(|a| a.kind == AnomalyKind::UnicastLeak),
-            "expired and goodbye SOA must not leak-flag"
+            !found
+                .iter()
+                .any(|a| a.kind == AnomalyKind::UnicastStyleResponse),
+            "expired and goodbye SOA must not be flagged"
         );
     }
 
     #[test]
-    fn multicast_types_and_cname_stay_quiet_for_leak() {
+    fn multicast_types_and_cname_stay_quiet_for_unicast_style() {
         let answers = vec![
             rec(
                 "_http._tcp.local.",
@@ -3203,8 +3213,10 @@ mod tests {
         ];
         let found = analyze_service("X", "_http._tcp.local", "h.local.", &answers);
         assert!(
-            !found.iter().any(|a| a.kind == AnomalyKind::UnicastLeak),
-            "valid multicast types and CNAME must not leak-flag"
+            !found
+                .iter()
+                .any(|a| a.kind == AnomalyKind::UnicastStyleResponse),
+            "valid multicast types and CNAME must not be flagged"
         );
     }
 
@@ -3219,7 +3231,8 @@ mod tests {
             found.is_empty()
                 || !found
                     .iter()
-                    .any(|a| a.kind == AnomalyKind::UnicastLeak || a.kind == AnomalyKind::TtlLow)
+                    .any(|a| a.kind == AnomalyKind::UnicastStyleResponse
+                        || a.kind == AnomalyKind::TtlLow)
         );
         assert!(!found.iter().any(|a| a.kind == AnomalyKind::TtlHigh));
     }

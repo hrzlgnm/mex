@@ -2586,8 +2586,8 @@ impl App {
             })
             .collect();
         // Observed questions flattened with their owning service id, so the
-        // analyzer can attribute demand-side leaks the same way it does
-        // answer sightings. Unrecognised type labels stay quiet.
+        // analyzer can attribute demand-side unicast-type questions the
+        // same way it does answer sightings. Unrecognised type labels stay quiet.
         let mut questions: Vec<anomalies::QuestionView<'_>> = Vec::new();
         for s in &self.services {
             Self::push_question_views(
@@ -5639,8 +5639,8 @@ impl App {
     }
 
     /// Row-identity match for one observed question row within a
-    /// precomputed finding set: the demand-side leak attributed to its
-    /// querier. Own inferred sends (`SELF_SOURCE`, port 0) never match a
+    /// precomputed finding set: the demand-side unicast-type question
+    /// attributed to its querier. Own inferred sends (`SELF_SOURCE`, port 0) never match a
     /// finding, and unrecognised type labels stay quiet.
     fn question_anomalies_in(
         found: &[anomalies::Anomaly],
@@ -6877,7 +6877,7 @@ mod tests {
             .anomalies()
             .into_iter()
             .find(|a| a.kind == anomalies::AnomalyKind::UnicastQuestion)
-            .expect("expected routed SOA question leak");
+            .expect("expected routed SOA unicast question");
         assert_eq!(item.service, "Test._http._tcp.local");
         assert_eq!(item.severity, crate::anomalies::Severity::Info);
         assert_eq!(

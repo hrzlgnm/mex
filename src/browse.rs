@@ -138,8 +138,8 @@ pub struct RawRecord {
     /// (question and known-answer rows) as well as responses. Since the
     /// sockets listen on 5353, a unicast response is a QU reply, never a
     /// legacy unicast one (RFC 6762 §6.7). The analyzer treats it as
-    /// unconfirmed context for unicast-leak verdicts, and only names
-    /// unicast replies in no-flush messages.
+    /// unconfirmed context for unicast-style-response verdicts, and only
+    /// names unicast replies in no-flush messages.
     pub dst_is_multicast: bool,
     /// Which DNS section carried the record. Responses merge answer /
     /// authority / additional sections; known answers ride in queries.
