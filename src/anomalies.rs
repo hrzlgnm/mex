@@ -1288,19 +1288,24 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         });
     }
     // Unique records MUST carry the cache-flush bit in responses to port
-    // 5353 (RFC 6762 §10.2), but in legacy unicast responses and in
-    // known-answer sections the bit MUST NOT be set, so a missing bit
-    // there is not anomalous. Promote to Warning (and claim the MUST)
-    // only for confirmed multicast answers; otherwise Info with no
-    // requirement level, since the absence may be compliant.
+    // 5353 (RFC 6762 §10.2), answer and additional sections alike. The
+    // bit MUST NOT be set only in legacy unicast responses (to a querier
+    // port other than 5353, §6.7), and known answers ride in queries, so
+    // a missing bit there is not anomalous. mex only listens on 5353, so
+    // every response it receives — multicast or a unicast reply to its
+    // QU questions — is a non-legacy one: Warning with the MUST.
+    // Authority/known-answer rows stay Info with no requirement level.
     // Scoped to SRV/TXT: omitting the bit on A/AAAA is universal practice
     // across embedded stacks, so flagging it is pure noise (removed).
     if matches!(rec.rtype, 33 | 16) && !rec.flush_bit {
-        let confirmed = rec.dst_is_multicast && rec.section == crate::browse::RecordSection::Answer;
-        let message = if confirmed {
-            "missing flush bit; coherency risk".to_string()
-        } else {
-            "missing flush bit".to_string()
+        let confirmed = matches!(
+            rec.section,
+            crate::browse::RecordSection::Answer | crate::browse::RecordSection::Additional
+        );
+        let message = match (confirmed, rec.dst_is_multicast) {
+            (true, true) => "missing flush bit; coherency risk".to_string(),
+            (true, false) => "missing flush bit; coherency risk (unicast reply)".to_string(),
+            (false, _) => "missing flush bit".to_string(),
         };
         out.push(Anomaly {
             kind: AnomalyKind::NoFlush,
@@ -2403,8 +2408,8 @@ mod tests {
             .expect("expected finding");
         assert_eq!(item.severity, Severity::Warning);
         assert_eq!(item.requirement, "MUST");
-        // Same record via unicast reply: Info only (bit MUST NOT be set
-        // in legacy unicast, so its absence is not a coherency signal).
+        // Same record via unicast reply: mex listens on 5353, so this is
+        // a non-legacy response and the MUST still applies (§6.7, §10.2).
         let answers = vec![rec_with(
             "My._http._tcp.local.",
             33,
@@ -2420,9 +2425,46 @@ mod tests {
             .iter()
             .find(|a| a.kind == AnomalyKind::NoFlush)
             .expect("expected finding");
-        assert_eq!(item.severity, Severity::Info);
-        // The absence may be compliant here: no MUST is claimed.
-        assert_eq!(item.requirement, "");
+        assert_eq!(item.severity, Severity::Warning);
+        assert_eq!(item.requirement, "MUST");
+        assert!(
+            item.message.ends_with("(unicast reply)"),
+            "{}",
+            item.message
+        );
+    }
+
+    #[test]
+    fn missing_flush_by_section() {
+        use crate::browse::RecordSection;
+        let verdict = |section| {
+            let answers = vec![rec_with(
+                "My._http._tcp.local.",
+                16,
+                "TXT",
+                "k=v",
+                4500,
+                false,
+                true,
+                section,
+            )];
+            let found = analyze_service("My", "_http._tcp.local", "myhost.local.", &answers);
+            let item = found
+                .iter()
+                .find(|a| a.kind == AnomalyKind::NoFlush)
+                .expect("expected finding")
+                .clone();
+            (item.severity, item.requirement)
+        };
+        // Additional records in a response are held to the same MUST.
+        assert_eq!(
+            verdict(RecordSection::Additional),
+            (Severity::Warning, "MUST")
+        );
+        // Known answers ride in queries and authority rows in probes: no
+        // response-side MUST applies, so the absence stays informational.
+        assert_eq!(verdict(RecordSection::KnownAnswer), (Severity::Info, ""));
+        assert_eq!(verdict(RecordSection::Authority), (Severity::Info, ""));
     }
 
     #[test]
