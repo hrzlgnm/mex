@@ -1014,15 +1014,13 @@ fn draw_questions_tab(
                 // claims our refresh/browse/expired schedule, even when
                 // the interest itself is one we maintain.
                 let due = if self_row {
+                    use crate::app::TimerKind;
                     match (s.timer, s.next_due_in_secs) {
-                        (crate::app::TimerKind::Refresh, Some(d)) => {
-                            format!("{} refresh", fmt_qage(d))
-                        }
-                        (crate::app::TimerKind::Browse, Some(d)) => {
-                            format!("{} browse", fmt_qage(d))
+                        (TimerKind::Refresh | TimerKind::Browse, Some(d)) => {
+                            format!("{} {}", fmt_qage(d), s.timer.as_str())
                         }
                         // No schedule: "expired" only for lapsed local demand.
-                        _ if s.had_local_demand => "expired".to_string(),
+                        _ if s.had_local_demand => TimerKind::Expired.as_str().to_string(),
                         _ => "—".to_string(),
                     }
                 } else {
