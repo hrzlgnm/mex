@@ -406,7 +406,7 @@ fn subtype_owner_parts(rec: &browse::RawRecord) -> Option<(Vec<u8>, String)> {
     let [subtype, sub_keyword, service, protocol, local] = labels else {
         return None;
     };
-    if !sub_keyword.as_slice().eq_ignore_ascii_case(b"_sub") {
+    if !browse::is_sub_label(sub_keyword) {
         return None;
     }
 

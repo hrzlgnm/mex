@@ -799,15 +799,10 @@ fn known_answers_for_iface<'a>(kas: &'a [KnownAnswer], iface: &str) -> Vec<(&'a 
 fn split_instance_labels(name: &str) -> Vec<&str> {
     let name = name.trim_end_matches('.');
     let parts: Vec<&str> = name.split('.').collect();
-    let Some(proto) = parts
-        .iter()
-        .rposition(|l| l.eq_ignore_ascii_case("_tcp") || l.eq_ignore_ascii_case("_udp"))
-    else {
+    let Some(proto) = parts.iter().rposition(|l| is_proto_label(l.as_bytes())) else {
         return parts;
     };
-    if proto < 2
-        || !parts[proto - 1].starts_with('_')
-        || parts[proto - 2].eq_ignore_ascii_case("_sub")
+    if proto < 2 || !parts[proto - 1].starts_with('_') || is_sub_label(parts[proto - 2].as_bytes())
     {
         return parts;
     }
@@ -1329,6 +1324,18 @@ pub fn record_type_from_u16(rtype: u16) -> Option<TYPE> {
     }
 }
 
+/// Whether a label is a DNS-SD protocol label, `_tcp` or `_udp`
+/// (RFC 6763 §7), ignoring case.
+pub(crate) fn is_proto_label(label: &[u8]) -> bool {
+    label.eq_ignore_ascii_case(b"_tcp") || label.eq_ignore_ascii_case(b"_udp")
+}
+
+/// Whether a label is the DNS-SD subtype keyword `_sub` (RFC 6763
+/// §7.1), ignoring case.
+pub(crate) fn is_sub_label(label: &[u8]) -> bool {
+    label.eq_ignore_ascii_case(b"_sub")
+}
+
 /// Byte offset of a case-insensitive `.local` suffix in a dot-trimmed
 /// name. Byte-wise compare: a match on the ASCII suffix also proves the
 /// offset is a char boundary, so slicing there cannot panic.
@@ -1465,6 +1472,16 @@ fn rdata_label(data: &RData) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dns_sd_label_helpers() {
+        assert!(is_proto_label(b"_tcp"));
+        assert!(is_proto_label(b"_UDP"));
+        assert!(!is_proto_label(b"_sctp"));
+        assert!(!is_proto_label(b"tcp"));
+        assert!(is_sub_label(b"_Sub"));
+        assert!(!is_sub_label(b"sub"));
+    }
 
     #[test]
     fn local_suffix_helpers() {
