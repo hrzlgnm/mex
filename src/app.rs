@@ -446,6 +446,36 @@ fn in_refresh_window(elapsed: u32, ttl: u32) -> bool {
     u64::from(elapsed) * 5 >= u64::from(ttl) * 4
 }
 
+/// Identity of one cached row for refresh bookkeeping: refresh key, then
+/// source, rdata and receive time. A re-announcement replaces the row
+/// with a new `received_at`, so it gets a fresh identity.
+type RefreshRow = (String, u16, std::net::SocketAddr, String, Instant);
+
+/// A row inside its refresh window this pass: identity, TTL, and
+/// whether its own next attempt is due.
+type PendingRow = (RefreshRow, u32, bool);
+
+/// Refresh progress of one cached row: queries so far (sent or
+/// suppressed) and when the next one is due.
+#[derive(Clone, Copy, Debug)]
+struct RowRefresh {
+    next_due: Instant,
+    attempts: u8,
+}
+
+/// Refresh queries per row before it is left to expire (RFC 6762 §5.2).
+const REFRESH_ATTEMPTS: u8 = 4;
+
+fn refresh_row(rec: &browse::RawRecord) -> RefreshRow {
+    (
+        rec.name.trim_end_matches('.').to_string(),
+        rec.rtype,
+        rec.source,
+        rec.rdata.clone(),
+        rec.received_at,
+    )
+}
+
 /// Cache-refresh spacing: 5% of the TTL plus 0-2% random variation, so
 /// queries land at ~80/85/90/95% with 80-82/85-87/90-92/95-97% jitter
 /// (RFC 6762 §5.2). No 1s floor: the >=1s rule governs the continuous
@@ -622,14 +652,20 @@ pub struct App {
     /// confirmed services). Persistent: used for instance/type splitting
     /// and as the desired continuous-query set. Never cleared on a timer.
     known_types: HashSet<String>,
-    /// Requery schedule per (name, type): (next query due, unanswered
-    /// count). RFC 6762 §5.2: a querier SHOULD re-ask at 80% of the TTL,
-    /// then 85/90/95% if no answer arrives, with ~2% random variation;
-    /// after four misses the record expires at 100% (no hourly refresh —
-    /// hourly is only the cap for *unanswered* continuous browsing).
-    /// Known answers suppress the responses in between. Answers reset the
-    /// schedule via push_record.
+    /// Per-interest summary of `refresh_rows` for the UI and dumps:
+    /// (earliest next refresh due, highest unanswered count) over the
+    /// rows of a (name, type) still being refreshed. Rebuilt by every
+    /// `requery_expiring` pass; answers clear it early via push_record.
     requeries: HashMap<(String, u16), (Instant, u8)>,
+    /// Refresh schedule per cached row (RFC 6762 §5.2): a querier SHOULD
+    /// re-ask at 80% of the row's TTL, then 85/90/95% if no answer
+    /// arrives, with ~2% random variation; after four misses the row
+    /// expires at 100% (no hourly refresh — hourly is only the cap for
+    /// *unanswered* continuous browsing). Rows sharing a question are
+    /// tracked separately so each gets its own four attempts on its own
+    /// TTL. A re-announcement replaces the row and starts it afresh.
+    /// Pruned to live rows in `requery_expiring`.
+    refresh_rows: HashMap<RefreshRow, RowRefresh>,
     /// Per-interest query provenance (transmit / suppress / observe),
     /// keyed like `continuous` by (lowercased name, type) — see
     /// `provenance_key`. Pruned with dead interests in `evict_expired`.
@@ -893,6 +929,7 @@ impl App {
             continuous: HashMap::new(),
             known_types: HashSet::new(),
             requeries: HashMap::new(),
+            refresh_rows: HashMap::new(),
             query_history: HashMap::new(),
             enum_known: HashMap::new(),
             startup_qu_sent: false,
@@ -1267,16 +1304,17 @@ impl App {
 
     fn requery_expiring(&mut self) {
         let now = Instant::now();
-        // Per-key minimum TTL plus whether any *live* row reached the 80%
-        // window. Expired rows (elapsed > TTL) are not refreshed: RFC 6762
-        // §5.2 deletes the record at 100% after four unanswered queries.
-        let mut ttl_by_key: HashMap<(String, u16), u32> = HashMap::new();
-        let mut triggered: HashSet<(String, u16)> = HashSet::new();
-        let mut live_keys: HashSet<(String, u16)> = HashSet::new();
-        let scan = |rec: &browse::RawRecord,
-                    ttl_by_key: &mut HashMap<(String, u16), u32>,
-                    triggered: &mut HashSet<(String, u16)>,
-                    live_keys: &mut HashSet<(String, u16)>| {
+        // Live rows inside their 80% window with attempts left, grouped by
+        // question, each flagged whether its own next attempt is due.
+        // Several rows (sources, rdata) share one question; each keeps
+        // its own TTL and count, so one row can neither set another's
+        // pace nor use up its attempts. Expired rows (elapsed > TTL) are
+        // not refreshed: RFC 6762 §5.2 deletes the record at 100% after
+        // four unanswered queries.
+        let mut pending: HashMap<(String, u16), Vec<PendingRow>> = HashMap::new();
+        let mut live_rows: HashSet<RefreshRow> = HashSet::new();
+        let tracked = &self.refresh_rows;
+        let mut scan = |rec: &browse::RawRecord| {
             if rec.ttl == 0 {
                 return;
             }
@@ -1284,82 +1322,112 @@ impl App {
                 12 | 33 | 16 | 1 | 28 => {}
                 _ => return,
             }
-            let key = (rec.name.trim_end_matches('.').to_string(), rec.rtype);
             let elapsed = rec.received_at.elapsed().as_secs() as u32;
             if elapsed > rec.ttl {
                 return;
             }
-            live_keys.insert(key.clone());
-            ttl_by_key
-                .entry(key.clone())
-                .and_modify(|t| *t = (*t).min(rec.ttl))
-                .or_insert(rec.ttl);
-            if in_refresh_window(elapsed, rec.ttl) {
-                triggered.insert(key);
+            let row = refresh_row(rec);
+            // One A/AAAA row is filed under every service of its host;
+            // count it once, or a single query would use up several of
+            // its attempts.
+            if !live_rows.insert(row.clone()) || !in_refresh_window(elapsed, rec.ttl) {
+                return;
             }
+            let state = tracked.get(&row);
+            if state.is_some_and(|s| s.attempts >= REFRESH_ATTEMPTS) {
+                return;
+            }
+            let due = state.is_none_or(|s| now >= s.next_due);
+            pending
+                .entry((row.0.clone(), row.1))
+                .or_default()
+                .push((row, rec.ttl, due));
         };
         for svc in &self.services {
-            for rec in &svc.answers {
-                scan(rec, &mut ttl_by_key, &mut triggered, &mut live_keys);
-            }
+            svc.answers.iter().for_each(&mut scan);
         }
         for entry in &self.enum_entries {
-            for rec in &entry.answers {
-                scan(rec, &mut ttl_by_key, &mut triggered, &mut live_keys);
+            entry.answers.iter().for_each(&mut scan);
+        }
+        // No maintenance without a live record (RFC 6762 §5.2 deletes at
+        // 100%); a replaced row is gone with its old identity.
+        self.refresh_rows.retain(|r, _| live_rows.contains(r));
+        let fired: Vec<_> = pending
+            .iter()
+            .filter(|(_, rows)| rows.iter().any(|(_, _, due)| *due))
+            .map(|(key, _)| key.clone())
+            .collect();
+        if !fired.is_empty() {
+            log::debug!(
+                "mex: cache refresh triggered for {} interest(s)",
+                fired.len()
+            );
+        }
+        for key in fired {
+            if !self.send_refresh(&key, now) {
+                continue;
             }
-        }
-        // Drop refresh schedules whose rows all expired: no maintenance
-        // without a live record (RFC 6762 §5.2 deletes at 100%).
-        self.requeries.retain(|k, _| live_keys.contains(k));
-        if triggered.is_empty() {
-            return;
-        }
-        log::debug!(
-            "mex: cache refresh triggered for {} interest(s)",
-            triggered.len()
-        );
-        for key in triggered {
-            let ttl = ttl_by_key.get(&key).copied().unwrap_or(120);
             // 0-2% random variation so queriers do not stay in lockstep
             // (RFC 6762 §5.2: 80-82%, 85-87%, 90-92%, 95-97%). No 1s floor
             // here: the >=1s rule applies to the continuous stream, while
             // refresh spacing is 5% of the TTL (floors would push small
-            // TTLs past 100%).
+            // TTLs past 100%). Only rows whose own attempt was due count
+            // this query; the others keep their pace.
             let jitter_pct = rand_u32() % 201;
-            let step = refresh_step(ttl, jitter_pct);
-            let (due, count) = self.requeries.get(&key).copied().unwrap_or((now, 0));
-            if count > 0 && now < due {
-                continue;
-            }
-            let Some(rt) = browse::record_type_from_u16(key.1) else {
-                continue;
-            };
-            let ka = if rt == TYPE::PTR {
-                if is_enum_name(&key.0) {
-                    self.known_enum_answers()
-                } else {
-                    self.known_ptrs(&key.0)
+            for (row, ttl, due) in &pending[&key] {
+                if !due {
+                    continue;
                 }
+                let state = self.refresh_rows.entry(row.clone()).or_insert(RowRefresh {
+                    next_due: now,
+                    attempts: 0,
+                });
+                state.attempts += 1;
+                state.next_due = now + refresh_step(*ttl, jitter_pct);
+            }
+        }
+        // Per-question summary for the UI: rows that used up their four
+        // attempts drop out and are left to expire at 100%.
+        self.requeries.clear();
+        for (key, rows) in pending {
+            let summary = rows
+                .iter()
+                .filter_map(|(row, _, _)| self.refresh_rows.get(row))
+                .filter(|s| s.attempts < REFRESH_ATTEMPTS)
+                .fold(None, |acc: Option<(Instant, u8)>, s| {
+                    Some(match acc {
+                        Some((due, n)) => (due.min(s.next_due), n.max(s.attempts)),
+                        None => (s.next_due, s.attempts),
+                    })
+                });
+            if let Some(summary) = summary {
+                self.requeries.insert(key, summary);
+            }
+        }
+    }
+
+    /// Transmit one refresh query for `key`, or count it as sent when an
+    /// overheard query already asked it (RFC 6762 §7.3). Returns whether
+    /// the attempt counts (false only for an unsupported record type).
+    fn send_refresh(&mut self, key: &(String, u16), now: Instant) -> bool {
+        let Some(rt) = browse::record_type_from_u16(key.1) else {
+            return false;
+        };
+        let ka = if rt == TYPE::PTR {
+            if is_enum_name(&key.0) {
+                self.known_enum_answers()
             } else {
-                Vec::new()
-            };
-            // RFC 6762 §7.3: another querier just asked the same QM
-            // question with no KA we wouldn't send — count ours as sent.
-            if self.suppressed_by_overheard(&key, &ka) {
-                log::debug!("mex: suppressed refresh query for {} (overheard)", key.0);
-                self.metrics.suppressed_refresh += 1;
-                self.metrics.suppressed_times.push_back(now);
-                self.note_query(&key.0, key.1, QueryOrigin::Suppressed, now);
-                self.route_own_question(&key.0, key.1, false);
-                self.postpone_continuous_for_refresh(&key, now);
-                let unanswered = (count + 1).min(4);
-                if unanswered >= 4 {
-                    self.requeries.remove(&key);
-                } else {
-                    self.requeries.insert(key, (now + step, unanswered));
-                }
-                continue;
+                self.known_ptrs(&key.0)
             }
+        } else {
+            Vec::new()
+        };
+        if self.suppressed_by_overheard(key, &ka) {
+            log::debug!("mex: suppressed refresh query for {} (overheard)", key.0);
+            self.metrics.suppressed_refresh += 1;
+            self.metrics.suppressed_times.push_back(now);
+            self.note_query(&key.0, key.1, QueryOrigin::Suppressed, now);
+        } else {
             self.metrics.q_sent_refresh += 1;
             self.metrics.ka_sent += ka.len() as u64;
             if self.query_tx.send(browse::QueryRequest {
@@ -1375,23 +1443,14 @@ impl App {
                     key.0
                 );
             }
-            self.route_own_question(&key.0, key.1, false);
-            // A refresh query also elicits new answers, so postpone the
-            // exponential stream for the same question: otherwise the two
-            // timers can fire on the same tick and emit back-to-back
-            // duplicates (RFC 6762 §5.2 spacing).
-            self.postpone_continuous_for_refresh(&key, now);
-            let unanswered = (count + 1).min(4);
-            if unanswered >= 4 {
-                // RFC 6762 §5.2: after queries at ~80/85/90/95% with no
-                // answer, the record expires at 100% — no hourly refresh.
-                // Hourly is only the cap for unanswered *continuous*
-                // browsing (see `continuous`), which keeps running.
-                self.requeries.remove(&key);
-            } else {
-                self.requeries.insert(key, (now + step, unanswered));
-            }
         }
+        self.route_own_question(&key.0, key.1, false);
+        // A refresh query also elicits new answers, so postpone the
+        // exponential stream for the same question: otherwise the two
+        // timers can fire on the same tick and emit back-to-back
+        // duplicates (RFC 6762 §5.2 spacing).
+        self.postpone_continuous_for_refresh(key, now);
+        true
     }
 
     /// Map key for `continuous` and `requeries`: lowercased name per
@@ -1506,6 +1565,14 @@ impl App {
             if rec.rtype != key.1
                 || Self::provenance_key(&rec.name, rec.rtype).0 != key.0
                 || rec.received_at.elapsed().as_secs() as u32 > rec.ttl
+            {
+                return None;
+            }
+            // Rows that used up their four attempts only wait to expire.
+            if self
+                .refresh_rows
+                .get(&refresh_row(rec))
+                .is_some_and(|s| s.attempts >= REFRESH_ATTEMPTS)
             {
                 return None;
             }
@@ -5887,6 +5954,16 @@ mod tests {
         }
     }
 
+    /// Backdate the refresh schedule of every tracked row of a question
+    /// so the next `requery_expiring` pass treats its attempt as due.
+    fn make_refresh_due(app: &mut App, name: &str, rtype: u16) {
+        for (row, state) in app.refresh_rows.iter_mut() {
+            if row.0 == name && row.1 == rtype {
+                state.next_due = Instant::now() - Duration::from_millis(1);
+            }
+        }
+    }
+
     fn ingest(app: &mut App, rec: &browse::RawRecord) {
         let ev = event_for(rec);
         app.ingest_event(&ev);
@@ -9315,6 +9392,195 @@ mod tests {
         );
     }
 
+    /// Enumeration rows from two responders share one refresh key: a
+    /// short-TTL row that keeps being answered, and a long-TTL row whose
+    /// responder went silent, sitting inside its 80-100% window.
+    fn app_with_stale_enum_row() -> App {
+        let mut app = App::new().unwrap();
+        let mut fresh = raw_record(
+            "_services._dns-sd._udp.local.",
+            12,
+            "PTR",
+            "_http._tcp.local.",
+            60,
+        );
+        fresh.source = "192.168.1.3:5353".parse().unwrap();
+        let mut stale = raw_record(
+            "_services._dns-sd._udp.local.",
+            12,
+            "PTR",
+            "_ipp._tcp.local.",
+            4500,
+        );
+        stale.source = "192.168.1.4:5353".parse().unwrap();
+        stale.received_at = Instant::now() - Duration::from_secs(3825); // 85%
+        app.enum_entries[0].answers.push(fresh);
+        app.enum_entries[0].answers.push(stale);
+        app
+    }
+
+    #[test]
+    fn stale_row_gets_four_refreshes_then_stops() {
+        let mut app = app_with_stale_enum_row();
+        for _ in 0..12 {
+            app.requery_expiring();
+            make_refresh_due(&mut app, "_services._dns-sd._udp.local", 12);
+        }
+        assert_eq!(
+            app.metrics.q_sent_refresh, 4,
+            "after four misses the row expires at 100%; no new cycle"
+        );
+    }
+
+    #[test]
+    fn refresh_step_follows_the_triggering_row_ttl() {
+        let mut app = app_with_stale_enum_row();
+        app.requery_expiring();
+        let key = ("_services._dns-sd._udp.local".to_string(), 12);
+        let (due, count) = app.requeries[&key];
+        assert_eq!(count, 1);
+        // 5% of the stale row's 4500s TTL, not of the sibling's 60s.
+        assert!(
+            due >= Instant::now() + Duration::from_secs(200),
+            "step must come from the row inside its refresh window"
+        );
+    }
+
+    #[test]
+    fn new_answer_rearms_a_spent_row() {
+        let mut app = app_with_stale_enum_row();
+        for _ in 0..6 {
+            app.requery_expiring();
+            make_refresh_due(&mut app, "_services._dns-sd._udp.local", 12);
+        }
+        assert_eq!(app.metrics.q_sent_refresh, 4);
+        // The responder re-announces late, then that row ages into its
+        // window again: it is a new row and gets its own refresh cycle.
+        let row = app.enum_entries[0]
+            .answers
+            .iter_mut()
+            .find(|r| r.ttl == 4500)
+            .unwrap();
+        row.received_at = Instant::now() - Duration::from_secs(3700);
+        app.requery_expiring();
+        assert_eq!(app.metrics.q_sent_refresh, 5);
+    }
+
+    fn enum_row(target: &str, ttl: u32, source: &str, age_secs: u64) -> browse::RawRecord {
+        let mut rec = raw_record("_services._dns-sd._udp.local.", 12, "PTR", target, ttl);
+        rec.source = source.parse().unwrap();
+        rec.received_at = Instant::now() - Duration::from_secs(age_secs);
+        rec
+    }
+
+    #[test]
+    fn shared_address_row_counts_one_attempt_per_query() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        ingest(
+            &mut app,
+            &raw_record(
+                "_http._tcp.local.",
+                12,
+                "PTR",
+                "Other._http._tcp.local.",
+                120,
+            ),
+        );
+        let mut srv = raw_record(
+            "Other._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 81 test.local.",
+            120,
+        );
+        srv.flush_bit = true;
+        ingest(&mut app, &srv);
+        let mut addr = raw_record("test.local.", 1, "A", "192.168.1.2", 120);
+        addr.flush_bit = true;
+        ingest(&mut app, &addr);
+        // One host backs both services: the same A row is filed twice.
+        let aged = Instant::now() - Duration::from_secs(100);
+        let mut copies = 0;
+        for svc in &mut app.services {
+            for rec in &mut svc.answers {
+                if rec.rtype == 1 {
+                    rec.received_at = aged;
+                    copies += 1;
+                }
+            }
+        }
+        assert_eq!(copies, 2);
+        for _ in 0..8 {
+            app.requery_expiring();
+            make_refresh_due(&mut app, "test.local", 1);
+        }
+        assert_eq!(app.metrics.q_sent_refresh, 4);
+    }
+
+    #[test]
+    fn newly_due_sibling_is_not_held_by_a_pending_deadline() {
+        let mut app = App::new().unwrap();
+        app.enum_entries[0].answers.push(enum_row(
+            "_ipp._tcp.local.",
+            4500,
+            "192.168.1.4:5353",
+            3600,
+        ));
+        app.requery_expiring();
+        assert_eq!(app.metrics.q_sent_refresh, 1);
+        // A TTL 60 sibling reaches 80% while the 4500s row's next attempt
+        // is ~225s away: it must be asked about in its own window.
+        app.enum_entries[0]
+            .answers
+            .push(enum_row("_http._tcp.local.", 60, "192.168.1.3:5353", 48));
+        app.requery_expiring();
+        assert_eq!(app.metrics.q_sent_refresh, 2);
+    }
+
+    #[test]
+    fn late_sibling_gets_its_own_four_attempts() {
+        let mut app = App::new().unwrap();
+        app.enum_entries[0]
+            .answers
+            .push(enum_row("_ipp._tcp.local.", 100, "192.168.1.4:5353", 80));
+        let key = "_services._dns-sd._udp.local";
+        for _ in 0..3 {
+            app.requery_expiring();
+            make_refresh_due(&mut app, key, 12);
+        }
+        assert_eq!(app.metrics.q_sent_refresh, 3);
+        // The sibling enters its window just before the first row's
+        // fourth attempt; that shared query is only its first.
+        app.enum_entries[0].answers.push(enum_row(
+            "_http._tcp.local.",
+            100,
+            "192.168.1.3:5353",
+            80,
+        ));
+        for _ in 0..8 {
+            app.requery_expiring();
+            make_refresh_due(&mut app, key, 12);
+        }
+        assert_eq!(app.metrics.q_sent_refresh, 7);
+    }
+
+    #[test]
+    fn spent_rows_are_not_projected_as_due() {
+        let mut app = app_with_stale_enum_row();
+        for _ in 0..6 {
+            app.requery_expiring();
+            make_refresh_due(&mut app, "_services._dns-sd._udp.local", 12);
+        }
+        assert_eq!(app.metrics.q_sent_refresh, 4);
+        let key = ("_services._dns-sd._udp.local".to_string(), 12);
+        assert!(!app.requeries.contains_key(&key));
+        // Only the fresh TTL 60 row is left to refresh, at 80% (48s).
+        let due = app.next_refresh_due(&key).expect("fresh row projected");
+        assert!(due >= Instant::now() + Duration::from_secs(40));
+    }
+
     #[test]
     fn query_provenance_records_transmit_suppress_observe() {
         let mut app = App::new().unwrap();
@@ -9356,11 +9622,7 @@ mod tests {
         assert!(prov.observed.is_some());
         // Make the refresh due again: the schedule spaces attempts ~5%
         // of TTL apart, so without backdating the second run skips it.
-        for ((name, rtype), (due, _)) in app.requeries.iter_mut() {
-            if name == "Test._http._tcp.local" && *rtype == 33 {
-                *due = Instant::now() - Duration::from_secs(1);
-            }
-        }
+        make_refresh_due(&mut app, "Test._http._tcp.local", 33);
         app.requery_expiring();
         let prov = app.query_history.get(&srv_key).expect("still there");
         assert!(prov.suppressed.is_some());
@@ -9531,11 +9793,7 @@ mod tests {
         // Four unanswered refreshes: attempts 1-3 stay pending, the
         // fourth expires the schedule.
         for expected in 1u8..=4u8 {
-            for ((name, rtype), (due, _)) in app.requeries.iter_mut() {
-                if name == "Test._http._tcp.local" && *rtype == 33 {
-                    *due = Instant::now() - Duration::from_secs(1);
-                }
-            }
+            make_refresh_due(&mut app, "Test._http._tcp.local", 33);
             app.requery_expiring();
             if expected < 4 {
                 let view = app.interest_view(&("test._http._tcp.local".to_string(), 33));
@@ -9773,11 +10031,7 @@ mod tests {
             remote_source(),
         );
         app.ingest_event(&ev);
-        for ((name, rtype), (due, _)) in app.requeries.iter_mut() {
-            if name == "Test._http._tcp.local" && *rtype == 33 {
-                *due = Instant::now() - Duration::from_secs(1);
-            }
-        }
+        make_refresh_due(&mut app, "Test._http._tcp.local", 33);
         app.requery_expiring();
         let text = questions_pane_text(&app);
         assert!(
