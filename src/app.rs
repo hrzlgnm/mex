@@ -1327,8 +1327,10 @@ impl App {
                 return;
             }
             let row = refresh_row(rec);
-            live_rows.insert(row.clone());
-            if !in_refresh_window(elapsed, rec.ttl) {
+            // One A/AAAA row is filed under every service of its host;
+            // count it once, or a single query would use up several of
+            // its attempts.
+            if !live_rows.insert(row.clone()) || !in_refresh_window(elapsed, rec.ttl) {
                 return;
             }
             let state = tracked.get(&row);
@@ -9469,6 +9471,52 @@ mod tests {
         rec.source = source.parse().unwrap();
         rec.received_at = Instant::now() - Duration::from_secs(age_secs);
         rec
+    }
+
+    #[test]
+    fn shared_address_row_counts_one_attempt_per_query() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        ingest(
+            &mut app,
+            &raw_record(
+                "_http._tcp.local.",
+                12,
+                "PTR",
+                "Other._http._tcp.local.",
+                120,
+            ),
+        );
+        let mut srv = raw_record(
+            "Other._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 81 test.local.",
+            120,
+        );
+        srv.flush_bit = true;
+        ingest(&mut app, &srv);
+        let mut addr = raw_record("test.local.", 1, "A", "192.168.1.2", 120);
+        addr.flush_bit = true;
+        ingest(&mut app, &addr);
+        // One host backs both services: the same A row is filed twice.
+        let aged = Instant::now() - Duration::from_secs(100);
+        let mut copies = 0;
+        for svc in &mut app.services {
+            for rec in &mut svc.answers {
+                if rec.rtype == 1 {
+                    rec.received_at = aged;
+                    copies += 1;
+                }
+            }
+        }
+        assert_eq!(copies, 2);
+        for _ in 0..8 {
+            app.requery_expiring();
+            make_refresh_due(&mut app, "test.local", 1);
+        }
+        assert_eq!(app.metrics.q_sent_refresh, 4);
     }
 
     #[test]
