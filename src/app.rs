@@ -11417,7 +11417,7 @@ mod tests {
 
     #[test]
     fn shared_target_question_is_listed_once_in_global_views() {
-        // One `fritz.box A` question files on both services pointing at
+        // One `fritz.box SOA` question files on both services pointing at
         // fritz.box: each pane keeps its finding, the dump and the metrics
         // overlay list it once and name the other service.
         let mut app = App::new().unwrap();
@@ -11432,8 +11432,8 @@ mod tests {
         let querier: SocketAddr = "192.168.1.9:5353".parse().unwrap();
         app.ingest_event(&query_event(
             "fritz.box.",
-            1,
-            "A",
+            6,
+            "SOA",
             false,
             Vec::new(),
             querier,
@@ -11442,7 +11442,7 @@ mod tests {
         let per_service: Vec<_> = app
             .anomalies()
             .into_iter()
-            .filter(|a| a.kind == anomalies::AnomalyKind::GlobalQuestion)
+            .filter(|a| a.kind == anomalies::AnomalyKind::UnicastQuestion)
             .map(|a| a.service)
             .collect();
         assert_eq!(per_service.len(), 2, "each service keeps its finding");
@@ -11451,7 +11451,7 @@ mod tests {
         let dumped: Vec<_> = dump
             .anomalies
             .iter()
-            .filter(|a| a.kind == "global-question")
+            .filter(|a| a.kind == "unicast-question")
             .collect();
         assert_eq!(dumped.len(), 1, "dump lists the question once");
         assert_eq!(dumped[0].also_services.len(), 1);
@@ -11461,16 +11461,17 @@ mod tests {
         let overlay: Vec<_> = app
             .metrics_rows()
             .into_iter()
-            .filter(|(k, _)| k.ends_with("global-question"))
+            .filter(|(k, _)| k.ends_with("unicast-question"))
             .collect();
         assert_eq!(overlay.len(), 1, "overlay lists the question once");
         assert!(overlay[0].1.contains("(+1 more)"), "got: {}", overlay[0].1);
     }
 
     #[test]
-    fn global_srv_target_question_routes_to_global_question() {
-        // A querier asking mDNS for a service's global SRV target lands on
-        // that service as an info-level global-question (RFC 6762 §13).
+    fn global_srv_target_question_is_not_flagged() {
+        // A querier resolving a service's global SRV target over mDNS is
+        // doing ordinary DNS-SD (mex and avahi both do): the question is
+        // filed on the service, but raises no finding.
         let mut app = App::new().unwrap();
         ingest(
             &mut app,
@@ -11501,14 +11502,21 @@ mod tests {
             Vec::new(),
             querier,
         ));
-        let item = app
+        let svc = app
+            .services
+            .iter()
+            .find(|s| s.instance == "Fritzel")
+            .expect("service");
+        assert!(
+            svc.questions.iter().any(|(name, ..)| name == "fritz.box."),
+            "question filed on the service"
+        );
+        let questions: Vec<_> = app
             .anomalies()
             .into_iter()
-            .find(|a| a.kind == anomalies::AnomalyKind::GlobalQuestion)
-            .expect("expected routed global-question");
-        assert_eq!(item.service, "Fritzel._avmnexus._tcp.local");
-        assert_eq!(item.severity, anomalies::Severity::Info);
-        assert_eq!(item.source.as_deref(), Some("192.168.1.9:5353"));
+            .filter(|a| a.kind.is_question())
+            .collect();
+        assert!(questions.is_empty(), "got: {questions:?}");
     }
 
     #[test]
