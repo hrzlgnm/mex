@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.3](https://github.com/hrzlgnm/mex/compare/v0.18.2...v0.18.3) (2026-11-15)
+
+
+### Bug Fixes
+
+* refresh each cached row on its own TTL, once ([#236](https://github.com/hrzlgnm/mex/issues/236)) ([4808fd3](https://github.com/hrzlgnm/mex/commit/4808fd3578f967f1fe095849984a03881fa4664e))
+
 ## [0.18.2](https://github.com/hrzlgnm/mex/compare/v0.18.1...v0.18.2) (2026-11-15)
 
 
