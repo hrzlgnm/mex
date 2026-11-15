@@ -377,13 +377,7 @@ fn draw_status_popup(frame: &mut Frame, text: String) {
 /// Only used for rendering; grouping and collapse keys keep the full name.
 fn short_service_type(label: &str) -> String {
     let trimmed = label.trim_end_matches('.');
-    let base = if trimmed.len() > ".local".len()
-        && trimmed[trimmed.len() - ".local".len()..].eq_ignore_ascii_case(".local")
-    {
-        &trimmed[..trimmed.len() - ".local".len()]
-    } else {
-        trimmed
-    };
+    let base = crate::browse::strip_local_suffix(trimmed).unwrap_or(trimmed);
     let joined: Vec<&str> = base
         .split('.')
         .map(|part| part.strip_prefix('_').unwrap_or(part))

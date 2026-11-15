@@ -682,7 +682,7 @@ fn check_unresolved_path(
         .filter(|(_, iface)| !iface.is_empty())
         .map(|(_, iface)| format!("; response on {iface}"))
         .unwrap_or_default();
-    let unicast_note = if host_key != "local" && !host_key.ends_with(".local") {
+    let unicast_note = if !crate::browse::is_local_name(host_key) {
         "; unicast DNS may still resolve this target"
     } else {
         ""
@@ -1495,7 +1495,7 @@ fn check_srv_target(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         ));
         return;
     }
-    if !trimmed.to_ascii_lowercase().ends_with(".local") && !trimmed.eq_ignore_ascii_case("local") {
+    if !crate::browse::is_local_name(trimmed) {
         // A target outside .local is not inherently invalid: DNS-SD may
         // reference hostnames resolved via unicast DNS. Info, worded as a
         // resolution note rather than a violation.

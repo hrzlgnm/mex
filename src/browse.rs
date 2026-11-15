@@ -1329,6 +1329,33 @@ pub fn record_type_from_u16(rtype: u16) -> Option<TYPE> {
     }
 }
 
+/// Byte offset of a case-insensitive `.local` suffix in a dot-trimmed
+/// name. Byte-wise compare: a match on the ASCII suffix also proves the
+/// offset is a char boundary, so slicing there cannot panic.
+fn local_suffix_offset(trimmed: &str) -> Option<usize> {
+    let off = trimmed.len().checked_sub(".local".len())?;
+    trimmed.as_bytes()[off..]
+        .eq_ignore_ascii_case(b".local")
+        .then_some(off)
+}
+
+/// `name` without trailing root dots and its `.local` suffix
+/// (`printer.local.` → `printer`), matched case-insensitively. `None`
+/// when the name is not under `.local` or nothing precedes the suffix.
+pub(crate) fn strip_local_suffix(name: &str) -> Option<&str> {
+    let trimmed = name.trim_end_matches('.');
+    local_suffix_offset(trimmed)
+        .filter(|&off| off > 0)
+        .map(|off| &trimmed[..off])
+}
+
+/// Whether `name` is `local` itself or ends in `.local` (RFC 6762 §3),
+/// ignoring case and trailing root dots.
+pub(crate) fn is_local_name(name: &str) -> bool {
+    let trimmed = name.trim_end_matches('.');
+    trimmed.eq_ignore_ascii_case("local") || local_suffix_offset(trimmed).is_some()
+}
+
 /// Mnemonics for the record/question types mex names, including
 /// QTYPE-only codes such as ANY (255) that have no `TYPE` counterpart —
 /// which is why this stays keyed by raw u16 instead of the query-type
@@ -1438,6 +1465,25 @@ fn rdata_label(data: &RData) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_suffix_helpers() {
+        assert_eq!(strip_local_suffix("printer.local."), Some("printer"));
+        assert_eq!(strip_local_suffix("Printer.LOCAL"), Some("Printer"));
+        assert_eq!(strip_local_suffix("_http._tcp.local"), Some("_http._tcp"));
+        assert_eq!(strip_local_suffix("local."), None);
+        assert_eq!(strip_local_suffix(".local"), None);
+        assert_eq!(strip_local_suffix("localhost"), None);
+        assert_eq!(strip_local_suffix("example.com"), None);
+        // Multi-byte text right before the suffix must not panic.
+        assert_eq!(strip_local_suffix("ä.local"), Some("ä"));
+        assert_eq!(strip_local_suffix("éélocal"), None);
+        assert!(is_local_name("LOCAL."));
+        assert!(is_local_name("host.local"));
+        assert!(!is_local_name("host.example"));
+        assert!(!is_local_name("notlocal"));
+        assert!(is_local_name(".local"));
+    }
 
     #[test]
     fn rtype_names_round_trip() {

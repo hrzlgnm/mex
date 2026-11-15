@@ -1874,14 +1874,9 @@ impl App {
     /// removed (`printer.local.` → `printer`). Case-insensitive; names
     /// that merely contain `local` elsewhere are untouched.
     fn short_hostname(name: &str) -> String {
-        let trimmed = name.trim_end_matches('.');
-        if trimmed.len() > ".local".len() {
-            let off = trimmed.len() - ".local".len();
-            if trimmed.is_char_boundary(off) && trimmed[off..].eq_ignore_ascii_case(".local") {
-                return trimmed[..off].to_string();
-            }
-        }
-        trimmed.to_string()
+        browse::strip_local_suffix(name)
+            .unwrap_or_else(|| name.trim_end_matches('.'))
+            .to_string()
     }
 
     /// Live addresses (A/AAAA rdata) aggregated across all services on the
