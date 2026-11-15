@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use crate::app::ENUM_SERVICE;
-use crate::browse::RawRecord;
+use crate::browse::{rtype_from_str, RawRecord};
 
 /// Service identity carried by findings: `instance.service_type`, or
 /// `enumeration` for enumeration-row answers. Single definition shared
@@ -1130,25 +1130,6 @@ pub(crate) fn is_one_shot_querier(source: &SocketAddr) -> bool {
     source.port() != 5353 && source.port() >= 1024
 }
 
-/// Numeric type for a displayed `rtype_str` (`A` → 1, …, `TYPE47` → 47).
-/// `None` means unrecognised: the row stays quiet rather than guessing.
-pub(crate) fn rtype_from_str(s: &str) -> Option<u16> {
-    match s {
-        "A" => Some(1),
-        "NS" => Some(2),
-        "CNAME" => Some(5),
-        "SOA" => Some(6),
-        "MX" => Some(15),
-        "TXT" => Some(16),
-        "AAAA" => Some(28),
-        "SRV" => Some(33),
-        "PTR" => Some(12),
-        "NSEC" => Some(47),
-        "ANY" => Some(255),
-        _ => s.strip_prefix("TYPE").and_then(|n| n.parse().ok()),
-    }
-}
-
 /// One observed question asking multicast for a unicast-only type: the
 /// demand-side twin of `unicast-style-response`. Port 0 can never be a real querier,
 /// so our own inferred sends stay quiet here, not just in the UI.
@@ -1997,16 +1978,6 @@ mod tests {
         )];
         let found = analyze_service("Test", "_http._tcp.local", "myhost.local.", &clean);
         assert!(found.iter().all(|a| a.kind != AnomalyKind::NonUtf8));
-    }
-
-    #[test]
-    fn rtype_from_str_round_trips() {
-        use super::rtype_from_str;
-        assert_eq!(rtype_from_str("A"), Some(1));
-        assert_eq!(rtype_from_str("SOA"), Some(6));
-        assert_eq!(rtype_from_str("ANY"), Some(255));
-        assert_eq!(rtype_from_str("TYPE47"), Some(47));
-        assert_eq!(rtype_from_str("bogus"), None);
     }
 
     #[test]

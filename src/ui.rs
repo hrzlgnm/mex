@@ -986,7 +986,7 @@ fn draw_questions_tab(
         // Latest event and owning timer for this interest, from the
         // authoritative per-interest state (app.rs): rows stay dumb.
         let self_row = *source == crate::app::SELF_SOURCE;
-        let (last_txt, due_txt) = match crate::anomalies::rtype_from_str(rtype) {
+        let (last_txt, due_txt) = match crate::browse::rtype_from_str(rtype) {
             Some(t) => {
                 let s = app.interest_summary(name, t);
                 let now = std::time::Instant::now();
@@ -1049,7 +1049,7 @@ fn draw_questions_tab(
         // Port 0 is never a real querier, so inferred self sends never
         // match a finding; unparsable type labels stay quiet.
         let flagged = !self_row
-            && crate::anomalies::rtype_from_str(rtype).is_some_and(|t| {
+            && crate::browse::rtype_from_str(rtype).is_some_and(|t| {
                 question_keys.contains(&(
                     name.trim_end_matches('.').to_lowercase(),
                     t,

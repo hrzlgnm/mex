@@ -2524,7 +2524,7 @@ impl App {
         rows: &'a [QuestionRow],
     ) {
         for (name, rtype_str, source, _, _) in rows {
-            if let Some(rtype) = anomalies::rtype_from_str(rtype_str) {
+            if let Some(rtype) = browse::rtype_from_str(rtype_str) {
                 out.push(anomalies::QuestionView {
                     service: service.clone(),
                     name,
@@ -4587,19 +4587,6 @@ impl App {
         }
     }
 
-    /// Short label for the record types we ever transmit (the only ones
-    /// `route_own_question` can see).
-    fn own_rtype_label(rtype: u16) -> Option<&'static str> {
-        match rtype {
-            12 => Some("PTR"),
-            33 => Some("SRV"),
-            16 => Some("TXT"),
-            1 => Some("A"),
-            28 => Some("AAAA"),
-            _ => None,
-        }
-    }
-
     /// File a question we sent ourselves, inferred from the send path:
     /// multicast loop is disabled so our transmissions never arrive as
     /// events. Store a minimal query packet for the question fields rather
@@ -4613,7 +4600,9 @@ impl App {
         let bare = name.trim_end_matches('.');
         let display = format!("{bare}.");
         let key = bare.to_lowercase();
-        let Some(label) = Self::own_rtype_label(rtype) else {
+        // Only the types we ever transmit (`record_type_from_u16`) can
+        // reach this path.
+        let Some(label) = browse::record_type_from_u16(rtype).and(browse::rtype_name(rtype)) else {
             return;
         };
         let bytes = browse::inferred_question_packet(name, rtype, qu).unwrap_or_else(|| {
@@ -5716,7 +5705,7 @@ impl App {
         key: QuestionKey<'_>,
         id: &str,
     ) -> Vec<anomalies::Anomaly> {
-        let Some(rtype) = anomalies::rtype_from_str(key.rtype_str) else {
+        let Some(rtype) = browse::rtype_from_str(key.rtype_str) else {
             return Vec::new();
         };
         let name = key.name.trim_end_matches('.').to_lowercase();

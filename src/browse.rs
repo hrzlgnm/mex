@@ -1329,24 +1329,45 @@ pub fn record_type_from_u16(rtype: u16) -> Option<TYPE> {
     }
 }
 
-/// Human label for a numeric record/question type, including QTYPE-only
-/// codes such as ANY (255) that have no `TYPE` counterpart — which is
-/// why this stays keyed by raw u16 instead of the query-type enum.
+/// Mnemonics for the record/question types mex names, including
+/// QTYPE-only codes such as ANY (255) that have no `TYPE` counterpart —
+/// which is why this stays keyed by raw u16 instead of the query-type
+/// enum. Single source for both directions of the mapping.
+const RTYPE_NAMES: &[(u16, &str)] = &[
+    (1, "A"),
+    (2, "NS"),
+    (5, "CNAME"),
+    (6, "SOA"),
+    (12, "PTR"),
+    (15, "MX"),
+    (16, "TXT"),
+    (28, "AAAA"),
+    (33, "SRV"),
+    (47, "NSEC"),
+    (255, "ANY"),
+];
+
+/// Mnemonic for a numeric type, if it has one in `RTYPE_NAMES`.
+pub(crate) fn rtype_name(rtype: u16) -> Option<&'static str> {
+    RTYPE_NAMES
+        .iter()
+        .find_map(|&(code, name)| (code == rtype).then_some(name))
+}
+
+/// Human label for a numeric record/question type: its mnemonic, or the
+/// RFC 3597 `TYPEnn` form for anything else.
 pub(crate) fn rtype_label(rtype: u16) -> String {
-    match rtype {
-        1 => "A".into(),
-        28 => "AAAA".into(),
-        33 => "SRV".into(),
-        16 => "TXT".into(),
-        12 => "PTR".into(),
-        5 => "CNAME".into(),
-        2 => "NS".into(),
-        47 => "NSEC".into(),
-        255 => "ANY".into(),
-        6 => "SOA".into(),
-        15 => "MX".into(),
-        _ => format!("TYPE{rtype}"),
-    }
+    rtype_name(rtype).map_or_else(|| format!("TYPE{rtype}"), str::to_string)
+}
+
+/// Numeric type for a displayed label (`A` → 1, …, `TYPE47` → 47); the
+/// inverse of `rtype_label`. `None` means unrecognised: callers stay
+/// quiet rather than guessing.
+pub(crate) fn rtype_from_str(s: &str) -> Option<u16> {
+    RTYPE_NAMES
+        .iter()
+        .find_map(|&(code, name)| (name == s).then_some(code))
+        .or_else(|| s.strip_prefix("TYPE").and_then(|n| n.parse().ok()))
 }
 
 fn rdata_label(data: &RData) -> String {
@@ -1417,6 +1438,18 @@ fn rdata_label(data: &RData) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rtype_names_round_trip() {
+        for &(code, name) in RTYPE_NAMES {
+            assert_eq!(rtype_label(code), name);
+            assert_eq!(rtype_from_str(name), Some(code));
+        }
+        assert_eq!(rtype_label(99), "TYPE99");
+        assert_eq!(rtype_from_str("TYPE47"), Some(47));
+        assert_eq!(rtype_from_str("TYPE99"), Some(99));
+        assert_eq!(rtype_from_str("bogus"), None);
+    }
 
     #[test]
     fn v6_dest_carries_interface_scope() {
