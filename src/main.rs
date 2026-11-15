@@ -11,9 +11,13 @@ use anyhow::Result;
 use clap::Parser;
 use std::str::FromStr;
 
+/// Program name, from Cargo: the CLI name, the log/state directory and
+/// log file names, and the dump's `application_name` all derive from it.
+pub const APP_NAME: &str = env!("CARGO_PKG_NAME");
+
 #[derive(Parser, Debug)]
 #[command(
-    name = "mex",
+    name = APP_NAME,
     version,
     about = "Terminal UI to browse and debug mDNS/DNS-SD on the local link — live services, records, queries, and raw packets"
 )]
@@ -243,19 +247,19 @@ impl RotatingLog {
 fn default_log_dir() -> std::path::PathBuf {
     #[cfg(target_os = "windows")]
     if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
-        return std::path::PathBuf::from(dir).join("mex").join("logs");
+        return std::path::PathBuf::from(dir).join(APP_NAME).join("logs");
     }
     #[cfg(target_os = "macos")]
     if let Some(home) = std::env::var_os("HOME") {
         return std::path::PathBuf::from(home)
             .join("Library")
             .join("Logs")
-            .join("mex");
+            .join(APP_NAME);
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     if let Some(state) = std::env::var_os("XDG_STATE_HOME") {
         if !state.is_empty() {
-            return std::path::PathBuf::from(state).join("mex");
+            return std::path::PathBuf::from(state).join(APP_NAME);
         }
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -263,9 +267,9 @@ fn default_log_dir() -> std::path::PathBuf {
         return std::path::PathBuf::from(home)
             .join(".local")
             .join("state")
-            .join("mex");
+            .join(APP_NAME);
     }
-    std::env::temp_dir().join("mex")
+    std::env::temp_dir().join(APP_NAME)
 }
 
 /// Install logging before the app runs: an explicit `--log-file`
@@ -280,7 +284,7 @@ fn init_logging(
 ) -> Result<()> {
     let (path, stderr) = match log_file {
         Some(p) => (std::path::PathBuf::from(p), false),
-        None => (default_log_dir().join("mex.log"), !has_tui),
+        None => (default_log_dir().join(format!("{APP_NAME}.log")), !has_tui),
     };
     match RotatingLog::open(&path, MAX_LOG_BYTES, KEEP_LOG_GENERATIONS) {
         Ok(log) => {

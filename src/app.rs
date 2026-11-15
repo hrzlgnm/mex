@@ -2916,7 +2916,7 @@ impl App {
         dump::StateDump {
             metadata: dump::Metadata {
                 dump_timestamp: dump::dump_timestamp_iso(),
-                application_name: "mex".to_string(),
+                application_name: crate::APP_NAME.to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
             services: self.services.iter().map(|s| self.dump_service(s)).collect(),
