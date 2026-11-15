@@ -217,14 +217,11 @@ to stderr.
 
 ## Known limitations
 
-**Quiet publishers' subtypes are undiscoverable.** A service subtype (e.g.
-`_magic._sub._test._tcp`) can only be learned two ways: from a
-`_services._dns-sd._udp` enumeration that lists it, or by overhearing
-subtype traffic (startup announcements, someone else's subtype
-queries/responses). Some responders (e.g. avahi) do not list subtypes in
-their enumeration answers, and there is no DNS query that enumerates
-_unknown_ subtype labels. So if mex starts after such a publisher has gone
-quiet, it shows the service but not its subtype; starting mex first (or
-any subtype traffic while it runs) picks it up normally via the
-announcement burst. Once learned, subtype enumerations are re-queried to
-stay fresh.
+**Subtypes of quiet publishers can remain hidden.** DNS-SD has no query
+that enumerates a service type's subtypes, so mex learns a subtype (e.g.
+`_printer._sub._http._tcp`) only from traffic: the publisher's
+announcement, another client's subtype query or response, or a service
+enumeration that lists it (non-standard, flagged as `enum-subtype`).
+
+Start mex before the publisher, or trigger subtype traffic. Once seen,
+the subtype is refreshed like any other record.
