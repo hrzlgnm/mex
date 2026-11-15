@@ -435,6 +435,10 @@ const PENDING_ADDR_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 pub const SELF_SOURCE: std::net::SocketAddr =
     std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
 
+/// How `SELF_SOURCE` is spelled wherever a querier is shown (Questions
+/// pane, state dump), instead of the meaningless `0.0.0.0:0`.
+pub const SELF_SOURCE_LABEL: &str = "self";
+
 /// Whether a record `elapsed` seconds old has reached its 80%-TTL refresh
 /// window (RFC 6762 §5.2). Widened to u64: TTLs are unbounded u32 from the
 /// wire, so `ttl * 4` would overflow for TTLs of 2^30 s or more.
@@ -2714,7 +2718,11 @@ impl App {
         dump::DumpQuestion {
             name: q.0.clone(),
             rtype_str: q.1.clone(),
-            source: q.2.to_string(),
+            source: if q.2 == SELF_SOURCE {
+                SELF_SOURCE_LABEL.to_string()
+            } else {
+                q.2.to_string()
+            },
             received_at: dump::instant_to_iso(q.3),
             age_secs: q.3.elapsed().as_secs(),
         }
@@ -6523,6 +6531,27 @@ mod tests {
             txt.rdata,
             "id=*REDACTED*; external_url=*REDACTED*; fn=Schreibtisch"
         );
+    }
+
+    #[test]
+    fn dump_question_row_labels_self_source() {
+        let now = Instant::now();
+        let own = (
+            "_http._tcp.local".to_string(),
+            "PTR".to_string(),
+            SELF_SOURCE,
+            now,
+            Vec::new(),
+        );
+        assert_eq!(App::dump_question_row(&own).source, SELF_SOURCE_LABEL);
+        let remote = (
+            "_http._tcp.local".to_string(),
+            "PTR".to_string(),
+            "192.168.1.5:5353".parse().unwrap(),
+            now,
+            Vec::new(),
+        );
+        assert_eq!(App::dump_question_row(&remote).source, "192.168.1.5:5353");
     }
 
     #[test]

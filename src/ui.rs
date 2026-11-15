@@ -1169,7 +1169,7 @@ fn draw_questions_tab(
 /// everything else as the querier address.
 fn question_source_label(source: &SocketAddr) -> String {
     if *source == crate::app::SELF_SOURCE {
-        "self".to_string()
+        crate::app::SELF_SOURCE_LABEL.to_string()
     } else if crate::anomalies::is_one_shot_querier(source) {
         format!("{source} (one-shot)")
     } else {
