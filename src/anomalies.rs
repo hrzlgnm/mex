@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+use crate::app::ENUM_SERVICE;
 use crate::browse::RawRecord;
 
 /// Service identity carried by findings: `instance.service_type`, or
@@ -718,7 +719,7 @@ fn check_unresolved_path(
 
 fn check_type_format(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>) {
     let st = svc.service_type.trim_end_matches('.');
-    if st.eq_ignore_ascii_case("_services._dns-sd._udp.local") {
+    if st.eq_ignore_ascii_case(ENUM_SERVICE) {
         return;
     }
     // Reverse-mapping names map addresses to hostnames; they are not
@@ -1034,10 +1035,7 @@ pub(crate) fn visible_scope(a: &Anomaly, identity_count: &HashMap<(String, u16),
 /// varying target instead.
 pub(crate) fn is_enumeration_row(service: &str, record_name: Option<&str>) -> bool {
     service == ENUMERATION_SERVICE
-        && record_name.is_some_and(|n| {
-            n.trim_end_matches('.')
-                .eq_ignore_ascii_case("_services._dns-sd._udp.local")
-        })
+        && record_name.is_some_and(|n| n.trim_end_matches('.').eq_ignore_ascii_case(ENUM_SERVICE))
 }
 
 /// Whether a PTR owner name is a reverse-mapping name. Those PTRs are
