@@ -761,7 +761,7 @@ fn service_type_labels_problem(parts: &[&[u8]]) -> Option<String> {
             if let Some(reason) = service_label_problem(svc) {
                 return Some(reason);
             }
-            if !proto.eq_ignore_ascii_case(b"_tcp") && !proto.eq_ignore_ascii_case(b"_udp") {
+            if !crate::browse::is_proto_label(proto) {
                 return Some("protocol must be _tcp or _udp".to_string());
             }
             if !local.eq_ignore_ascii_case(b"local") {
@@ -773,7 +773,7 @@ fn service_type_labels_problem(parts: &[&[u8]]) -> Option<String> {
             if let Some(reason) = subtype_problem(sub) {
                 return Some(format!("subtype {reason}"));
             }
-            if !sub_kw.eq_ignore_ascii_case(b"_sub") {
+            if !crate::browse::is_sub_label(sub_kw) {
                 return Some(
                     "expected _service._tcp.local or subtype._sub._service._tcp.local".to_string(),
                 );
@@ -781,7 +781,7 @@ fn service_type_labels_problem(parts: &[&[u8]]) -> Option<String> {
             if let Some(reason) = service_label_problem(svc) {
                 return Some(reason);
             }
-            if !proto.eq_ignore_ascii_case(b"_tcp") && !proto.eq_ignore_ascii_case(b"_udp") {
+            if !crate::browse::is_proto_label(proto) {
                 return Some("protocol must be _tcp or _udp".to_string());
             }
             if !local.eq_ignore_ascii_case(b"local") {
@@ -817,7 +817,7 @@ fn is_subtype_wire_labels(labels: &[Vec<u8>]) -> bool {
 }
 
 fn is_subtype_labels(labels: &[&[u8]]) -> bool {
-    matches!(labels, [_, sub_kw, _, _, _] if sub_kw.eq_ignore_ascii_case(b"_sub"))
+    matches!(labels, [_, sub_kw, _, _, _] if crate::browse::is_sub_label(sub_kw))
 }
 
 fn display_type_target(labels: &[Vec<u8>]) -> String {
