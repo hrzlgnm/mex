@@ -175,7 +175,9 @@ severity (no severity word), and enumeration-row findings omit their
 constant scope. The metrics overlay (`m`) lists all findings with
 severity icons as `<icon> <kind>` → `<source>: <service>
 <record>: <message> (<rfc>)`, and `Ctrl+J` state dumps include the
-full list.
+full list. A question that asks for a name shared by several services
+(e.g. an SRV target) shows on each of their panes, but the overlay and
+the dump list it once (`+N more` / `also_services`).
 
 Omitting A/AAAA records from PTR/SRV replies is not flagged.
 `unresolved-srv-target` reports outcomes of transmitted address queries for live
