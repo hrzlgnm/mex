@@ -433,6 +433,10 @@ const PENDING_ADDR_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 pub const SELF_SOURCE: std::net::SocketAddr =
     std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
 
+/// How `SELF_SOURCE` is spelled wherever a querier is shown (Questions
+/// pane, state dump), instead of the meaningless `0.0.0.0:0`.
+pub const SELF_SOURCE_LABEL: &str = "self";
+
 /// Whether a record `elapsed` seconds old has reached its 80%-TTL refresh
 /// window (RFC 6762 §5.2). Widened to u64: TTLs are unbounded u32 from the
 /// wire, so `ttl * 4` would overflow for TTLs of 2^30 s or more.
@@ -2712,10 +2716,8 @@ impl App {
         dump::DumpQuestion {
             name: q.0.clone(),
             rtype_str: q.1.clone(),
-            // Own inferred sends carry the `SELF_SOURCE` sentinel; spell
-            // it `self` as the Questions pane does, not `0.0.0.0:0`.
             source: if q.2 == SELF_SOURCE {
-                "self".to_string()
+                SELF_SOURCE_LABEL.to_string()
             } else {
                 q.2.to_string()
             },
@@ -6539,7 +6541,7 @@ mod tests {
             now,
             Vec::new(),
         );
-        assert_eq!(App::dump_question_row(&own).source, "self");
+        assert_eq!(App::dump_question_row(&own).source, SELF_SOURCE_LABEL);
         let remote = (
             "_http._tcp.local".to_string(),
             "PTR".to_string(),
