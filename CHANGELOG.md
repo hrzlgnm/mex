@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.18.1](https://github.com/hrzlgnm/mex/compare/v0.18.0...v0.18.1) (2026-11-15)
+
+
+### Bug Fixes
+
+* label own questions as self in the state dump ([#225](https://github.com/hrzlgnm/mex/issues/225)) ([b88424a](https://github.com/hrzlgnm/mex/commit/b88424a7e6da52754de873a124dbab34df2d00a4))
+* share one .local suffix helper, removing a UI panic ([#228](https://github.com/hrzlgnm/mex/issues/228)) ([0fa538a](https://github.com/hrzlgnm/mex/commit/0fa538a6aca8198b8ea547b47b82b33edd428072))
+
+
+### Documentation
+
+* trim the known-limitations section ([#223](https://github.com/hrzlgnm/mex/issues/223)) ([10b1fb0](https://github.com/hrzlgnm/mex/commit/10b1fb0b5ba1688669a2dc5bcef6df0c834b0768))
+
+
+### Code Refactoring
+
+* derive record type names from one shared table ([#227](https://github.com/hrzlgnm/mex/issues/227)) ([b9c601c](https://github.com/hrzlgnm/mex/commit/b9c601cd64c7b48fa1af570501e3d7e9b990453e))
+* share DNS-SD protocol and subtype label checks ([#229](https://github.com/hrzlgnm/mex/issues/229)) ([9d7dbfc](https://github.com/hrzlgnm/mex/commit/9d7dbfc2e8e73629079d32732efe788594a2a2cb))
+* share the DNS-SD enumeration name with anomaly checks ([#226](https://github.com/hrzlgnm/mex/issues/226)) ([0df8ddc](https://github.com/hrzlgnm/mex/commit/0df8ddc945658a19801dcae8ccdcfafa178a63dc))
+
 ## [0.18.0](https://github.com/hrzlgnm/mex/compare/v0.17.2...v0.18.0) (2026-11-15)
 
 
