@@ -965,12 +965,16 @@ pub(crate) fn parse_packet(
     // Walk the record headers first: out-of-scope records are made
     // opaque before `Packet::parse`, so their rdata is never decoded and
     // a malformed one cannot fail the whole packet.
-    let walked = walk_records(raw);
-    let (parse_bytes, wire_records) = match &walked {
-        Some((bytes, records)) => (bytes.as_slice(), records.as_slice()),
-        None => (raw, &[][..]),
-    };
-    let pkt = Packet::parse(parse_bytes).ok()?;
+    // A packet the walk can't follow is dropped: parsing the raw bytes
+    // instead would decode out-of-scope rdata after all.
+    let (parse_bytes, mut wire) = walk_records(raw)?;
+    let pkt = Packet::parse(&parse_bytes).ok()?;
+    // `Packet::parse` moves the first OPT pseudo-record out of the
+    // Additional section into the header; drop its walked entry too, so
+    // walked and parsed records stay aligned.
+    if let Some(i) = wire.additional.iter().position(|w| w.rtype == OPT_TYPE) {
+        wire.additional.remove(i);
+    }
     let dst_is_multicast = mdns_multicast_dest(&dst);
     let is_response = pkt.has_flags(PacketFlag::RESPONSE);
     let ing = Ingress {
@@ -981,9 +985,6 @@ pub(crate) fn parse_packet(
     };
 
     let mut answers = Vec::new();
-    // On-wire type and RDLENGTH per resource record, in packet order
-    // (answer, authority, additional).
-    let mut wire_at = wire_records.iter().copied();
 
     // Only responses carry authoritative answers. Queries may carry the
     // same answers as known answers (RFC 6762 §7.1 suppression), which
@@ -992,26 +993,22 @@ pub(crate) fn parse_packet(
     // source. Filing them would conjure phantom sightings on links the
     // device never touched.
     if is_response {
-        for (section, rec) in pkt
-            .answers
-            .iter()
-            .map(|r| (RecordSection::Answer, r))
-            .chain(
-                pkt.name_servers
-                    .iter()
-                    .map(|r| (RecordSection::Authority, r)),
-            )
-            .chain(
-                pkt.additional_records
-                    .iter()
-                    .map(|r| (RecordSection::Additional, r)),
-            )
-        {
-            let wire = wire_at.next();
-            if is_opt(rec, wire) {
-                continue;
+        for (section, records, walked) in [
+            (RecordSection::Answer, &pkt.answers, &wire.answer),
+            (RecordSection::Authority, &pkt.name_servers, &wire.authority),
+            (
+                RecordSection::Additional,
+                &pkt.additional_records,
+                &wire.additional,
+            ),
+        ] {
+            for (i, rec) in records.iter().enumerate() {
+                let w = walked.get(i).copied();
+                if is_opt(rec, w) {
+                    continue;
+                }
+                answers.push(record_row(rec, w, section, ing));
             }
-            answers.push(record_row(rec, wire, section, ing));
         }
     }
 
@@ -1019,12 +1016,12 @@ pub(crate) fn parse_packet(
     // question suppression (§7.3) and never filed as answers.
     let mut query_kas = Vec::new();
     if !is_response {
-        for rec in pkt.answers.iter() {
-            let wire = wire_at.next();
-            if is_opt(rec, wire) {
+        for (i, rec) in pkt.answers.iter().enumerate() {
+            let w = wire.answer.get(i).copied();
+            if is_opt(rec, w) {
                 continue;
             }
-            query_kas.push(record_row(rec, wire, RecordSection::KnownAnswer, ing));
+            query_kas.push(record_row(rec, w, RecordSection::KnownAnswer, ing));
         }
     }
 
@@ -1193,28 +1190,39 @@ fn is_opt(rec: &ResourceRecord<'_>, wire: Option<WireRecord>) -> bool {
     wire.map_or_else(|| u16::from(rec.rdata.type_code()), |w| w.rtype) == OPT_TYPE
 }
 
+/// Walked record headers per section, in wire order.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct WalkedSections {
+    answer: Vec<WireRecord>,
+    authority: Vec<WireRecord>,
+    additional: Vec<WireRecord>,
+}
+
 /// Walk every resource record header in a packet (answer, authority,
 /// additional; questions skipped) and return a copy whose out-of-scope
 /// records (`anomalies::is_mdns_answer_type` false, OPT excepted) carry
-/// `OPAQUE_TYPE`, plus each record's on-wire type and RDLENGTH in
-/// order. Only the TYPE field changes, so names, offsets and
+/// `OPAQUE_TYPE`, plus each record's on-wire type and RDLENGTH per
+/// section. Only the TYPE field changes, so names, offsets and
 /// compression pointers stay valid; re-encoding would expand
-/// compressed names and misreport RDLENGTH. `None` when the walk falls
-/// off the end (a truncated or malformed packet).
-fn walk_records(raw: &[u8]) -> Option<(Vec<u8>, Vec<WireRecord>)> {
+/// compressed names and misreport RDLENGTH. Every parse of received
+/// bytes goes through this copy, so out-of-scope rdata is never
+/// decoded. `None` when the walk falls off the end (a truncated or
+/// malformed packet).
+fn walk_records(raw: &[u8]) -> Option<(Vec<u8>, WalkedSections)> {
     let count = |at: usize| -> Option<usize> {
         let b = raw.get(at..at + 2)?;
         Some(usize::from(u16::from_be_bytes([b[0], b[1]])))
     };
     let questions = count(4)?;
-    let records = count(6)? + count(8)? + count(10)?;
+    let (answers, authority) = (count(6)?, count(8)?);
+    let records = answers + authority + count(10)?;
     let mut offset = 12;
     for _ in 0..questions {
         offset = packet_name_end(raw, offset)?.checked_add(4)?;
     }
     let mut bytes = raw.to_vec();
-    let mut out = Vec::with_capacity(records);
-    for _ in 0..records {
+    let mut out = WalkedSections::default();
+    for index in 0..records {
         let type_at = packet_name_end(raw, offset)?;
         let t = raw.get(type_at..type_at.checked_add(2)?)?;
         let rtype = u16::from_be_bytes([t[0], t[1]]);
@@ -1228,7 +1236,14 @@ fn walk_records(raw: &[u8]) -> Option<(Vec<u8>, Vec<WireRecord>)> {
         if rtype != OPT_TYPE && !crate::anomalies::is_mdns_answer_type(rtype) {
             bytes[type_at..type_at + 2].copy_from_slice(&OPAQUE_TYPE.to_be_bytes());
         }
-        out.push(WireRecord { rtype, rdlength });
+        let section = if index < answers {
+            &mut out.answer
+        } else if index < answers + authority {
+            &mut out.authority
+        } else {
+            &mut out.additional
+        };
+        section.push(WireRecord { rtype, rdlength });
     }
     Some((bytes, out))
 }
@@ -1303,7 +1318,11 @@ pub fn record_fields(wire: &[u8], rtype: u16) -> Vec<RecordField> {
 }
 
 pub fn question_fields(wire: &[u8], name: &str, rtype_str: &str) -> Option<Vec<RecordField>> {
-    let packet = Packet::parse(wire).ok()?;
+    // Parse the opaque copy: known answers in the stored query must not
+    // be decoded (or fail the parse) when they are out of scope. The
+    // layout is identical, so field offsets apply to `wire`.
+    let (opaque, _) = walk_records(wire)?;
+    let packet = Packet::parse(&opaque).ok()?;
     if packet.has_flags(PacketFlag::RESPONSE) {
         return None;
     }
@@ -2070,10 +2089,11 @@ mod tests {
         let ev =
             parse_packet(&raw, test_source(), std::net::IpAddr::V4(MDNS_V4), "br0", 3).unwrap();
         assert_eq!(ev.answers.len(), 3);
-        let wire_lengths: Vec<u16> = walk_records(&raw)
-            .unwrap()
-            .1
+        let walked = walk_records(&raw).unwrap().1;
+        let wire_lengths: Vec<u16> = walked
+            .answer
             .iter()
+            .chain(&walked.additional)
             .map(|w| w.rdlength)
             .collect();
         let soa = &ev.answers[0];
@@ -2129,6 +2149,71 @@ mod tests {
     }
 
     #[test]
+    fn opt_before_other_additionals_keeps_records_aligned() {
+        // Response: A host.local in Answer; Additional holds OPT first,
+        // then AAAA host.local, then an MX. The parser lifts the OPT out
+        // of Additional; walked types and lengths must still line up.
+        let name: &[u8] = b"\x04host\x05local\x00";
+        let mut raw = vec![0, 0, 0x84, 0, 0, 0, 0, 1, 0, 0, 0, 3];
+        raw.extend_from_slice(name);
+        raw.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 120, 0, 4, 10, 0, 0, 1]);
+        raw.extend_from_slice(&[0, 0, 41, 0x05, 0xa0, 0, 0, 0, 0, 0, 0]);
+        raw.extend_from_slice(name);
+        raw.extend_from_slice(&[0, 28, 0, 1, 0, 0, 0, 120, 0, 16]);
+        raw.extend_from_slice(&[0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        raw.extend_from_slice(name);
+        raw.extend_from_slice(&[0, 15, 0, 1, 0, 0, 0, 120, 0, 4, 0, 10, 0xc0, 12]);
+        let ev = parse_packet(&raw, test_source(), std::net::IpAddr::V4(MDNS_V4), "br0", 3)
+            .expect("packet parses");
+        let rows: Vec<(u16, &str, RecordSection)> = ev
+            .answers
+            .iter()
+            .map(|r| (r.rtype, r.rdata.as_str(), r.section))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (1, "10.0.0.1", RecordSection::Answer),
+                (28, "fd00::1", RecordSection::Additional),
+                (15, "rdlength=4", RecordSection::Additional),
+            ]
+        );
+    }
+
+    #[test]
+    fn unwalkable_packet_is_dropped_not_parsed_raw() {
+        // A valid MX followed by a record whose RDLENGTH runs past the
+        // end: dropped as a whole, the MX never reaches the parser.
+        let name: &[u8] = b"\x04host\x05local\x00";
+        let mut raw = vec![0, 0, 0x84, 0, 0, 0, 0, 2, 0, 0, 0, 0];
+        raw.extend_from_slice(name);
+        raw.extend_from_slice(&[0, 15, 0, 1, 0, 0, 0, 120, 0, 4, 0, 10, 0xc0, 12]);
+        raw.extend_from_slice(name);
+        raw.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 120, 0, 9, 10, 0]);
+        assert!(walk_records(&raw).is_none());
+        assert!(
+            parse_packet(&raw, test_source(), std::net::IpAddr::V4(MDNS_V4), "br0", 3).is_none()
+        );
+    }
+
+    #[test]
+    fn question_fields_survive_malformed_out_of_scope_known_answer() {
+        // Query: one PTR question, one known answer that is a malformed
+        // SOA. Highlighting the question must not decode (and fail on)
+        // the out-of-scope known answer.
+        let mut raw = vec![0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0];
+        raw.extend_from_slice(b"\x05_http\x04_tcp\x05local\x00");
+        raw.extend_from_slice(&[0, 12, 0, 1]);
+        raw.extend_from_slice(&[0xc0, 12, 0, 6, 0, 1, 0, 0, 0, 120, 0, 3, 0xff, 0xff, 0xff]);
+        assert!(
+            Packet::parse(&raw).is_err(),
+            "the SOA known answer is malformed"
+        );
+        let fields = question_fields(&raw, "_http._tcp.local", "PTR").expect("question fields");
+        assert!(fields.iter().any(|f| f.label == "QTYPE"), "{fields:?}");
+    }
+
+    #[test]
     fn walk_records_skips_questions_and_rejects_truncation() {
         let mut msg = Packet::new_query(0);
         msg.questions.push(Question::new(
@@ -2148,7 +2233,7 @@ mod tests {
         let raw = msg.build_bytes_vec().unwrap();
         let (bytes, records) = walk_records(&raw).unwrap();
         assert_eq!(
-            records,
+            records.answer,
             vec![WireRecord {
                 rtype: 1,
                 rdlength: 4

@@ -542,12 +542,15 @@ impl Sighting {
         }
     }
 
-    /// The record a goodbye withdraws: same kind, owner, type and
-    /// source, in any response context.
+    /// The record a goodbye withdraws: same kind, owner, type, source
+    /// and ingress link, in any response context. The link counts
+    /// because an IPv4 source carries no scope: the same address on two
+    /// links is two responders, each with its own finding.
     fn same_record(&self, kind: SightingKind, rec: &browse::RawRecord) -> bool {
         self.kind == kind
             && self.rec.rtype == rec.rtype
             && self.rec.source == rec.source
+            && self.rec.ifindex == rec.ifindex
             && self.rec.name.eq_ignore_ascii_case(&rec.name)
     }
 
@@ -4472,14 +4475,10 @@ impl App {
     }
 
     /// Hostnames a service lives on, lowercased without the root dot:
-    /// its selected hostname plus every live SRV target, as for address
-    /// routing (`handle_addr`).
+    /// every live SRV target. The selected hostname alone is no evidence:
+    /// it outlives an expired SRV while the PTR is still live.
     fn service_hosts(svc: &ServiceEntry) -> Vec<String> {
         let mut hosts = Vec::new();
-        let selected = anomalies::host_id(&svc.hostname);
-        if !selected.is_empty() {
-            hosts.push(selected);
-        }
         for r in &svc.answers {
             if r.rtype != 33 || r.ttl <= r.received_at.elapsed().as_secs() as u32 {
                 continue;
@@ -13728,5 +13727,64 @@ mod tests {
             .filter(|(k, _)| k.ends_with("unicast-style-response"))
             .count();
         assert_eq!(overlay, sources.len());
+    }
+
+    #[test]
+    fn same_source_on_two_links_keeps_a_sighting_per_link() {
+        // One IPv4 address heard on two links: two responders. A goodbye
+        // on one link leaves the other link's finding in place.
+        let mut app = App::new().unwrap();
+        let on = |ifindex: u32, iface: &str, ttl: u32| {
+            let mut soa = raw_record("fritz.box.", 6, "TYPE6", "rdlength=30", ttl);
+            soa.source = "169.254.1.1:5353".parse().unwrap();
+            soa.ifindex = ifindex;
+            soa.iface = iface.to_string();
+            soa
+        };
+        ingest(&mut app, &on(2, "enp0s25", 120));
+        ingest(&mut app, &on(3, "wlan0", 120));
+        let mut sources: Vec<String> =
+            findings_of(&app, anomalies::AnomalyKind::UnicastStyleResponse)
+                .into_iter()
+                .filter_map(|a| a.source)
+                .collect();
+        sources.sort();
+        assert_eq!(
+            sources,
+            vec!["169.254.1.1:5353@enp0s25", "169.254.1.1:5353@wlan0"]
+        );
+        ingest(&mut app, &on(3, "wlan0", 0));
+        let sources: Vec<String> = findings_of(&app, anomalies::AnomalyKind::UnicastStyleResponse)
+            .into_iter()
+            .filter_map(|a| a.source)
+            .collect();
+        assert_eq!(sources, vec!["169.254.1.1:5353@enp0s25"]);
+    }
+
+    #[test]
+    fn expired_srv_no_longer_makes_its_target_an_owned_host() {
+        // The selected SRV expires while PTR and sighting stay live: the
+        // stale hostname owns nothing, so the sighting is unattributed
+        // and the service pane no longer lists it.
+        let mut app = test_service_app();
+        for r in app.services.iter_mut().flat_map(|s| s.answers.iter_mut()) {
+            if r.rtype == 33 {
+                r.received_at = Instant::now() - Duration::from_secs(300);
+            }
+        }
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 15, "TYPE15", "rdlength=9", 4500),
+        );
+        let owners: Vec<_> = findings_of(&app, anomalies::AnomalyKind::UnsupportedType)
+            .into_iter()
+            .map(|a| a.service)
+            .collect();
+        assert_eq!(owners, vec![anomalies::UNATTRIBUTED_SERVICE]);
+        select_instance(&mut app, "Test");
+        assert!(!app
+            .anomalies_for_selected()
+            .iter()
+            .any(|p| p.anomaly.kind == anomalies::AnomalyKind::UnsupportedType));
     }
 }
