@@ -2680,6 +2680,8 @@ impl App {
                     rtype,
                     rtype_str,
                     source: *source,
+                    // Questions rows carry no ingress link.
+                    source_label: source.to_string(),
                 });
             }
         }
@@ -2788,6 +2790,7 @@ impl App {
                         rtype: s.rec.rtype,
                         rtype_str: &s.rec.rtype_str,
                         source: s.rec.source,
+                        source_label: s.rec.source_label(),
                     }),
                     SightingKind::Response | SightingKind::KnownAnswer => {
                         sightings.push((service, &s.rec))
@@ -13786,5 +13789,29 @@ mod tests {
             .anomalies_for_selected()
             .iter()
             .any(|p| p.anomaly.kind == anomalies::AnomalyKind::UnsupportedType));
+    }
+
+    #[test]
+    fn same_querier_on_two_links_keeps_a_question_finding_per_link() {
+        // One querier address asking an out-of-scope question on two
+        // links: two findings, named with their links.
+        let mut app = App::new().unwrap();
+        let querier: SocketAddr = "169.254.1.1:5353".parse().unwrap();
+        for (ifindex, iface) in [(2, "enp0s25"), (3, "wlan0")] {
+            let mut ev = query_event("fritz.box.", 6, "TYPE6", false, Vec::new(), querier);
+            ev.questions[0].ifindex = ifindex;
+            ev.questions[0].iface = iface.to_string();
+            app.ingest_event(&ev);
+        }
+        let mut sources: Vec<String> =
+            findings_of(&app, anomalies::AnomalyKind::UnsupportedQuestion)
+                .into_iter()
+                .filter_map(|a| a.source)
+                .collect();
+        sources.sort();
+        assert_eq!(
+            sources,
+            vec!["169.254.1.1:5353@enp0s25", "169.254.1.1:5353@wlan0"]
+        );
     }
 }

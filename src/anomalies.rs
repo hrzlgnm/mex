@@ -229,7 +229,14 @@ pub struct QuestionView<'a> {
     pub name: &'a str,
     pub rtype: u16,
     pub rtype_str: &'a str,
+    /// The querier's socket address: port checks (one-shot, our own
+    /// port-0 sends) need it as an address.
     pub source: SocketAddr,
+    /// The querier as findings name it: `address@iface` (or the IPv6
+    /// zone) when the ingress link is known, like
+    /// `RawRecord::source_label`, so one address on two links stays two
+    /// findings.
+    pub source_label: String,
 }
 
 /// One transmitted A/AAAA lookup for a live SRV target.
@@ -1197,7 +1204,7 @@ fn check_question(q: &QuestionView, out: &mut Vec<Anomaly>) {
         rtype: Some(q.rtype),
         rtype_str: Some(q.rtype_str.to_string()),
         rdata: None,
-        source: Some(q.source.to_string()),
+        source: Some(q.source_label.clone()),
         message,
         rfc,
         requirement,
@@ -2003,6 +2010,7 @@ mod tests {
             rtype,
             rtype_str,
             source,
+            source_label: source.to_string(),
         }
     }
 
