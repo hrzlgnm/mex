@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.19.0](https://github.com/hrzlgnm/mex/compare/v0.18.3...v0.19.0) (2026-11-16)
+
+
+### Features
+
+* hold query schedules while no family can transmit ([#254](https://github.com/hrzlgnm/mex/issues/254)) ([88b3991](https://github.com/hrzlgnm/mex/commit/88b39916103cfeee7c4c8b65f1360cd85a3d8a26))
+* show out-of-scope mDNS types only as anomalies ([#244](https://github.com/hrzlgnm/mex/issues/244)) ([24dbc3f](https://github.com/hrzlgnm/mex/commit/24dbc3fcecfa061a2a1377d2151725f14e9d2070))
+
+
+### Bug Fixes
+
+* enable multicast loop so local responders hear our queries ([#256](https://github.com/hrzlgnm/mex/issues/256)) ([3d9c01b](https://github.com/hrzlgnm/mex/commit/3d9c01b4476970b3c2b02b57bb03ee220a74a7ff))
+* log query send and egress pin failures ([#251](https://github.com/hrzlgnm/mex/issues/251)) ([ba1281a](https://github.com/hrzlgnm/mex/commit/ba1281ae151cbd39cd70f0ecee688d0db31b878f))
+* send nothing when a family has no usable interface ([#252](https://github.com/hrzlgnm/mex/issues/252)) ([fd661ff](https://github.com/hrzlgnm/mex/commit/fd661ffb97605223e2344b5acb75d233d812ed06))
+
+
+### Dependencies
+
+* update rust crate simple-dns to v0.13.1 ([#242](https://github.com/hrzlgnm/mex/issues/242)) ([bed537e](https://github.com/hrzlgnm/mex/commit/bed537e5689613b085dec3e473d77b989626ad61))
+
+
+### Code Refactoring
+
+* drive both mDNS sockets from one mio poll loop ([#250](https://github.com/hrzlgnm/mex/issues/250)) ([773ddd3](https://github.com/hrzlgnm/mex/commit/773ddd37415e6e12175cdf8f585d67962b57048d))
+
 ## [0.18.3](https://github.com/hrzlgnm/mex/compare/v0.18.2...v0.18.3) (2026-11-15)
 
 

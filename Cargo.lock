@@ -952,7 +952,7 @@ dependencies = [
 
 [[package]]
 name = "mex"
-version = "0.18.3"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "chrono",
