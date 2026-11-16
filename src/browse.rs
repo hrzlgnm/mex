@@ -75,10 +75,117 @@ const IFACE_REFRESH: Duration = Duration::from_secs(10);
 
 /// Address family of a listener socket: selects the interface list,
 /// the join call, and the per-packet transmit interface.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Family {
     V4,
     V6,
+}
+
+impl Family {
+    fn label(self) -> &'static str {
+        match self {
+            Family::V4 => "v4",
+            Family::V6 => "v6",
+        }
+    }
+}
+
+/// What a send outcome means for the log, after dedup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendLog {
+    /// First failure of this kind on this link: log it at error.
+    Failed,
+    /// The link sent successfully after failing: log one recovery line.
+    Recovered,
+}
+
+/// The socket call a send-path failure came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SendOp {
+    /// Pinning the multicast egress interface.
+    Pin,
+    /// Sending the query copy.
+    Send,
+}
+
+/// Send-failure dedup per (family, link): a broken link logs each
+/// (operation, error kind) once until it sends successfully again, then
+/// logs one recovery line, instead of once per query. Links that leave
+/// the interface list forget their state.
+#[derive(Debug, Default)]
+struct SendFailures {
+    failing: HashMap<(Family, String), HashSet<(SendOp, std::io::ErrorKind)>>,
+}
+
+impl SendFailures {
+    /// Record a failed pin or send on `iface`, returning `Failed` the
+    /// first time this (operation, kind) fails since the link last sent.
+    fn record_failure(
+        &mut self,
+        family: Family,
+        iface: &str,
+        op: SendOp,
+        kind: std::io::ErrorKind,
+    ) -> Option<SendLog> {
+        self.failing
+            .entry((family, iface.to_string()))
+            .or_default()
+            .insert((op, kind))
+            .then_some(SendLog::Failed)
+    }
+
+    /// Record a successful send on `iface`, returning `Recovered` when
+    /// the link had failed since its last successful send.
+    fn record_success(&mut self, family: Family, iface: &str) -> Option<SendLog> {
+        self.failing
+            .remove(&(family, iface.to_string()))
+            .map(|_| SendLog::Recovered)
+    }
+
+    /// Forget links of `family` no longer in `links`.
+    fn retain_links<'a>(&mut self, family: Family, links: impl IntoIterator<Item = &'a str>) {
+        let keep: HashSet<&str> = links.into_iter().collect();
+        self.failing
+            .retain(|(f, name), _| *f != family || keep.contains(name.as_str()));
+    }
+}
+
+/// The interface a query copy is pinned to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Egress {
+    V4(Ipv4Addr),
+    V6(u32),
+}
+
+/// The two socket calls the send path makes, so the per-link pin/send
+/// sequence can be checked without a network.
+trait QuerySocket {
+    /// Pin the multicast egress interface (socket-wide).
+    fn pin(&self, egress: Egress) -> std::io::Result<()>;
+    fn send_to(&self, bytes: &[u8], dest: SocketAddr) -> std::io::Result<()>;
+}
+
+impl QuerySocket for PktInfoUdpSocket {
+    fn pin(&self, egress: Egress) -> std::io::Result<()> {
+        match egress {
+            Egress::V4(ip) => self.set_multicast_if_v4(&ip),
+            Egress::V6(idx) => self.set_multicast_if_v6(idx),
+        }
+    }
+
+    fn send_to(&self, bytes: &[u8], dest: SocketAddr) -> std::io::Result<()> {
+        PktInfoUdpSocket::send_to(self, bytes, &SockAddr::from(dest)).map(|_| ())
+    }
+}
+
+/// Link name for send logs; the unpinned fallback (no usable link)
+/// goes out the kernel's default multicast interface.
+fn link_label(iface: &str) -> &str {
+    if iface.is_empty() {
+        "the default interface"
+    } else {
+        iface
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -771,6 +878,7 @@ struct Listener {
     /// The last pass stopped at `QUERY_BUDGET`: more may be queued,
     /// and the waker won't announce them again.
     queries_pending: bool,
+    send_failures: SendFailures,
     buf: Vec<u8>,
 }
 
@@ -799,6 +907,7 @@ impl Listener {
             unknown: HashSet::new(),
             next_refresh: Instant::now(),
             queries_pending: false,
+            send_failures: SendFailures::default(),
             buf: vec![0u8; 65535],
         }
     }
@@ -882,6 +991,17 @@ impl Listener {
                 }
             }
         }
+        // Links gone from the lists forget their send-failure state; the
+        // unpinned fallback ("") counts as listed while a family has no
+        // usable link.
+        let v4_links = self.ifaces_v4.iter().map(|(name, _)| name.as_str());
+        let v4_fallback = self.ifaces_v4.is_empty().then_some("");
+        self.send_failures
+            .retain_links(Family::V4, v4_links.chain(v4_fallback));
+        let v6_links = self.ifaces_v6.iter().map(|(name, _)| name.as_str());
+        let v6_fallback = self.ifaces_v6.is_empty().then_some("");
+        self.send_failures
+            .retain_links(Family::V6, v6_links.chain(v6_fallback));
     }
 
     /// Send queued queries (up to the budget) on each open family.
@@ -892,11 +1012,19 @@ impl Listener {
             query_rx,
             ifaces_v4,
             ifaces_v6,
+            send_failures,
             ..
         } = self;
         let (_, more) = drain_queries(query_rx, QUERY_BUDGET, |req| {
             for socket in [v4.as_ref(), v6.as_ref()].into_iter().flatten() {
-                send_on_all_interfaces(&socket.pktinfo, req, socket.family, ifaces_v4, ifaces_v6);
+                send_on_all_interfaces(
+                    &socket.pktinfo,
+                    req,
+                    socket.family,
+                    ifaces_v4,
+                    ifaces_v6,
+                    send_failures,
+                );
             }
         });
         self.queries_pending = more;
@@ -989,33 +1117,60 @@ impl Listener {
 /// via the default multicast interface and other links (e.g. a bridge)
 /// never see our queries.
 fn send_on_all_interfaces(
-    socket: &PktInfoUdpSocket,
+    socket: &impl QuerySocket,
     req: &QueryRequest,
     family: Family,
     ifaces_v4: &[(String, Ipv4Addr)],
     ifaces_v6: &[(String, u32)],
+    failures: &mut SendFailures,
 ) {
-    match family {
-        Family::V4 => {
-            if ifaces_v4.is_empty() {
-                let dest = SocketAddr::from(SocketAddrV4::new(MDNS_V4, MDNS_PORT));
-                send_query(socket, req, dest, "");
-                return;
+    let v4_dest = SocketAddr::from(SocketAddrV4::new(MDNS_V4, MDNS_PORT));
+    // One copy per link: (link, destination, egress to pin). An empty link
+    // list falls back to one unpinned copy.
+    let copies: Vec<(&str, SocketAddr, Option<Egress>)> = match family {
+        Family::V4 if ifaces_v4.is_empty() => vec![("", v4_dest, None)],
+        Family::V4 => ifaces_v4
+            .iter()
+            .map(|(name, ip)| (name.as_str(), v4_dest, Some(Egress::V4(*ip))))
+            .collect(),
+        Family::V6 if ifaces_v6.is_empty() => vec![("", mdns_dest_v6(0), None)],
+        Family::V6 => ifaces_v6
+            .iter()
+            .map(|(name, idx)| (name.as_str(), mdns_dest_v6(*idx), Some(Egress::V6(*idx))))
+            .collect(),
+    };
+    let family_label = family.label();
+    for (iface, dest, egress) in copies {
+        let link = link_label(iface);
+        // The egress pin is socket-wide: set it right before this copy.
+        // A failed pin would send the copy out of the default multicast
+        // interface instead: skip it.
+        let pin = egress.map(|egress| socket.pin(egress));
+        if let Some(Err(e)) = pin {
+            if failures
+                .record_failure(family, iface, SendOp::Pin, e.kind())
+                .is_some()
+            {
+                log::error!("mex: {family_label} egress pin on {link} failed: {e}; copy skipped");
             }
-            for (name, ip) in ifaces_v4 {
-                let _ = socket.set_multicast_if_v4(ip);
-                let dest = SocketAddr::from(SocketAddrV4::new(MDNS_V4, MDNS_PORT));
-                send_query(socket, req, dest, name);
-            }
+            continue;
         }
-        Family::V6 => {
-            if ifaces_v6.is_empty() {
-                send_query(socket, req, mdns_dest_v6(0), "");
-                return;
+        let Some(sent) = send_query(socket, req, dest, iface) else {
+            continue;
+        };
+        match sent {
+            Ok(()) => {
+                if failures.record_success(family, iface).is_some() {
+                    log::info!("mex: {family_label} send on {link} recovered");
+                }
             }
-            for (name, idx) in ifaces_v6 {
-                let _ = socket.set_multicast_if_v6(*idx);
-                send_query(socket, req, mdns_dest_v6(*idx), name);
+            Err(e) => {
+                if failures
+                    .record_failure(family, iface, SendOp::Send, e.kind())
+                    .is_some()
+                {
+                    log::error!("mex: {family_label} send on {link} to {dest} failed: {e}");
+                }
             }
         }
     }
@@ -1186,11 +1341,16 @@ pub(crate) fn inferred_question_packet(name: &str, rtype: u16, qu: bool) -> Opti
     build_query(&qname, record_type, qu, &[])
 }
 
-fn send_query(socket: &PktInfoUdpSocket, req: &QueryRequest, dest: SocketAddr, egress_iface: &str) {
-    let Some(bytes) = encode_query(req, egress_iface) else {
-        return;
-    };
-    let _ = socket.send_to(&bytes, &SockAddr::from(dest));
+/// Encode and send one query copy. `None` when encoding failed (already
+/// logged in `encode_query`), so nothing was sent.
+fn send_query(
+    socket: &impl QuerySocket,
+    req: &QueryRequest,
+    dest: SocketAddr,
+    egress_iface: &str,
+) -> Option<std::io::Result<()>> {
+    let bytes = encode_query(req, egress_iface)?;
+    Some(socket.send_to(&bytes, dest))
 }
 
 pub(crate) fn parse_packet(
@@ -2898,6 +3058,226 @@ mod tests {
             (0, false),
             "drained once"
         );
+    }
+
+    /// Records pin/send calls; fails the configured ones.
+    #[derive(Default)]
+    struct FakeSocket {
+        calls: std::cell::RefCell<Vec<String>>,
+        failing_pin: Option<Egress>,
+        failing_send: std::cell::Cell<bool>,
+    }
+
+    impl QuerySocket for FakeSocket {
+        fn pin(&self, egress: Egress) -> std::io::Result<()> {
+            self.calls.borrow_mut().push(format!("pin {egress:?}"));
+            if self.failing_pin == Some(egress) {
+                return Err(std::io::ErrorKind::AddrNotAvailable.into());
+            }
+            Ok(())
+        }
+
+        fn send_to(&self, _bytes: &[u8], dest: SocketAddr) -> std::io::Result<()> {
+            self.calls.borrow_mut().push(format!("send {dest}"));
+            if self.failing_send.get() {
+                return Err(std::io::ErrorKind::NetworkUnreachable.into());
+            }
+            Ok(())
+        }
+    }
+
+    fn ptr_query() -> QueryRequest {
+        QueryRequest {
+            name: "_http._tcp.local".to_string(),
+            record_type: TYPE::PTR,
+            known_answers: Vec::new(),
+            qu: false,
+        }
+    }
+
+    #[test]
+    fn each_copy_is_pinned_right_before_it_is_sent() {
+        // The egress pin is socket-wide: pinning every link first would
+        // send all copies out of the last one.
+        let socket = FakeSocket::default();
+        let links = [("eth0".to_string(), 2u32), ("wlan0".to_string(), 3u32)];
+        let mut failures = SendFailures::default();
+        send_on_all_interfaces(
+            &socket,
+            &ptr_query(),
+            Family::V6,
+            &[],
+            &links,
+            &mut failures,
+        );
+        assert_eq!(
+            *socket.calls.borrow(),
+            [
+                "pin V6(2)",
+                "send [ff02::fb%2]:5353",
+                "pin V6(3)",
+                "send [ff02::fb%3]:5353",
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_pin_skips_only_that_links_copy() {
+        let eth0 = Ipv4Addr::new(192, 168, 1, 2);
+        let wlan0 = Ipv4Addr::new(10, 0, 0, 2);
+        let socket = FakeSocket {
+            failing_pin: Some(Egress::V4(eth0)),
+            ..FakeSocket::default()
+        };
+        let links = [("eth0".to_string(), eth0), ("wlan0".to_string(), wlan0)];
+        let mut failures = SendFailures::default();
+        send_on_all_interfaces(
+            &socket,
+            &ptr_query(),
+            Family::V4,
+            &links,
+            &[],
+            &mut failures,
+        );
+        assert_eq!(
+            *socket.calls.borrow(),
+            [
+                "pin V4(192.168.1.2)",
+                "pin V4(10.0.0.2)",
+                "send 224.0.0.251:5353",
+            ],
+            "no unpinned copy leaves for eth0"
+        );
+        // The pin failure is on record: a second query logs nothing new.
+        assert_eq!(
+            failures.record_failure(
+                Family::V4,
+                "eth0",
+                SendOp::Pin,
+                std::io::ErrorKind::AddrNotAvailable
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn send_failure_is_recorded_until_the_link_recovers() {
+        let socket = FakeSocket::default();
+        socket.failing_send.set(true);
+        let links = [("eth0".to_string(), 2u32)];
+        let mut failures = SendFailures::default();
+        send_on_all_interfaces(
+            &socket,
+            &ptr_query(),
+            Family::V6,
+            &[],
+            &links,
+            &mut failures,
+        );
+        assert_eq!(
+            failures.record_failure(
+                Family::V6,
+                "eth0",
+                SendOp::Send,
+                std::io::ErrorKind::NetworkUnreachable
+            ),
+            None,
+            "the first failure was already recorded"
+        );
+        socket.failing_send.set(false);
+        send_on_all_interfaces(
+            &socket,
+            &ptr_query(),
+            Family::V6,
+            &[],
+            &links,
+            &mut failures,
+        );
+        assert_eq!(
+            failures.record_success(Family::V6, "eth0"),
+            None,
+            "the successful send already recorded the recovery"
+        );
+    }
+
+    #[test]
+    fn send_failures_log_once_per_kind_until_recovery() {
+        use std::io::ErrorKind::{NetworkUnreachable, PermissionDenied};
+        use SendOp::{Pin, Send};
+        let failed = Some(SendLog::Failed);
+        let mut failures = SendFailures::default();
+        // Success without a prior failure is silent.
+        assert_eq!(failures.record_success(Family::V6, "eth0"), None);
+        // First failure logs; a repeat of the same kind is silent.
+        assert_eq!(
+            failures.record_failure(Family::V6, "eth0", Send, NetworkUnreachable),
+            failed
+        );
+        assert_eq!(
+            failures.record_failure(Family::V6, "eth0", Send, NetworkUnreachable),
+            None
+        );
+        // A different kind logs once; alternating kinds stay deduped.
+        assert_eq!(
+            failures.record_failure(Family::V6, "eth0", Send, PermissionDenied),
+            failed
+        );
+        assert_eq!(
+            failures.record_failure(Family::V6, "eth0", Send, NetworkUnreachable),
+            None
+        );
+        assert_eq!(
+            failures.record_failure(Family::V6, "eth0", Send, PermissionDenied),
+            None
+        );
+        // A pin failure of an already-logged kind still logs: other call.
+        assert_eq!(
+            failures.record_failure(Family::V6, "eth0", Pin, NetworkUnreachable),
+            failed
+        );
+        // Same link name, other family: its own state.
+        assert_eq!(
+            failures.record_failure(Family::V4, "eth0", Send, PermissionDenied),
+            failed
+        );
+        // Success after failure logs one recovery, then silence.
+        assert_eq!(
+            failures.record_success(Family::V6, "eth0"),
+            Some(SendLog::Recovered)
+        );
+        assert_eq!(failures.record_success(Family::V6, "eth0"), None);
+        assert_eq!(
+            failures.record_failure(Family::V6, "eth0", Send, NetworkUnreachable),
+            failed
+        );
+    }
+
+    #[test]
+    fn send_failures_forget_pruned_links() {
+        use std::io::ErrorKind::NetworkUnreachable;
+        use SendOp::Send;
+        let failed = Some(SendLog::Failed);
+        let mut failures = SendFailures::default();
+        failures.record_failure(Family::V4, "eth0", Send, NetworkUnreachable);
+        failures.record_failure(Family::V4, "wlan0", Send, NetworkUnreachable);
+        failures.record_failure(Family::V6, "eth0", Send, NetworkUnreachable);
+        // eth0 left the v4 list; the v6 list is unaffected.
+        failures.retain_links(Family::V4, ["wlan0"]);
+        assert_eq!(
+            failures.record_failure(Family::V4, "eth0", Send, NetworkUnreachable),
+            failed
+        );
+        assert_eq!(
+            failures.record_failure(Family::V4, "wlan0", Send, NetworkUnreachable),
+            None
+        );
+        assert_eq!(
+            failures.record_failure(Family::V6, "eth0", Send, NetworkUnreachable),
+            None
+        );
+        // A pruned link that comes back and succeeds logs no recovery.
+        failures.retain_links(Family::V4, ["wlan0"]);
+        assert_eq!(failures.record_success(Family::V4, "eth0"), None);
     }
 
     #[test]
