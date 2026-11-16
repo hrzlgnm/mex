@@ -1388,6 +1388,14 @@ impl App {
     }
 
     fn requery_expiring(&mut self) {
+        self.update_refreshes(true);
+    }
+
+    /// Track live rows' refresh state and rebuild the per-question
+    /// summaries; with `send`, also fire due refresh queries. Without
+    /// it (transmission on hold) nothing is sent and no attempt is used:
+    /// expired or replaced rows just drop out.
+    fn update_refreshes(&mut self, send: bool) {
         let now = Instant::now();
         // Live rows inside their 80% window with attempts left, grouped by
         // question, each flagged whether its own next attempt is due.
@@ -1437,11 +1445,15 @@ impl App {
         // No maintenance without a live record (RFC 6762 §5.2 deletes at
         // 100%); a replaced row is gone with its old identity.
         self.refresh_rows.retain(|r, _| live_rows.contains(r));
-        let fired: Vec<_> = pending
-            .iter()
-            .filter(|(_, rows)| rows.iter().any(|(_, _, due)| *due))
-            .map(|(key, _)| key.clone())
-            .collect();
+        let fired: Vec<_> = if send {
+            pending
+                .iter()
+                .filter(|(_, rows)| rows.iter().any(|(_, _, due)| *due))
+                .map(|(key, _)| key.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
         if !fired.is_empty() {
             log::debug!(
                 "mex: cache refresh triggered for {} interest(s)",
@@ -1941,11 +1953,19 @@ impl App {
                     log::info!("mex: no family can transmit; queries on hold");
                 }
                 self.transmit_held = true;
+                // Keep the refresh bookkeeping honest without sending:
+                // expired or replaced rows drop out, live rows keep their
+                // attempts and next due time.
+                self.update_refreshes(false);
             } else {
                 if self.transmit_held {
                     log::info!("mex: transmission resumed; restarting discovery");
                     self.continuous.clear();
                     self.transmit_held = false;
+                    // Links just came back: take a fresh interface
+                    // snapshot first, so resumed queries record the
+                    // interfaces they really went out on.
+                    self.refresh_link_snapshot();
                 }
                 self.requery_expiring();
                 self.poll_continuous();
@@ -1955,10 +1975,16 @@ impl App {
         // Refresh in case interfaces/addresses changed (cheap: ~1 fork/min).
         // Independent of query backoff.
         if self.last_ip_refresh.elapsed() >= LOCAL_IPS_REFRESH {
-            self.last_ip_refresh = Instant::now();
-            self.local_ips = browse::local_ips();
-            self.link_stats = browse::link_stats(self.interfaces.as_ref());
+            self.refresh_link_snapshot();
         }
+    }
+
+    /// Re-read local addresses and per-link interface stats (the
+    /// snapshot `note_query` records as a query's interfaces).
+    fn refresh_link_snapshot(&mut self) {
+        self.last_ip_refresh = Instant::now();
+        self.local_ips = browse::local_ips();
+        self.link_stats = browse::link_stats(self.interfaces.as_ref());
     }
 
     pub fn display_items(&self) -> Vec<DisplayItem> {
@@ -13975,5 +14001,45 @@ mod tests {
         let dump = app.state_dump();
         assert_eq!(dump.metrics["transmit_v4"], 0);
         assert_eq!(dump.metrics["transmit_v6"], 1);
+    }
+
+    #[test]
+    fn hold_drops_expired_refresh_summaries_and_keeps_live_attempts() {
+        let mut app = app_with_stale_enum_row();
+        let key = ("_services._dns-sd._udp.local".to_string(), 12);
+        app.requery_expiring();
+        assert!(app.requeries.contains_key(&key), "refresh scheduled");
+        let attempts = |app: &App| app.refresh_rows.values().map(|s| s.attempts).sum::<u8>();
+        assert_eq!(attempts(&app), 1);
+        // Held: the live row keeps its attempt; nothing is sent.
+        app.query_tx.transmit().pin(false, false);
+        make_refresh_due(&mut app, "_services._dns-sd._udp.local", 12);
+        app.send_queries();
+        assert_eq!(attempts(&app), 1, "no attempt used while held");
+        assert_eq!(app.metrics.q_sent_refresh, 1);
+        // The record expires during the hold: its summary goes too.
+        app.enum_entries[0].answers[1].received_at = Instant::now() - Duration::from_secs(4600);
+        app.send_queries();
+        assert!(!app.requeries.contains_key(&key), "no refresh shown for it");
+        assert!(app.refresh_rows.is_empty());
+        assert_eq!(app.requery_overdue(), 0);
+    }
+
+    #[test]
+    fn resume_refreshes_the_link_snapshot_before_queries() {
+        let mut app = App::new().unwrap();
+        due_http_stream(&mut app);
+        app.query_tx.transmit().pin(false, false);
+        // Well inside the 10 s snapshot interval: no routine refresh.
+        let stale = Instant::now() - Duration::from_secs(5);
+        app.last_ip_refresh = stale;
+        app.send_queries();
+        assert_eq!(app.last_ip_refresh, stale, "held ticks leave it alone");
+        app.query_tx.transmit().pin(true, false);
+        app.send_queries();
+        assert!(
+            app.last_ip_refresh > stale,
+            "snapshot refreshed on resume, before resumed queries record interfaces"
+        );
     }
 }
