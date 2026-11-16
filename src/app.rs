@@ -566,6 +566,63 @@ impl Sighting {
     }
 }
 
+/// How a responder said an address type is absent for a service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenialForm {
+    /// RFC 6762 §6.1: a hostname-owned NSEC, arriving in the same packet
+    /// as the service's SRV for that host, whose bitmap lists the types
+    /// that exist; absent address types are denied.
+    Rfc,
+    /// Older python-zeroconf: an instance-owned NSEC whose bitmap lists
+    /// only the *missing* address types (inverted bitmap).
+    Legacy,
+}
+
+impl DenialForm {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DenialForm::Rfc => "rfc",
+            DenialForm::Legacy => "legacy",
+        }
+    }
+}
+
+/// A service's own responder said it has no address of `rtype` (A or
+/// AAAA): rows of that type stay off this service while it is live.
+#[derive(Debug, Clone)]
+struct AddressDenial {
+    /// Lowercased `instance.service_type` (`service_key`).
+    service: String,
+    rtype: u16,
+    /// The hostname it applies to (RFC form); `None` for every host of
+    /// the service (legacy, instance-owned form).
+    host: Option<String>,
+    form: DenialForm,
+    source: std::net::SocketAddr,
+    ttl: u32,
+    received_at: Instant,
+}
+
+impl AddressDenial {
+    fn is_live(&self) -> bool {
+        self.ttl > 0 && self.received_at.elapsed().as_secs() <= u64::from(self.ttl)
+    }
+
+    /// Whether this denial is about an address of `rtype` owned by `host`.
+    fn applies_to(&self, rtype: u16, host: &str) -> bool {
+        self.rtype == rtype && self.host.as_deref().is_none_or(|h| h == host)
+    }
+
+    fn covers(&self, service: &str, rtype: u16, host: &str) -> bool {
+        self.service == service && self.applies_to(rtype, host) && self.is_live()
+    }
+}
+
+/// Lowercased `instance.service_type`, the identity address denials use.
+fn service_key(instance: &str, service_type: &str) -> String {
+    format!("{instance}.{service_type}").to_lowercase()
+}
+
 /// Cumulative v2 traffic/query counters for the metrics overlay. Derived
 /// snapshot rows come from here plus live state; per-packet maps stay
 /// bounded by network size (tens of responders/interfaces).
@@ -784,6 +841,12 @@ pub struct App {
     /// findings: never Answers or Questions rows, never query drivers.
     /// Oldest first, capped at `SIGHTINGS_CAP`.
     sightings: Vec<Sighting>,
+    /// Address types a service's own responder denies via NSEC (#245):
+    /// rows of that type are never filed on that service.
+    address_denials: Vec<AddressDenial>,
+    /// Address records withheld from every service of their host by a
+    /// denial, by lowercased host: the Hosts header still lists them.
+    withheld_addrs: HashMap<String, Vec<browse::RawRecord>>,
     /// Transient confirmation popup (e.g. state-dump result), shown for
     /// a few seconds and dismissed by any key.
     status_msg: Option<(String, Instant)>,
@@ -1064,6 +1127,8 @@ impl App {
             next_pending_addr_prune: Instant::now(),
             raw_events: Vec::new(),
             sightings: Vec::new(),
+            address_denials: Vec::new(),
+            withheld_addrs: HashMap::new(),
             status_msg: None,
             show_metrics: false,
             metrics_scroll: Cell::new(0),
@@ -1802,9 +1867,20 @@ impl App {
             want(full.clone(), 33);
             want(full, 16);
             if !svc.hostname.is_empty() {
+                // A denied address type is no interest of this service:
+                // only other services (or other demand) keep asking.
                 let host = svc.hostname.trim_end_matches('.').to_string();
-                want(host.clone(), 1);
-                want(host, 28);
+                let key = service_key(&svc.instance, &svc.service_type);
+                let host_key = host.to_lowercase();
+                for rtype in [1, 28] {
+                    if !self
+                        .address_denials
+                        .iter()
+                        .any(|d| d.covers(&key, rtype, &host_key))
+                    {
+                        want(host.clone(), rtype);
+                    }
+                }
             }
         }
         desired
@@ -2139,6 +2215,22 @@ impl App {
                 } else {
                     v6.push(ip);
                 }
+            }
+        }
+        // Addresses withheld from every service of this host by an NSEC
+        // denial (#245) are still the host's own addresses.
+        for rec in self.withheld_addrs.get(key).into_iter().flatten() {
+            if rec.ttl <= rec.received_at.elapsed().as_secs() as u32 {
+                continue;
+            }
+            let ip = rec.rdata.trim().to_string();
+            if ip.is_empty() || !seen.insert(ip.clone()) {
+                continue;
+            }
+            if rec.rtype == 1 {
+                v4.push(ip);
+            } else {
+                v6.push(ip);
             }
         }
         v4.sort();
@@ -2759,6 +2851,7 @@ impl App {
                 service_type: &s.service_type,
                 answers: &s.answers,
                 subtypes: &s.subtypes,
+                denied_address_types: self.denied_types(&service_key(&s.instance, &s.service_type)),
             })
             .collect();
         // Pending instances hold PTR/TXT rows that arrived before their
@@ -2771,6 +2864,7 @@ impl App {
                 service_type: &p.service_type,
                 answers: &p.answers,
                 subtypes: &p.subtypes,
+                denied_address_types: self.denied_types(&service_key(&p.instance, &p.service_type)),
             });
         }
         let enum_answers: Vec<&browse::RawRecord> = self
@@ -3003,7 +3097,24 @@ impl App {
             questions: svc.questions.iter().map(Self::dump_question_row).collect(),
             questions_truncated: svc.questions_dropped > 0,
             questions_dropped: svc.questions_dropped,
+            address_denials: self.dump_denials(&service_key(&svc.instance, &svc.service_type)),
         }
+    }
+
+    /// Live address denials of one service, for the dump (#245).
+    fn dump_denials(&self, service: &str) -> Vec<dump::DumpDenial> {
+        self.address_denials
+            .iter()
+            .filter(|d| d.service == service && d.is_live())
+            .map(|d| dump::DumpDenial {
+                rtype_str: browse::rtype_label(d.rtype),
+                form: d.form.as_str().to_string(),
+                host: d.host.clone(),
+                source: d.source.to_string(),
+                ttl_remaining_secs: u64::from(d.ttl)
+                    .saturating_sub(d.received_at.elapsed().as_secs()),
+            })
+            .collect()
     }
 
     /// Snapshot of mex's own browse state.
@@ -4504,6 +4615,10 @@ impl App {
             ev.answers.len(),
             ev.questions.len()
         );
+        // Denials first: the filing gate then keeps this packet's own
+        // address additionals off a denying service, with no side effects
+        // (e.g. cache-flush damping) for rows it never keeps.
+        self.ingest_address_denials(ev);
         for rec in &ev.answers {
             // Out-of-scope types never become rows: they are kept only as
             // sightings behind findings, goodbyes included.
@@ -4540,6 +4655,166 @@ impl App {
             if !anomalies::is_mdns_answer_type(ka.rtype) {
                 self.ingest_sighting(SightingKind::KnownAnswer, ka.clone());
             }
+        }
+    }
+
+    /// Lowercased keys of every live and pending service instance.
+    fn live_service_keys(&self) -> HashSet<String> {
+        self.services
+            .iter()
+            .map(|s| service_key(&s.instance, &s.service_type))
+            .chain(
+                self.pending_instances
+                    .iter()
+                    .map(|p| service_key(&p.instance, &p.service_type)),
+            )
+            .collect()
+    }
+
+    /// Apply NSEC address denials in a response (#245). Each NSEC states
+    /// the full set of types at its owner, so it both adds and lifts:
+    /// * RFC form: a hostname-owned NSEC in the same packet as a
+    ///   service's SRV for that host denies the address types absent
+    ///   from its bitmap and lifts those present, for that service and
+    ///   host only;
+    /// * legacy form: an instance-owned NSEC whose bitmap holds only A
+    ///   and/or AAAA denies the listed types and lifts the others; any
+    ///   other instance NSEC (the compliant SRV/TXT form) lifts them all;
+    /// * a TTL-0 NSEC withdraws every denial its owner made, with or
+    ///   without an SRV in the packet.
+    fn ingest_address_denials(&mut self, ev: &browse::Event) {
+        let srvs: Vec<(String, String)> = ev
+            .answers
+            .iter()
+            .filter(|r| r.rtype == 33 && r.ttl > 0)
+            .filter_map(|r| {
+                let target = srv_target(&r.rdata)?.to_lowercase();
+                Some((r.name.trim_end_matches('.').to_lowercase(), target))
+            })
+            .collect();
+        // This packet's SRVs name instances too (they are filed next).
+        let mut instances = self.live_service_keys();
+        instances.extend(srvs.iter().map(|(service, _)| service.clone()));
+        for nsec in ev.answers.iter().filter(|r| r.rtype == 47) {
+            let owner = nsec.name.trim_end_matches('.').to_lowercase();
+            let (address, other) = browse::nsec_address_types(&nsec.rdata);
+            let denial =
+                |service: &str, rtype: u16, host: Option<&str>, form: DenialForm| AddressDenial {
+                    service: service.to_string(),
+                    rtype,
+                    host: host.map(str::to_string),
+                    form,
+                    source: nsec.source,
+                    ttl: nsec.ttl,
+                    received_at: nsec.received_at,
+                };
+            if nsec.ttl == 0 {
+                // Goodbye: lift whatever this owner denied, anywhere.
+                let before = self.address_denials.len();
+                self.address_denials.retain(|d| {
+                    d.host.as_deref() != Some(owner.as_str())
+                        && !(d.host.is_none() && d.service == owner)
+                });
+                if self.address_denials.len() != before {
+                    self.touch();
+                }
+                continue;
+            }
+            for (service, _) in srvs.iter().filter(|(_, target)| *target == owner) {
+                for rtype in [1, 28] {
+                    let d = denial(service, rtype, Some(&owner), DenialForm::Rfc);
+                    if address.contains(&rtype) {
+                        self.lift_denial(&d);
+                    } else {
+                        self.apply_denial(d);
+                    }
+                }
+            }
+            if instances.contains(&owner) {
+                let inverted = !address.is_empty() && !other;
+                for rtype in [1, 28] {
+                    let d = denial(&owner, rtype, None, DenialForm::Legacy);
+                    if inverted && address.contains(&rtype) {
+                        self.apply_denial(d);
+                    } else {
+                        self.lift_denial(&d);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drop any denial with the same identity (service, type, host).
+    fn lift_denial(&mut self, denial: &AddressDenial) {
+        let before = self.address_denials.len();
+        self.address_denials.retain(|d| {
+            !(d.service == denial.service && d.rtype == denial.rtype && d.host == denial.host)
+        });
+        if self.address_denials.len() != before {
+            self.touch();
+        }
+    }
+
+    /// Record (or refresh) one denial, and take matching address rows
+    /// back off its service.
+    fn apply_denial(&mut self, denial: AddressDenial) {
+        self.lift_denial(&denial);
+        log::debug!(
+            "mex: {} denies {} via NSEC ({} form, from {})",
+            denial.service,
+            browse::rtype_label(denial.rtype),
+            denial.form.as_str(),
+            denial.source
+        );
+        if let Some(svc) = self
+            .services
+            .iter_mut()
+            .find(|s| service_key(&s.instance, &s.service_type) == denial.service)
+        {
+            let mut withheld = Vec::new();
+            svc.answers.retain(|r| {
+                let owner = r.name.trim_end_matches('.').to_lowercase();
+                let denied = denial.applies_to(r.rtype, &owner);
+                if denied {
+                    withheld.push(r.clone());
+                }
+                !denied
+            });
+            for rec in withheld {
+                self.withhold_address(&rec);
+            }
+        }
+        self.address_denials.push(denial);
+        self.touch();
+    }
+
+    /// Live denials of `service` as (address type, host or every host).
+    fn denied_types(&self, service: &str) -> Vec<(u16, Option<String>)> {
+        self.address_denials
+            .iter()
+            .filter(|d| d.service == service && d.is_live())
+            .map(|d| (d.rtype, d.host.clone()))
+            .collect()
+    }
+
+    /// Whether a live denial keeps this address row off `service`.
+    fn address_denied(&self, service: &str, rec: &browse::RawRecord) -> bool {
+        matches!(rec.rtype, 1 | 28) && {
+            let host = rec.name.trim_end_matches('.').to_lowercase();
+            self.address_denials
+                .iter()
+                .any(|d| d.covers(service, rec.rtype, &host))
+        }
+    }
+
+    /// Keep an address no service may show, so its host header still
+    /// lists it (deduplicated like rows: type, address, source).
+    fn withhold_address(&mut self, rec: &browse::RawRecord) {
+        let host = rec.name.trim_end_matches('.').to_lowercase();
+        let rows = self.withheld_addrs.entry(host).or_default();
+        rows.retain(|r| !(r.rtype == rec.rtype && r.rdata == rec.rdata && r.source == rec.source));
+        if rec.ttl > 0 {
+            rows.push(rec.clone());
         }
     }
 
@@ -5493,6 +5768,16 @@ impl App {
     }
 
     fn push_record(&mut self, svc_idx: usize, rec: &browse::RawRecord) {
+        // A denied address type stays off this service (#245); the host
+        // header still lists it.
+        let key = service_key(
+            &self.services[svc_idx].instance,
+            &self.services[svc_idx].service_type,
+        );
+        if self.address_denied(&key, rec) {
+            self.withhold_address(rec);
+            return;
+        }
         let s = &mut self.services[svc_idx];
         // Host addresses are not signs of service life: filing one on an
         // already-withdrawn service must not extend its grace deadline.
@@ -5618,6 +5903,15 @@ impl App {
                 !records.is_empty()
             });
         }
+        // Denials live for their NSEC's TTL and only while their service
+        // (or pending instance) does; withheld addresses for their TTL.
+        let owners = self.live_service_keys();
+        self.address_denials
+            .retain(|d| d.is_live() && owners.contains(&d.service));
+        self.withheld_addrs.retain(|_, rows| {
+            rows.retain(|r| r.ttl > 0 && r.received_at.elapsed().as_secs() <= u64::from(r.ttl));
+            !rows.is_empty()
+        });
         Self::expire_stale_services(&mut self.services);
         let before = self.services.len();
         self.services
@@ -14041,5 +14335,382 @@ mod tests {
             app.last_ip_refresh > stale,
             "snapshot refreshed on resume, before resumed queries record interfaces"
         );
+    }
+
+    // --- NSEC address denials (#245) ---
+
+    const DACP: &str = "iTunes_Ctrl._dacp._tcp.local.";
+    const SMB: &str = "KNULP._smb._tcp.local.";
+
+    fn packet(records: Vec<browse::RawRecord>) -> browse::Event {
+        browse::Event {
+            answers: records,
+            questions: Vec::new(),
+            query_kas: Vec::new(),
+            rcode: Some(0),
+            received_at: Instant::now(),
+            raw_bytes: Vec::new(),
+            source: test_source(),
+        }
+    }
+
+    fn srv_on_knulp(instance: &str) -> browse::RawRecord {
+        let mut srv = raw_record(instance, 33, "SRV", "0 0 3689 knulp.local.", 120);
+        srv.flush_bit = true;
+        srv
+    }
+
+    fn aaaa_knulp() -> browse::RawRecord {
+        raw_record("knulp.local.", 28, "AAAA", "fd00::1", 120)
+    }
+
+    fn a_knulp() -> browse::RawRecord {
+        raw_record("knulp.local.", 1, "A", "192.168.178.27", 120)
+    }
+
+    /// `_dacp` and `_smb` both on knulp.local; avahi's AAAA already filed.
+    fn knulp_app() -> App {
+        let mut app = App::new().unwrap();
+        for (ty, inst) in [("_dacp._tcp.local.", DACP), ("_smb._tcp.local.", SMB)] {
+            ingest(&mut app, &raw_record(ty, 12, "PTR", inst, 4500));
+            ingest(&mut app, &srv_on_knulp(inst));
+        }
+        ingest(&mut app, &aaaa_knulp());
+        app
+    }
+
+    fn rows_of(app: &App, instance: &str) -> Vec<u16> {
+        let inst = instance.split('.').next().unwrap();
+        app.services
+            .iter()
+            .find(|s| s.instance == inst)
+            .expect("service")
+            .answers
+            .iter()
+            .filter(|r| r.ttl > 0)
+            .map(|r| r.rtype)
+            .collect()
+    }
+
+    #[test]
+    fn rfc_nsec_with_srv_denies_absent_type_for_that_service_only() {
+        let mut app = knulp_app();
+        // zeroconf: SRV + A + hostname NSEC [A] in one response.
+        app.ingest_event(&packet(vec![
+            srv_on_knulp(DACP),
+            a_knulp(),
+            raw_record("knulp.local.", 47, "NSEC", "knulp.local. A", 120),
+        ]));
+        assert!(rows_of(&app, DACP).contains(&1), "A stays");
+        assert!(
+            !rows_of(&app, DACP).contains(&28),
+            "earlier AAAA taken back"
+        );
+        assert!(rows_of(&app, SMB).contains(&28), "sibling keeps its AAAA");
+        // A later AAAA is not filed on _dacp either.
+        ingest(
+            &mut app,
+            &raw_record("knulp.local.", 28, "AAAA", "fd00::2", 120),
+        );
+        assert!(!rows_of(&app, DACP).contains(&28));
+        assert!(rows_of(&app, SMB).contains(&28));
+        // The NSEC row itself stays visible, and the host still lists v6.
+        assert!(rows_of(&app, DACP).contains(&47));
+        assert!(app
+            .host_addresses("knulp.local")
+            .iter()
+            .any(|a| a == "fd00::1"));
+    }
+
+    #[test]
+    fn hostname_nsec_without_srv_in_packet_denies_nothing() {
+        let mut app = knulp_app();
+        app.ingest_event(&packet(vec![
+            a_knulp(),
+            raw_record("knulp.local.", 47, "NSEC", "knulp.local. A", 120),
+        ]));
+        assert!(rows_of(&app, DACP).contains(&28));
+        assert!(rows_of(&app, SMB).contains(&28));
+    }
+
+    #[test]
+    fn legacy_instance_nsec_denies_listed_types_and_is_flagged() {
+        let mut app = knulp_app();
+        ingest(
+            &mut app,
+            &raw_record(DACP, 47, "NSEC", "iTunes_Ctrl._dacp._tcp.local. AAAA", 120),
+        );
+        assert!(!rows_of(&app, DACP).contains(&28));
+        assert!(rows_of(&app, SMB).contains(&28));
+        let found: Vec<_> = app
+            .anomalies()
+            .into_iter()
+            .filter(|a| a.kind == anomalies::AnomalyKind::NsecInvertedBitmap)
+            .collect();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].severity, anomalies::Severity::Info);
+        assert_eq!(found[0].service, "iTunes_Ctrl._dacp._tcp.local");
+    }
+
+    #[test]
+    fn compliant_instance_nsec_denies_nothing() {
+        let mut app = knulp_app();
+        ingest(
+            &mut app,
+            &raw_record(
+                DACP,
+                47,
+                "NSEC",
+                "iTunes_Ctrl._dacp._tcp.local. TXT SRV",
+                120,
+            ),
+        );
+        assert!(rows_of(&app, DACP).contains(&28));
+        assert!(!app
+            .anomalies()
+            .iter()
+            .any(|a| a.kind == anomalies::AnomalyKind::NsecInvertedBitmap));
+    }
+
+    #[test]
+    fn goodbye_lifts_the_denial_and_the_next_aaaa_files_again() {
+        let mut app = knulp_app();
+        let legacy = |ttl| raw_record(DACP, 47, "NSEC", "iTunes_Ctrl._dacp._tcp.local. AAAA", ttl);
+        ingest(&mut app, &legacy(120));
+        assert!(!rows_of(&app, DACP).contains(&28));
+        app.ingest_event(&packet(vec![legacy(0)]));
+        ingest(
+            &mut app,
+            &raw_record("knulp.local.", 28, "AAAA", "fd00::3", 120),
+        );
+        assert!(
+            rows_of(&app, DACP).contains(&28),
+            "files again after the goodbye"
+        );
+    }
+
+    #[test]
+    fn expired_denial_stops_applying() {
+        let mut app = knulp_app();
+        let mut nsec = raw_record(DACP, 47, "NSEC", "iTunes_Ctrl._dacp._tcp.local. AAAA", 1);
+        nsec.received_at = Instant::now() - Duration::from_secs(5);
+        app.ingest_event(&packet(vec![nsec]));
+        app.evict_expired();
+        ingest(
+            &mut app,
+            &raw_record("knulp.local.", 28, "AAAA", "fd00::4", 120),
+        );
+        assert!(rows_of(&app, DACP).contains(&28));
+    }
+
+    #[test]
+    fn denied_type_drives_no_interest_unless_a_sibling_wants_it() {
+        let mut app = knulp_app();
+        let denial = |inst: &str| {
+            let owner = inst.trim_end_matches('.');
+            raw_record(inst, 47, "NSEC", &format!("{owner}. AAAA"), 120)
+        };
+        ingest(&mut app, &denial(DACP));
+        let wants_aaaa = |app: &App| {
+            app.desired_continuous()
+                .contains_key(&("knulp.local".to_string(), 28))
+        };
+        assert!(wants_aaaa(&app), "_smb still wants knulp AAAA");
+        ingest(&mut app, &denial(SMB));
+        assert!(!wants_aaaa(&app), "no service wants it any more");
+        assert!(app
+            .desired_continuous()
+            .contains_key(&("knulp.local".to_string(), 1)));
+    }
+
+    #[test]
+    fn ipv4_only_service_with_live_a_is_not_unresolved() {
+        let mut app = knulp_app();
+        ingest(&mut app, &a_knulp());
+        ingest(
+            &mut app,
+            &raw_record(DACP, 47, "NSEC", "iTunes_Ctrl._dacp._tcp.local. AAAA", 120),
+        );
+        assert!(!app.anomalies().iter().any(|a| {
+            a.kind == anomalies::AnomalyKind::UnresolvedSrvTarget
+                && a.service == "iTunes_Ctrl._dacp._tcp.local"
+        }));
+    }
+
+    #[test]
+    fn dump_lists_denials_and_omits_denied_rows() {
+        let mut app = knulp_app();
+        ingest(
+            &mut app,
+            &raw_record(DACP, 47, "NSEC", "iTunes_Ctrl._dacp._tcp.local. AAAA", 120),
+        );
+        let dump = app.state_dump();
+        let dacp = dump
+            .services
+            .iter()
+            .find(|s| s.instance == "iTunes_Ctrl")
+            .expect("dumped");
+        assert!(!dacp.answers.iter().any(|r| r.rtype == 28));
+        assert_eq!(dacp.address_denials.len(), 1);
+        assert_eq!(dacp.address_denials[0].rtype_str, "AAAA");
+        assert_eq!(dacp.address_denials[0].form, "legacy");
+        let smb = dump
+            .services
+            .iter()
+            .find(|s| s.instance == "KNULP")
+            .unwrap();
+        assert!(smb.address_denials.is_empty());
+    }
+
+    #[test]
+    fn rfc_goodbye_lifts_without_a_live_srv_in_the_packet() {
+        let mut app = knulp_app();
+        app.ingest_event(&packet(vec![
+            srv_on_knulp(DACP),
+            raw_record("knulp.local.", 47, "NSEC", "knulp.local. A", 120),
+        ]));
+        assert!(!rows_of(&app, DACP).contains(&28));
+        // A lone NSEC goodbye (no SRV in its packet) still lifts it.
+        app.ingest_event(&packet(vec![raw_record(
+            "knulp.local.",
+            47,
+            "NSEC",
+            "knulp.local. A",
+            0,
+        )]));
+        ingest(
+            &mut app,
+            &raw_record("knulp.local.", 28, "AAAA", "fd00::5", 120),
+        );
+        assert!(rows_of(&app, DACP).contains(&28));
+    }
+
+    #[test]
+    fn newer_nsec_bitmap_replaces_the_denial() {
+        let mut app = knulp_app();
+        let nsec = |types: &str| {
+            raw_record(
+                "knulp.local.",
+                47,
+                "NSEC",
+                &format!("knulp.local. {types}"),
+                120,
+            )
+        };
+        app.ingest_event(&packet(vec![srv_on_knulp(DACP), nsec("A")]));
+        assert!(!rows_of(&app, DACP).contains(&28));
+        // The host gained IPv6: the new bitmap lists AAAA, lifting it.
+        app.ingest_event(&packet(vec![srv_on_knulp(DACP), nsec("A AAAA")]));
+        ingest(
+            &mut app,
+            &raw_record("knulp.local.", 28, "AAAA", "fd00::6", 120),
+        );
+        assert!(rows_of(&app, DACP).contains(&28));
+        // Legacy form: a compliant instance NSEC lifts its denial too.
+        let legacy = |types: &str| {
+            raw_record(
+                DACP,
+                47,
+                "NSEC",
+                &format!("iTunes_Ctrl._dacp._tcp.local. {types}"),
+                120,
+            )
+        };
+        ingest(&mut app, &legacy("AAAA"));
+        assert!(!rows_of(&app, DACP).contains(&28));
+        ingest(&mut app, &legacy("TXT SRV"));
+        ingest(
+            &mut app,
+            &raw_record("knulp.local.", 28, "AAAA", "fd00::7", 120),
+        );
+        assert!(rows_of(&app, DACP).contains(&28));
+    }
+
+    #[test]
+    fn same_packet_additional_is_never_filed_on_a_denying_service() {
+        // _dacp is knulp's only service, so nothing else files AAAA.
+        let mut app = App::new().unwrap();
+        ingest(
+            &mut app,
+            &raw_record("_dacp._tcp.local.", 12, "PTR", DACP, 4500),
+        );
+        ingest(&mut app, &srv_on_knulp(DACP));
+        let key = ("knulp.local".to_string(), 28);
+        let undamped = Duration::from_secs(4);
+        app.continuous.insert(
+            key.clone(),
+            ContinuousQuery {
+                next_due: Instant::now() + undamped,
+                interval: undamped,
+                qname: "knulp.local".to_string(),
+            },
+        );
+        // One zeroconf response: SRV, inverted NSEC and a unique AAAA.
+        let mut aaaa = aaaa_knulp();
+        aaaa.flush_bit = true;
+        app.ingest_event(&packet(vec![
+            srv_on_knulp(DACP),
+            raw_record(DACP, 47, "NSEC", "iTunes_Ctrl._dacp._tcp.local. AAAA", 120),
+            aaaa,
+        ]));
+        assert!(!rows_of(&app, DACP).contains(&28));
+        // Never filed, so its cache-flush bit didn't damp the stream.
+        assert_eq!(app.continuous.get(&key).unwrap().interval, undamped);
+    }
+
+    #[test]
+    fn pending_instance_picks_up_a_legacy_denial_on_promotion() {
+        let mut app = App::new().unwrap();
+        // PTR seen, SRV not yet: the instance is pending.
+        ingest(
+            &mut app,
+            &raw_record("_dacp._tcp.local.", 12, "PTR", DACP, 4500),
+        );
+        ingest(
+            &mut app,
+            &raw_record(DACP, 47, "NSEC", "iTunes_Ctrl._dacp._tcp.local. AAAA", 120),
+        );
+        // AAAA arrives before the SRV (pending address), then the SRV.
+        ingest(&mut app, &aaaa_knulp());
+        ingest(&mut app, &a_knulp());
+        ingest(&mut app, &srv_on_knulp(DACP));
+        app.flush_pending_addrs();
+        assert!(rows_of(&app, DACP).contains(&1));
+        assert!(!rows_of(&app, DACP).contains(&28));
+    }
+
+    #[test]
+    fn denials_from_several_responders_collapse() {
+        let mut app = knulp_app();
+        for source in [
+            "192.168.178.27:5353",
+            "[fd00::d250:99ff:fe3b:8ce1]:5353",
+            "172.17.0.1:5353",
+        ] {
+            let mut nsec = raw_record(DACP, 47, "NSEC", "iTunes_Ctrl._dacp._tcp.local. AAAA", 120);
+            nsec.source = source.parse().unwrap();
+            ingest(&mut app, &nsec);
+        }
+        let dump = app.state_dump();
+        let dacp = dump
+            .services
+            .iter()
+            .find(|s| s.instance == "iTunes_Ctrl")
+            .unwrap();
+        assert_eq!(dacp.address_denials.len(), 1);
+    }
+
+    #[test]
+    fn rfc_denial_is_host_scoped_in_query_interest() {
+        let mut app = knulp_app();
+        // Both services deny AAAA for knulp via the RFC form.
+        app.ingest_event(&packet(vec![
+            srv_on_knulp(DACP),
+            srv_on_knulp(SMB),
+            raw_record("knulp.local.", 47, "NSEC", "knulp.local. A", 120),
+        ]));
+        let desired = app.desired_continuous();
+        assert!(!desired.contains_key(&("knulp.local".to_string(), 28)));
+        assert!(desired.contains_key(&("knulp.local".to_string(), 1)));
     }
 }

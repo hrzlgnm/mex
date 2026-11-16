@@ -2084,6 +2084,22 @@ pub(crate) fn rtype_label(rtype: u16) -> String {
     rtype_name(rtype).map_or_else(|| format!("TYPE{rtype}"), str::to_string)
 }
 
+/// Address types (A, AAAA) named in an NSEC row's rendered bitmap
+/// (`next_name TYPE…`), and whether it names any other type. Shared by
+/// address denials (app) and the inverted-bitmap finding (analyzer), so
+/// both read the same rule.
+pub(crate) fn nsec_address_types(rdata: &str) -> (Vec<u16>, bool) {
+    let mut address = Vec::new();
+    let mut other = false;
+    for t in rdata.split_whitespace().skip(1).filter_map(rtype_from_str) {
+        match t {
+            1 | 28 => address.push(t),
+            _ => other = true,
+        }
+    }
+    (address, other)
+}
+
 /// Numeric type for a displayed label (`A` → 1, …, `TYPE47` → 47); the
 /// inverse of `rtype_label`. `None` means unrecognised: callers stay
 /// quiet rather than guessing.

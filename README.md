@@ -109,7 +109,10 @@ browsed as before.
   expand into unlabeled child rows. Records announced by this host are
   highlighted; goodbye (TTL 0) records show as expired. Only the mDNS
   answer types A, AAAA, NS, CNAME, PTR, TXT, SRV, NSEC and HINFO become
-  rows; see [Out-of-scope types](#out-of-scope-types).
+  rows; see [Out-of-scope types](#out-of-scope-types). An address family
+  the service's own responder denies with an NSEC (e.g. an IPv4-only
+  service on a host that also has IPv6) shows no rows on that service;
+  sibling services and the host header keep it.
 - **Right middle — Questions.** Recently observed queries asking for this
   service, newest first (capped), with per-query age instead of TTL.
   Only questions for A, AAAA, NS, CNAME, PTR, TXT, SRV, HINFO and ANY
@@ -199,6 +202,7 @@ info for inconclusive lookups).
 | `no-flush` (warning when confirmed, else info) | unique SRV/TXT record missing the cache-flush bit ([RFC 6762 §10.2](https://www.rfc-editor.org/rfc/rfc6762#section-10.2), MUST when confirmed); confirmed in the answer or additional section of any response mex receives, including unicast replies, since mex only listens on port 5353 and so never gets legacy unicast responses ([RFC 6762 §6.7](https://www.rfc-editor.org/rfc/rfc6762#section-6.7)) |
 | `unicast-style-response` (error, warning or info) | an mDNS response carrying unicast DNS-style records, one finding per record, naming its section: ANY is error (a query type, never a record type, [RFC 1035 §3.2.3](https://www.rfc-editor.org/rfc/rfc1035#section-3.2.3)); SOA in the Authority section is a warning (a unicast-style negative answer, where mDNS uses NSEC, [RFC 6762 §6.1](https://www.rfc-editor.org/rfc/rfc6762#section-6.1)); other SOA is a warning for names in mDNS domains (`.local` and the link-local reverse zones; mDNS zones have none, [RFC 6762 §12](https://www.rfc-editor.org/rfc/rfc6762#section-12)) and info for names outside them, such as a router's `fritz.box` zone ([RFC 6762 §3](https://www.rfc-editor.org/rfc/rfc6762#section-3)); known answers are always info. State dumps add `section` and, when a question for the same name was seen up to 1 s before, `in_response_to` (`name TYPE`) and `in_response_to_own` (whether this mex instance asked) |
 | `unsupported-type` (warning; known answers info) | an mDNS response carrying any other out-of-scope record type (MX, unknown `TYPEnn`, …); DNS-SD over mDNS uses only the in-scope types ([RFC 6763 §12](https://www.rfc-editor.org/rfc/rfc6763#section-12)); state dumps add `section` and `in_response_to` like `unicast-style-response` |
+| `nsec-inverted-bitmap` (info) | an NSEC owned by a service instance whose bitmap lists only the *missing* address types (older python-zeroconf); RFC 6762 §6.1 has the bitmap list the types that exist ([RFC 6762 §6.1](https://www.rfc-editor.org/rfc/rfc6762#section-6.1)); mex still honours it as an address denial |
 | `unsupported-question` (info) | multicast question for an out-of-scope type: SOA never exists in mDNS ([RFC 6762 §12](https://www.rfc-editor.org/rfc/rfc6762#section-12)), others are outside mDNS scope ([RFC 6763 §12](https://www.rfc-editor.org/rfc/rfc6763#section-12)); asking is compliant, since [RFC 6762 §3](https://www.rfc-editor.org/rfc/rfc6762#section-3) requires `.local` queries on multicast; ANY questions are ownership probes and stay quiet; ephemeral-port queriers are tagged one-shot |
 | `ttl-low` / `ttl-high` (warning) | TTL below 10 s (churn risk) or above 7200 s (stale-cache risk) ([RFC 6762 §10](https://www.rfc-editor.org/rfc/rfc6762#section-10), SHOULD) |
 | `ttl-mismatch` (info) | service PTR at ≤ 120 s instead of the recommended 4500 s base ([RFC 6762 §10](https://www.rfc-editor.org/rfc/rfc6762#section-10), SHOULD) |

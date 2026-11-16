@@ -61,6 +61,24 @@ pub struct DumpService {
     /// do not mistake it for a complete packet log.
     pub questions_truncated: bool,
     pub questions_dropped: u64,
+    /// Address types this service's own responder denies via NSEC; their
+    /// rows are absent from `answers` (#245).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub address_denials: Vec<DumpDenial>,
+}
+
+/// One live NSEC address denial of a service.
+#[derive(serde::Serialize)]
+pub struct DumpDenial {
+    pub rtype_str: String,
+    /// `rfc` (hostname-owned NSEC with the SRV) or `legacy` (instance-owned
+    /// NSEC listing the missing types).
+    pub form: String,
+    /// Host the denial applies to (RFC form); absent for every host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub source: String,
+    pub ttl_remaining_secs: u64,
 }
 
 /// Unresolved group: enumeration row or pending instance.
