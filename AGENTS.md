@@ -26,7 +26,9 @@ Headless run (no TTY) logs to stderr.
   neither family's socket opens.
   Down, point-to-point, `lo`/`docker`/`veth` interfaces are skipped,
   unless explicitly selected via `-i/--interfaces` (user intent wins;
-  selected-but-down links wait for the rejoin refresh).
+  selected-but-down links wait for the rejoin refresh). A family with no
+  usable link sends nothing (no unpinned fallback); its pause and resume
+  are logged once each.
   Multicast loop disabled; unicast-dst packets from off-link subnets are
   refused (RFC 6762 §11) with a metrics counter.
   Only in-scope types (`anomalies::is_mdns_answer_type` /
