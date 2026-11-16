@@ -155,6 +155,28 @@ pub struct RawRecord {
     pub trigger: Option<QueryTrigger>,
 }
 
+impl RawRecord {
+    /// The responder address, suffixed with the ingress interface when
+    /// pktinfo provided one, so multi-link traffic can be told apart.
+    /// The `%iface` zone notation is only valid for IPv6 link-local
+    /// unicast (RFC 4007); everything else uses `@iface`. A link-local
+    /// source that already carries a zone (scope id) is shown as-is
+    /// instead of gaining a second suffix. Shared by the Records table
+    /// and findings that stand in for rows.
+    pub fn source_label(&self) -> String {
+        if self.iface.is_empty() {
+            return self.source.to_string();
+        }
+        match self.source {
+            SocketAddr::V6(v6) if v6.ip().is_unicast_link_local() && v6.scope_id() == 0 => {
+                format!("{}%{}", self.source, self.iface)
+            }
+            SocketAddr::V6(v6) if v6.ip().is_unicast_link_local() => self.source.to_string(),
+            _ => format!("{}@{}", self.source, self.iface),
+        }
+    }
+}
+
 /// The question a response most likely answered: the latest question for
 /// the record's owner name, of any type, seen shortly before the response
 /// arrived. mDNS responses carry no question section (RFC 6762 §6), so

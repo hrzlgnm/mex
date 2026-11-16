@@ -13671,4 +13671,62 @@ mod tests {
             "badge sits on the host header: {badged:?}"
         );
     }
+
+    #[test]
+    fn host_sighting_keeps_one_finding_per_source() {
+        // A router's SOA heard from several responders (its IPv4 and
+        // link-local addresses, a repeater): one finding per source, all
+        // owned by the host; serial churn per source stays one finding.
+        let mut app = App::new().unwrap();
+        ingest(
+            &mut app,
+            &raw_record(
+                "_fbox._tcp.local.",
+                12,
+                "PTR",
+                "Fritzel._fbox._tcp.local.",
+                4500,
+            ),
+        );
+        let mut srv = raw_record(
+            "Fritzel._fbox._tcp.local.",
+            33,
+            "SRV",
+            "0 0 49000 fritz.box.",
+            120,
+        );
+        srv.flush_bit = true;
+        ingest(&mut app, &srv);
+        let sources = [
+            "169.254.1.1:5353",
+            "192.168.178.109:5353",
+            "[fe80::7eff:4dff:fe15:7f88%2]:5353",
+        ];
+        for src in sources {
+            for len in [30, 31] {
+                let mut soa = raw_record("fritz.box.", 6, "TYPE6", &format!("rdlength={len}"), 10);
+                soa.source = src.parse().unwrap();
+                soa.iface = "enp0s25".to_string();
+                ingest(&mut app, &soa);
+            }
+        }
+        let found = findings_of(&app, anomalies::AnomalyKind::UnicastStyleResponse);
+        assert!(found.iter().all(|a| a.service == "fritz.box"), "{found:?}");
+        let mut got: Vec<String> = found.into_iter().filter_map(|a| a.source).collect();
+        got.sort();
+        // Named like the old Answers rows: `@iface`, or the zone as-is.
+        let mut want = vec![
+            "169.254.1.1:5353@enp0s25".to_string(),
+            "192.168.178.109:5353@enp0s25".to_string(),
+            "[fe80::7eff:4dff:fe15:7f88%2]:5353".to_string(),
+        ];
+        want.sort();
+        assert_eq!(got, want, "one finding per responder and link");
+        let overlay = app
+            .metrics_rows()
+            .into_iter()
+            .filter(|(k, _)| k.ends_with("unicast-style-response"))
+            .count();
+        assert_eq!(overlay, sources.len());
+    }
 }

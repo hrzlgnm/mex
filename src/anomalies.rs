@@ -435,12 +435,18 @@ fn dedup(mut items: Vec<Anomaly>) -> Vec<Anomaly> {
         };
         // Questions carry no rdata: tell queriers apart by source, so each
         // querier keeps its own finding and every row can mark.
-        // Answers keep the established behavior (one finding no matter how
-        // many sources announce it) — except context-gated kinds, where
-        // the same rdata via multicast vs unicast (or answer vs
-        // authority) is a different verdict and must not collapse.
+        // Out-of-scope records have no Answers row to list their
+        // responders, so their findings are the only per-source record:
+        // keep one per source too.
+        // Other answers keep the established behavior (one finding no
+        // matter how many sources announce it, the rows show them) —
+        // except context-gated kinds, where the same rdata via multicast
+        // vs unicast (or answer vs authority) is a different verdict and
+        // must not collapse.
         let source_key = match a.kind {
-            AnomalyKind::UnsupportedQuestion => a.source.clone().unwrap_or_default(),
+            AnomalyKind::UnsupportedQuestion
+            | AnomalyKind::UnicastStyleResponse
+            | AnomalyKind::UnsupportedType => a.source.clone().unwrap_or_default(),
             _ => String::new(),
         };
         let context_key = match a.kind {
@@ -1285,6 +1291,9 @@ fn check_record_claims(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>
     } else {
         "; unicast reply"
     };
+    // These findings stand in for the Answers rows out-of-scope records
+    // no longer get, so they name the source like a row does
+    // (`address@iface`), one finding per source and link.
     let response_finding = |kind, severity, message, rfc, requirement| Anomaly {
         kind,
         severity,
@@ -1293,7 +1302,7 @@ fn check_record_claims(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>
         rtype: Some(rec.rtype),
         rtype_str: Some(rec.rtype_str.clone()),
         rdata: Some(rdata.clone()),
-        source: Some(src.clone()),
+        source: Some(rec.source_label()),
         message,
         rfc,
         requirement,
@@ -2304,10 +2313,10 @@ mod tests {
     }
 
     #[test]
-    fn unicast_style_response_same_answer_from_two_sources_is_one_finding() {
-        // Demand-side findings split per querier, but answer sightings
-        // keep the established behavior: one finding no matter how many
-        // sources announce it, whatever their rdata length.
+    fn unicast_style_response_keeps_one_finding_per_source() {
+        // Out-of-scope records have no Answers row listing their
+        // responders: each source keeps its own finding, whatever the
+        // rdata length.
         let mut second = rec("host.local.", 6, "TYPE6", "rdlength=24", 120, false);
         second.source = "192.168.1.9:5353".parse().unwrap();
         let answers = vec![
@@ -2320,8 +2329,8 @@ mod tests {
                 .iter()
                 .filter(|a| a.kind == AnomalyKind::UnicastStyleResponse)
                 .count(),
-            1,
-            "same answer from two sources must stay one finding"
+            2,
+            "each responder keeps its own finding"
         );
     }
 

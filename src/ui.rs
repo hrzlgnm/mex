@@ -711,23 +711,9 @@ fn fit_row_extent(
     fitted.min(max_offset)
 }
 
-/// Source cell for the Records table: the responder address, suffixed
-/// with the ingress interface when pktinfo provided one, so multi-link
-/// traffic can be told apart. The `%iface` zone notation is only valid
-/// for IPv6 link-local unicast (RFC 4007); everything else uses `@iface`.
-/// A link-local source that already carries a zone (scope id) is shown
-/// as-is instead of gaining a second suffix.
+/// Source cell for the Records table (`RawRecord::source_label`).
 fn source_label(rec: &crate::browse::RawRecord) -> String {
-    if rec.iface.is_empty() {
-        return rec.source.to_string();
-    }
-    match rec.source {
-        SocketAddr::V6(v6) if v6.ip().is_unicast_link_local() && v6.scope_id() == 0 => {
-            format!("{}%{}", rec.source, rec.iface)
-        }
-        SocketAddr::V6(v6) if v6.ip().is_unicast_link_local() => rec.source.to_string(),
-        _ => format!("{}@{}", rec.source, rec.iface),
-    }
+    rec.source_label()
 }
 
 /// Heat color for the TTL cell, aligned to the RFC 6762 §5.2 requery

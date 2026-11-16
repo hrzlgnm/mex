@@ -229,7 +229,9 @@ its host's earlier sightings for that host. Out-of-scope types are named only by
 so a malformed one cannot drop the rest of its packet: mex keeps only
 its length (`rdlength=<n>`). A record finding lives for its TTL and is
 cleared by a goodbye; repeated records from the same source in the same
-section (e.g. SOA serial bumps) stay one finding. Findings from known
+section (e.g. SOA serial bumps) stay one finding, while each responder
+keeps its own, named with its interface like an Answers row
+(`169.254.1.1:5353@enp0s25`). Findings from known
 answers are always info. EDNS0 OPT pseudo-records are not records and
 are ignored. At most 256 sightings are kept; the metrics overlay counts
 evictions.
