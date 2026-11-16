@@ -13,9 +13,47 @@ use crate::browse::{rtype_from_str, RawRecord};
 /// by the analyzer and the pane filters so the two cannot drift.
 pub const ENUMERATION_SERVICE: &str = "enumeration";
 
+/// Catch-all service identity for out-of-scope sightings whose owner
+/// name matches no known service, pending instance or host (e.g. a
+/// router's `fritz.box.` SOA). Shown in the metrics overlay and dumps.
+pub const UNATTRIBUTED_SERVICE: &str = "unattributed";
+
+/// Types mex accepts both as mDNS answers and as questions: A, NS,
+/// CNAME, PTR, HINFO, TXT, AAAA, SRV. HINFO is in because Avahi can
+/// publish it (`publish-hinfo=yes`). `browse::RTYPE_NAMES` names exactly
+/// these plus NSEC and ANY (a test keeps them in step).
+fn is_mdns_common_type(rtype: u16) -> bool {
+    matches!(rtype, 1 | 2 | 5 | 12 | 13 | 16 | 28 | 33)
+}
+
+/// Record types mex accepts as mDNS answers: the common types plus
+/// NSEC (negative answers, RFC 6762 §6.1). Every other type is out of
+/// scope: never decoded, never an Answers row, only a sighting behind
+/// a finding. Single source of truth for ingest routing, parsing and
+/// verdicts.
+pub(crate) fn is_mdns_answer_type(rtype: u16) -> bool {
+    is_mdns_common_type(rtype) || rtype == 47
+}
+
+/// Question types mex accepts: the common types plus ANY (255); NSEC
+/// is answer-only (responders send it unasked). Every other QTYPE is
+/// out of scope: never a Questions row, only a sighting behind a
+/// finding.
+pub(crate) fn is_mdns_question_type(rtype: u16) -> bool {
+    is_mdns_common_type(rtype) || rtype == 255
+}
+
 /// Service identity for a confirmed or pending instance.
 pub fn service_id(instance: &str, service_type: &str) -> String {
     format!("{instance}.{service_type}")
+}
+
+/// Finding owner for a record or question owned by a hostname (an SRV
+/// target): the lowercased name without its root dot. One host backs
+/// many services, so host-owned evidence is recorded once, under the
+/// host, and every service on it shows it in its Anomalies pane.
+pub fn host_id(hostname: &str) -> String {
+    hostname.trim_end_matches('.').to_lowercase()
 }
 
 /// Severity of an anomaly: errors are clear RFC violations, warnings are
@@ -42,7 +80,8 @@ impl Severity {
 pub enum AnomalyKind {
     UnresolvedSrvTarget,
     UnicastStyleResponse,
-    UnicastQuestion,
+    UnsupportedType,
+    UnsupportedQuestion,
     TtlLow,
     TtlHigh,
     TtlMismatch,
@@ -61,7 +100,8 @@ impl AnomalyKind {
         match self {
             AnomalyKind::UnresolvedSrvTarget => "unresolved-srv-target",
             AnomalyKind::UnicastStyleResponse => "unicast-style-response",
-            AnomalyKind::UnicastQuestion => "unicast-question",
+            AnomalyKind::UnsupportedType => "unsupported-type",
+            AnomalyKind::UnsupportedQuestion => "unsupported-question",
             AnomalyKind::TtlLow => "ttl-low",
             AnomalyKind::TtlHigh => "ttl-high",
             AnomalyKind::TtlMismatch => "ttl-mismatch",
@@ -89,7 +129,7 @@ impl AnomalyKind {
 
     /// Whether this is a demand-side (observed question) finding.
     pub fn is_question(self) -> bool {
-        matches!(self, AnomalyKind::UnicastQuestion)
+        matches!(self, AnomalyKind::UnsupportedQuestion)
     }
 }
 
@@ -176,6 +216,9 @@ pub struct Snapshot<'a> {
     /// and enumeration rows. The owning service id rides along
     /// (`instance.service_type`, or `enumeration`).
     pub questions: Vec<QuestionView<'a>>,
+    /// Out-of-scope records kept only as evidence (never answer rows),
+    /// with their attributed service id (or `unattributed`).
+    pub sightings: Vec<(String, &'a RawRecord)>,
 }
 
 /// One observed question for analysis: borrows the row, owns the small
@@ -186,7 +229,14 @@ pub struct QuestionView<'a> {
     pub name: &'a str,
     pub rtype: u16,
     pub rtype_str: &'a str,
+    /// The querier's socket address: port checks (one-shot, our own
+    /// port-0 sends) need it as an address.
     pub source: SocketAddr,
+    /// The querier as findings name it: `address@iface` (or the IPv6
+    /// zone) when the ingress link is known, like
+    /// `RawRecord::source_label`, so one address on two links stays two
+    /// findings.
+    pub source_label: String,
 }
 
 /// One transmitted A/AAAA lookup for a live SRV target.
@@ -284,6 +334,12 @@ pub fn analyze_observations(
         check_ttl_stable(svc, &service_id, now, &mut out);
     }
 
+    for (service, rec) in &snap.sightings {
+        if is_live(rec, now) {
+            check_record(service, rec, &mut out);
+        }
+    }
+
     for rec in &snap.enum_answers {
         if !is_live(rec, now) {
             continue;
@@ -342,10 +398,9 @@ pub fn analyze_observations(
         }
     }
 
-    // Observed questions for unicast-only types: a querier asking
-    // multicast for what can only live in unicast is the demand-side
-    // twin of a unicast-style response. Stored rows are already capped and refreshed on
-    // re-ask, so every row on file is worth marking.
+    // Observed questions for out-of-scope types: the demand-side twin
+    // of an out-of-scope response record. They arrive as sightings
+    // (never Questions rows), bounded and refreshed on re-ask.
     for q in &snap.questions {
         check_question(q, &mut out);
     }
@@ -369,28 +424,15 @@ fn severity_rank(s: Severity) -> u8 {
     }
 }
 
-/// Display/dedup key for rdata: SOA serials churn constantly (one bump
-/// per announcement), so rows differing only in serial share one finding
-/// and one marker. All other types pass through untouched.
-pub(crate) fn anomaly_match_key(rtype: u16, rdata: &str) -> String {
-    if rtype == 6 {
-        normalize_soa_rdata(rdata.to_string())
-    } else {
-        rdata.to_string()
-    }
-}
-
 fn dedup(mut items: Vec<Anomaly>) -> Vec<Anomaly> {
     let mut seen = HashSet::new();
     let mut out = Vec::with_capacity(items.len());
     for a in items.drain(..) {
-        // SOA serials churn constantly (one bump per announcement), so two
-        // findings differing only in serial are the same finding. Normalize
-        // the serial away for the dedup key; the stored rdata keeps it.
+        // Out-of-scope sightings carry only `rdlength=<n>`: rdata churn
+        // (e.g. SOA serial bumps) must not multiply findings, so their
+        // identity ignores it.
         let rdata_key = match (a.kind, a.rtype) {
-            (AnomalyKind::UnicastStyleResponse, Some(6)) => {
-                anomaly_match_key(6, &a.rdata.clone().unwrap_or_default())
-            }
+            (AnomalyKind::UnicastStyleResponse | AnomalyKind::UnsupportedType, _) => String::new(),
             (AnomalyKind::EnumSubtype | AnomalyKind::TypeFormat, Some(12))
                 if a.service == ENUMERATION_SERVICE =>
             {
@@ -400,16 +442,23 @@ fn dedup(mut items: Vec<Anomaly>) -> Vec<Anomaly> {
         };
         // Questions carry no rdata: tell queriers apart by source, so each
         // querier keeps its own finding and every row can mark.
-        // Answers keep the established behavior (one finding no matter how
-        // many sources announce it) — except context-gated kinds, where
-        // the same rdata via multicast vs unicast (or answer vs
-        // authority) is a different verdict and must not collapse.
+        // Out-of-scope records have no Answers row to list their
+        // responders, so their findings are the only per-source record:
+        // keep one per source too.
+        // Other answers keep the established behavior (one finding no
+        // matter how many sources announce it, the rows show them) —
+        // except context-gated kinds, where the same rdata via multicast
+        // vs unicast (or answer vs authority) is a different verdict and
+        // must not collapse.
         let source_key = match a.kind {
-            AnomalyKind::UnicastQuestion => a.source.clone().unwrap_or_default(),
+            AnomalyKind::UnsupportedQuestion
+            | AnomalyKind::UnicastStyleResponse
+            | AnomalyKind::UnsupportedType => a.source.clone().unwrap_or_default(),
             _ => String::new(),
         };
         let context_key = match a.kind {
             AnomalyKind::UnicastStyleResponse
+            | AnomalyKind::UnsupportedType
             | AnomalyKind::NoFlush
             | AnomalyKind::UnresolvedSrvTarget => a.message.clone(),
             _ => String::new(),
@@ -434,25 +483,6 @@ fn dedup(mut items: Vec<Anomaly>) -> Vec<Anomaly> {
         }
     }
     out
-}
-
-/// Mask the serial (third field) of `mname rname serial refresh retry
-/// expire minimum` so serial bumps don't multiply findings.
-fn normalize_soa_rdata(rdata: String) -> String {
-    let mut parts = rdata.split_whitespace();
-    let (mname, rname) = (parts.next(), parts.next());
-    match (mname, rname, parts.next()) {
-        (Some(m), Some(r), Some(_)) => {
-            let rest: Vec<&str> = parts.collect();
-            let mut out = format!("{m} {r} *");
-            for p in rest {
-                out.push(' ');
-                out.push_str(p);
-            }
-            out
-        }
-        _ => rdata,
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1045,14 +1075,13 @@ pub(crate) fn is_reverse_ptr(name: &str) -> bool {
     lower.ends_with(".in-addr.arpa") || lower.ends_with(".ip6.arpa")
 }
 
-/// Verdict for a unicast-style record in an mDNS response, by type,
-/// section and owner domain: `(severity, reason, rfc, requirement)`, or
-/// `None` for types with no mDNS restriction (MX included: neither
-/// RFC 6762 nor RFC 6763 restricts it).
+/// Verdict for a unicast-style record (SOA or ANY) in an mDNS response,
+/// by type, section and owner domain: `(severity, reason, rfc,
+/// requirement)`. `None` for every other type: in-scope types raise no
+/// such finding, and the remaining out-of-scope types get
+/// `unsupported_type_verdict`.
 ///
 /// * ANY is a QTYPE and never an RR type (RFC 1035 §3.2.3): Error.
-/// * NS has no role in mDNS; §12 states there are none in mDNS domains,
-///   but no rule forbids sending one: Info.
 /// * SOA in the Authority section is a unicast-style negative answer;
 ///   mDNS denies records with NSEC (§6.1): Warning. §6.1's MUST is about
 ///   sending the NSEC, which a per-record check cannot see, so no
@@ -1076,8 +1105,6 @@ pub(crate) fn unicast_style_verdict(
             "a query type, never a record type",
             "RFC 1035 §3.2.3",
         ),
-        2 if mdns_name => (Severity::Info, "no meaning in mDNS", "RFC 6762 §12"),
-        2 => (Severity::Info, "no meaning in mDNS", "RFC 6762 §3"),
         6 if section == RecordSection::Authority => (
             Severity::Warning,
             "mDNS uses NSEC for negative answers",
@@ -1095,6 +1122,26 @@ pub(crate) fn unicast_style_verdict(
     Some((severity, reason, rfc, ""))
 }
 
+/// Verdict for an out-of-scope record type that is not unicast-style
+/// (MX, unknown `TYPEnn`, …): Warning, capped at Info for known answers.
+/// RFC 6763 §12 lists the records DNS-SD over mDNS involves; the rest
+/// is outside mex's scope, so no requirement level is claimed.
+/// `None` for in-scope types and for SOA/ANY, which
+/// `unicast_style_verdict` covers.
+pub(crate) fn unsupported_type_verdict(
+    rtype: u16,
+    section: crate::browse::RecordSection,
+) -> Option<Severity> {
+    if is_mdns_answer_type(rtype) || matches!(rtype, 6 | 255) {
+        return None;
+    }
+    Some(if section == crate::browse::RecordSection::KnownAnswer {
+        Severity::Info
+    } else {
+        Severity::Warning
+    })
+}
+
 /// Section name as shown in finding messages (`Authority section`).
 fn section_title(section: crate::browse::RecordSection) -> &'static str {
     use crate::browse::RecordSection;
@@ -1107,15 +1154,19 @@ fn section_title(section: crate::browse::RecordSection) -> &'static str {
     }
 }
 
-/// Verdict for observed *questions*: informational only. RFC 6762 §3
-/// requires every query for a `.local` name to go to the mDNS multicast
-/// group, so asking for NS/SOA there is compliant; §12 only says no such
-/// records exist, so the question can never be answered. QTYPE ANY (255)
-/// stays quiet: probes for unique ownership use it (RFC 6762 §8.1, §6.1).
-pub(crate) fn question_unicast_severity(rtype: u16) -> Option<Severity> {
+/// Verdict for observed *questions* outside `is_mdns_question_type`:
+/// informational only, `(reason, rfc)`. RFC 6762 §3 requires every
+/// query for a `.local` name to go to the mDNS multicast group, so
+/// asking is compliant; it just asks for something mex does not
+/// support. SOA gets §12's reason: no such record exists in mDNS.
+pub(crate) fn unsupported_question_verdict(rtype: u16) -> Option<(&'static str, &'static str)> {
     match rtype {
-        2 | 6 => Some(Severity::Info),
-        _ => None,
+        _ if is_mdns_question_type(rtype) => None,
+        6 => Some((
+            "asks for a type that does not exist in mDNS",
+            "RFC 6762 §12",
+        )),
+        _ => Some(("asks for a type outside mDNS scope", "RFC 6763 §12")),
     }
 }
 
@@ -1130,9 +1181,10 @@ pub(crate) fn is_one_shot_querier(source: &SocketAddr) -> bool {
     source.port() != 5353 && source.port() >= 1024
 }
 
-/// One observed question asking multicast for a unicast-only type: the
-/// demand-side twin of `unicast-style-response`. Port 0 can never be a real querier,
-/// so our own inferred sends stay quiet here, not just in the UI.
+/// One observed question for a type outside `is_mdns_question_type`:
+/// the demand-side twin of `unicast-style-response` / `unsupported-type`.
+/// Port 0 can never be a real querier, so our own inferred sends stay
+/// quiet here, not just in the UI.
 fn check_question(q: &QuestionView, out: &mut Vec<Anomaly>) {
     if q.source.port() == 0 {
         return;
@@ -1152,7 +1204,7 @@ fn check_question(q: &QuestionView, out: &mut Vec<Anomaly>) {
         rtype: Some(q.rtype),
         rtype_str: Some(q.rtype_str.to_string()),
         rdata: None,
-        source: Some(q.source.to_string()),
+        source: Some(q.source_label.clone()),
         message,
         rfc,
         requirement,
@@ -1164,12 +1216,12 @@ fn check_question(q: &QuestionView, out: &mut Vec<Anomaly>) {
     // resolve over mDNS on the link that advertised it (RFC 6762 §3
     // allows it). The §13 fail-over case, global names typed by a user,
     // never matches a service and so never reaches the analyzer.
-    if let Some(severity) = question_unicast_severity(q.rtype) {
+    if let Some((reason, rfc)) = unsupported_question_verdict(q.rtype) {
         out.push(finding(
-            AnomalyKind::UnicastQuestion,
-            severity,
-            format!("asks for a type that does not exist in mDNS{one_shot}"),
-            "RFC 6762 §12",
+            AnomalyKind::UnsupportedQuestion,
+            Severity::Info,
+            format!("{reason}{one_shot}"),
+            rfc,
             "",
         ));
     }
@@ -1192,7 +1244,21 @@ pub(crate) fn is_mdns_domain(name: &str) -> bool {
     .any(|zone| lower == *zone || lower.ends_with(&format!(".{zone}")))
 }
 
+/// Per-record checks. A known answer rides in a query (RFC 6762 §7.1):
+/// it is the querier's belief, not a responder's claim, so every
+/// finding it raises is capped at Info, and its TTL (the remaining one)
+/// gets no TTL checks at all.
 fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
+    let first = out.len();
+    check_record_claims(service_id, rec, out);
+    if rec.section == crate::browse::RecordSection::KnownAnswer {
+        for a in &mut out[first..] {
+            a.severity = Severity::Info;
+        }
+    }
+}
+
+fn check_record_claims(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     let name = rec.name.clone();
     let rdata = rec.rdata.clone();
     let src = rec.source.to_string();
@@ -1219,22 +1285,43 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         });
     }
 
-    // Unicast-style records in an mDNS response: one finding per record,
-    // the verdict set by type, section and owner domain (see
-    // `unicast_style_verdict`). Unicast replies to 5353 are mDNS
-    // responses too (RFC 6762 §6.7), so the destination only shows in the
-    // message. The section and the question that most likely triggered
-    // the response travel in `response`, so dumps can sort these from
-    // real answers and from replies to our own queries.
+    // Out-of-scope records: one finding per record, never a row.
+    // Unicast-style ones (SOA/ANY) get a verdict by type, section and
+    // owner domain (see `unicast_style_verdict`); every other
+    // out-of-scope type gets `unsupported_type_verdict`. Unicast replies
+    // to 5353 are mDNS responses too (RFC 6762 §6.7), so the destination
+    // only shows in the message. The section and the question that most
+    // likely triggered the response travel in `response`, so dumps can
+    // sort these from real answers and from replies to our own queries.
+    let section = section_title(rec.section);
+    let unicast = if rec.dst_is_multicast {
+        ""
+    } else {
+        "; unicast reply"
+    };
+    // These findings stand in for the Answers rows out-of-scope records
+    // no longer get, so they name the source like a row does
+    // (`address@iface`), one finding per source and link.
+    let response_finding = |kind, severity, message, rfc, requirement| Anomaly {
+        kind,
+        severity,
+        service: service_id.to_string(),
+        record_name: Some(name.clone()),
+        rtype: Some(rec.rtype),
+        rtype_str: Some(rec.rtype_str.clone()),
+        rdata: Some(rdata.clone()),
+        source: Some(rec.source_label()),
+        message,
+        rfc,
+        requirement,
+        response: Some(ResponseContext {
+            section: rec.section,
+            trigger: rec.trigger.clone(),
+        }),
+    };
     if let Some((severity, reason, rfc, requirement)) =
         unicast_style_verdict(rec.rtype, rec.section, is_mdns_domain(&rec.name))
     {
-        let section = section_title(rec.section);
-        let unicast = if rec.dst_is_multicast {
-            ""
-        } else {
-            "; unicast reply"
-        };
         let message = if rec.rtype == 255 {
             format!("ANY record in {section} section ({reason}){unicast}")
         } else {
@@ -1243,23 +1330,25 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
                 rec.rtype_str
             )
         };
-        out.push(Anomaly {
-            kind: AnomalyKind::UnicastStyleResponse,
+        out.push(response_finding(
+            AnomalyKind::UnicastStyleResponse,
             severity,
-            service: service_id.to_string(),
-            record_name: Some(name.clone()),
-            rtype: Some(rec.rtype),
-            rtype_str: Some(rec.rtype_str.clone()),
-            rdata: Some(rdata.clone()),
-            source: Some(src.clone()),
             message,
             rfc,
             requirement,
-            response: Some(ResponseContext {
-                section: rec.section,
-                trigger: rec.trigger.clone(),
-            }),
-        });
+        ));
+    }
+    if let Some(severity) = unsupported_type_verdict(rec.rtype, rec.section) {
+        out.push(response_finding(
+            AnomalyKind::UnsupportedType,
+            severity,
+            format!(
+                "record type {} is outside mDNS scope, in {section} section{unicast}",
+                rec.rtype_str
+            ),
+            "RFC 6763 §12",
+            "",
+        ));
     }
 
     // Cache-flush bit misuse: shared records must not set it. Reverse
@@ -1332,10 +1421,16 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         });
     }
 
+    // A known answer carries the querier's *remaining* TTL (RFC 6762
+    // §7.1), not the responder's: TTL checks say nothing about it.
+    let ttl_is_remaining = rec.section == crate::browse::RecordSection::KnownAnswer;
+
     // TTL band. Recommendations per RFC 6762 §10 (SHOULD): 120s base
     // for SRV/A/AAAA, 4500s for PTR/TXT. Values outside [10s, 7200s] risk
     // churn or stale caches.
-    if rec.ttl < TTL_LOW {
+    if ttl_is_remaining {
+        // No TTL verdicts for known answers.
+    } else if rec.ttl < TTL_LOW {
         out.push(Anomaly {
             kind: AnomalyKind::TtlLow,
             severity: Severity::Warning,
@@ -1384,7 +1479,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     // This is a SHOULD-level deviation (RFC 6762 §10), not a violation:
     // Info, since 60/120s values are common in real implementations and
     // only increase cache-refresh traffic.
-    if rec.rtype == 12 && rec.ttl <= 120 && !is_reverse_ptr(&rec.name) {
+    if !ttl_is_remaining && rec.rtype == 12 && rec.ttl <= 120 && !is_reverse_ptr(&rec.name) {
         // Enumeration rows all share the owner name, so name the
         // enumerated type: otherwise every finding reads identically.
         // The announcer is appended centrally below.
@@ -1724,6 +1819,7 @@ mod tests {
             enum_answers: Vec::new(),
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
+            sightings: Vec::new(),
         };
         analyze(&snap)
     }
@@ -1738,12 +1834,6 @@ mod tests {
             sev(255, Answer, true),
             Some((Severity::Error, "RFC 1035 §3.2.3"))
         );
-        // NS has no meaning in mDNS, but no rule forbids it.
-        assert_eq!(
-            sev(2, Authority, true),
-            Some((Severity::Info, "RFC 6762 §12"))
-        );
-        assert_eq!(sev(2, Answer, false), Some((Severity::Info, "RFC 6762 §3")));
         // SOA in Authority is a unicast-style negative answer (§6.1 NSEC),
         // whatever the owner domain.
         for mdns in [true, false] {
@@ -1764,13 +1854,26 @@ mod tests {
             Some(Severity::Info)
         );
         // No requirement level is ever claimed.
-        assert!([2, 6, 255]
+        assert!([6, 255]
             .into_iter()
             .all(|t| v(t, Authority, true).is_some_and(|(_, _, _, req)| req.is_empty())));
-        // Unrestricted types stay quiet, MX included.
-        for rtype in [1, 5, 12, 15, 16, 28, 33, 47] {
+        // In-scope types (NS included) and other out-of-scope types
+        // (MX: `unsupported_type_verdict`) get no unicast-style verdict.
+        for rtype in [1, 2, 5, 12, 13, 15, 16, 28, 33, 47] {
             assert_eq!(v(rtype, Answer, true), None, "type {rtype}");
         }
+    }
+
+    #[test]
+    fn unsupported_type_verdict_covers_only_the_rest() {
+        use super::unsupported_type_verdict as v;
+        use crate::browse::RecordSection::*;
+        for rtype in [1, 2, 5, 6, 12, 13, 16, 28, 33, 47, 255] {
+            assert_eq!(v(rtype, Answer), None, "type {rtype}");
+        }
+        assert_eq!(v(15, Answer), Some(Severity::Warning));
+        assert_eq!(v(65, Additional), Some(Severity::Warning));
+        assert_eq!(v(15, KnownAnswer), Some(Severity::Info));
     }
 
     #[test]
@@ -1825,27 +1928,21 @@ mod tests {
     }
 
     #[test]
-    fn unicast_style_response_ns_soa_for_global_name_is_info() {
+    fn unicast_style_response_soa_for_global_name_is_info() {
         // A router answering a query for its own unicast zone over mDNS:
         // §12 does not cover fritz.box, so this is an observation only.
         let answers = vec![
             rec("fritz.box.", 2, "NS", "fritz.box.", 10, false),
-            rec(
-                "fritz.box.",
-                6,
-                "SOA",
-                "fritz.box. admin.fritz.box. 1794738133 21600 1800 43200 10",
-                10,
-                false,
-            ),
+            rec("fritz.box.", 6, "TYPE6", "rdlength=49", 10, false),
         ];
         let found = analyze_service("Fritzel", "_fbox._tcp.local", "fritz.box.", &answers);
         let found_rows: Vec<_> = found
             .iter()
             .filter(|a| a.kind == AnomalyKind::UnicastStyleResponse)
             .collect();
-        assert_eq!(found_rows.len(), 2);
+        assert_eq!(found_rows.len(), 1);
         for item in found_rows {
+            assert_eq!(item.rtype, Some(6));
             assert_eq!(item.severity, Severity::Info);
             assert_eq!(item.rfc, "RFC 6762 §3");
             assert_eq!(item.requirement, "");
@@ -1856,14 +1953,7 @@ mod tests {
             );
         }
         // The same SOA owned by a .local name: mDNS zones have none (§12).
-        let answers = vec![rec(
-            "host.local.",
-            6,
-            "SOA",
-            "host.local. admin 1 2 3 4 5",
-            120,
-            false,
-        )];
+        let answers = vec![rec("host.local.", 6, "TYPE6", "rdlength=22", 120, false)];
         let found = analyze_service("My", "_http._tcp.local", "host.local.", &answers);
         let item = found
             .iter()
@@ -1899,6 +1989,7 @@ mod tests {
             enum_answers: vec![&enum_rec],
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
+            sightings: Vec::new(),
         };
         let item = analyze(&snap)
             .iter()
@@ -1918,17 +2009,7 @@ mod tests {
     fn qview(service: &str, name: &str, rtype: u16, source: SocketAddr) -> QuestionView<'static> {
         // Leak the service id for the snapshot lifetime: tests only.
         let service: &'static str = Box::leak(service.to_string().into_boxed_str());
-        let rtype_str: &'static str = Box::leak(
-            match rtype {
-                2 => "NS",
-                6 => "SOA",
-                15 => "MX",
-                255 => "ANY",
-                _ => "PTR",
-            }
-            .to_string()
-            .into_boxed_str(),
-        );
+        let rtype_str: &'static str = Box::leak(crate::browse::rtype_label(rtype).into_boxed_str());
         let name: &'static str = Box::leak(name.to_string().into_boxed_str());
         QuestionView {
             service: service.to_string(),
@@ -1936,6 +2017,7 @@ mod tests {
             rtype,
             rtype_str,
             source,
+            source_label: source.to_string(),
         }
     }
 
@@ -1945,6 +2027,7 @@ mod tests {
             enum_answers: Vec::new(),
             pending_hosts: HashSet::new(),
             questions: questions.to_vec(),
+            sightings: Vec::new(),
         };
         analyze(&snap)
     }
@@ -1986,7 +2069,7 @@ mod tests {
         let found = analyze_questions(&[qview("My._http._tcp.local", "fritz.box.", 6, querier)]);
         let item = found
             .iter()
-            .find(|a| a.kind == AnomalyKind::UnicastQuestion)
+            .find(|a| a.kind == AnomalyKind::UnsupportedQuestion)
             .expect("expected SOA question finding");
         // RFC 6762 §3 requires .local queries on multicast: asking is
         // compliant, the record just cannot exist (§12).
@@ -2011,7 +2094,7 @@ mod tests {
         let found = analyze_questions(&[qview("My._http._tcp.local", "fritz.box.", 6, stub)]);
         let item = found
             .iter()
-            .find(|a| a.kind == AnomalyKind::UnicastQuestion)
+            .find(|a| a.kind == AnomalyKind::UnsupportedQuestion)
             .expect("expected SOA unicast question");
         assert!(
             item.message.contains("one-shot"),
@@ -2022,7 +2105,7 @@ mod tests {
             analyze_questions(&[qview("My._http._tcp.local", "fritz.box.", 6, test_source())]);
         let item = found
             .iter()
-            .find(|a| a.kind == AnomalyKind::UnicastQuestion)
+            .find(|a| a.kind == AnomalyKind::UnsupportedQuestion)
             .expect("expected SOA unicast question");
         assert!(
             !item.message.contains("one-shot"),
@@ -2035,7 +2118,7 @@ mod tests {
         let found = analyze_questions(&[qview("My._http._tcp.local", "fritz.box.", 6, dns)]);
         let item = found
             .iter()
-            .find(|a| a.kind == AnomalyKind::UnicastQuestion)
+            .find(|a| a.kind == AnomalyKind::UnsupportedQuestion)
             .expect("expected SOA unicast question");
         assert!(
             !item.message.contains("one-shot"),
@@ -2048,7 +2131,7 @@ mod tests {
         let found = analyze_questions(&[qview("My._http._tcp.local", "fritz.box.", 6, other)]);
         let item = found
             .iter()
-            .find(|a| a.kind == AnomalyKind::UnicastQuestion)
+            .find(|a| a.kind == AnomalyKind::UnsupportedQuestion)
             .expect("expected SOA unicast question");
         assert!(
             item.message.contains("one-shot"),
@@ -2058,15 +2141,23 @@ mod tests {
     }
 
     #[test]
-    fn unicast_question_mx_is_quiet() {
-        // Neither RFC 6762 nor RFC 6763 restricts MX in mDNS.
-        let found = analyze_questions(&[qview(
-            "My._http._tcp.local",
-            "mail.local.",
-            15,
-            test_source(),
-        )]);
-        assert!(!found.iter().any(|a| a.kind == AnomalyKind::UnicastQuestion));
+    fn unsupported_question_mx_and_nsec_are_info() {
+        // MX is outside mex's mDNS scope; NSEC is answer-only (responders
+        // send it unasked as a negative answer, RFC 6762 §6.1).
+        for rtype in [15, 47] {
+            let found = analyze_questions(&[qview(
+                "My._http._tcp.local",
+                "mail.local.",
+                rtype,
+                test_source(),
+            )]);
+            let item = found
+                .iter()
+                .find(|a| a.kind == AnomalyKind::UnsupportedQuestion)
+                .unwrap_or_else(|| panic!("expected a finding for type {rtype}"));
+            assert_eq!(item.severity, Severity::Info);
+            assert_eq!(item.rfc, "RFC 6763 §12");
+        }
     }
 
     #[test]
@@ -2080,7 +2171,7 @@ mod tests {
         let stub: SocketAddr = "192.168.1.9:45678".parse().unwrap();
         let found = analyze_questions(&[qview("My._http._tcp.local", "fritz.box.", 6, stub)]);
         let kinds: Vec<_> = found.iter().map(|a| a.kind.as_str()).collect();
-        assert_eq!(kinds, ["unicast-question"]);
+        assert_eq!(kinds, ["unsupported-question"]);
         assert!(found[0].message.ends_with("(one-shot querier)"));
     }
 
@@ -2118,7 +2209,7 @@ mod tests {
         assert_eq!(
             found
                 .iter()
-                .filter(|f| f.kind == AnomalyKind::UnicastQuestion)
+                .filter(|f| f.kind == AnomalyKind::UnsupportedQuestion)
                 .count(),
             2,
             "one finding per querier"
@@ -2135,7 +2226,7 @@ mod tests {
         assert_eq!(
             found
                 .iter()
-                .filter(|a| a.kind == AnomalyKind::UnicastQuestion)
+                .filter(|a| a.kind == AnomalyKind::UnsupportedQuestion)
                 .count(),
             1,
             "unicast-question must not split on name case, got: {found:?}"
@@ -2149,7 +2240,9 @@ mod tests {
         let zelf: SocketAddr = "0.0.0.0:0".parse().unwrap();
         let found = analyze_questions(&[qview("My._http._tcp.local", "fritz.box.", 6, zelf)]);
         assert!(
-            !found.iter().any(|a| a.kind == AnomalyKind::UnicastQuestion),
+            !found
+                .iter()
+                .any(|a| a.kind == AnomalyKind::UnsupportedQuestion),
             "self sends must stay quiet"
         );
     }
@@ -2163,7 +2256,9 @@ mod tests {
             test_source(),
         )]);
         assert!(
-            !found.iter().any(|a| a.kind == AnomalyKind::UnicastQuestion),
+            !found
+                .iter()
+                .any(|a| a.kind == AnomalyKind::UnsupportedQuestion),
             "multicast-type questions must stay quiet"
         );
     }
@@ -2180,7 +2275,7 @@ mod tests {
         assert_eq!(
             found
                 .iter()
-                .filter(|a| a.kind == AnomalyKind::UnicastQuestion)
+                .filter(|a| a.kind == AnomalyKind::UnsupportedQuestion)
                 .count(),
             1
         );
@@ -2192,49 +2287,55 @@ mod tests {
         assert_eq!(
             found
                 .iter()
-                .filter(|a| a.kind == AnomalyKind::UnicastQuestion)
+                .filter(|a| a.kind == AnomalyKind::UnsupportedQuestion)
                 .count(),
             2
         );
     }
 
     #[test]
-    fn unicast_question_ns_is_info_any_is_quiet_probe() {
-        // NS questions can never be answered in mDNS (§12); ANY questions
-        // are ownership probes (RFC 6762 §8.1, §6.1) and must stay quiet.
+    fn in_scope_questions_are_quiet_soa_is_info() {
+        // NS and HINFO are in scope; ANY questions are ownership probes
+        // (RFC 6762 §8.1, §6.1). None of them is flagged.
+        for rtype in [1, 2, 5, 12, 13, 16, 28, 33, 255] {
+            let found = analyze_questions(&[qview(
+                "My._http._tcp.local",
+                "host.local.",
+                rtype,
+                test_source(),
+            )]);
+            assert!(
+                !found
+                    .iter()
+                    .any(|a| a.kind == AnomalyKind::UnsupportedQuestion),
+                "type {rtype} must stay quiet"
+            );
+        }
+        // SOA questions can never be answered in mDNS (§12).
         let found = analyze_questions(&[qview(
             "My._http._tcp.local",
             "host.local.",
-            2,
+            6,
             test_source(),
         )]);
         let item = found
             .iter()
-            .find(|a| a.kind == AnomalyKind::UnicastQuestion)
-            .expect("expected NS question finding");
+            .find(|a| a.kind == AnomalyKind::UnsupportedQuestion)
+            .expect("expected SOA question finding");
         assert_eq!(item.severity, Severity::Info);
-        assert_eq!(item.rtype_str.as_deref(), Some("NS"));
-        let found = analyze_questions(&[qview(
-            "My._http._tcp.local",
-            "host.local.",
-            255,
-            test_source(),
-        )]);
-        assert!(
-            !found.iter().any(|a| a.kind == AnomalyKind::UnicastQuestion),
-            "ANY probe questions must stay quiet"
-        );
+        assert_eq!(item.rfc, "RFC 6762 §12");
+        assert_eq!(item.rtype_str.as_deref(), Some("TYPE6"));
     }
 
     #[test]
-    fn unicast_style_response_same_answer_from_two_sources_is_one_finding() {
-        // Demand-side findings split per querier, but answer sightings
-        // keep the established behavior: one finding no matter how many
-        // sources announce it.
-        let mut second = rec("host.local.", 2, "NS", "host.local.", 120, false);
+    fn unicast_style_response_keeps_one_finding_per_source() {
+        // Out-of-scope records have no Answers row listing their
+        // responders: each source keeps its own finding, whatever the
+        // rdata length.
+        let mut second = rec("host.local.", 6, "TYPE6", "rdlength=24", 120, false);
         second.source = "192.168.1.9:5353".parse().unwrap();
         let answers = vec![
-            rec("host.local.", 2, "NS", "host.local.", 120, false),
+            rec("host.local.", 6, "TYPE6", "rdlength=22", 120, false),
             second,
         ];
         let found = analyze_service("My", "_http._tcp.local", "host.local.", &answers);
@@ -2243,41 +2344,64 @@ mod tests {
                 .iter()
                 .filter(|a| a.kind == AnomalyKind::UnicastStyleResponse)
                 .count(),
-            1,
-            "same answer from two sources must stay one finding"
+            2,
+            "each responder keeps its own finding"
         );
     }
 
     #[test]
-    fn unicast_style_response_flags_soa_and_ns() {
+    fn unicast_style_response_flags_soa_not_ns() {
         let answers = vec![
-            rec(
-                "host.local.",
-                6,
-                "SOA",
-                "host.local. admin 1 2 3 4 5",
-                120,
-                false,
-            ),
+            rec("host.local.", 6, "TYPE6", "rdlength=22", 120, false),
             rec("host.local.", 2, "NS", "host.local.", 120, false),
         ];
         let found = analyze_service("My", "_http._tcp.local", "host.local.", &answers);
-        assert_eq!(
-            found
-                .iter()
-                .filter(|a| a.kind == AnomalyKind::UnicastStyleResponse)
-                .count(),
-            2
-        );
-        let severity = |rtype| {
-            found
-                .iter()
-                .find(|a| a.kind == AnomalyKind::UnicastStyleResponse && a.rtype == Some(rtype))
-                .map(|a| a.severity)
-        };
-        // SOA: mDNS zones have none (§12). NS: no meaning, not forbidden.
-        assert_eq!(severity(6), Some(Severity::Warning));
-        assert_eq!(severity(2), Some(Severity::Info));
+        let flagged: Vec<_> = found
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a.kind,
+                    AnomalyKind::UnicastStyleResponse | AnomalyKind::UnsupportedType
+                )
+            })
+            .collect();
+        // SOA: mDNS zones have none (§12). NS is in scope: no finding.
+        assert_eq!(flagged.len(), 1, "{flagged:?}");
+        assert_eq!(flagged[0].rtype, Some(6));
+        assert_eq!(flagged[0].kind, AnomalyKind::UnicastStyleResponse);
+        assert_eq!(flagged[0].severity, Severity::Warning);
+    }
+
+    #[test]
+    fn unsupported_type_flags_mx_but_not_in_scope_types() {
+        let mut ka = rec("host.local.", 15, "TYPE15", "rdlength=9", 120, false);
+        ka.section = crate::browse::RecordSection::KnownAnswer;
+        let answers = vec![
+            rec("host.local.", 15, "TYPE15", "rdlength=9", 120, false),
+            rec("host.local.", 99, "TYPE99", "rdlength=4", 120, false),
+            rec("host.local.", 5, "CNAME", "alias.local.", 120, false),
+            rec("host.local.", 13, "HINFO", "X86_64 LINUX", 120, false),
+            rec("host.local.", 47, "NSEC", "host.local. A", 120, false),
+        ];
+        let found = analyze_service("My", "_http._tcp.local", "host.local.", &answers);
+        let unsupported: Vec<_> = found
+            .iter()
+            .filter(|a| a.kind == AnomalyKind::UnsupportedType)
+            .collect();
+        let mut types: Vec<_> = unsupported.iter().filter_map(|a| a.rtype).collect();
+        types.sort_unstable();
+        assert_eq!(types, vec![15, 99], "{unsupported:?}");
+        assert!(unsupported.iter().all(|a| a.severity == Severity::Warning));
+        assert!(!found
+            .iter()
+            .any(|a| a.kind == AnomalyKind::UnicastStyleResponse));
+        // Known answers ride in queries: capped at Info.
+        let found = analyze_service("My", "_http._tcp.local", "host.local.", &[ka]);
+        let item = found
+            .iter()
+            .find(|a| a.kind == AnomalyKind::UnsupportedType)
+            .expect("expected known-answer finding");
+        assert_eq!(item.severity, Severity::Info);
     }
 
     #[test]
@@ -2368,6 +2492,7 @@ mod tests {
             enum_answers: vec![&flushed],
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
+            sightings: Vec::new(),
         };
         let item = analyze(&snap)
             .iter()
@@ -2588,6 +2713,7 @@ mod tests {
             enum_answers: vec![&enum_rec],
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
+            sightings: Vec::new(),
         };
         let item = analyze(&snap)
             .iter()
@@ -2984,6 +3110,7 @@ mod tests {
             enum_answers: vec![&subtype],
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
+            sightings: Vec::new(),
         };
         let found = analyze(&snap);
         let item = found
@@ -3013,6 +3140,7 @@ mod tests {
             enum_answers: vec![&base],
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
+            sightings: Vec::new(),
         };
         assert!(
             !analyze(&snap)
@@ -3037,6 +3165,7 @@ mod tests {
             enum_answers: vec![&enum_rec],
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
+            sightings: Vec::new(),
         };
         let found = analyze(&snap);
         let item = found
@@ -3067,6 +3196,7 @@ mod tests {
             enum_answers: vec![&enum_rec],
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
+            sightings: Vec::new(),
         };
         assert!(!analyze(&snap)
             .iter()
@@ -3108,6 +3238,7 @@ mod tests {
             enum_answers: vec![subtype],
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
+            sightings: Vec::new(),
         };
 
         let found = analyze(&snap);
@@ -3136,6 +3267,7 @@ mod tests {
             enum_answers: vec![&enum_rec],
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
+            sightings: Vec::new(),
         };
         assert!(!analyze(&snap)
             .iter()
@@ -3158,22 +3290,11 @@ mod tests {
             enum_answers: vec![&enum_rec],
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
+            sightings: Vec::new(),
         };
         assert!(analyze(&snap)
             .iter()
             .any(|a| a.kind == AnomalyKind::TypeFormat && a.service == "enumeration"));
-    }
-
-    #[test]
-    fn soa_match_key_ignores_serial_for_display() {
-        // The Answers pane matches rows against findings by key: two live
-        // SOA rows differing only in serial must share one display key so
-        // both mark while counting as one finding.
-        let a = super::anomaly_match_key(6, "host.local. admin 1794425867 21600 1800 43200 10");
-        let b = super::anomaly_match_key(6, "host.local. admin 1794425874 21600 1800 43200 10");
-        assert_eq!(a, b);
-        // Non-SOA rdata passes through untouched.
-        assert_eq!(super::anomaly_match_key(1, "192.168.1.1"), "192.168.1.1");
     }
 
     #[test]

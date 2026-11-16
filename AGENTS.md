@@ -23,7 +23,17 @@ Headless run (no TTY) logs to stderr.
   selected-but-down links wait for the rejoin refresh).
   Multicast loop disabled; unicast-dst packets from off-link subnets are
   refused (RFC 6762 §11) with a metrics counter.
+  Only in-scope types (`anomalies::is_mdns_answer_type` /
+  `is_mdns_question_type`) are decoded or named; every other record keeps
+  just `rdlength=<n>` (on-wire RDLENGTH) and renders as `TYPEnn`; the
+  packet walk relabels them opaque before `Packet::parse`, so their rdata
+  is never decoded. EDNS0 OPT pseudo-records are skipped entirely.
 * `src/app.rs` — browser state, query scheduling, ingest/expire, selection.
+  Out-of-scope records, known answers and questions go to `sightings`
+  (never rows, never query drivers; capped, expired by TTL/time), with
+  owners resolved at analysis time: instance names to their service,
+  hostnames once to the host (`anomalies::host_id`), shown in every
+  sibling service's pane.
 * `src/ui.rs` — ratatui rendering only, no state mutations.
 
 ## Query scheduling (RFC 6762 §5.2, §5.4, §7.1)

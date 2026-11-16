@@ -498,6 +498,74 @@ const TRIGGER_WINDOW: Duration = Duration::from_secs(1);
 /// Packet arrival times older than this are dropped from the rate window.
 const METRICS_WINDOW: Duration = Duration::from_secs(300);
 
+/// Bound on out-of-scope sightings, so a peer flooding distinct
+/// unsupported records cannot grow state without limit. The oldest is
+/// evicted first and counted in `MetricsCounters::sightings_dropped`.
+const SIGHTINGS_CAP: usize = 256;
+
+/// How long an out-of-scope question sighting lives after its last ask.
+/// Questions carry no TTL; this matches the interest grace window.
+const QUESTION_SIGHTING_LIFETIME: Duration = INTEREST_GRACE;
+
+/// Where an out-of-scope sighting came from: it decides lifetime,
+/// goodbye handling and which analyzer checks run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SightingKind {
+    /// A record in a response (answer, authority or additional).
+    Response,
+    /// A known answer carried in a query (RFC 6762 §7.1): a belief, so
+    /// never a goodbye; its finding names the Known-Answer section.
+    KnownAnswer,
+    /// An observed question.
+    Question,
+}
+
+/// One out-of-scope record or question. Records carry only
+/// `rdlength=<n>` as rdata and no wire bytes (see `browse::record_row`).
+/// No owner is stored: attribution runs at analysis time
+/// (`App::sighting_owners`), so a host that appears later still claims
+/// its earlier sightings.
+#[derive(Debug, Clone)]
+struct Sighting {
+    kind: SightingKind,
+    rec: browse::RawRecord,
+}
+
+impl Sighting {
+    fn is_live(&self, now: Instant) -> bool {
+        let age = now.saturating_duration_since(self.rec.received_at);
+        match self.kind {
+            SightingKind::Question => age < QUESTION_SIGHTING_LIFETIME,
+            SightingKind::Response | SightingKind::KnownAnswer => {
+                self.rec.ttl > 0 && age.as_secs() <= u64::from(self.rec.ttl)
+            }
+        }
+    }
+
+    /// The record a goodbye withdraws: same kind, owner, type, source
+    /// and ingress link, in any response context. The link counts
+    /// because an IPv4 source carries no scope: the same address on two
+    /// links is two responders, each with its own finding.
+    fn same_record(&self, kind: SightingKind, rec: &browse::RawRecord) -> bool {
+        self.kind == kind
+            && self.rec.rtype == rec.rtype
+            && self.rec.source == rec.source
+            && self.rec.ifindex == rec.ifindex
+            && self.rec.name.eq_ignore_ascii_case(&rec.name)
+    }
+
+    /// Dedup identity without rdata: a newer sighting of the same record
+    /// in the same response context (section, multicast vs unicast)
+    /// replaces the older one (e.g. SOA serial bumps). Contexts stay
+    /// apart because they carry different verdicts (e.g. SOA in
+    /// Authority vs Additional).
+    fn same_identity(&self, kind: SightingKind, rec: &browse::RawRecord) -> bool {
+        self.same_record(kind, rec)
+            && self.rec.section == rec.section
+            && self.rec.dst_is_multicast == rec.dst_is_multicast
+    }
+}
+
 /// Cumulative v2 traffic/query counters for the metrics overlay. Derived
 /// snapshot rows come from here plus live state; per-packet maps stay
 /// bounded by network size (tens of responders/interfaces).
@@ -526,6 +594,8 @@ pub struct MetricsCounters {
     pub suppressed_times: VecDeque<Instant>,
     pub services_seen_total: u64,
     pub services_expired_total: u64,
+    /// Out-of-scope sightings evicted by `SIGHTINGS_CAP`.
+    pub sightings_dropped: u64,
 }
 
 fn fmt_age(secs: u64) -> String {
@@ -705,6 +775,11 @@ pub struct App {
     pending_addrs: HashMap<String, Vec<browse::RawRecord>>,
     next_pending_addr_prune: Instant,
     pub raw_events: Vec<browse::Event>,
+    /// Out-of-scope records and questions (`anomalies::is_mdns_answer_type`
+    /// / `is_mdns_question_type` false), kept only as evidence for
+    /// findings: never Answers or Questions rows, never query drivers.
+    /// Oldest first, capped at `SIGHTINGS_CAP`.
+    sightings: Vec<Sighting>,
     /// Transient confirmation popup (e.g. state-dump result), shown for
     /// a few seconds and dismissed by any key.
     status_msg: Option<(String, Instant)>,
@@ -979,6 +1054,7 @@ impl App {
             pending_addrs: HashMap::new(),
             next_pending_addr_prune: Instant::now(),
             raw_events: Vec::new(),
+            sightings: Vec::new(),
             status_msg: None,
             show_metrics: false,
             metrics_scroll: Cell::new(0),
@@ -1911,8 +1987,10 @@ impl App {
 
     /// Normalized group key for host grouping: lowercased hostname without
     /// trailing dot, `""` when the service has no hostname yet.
+    /// Same normalization as `anomalies::host_id`, so a host group's
+    /// key is also the owner id of its host-owned findings.
     fn host_key(hostname: &str) -> String {
-        hostname.trim_end_matches('.').to_lowercase()
+        anomalies::host_id(hostname)
     }
 
     /// Display name for a host group key: first-seen hostname without its
@@ -2102,6 +2180,15 @@ impl App {
                 self.services.len(),
                 active,
                 self.services.len().saturating_sub(active)
+            ),
+        );
+        kv(
+            &mut rows,
+            "out-of-scope sightings / dropped",
+            format!(
+                "{} / {}",
+                self.sightings.len(),
+                self.metrics.sightings_dropped
             ),
         );
         kv(
@@ -2593,6 +2680,8 @@ impl App {
                     rtype,
                     rtype_str,
                     source: *source,
+                    // Questions rows carry no ingress link.
+                    source_label: source.to_string(),
                 });
             }
         }
@@ -2684,11 +2773,37 @@ impl App {
                 &e.questions,
             );
         }
+        // Out-of-scope sightings: one analyzer entry per owner, resolved
+        // now so later-appearing services claim earlier sightings.
+        let now = Instant::now();
+        let mut sightings = Vec::new();
+        for s in self.sightings.iter().filter(|s| s.is_live(now)) {
+            let mut owners = self.sighting_owners(s);
+            if owners.is_empty() {
+                owners.push(anomalies::UNATTRIBUTED_SERVICE.to_string());
+            }
+            for service in owners {
+                match s.kind {
+                    SightingKind::Question => questions.push(anomalies::QuestionView {
+                        service,
+                        name: &s.rec.name,
+                        rtype: s.rec.rtype,
+                        rtype_str: &s.rec.rtype_str,
+                        source: s.rec.source,
+                        source_label: s.rec.source_label(),
+                    }),
+                    SightingKind::Response | SightingKind::KnownAnswer => {
+                        sightings.push((service, &s.rec))
+                    }
+                }
+            }
+        }
         let snap = anomalies::Snapshot {
             services,
             enum_answers,
             pending_hosts,
             questions,
+            sightings,
         };
         anomalies::analyze_observations(&snap, &self.raw_events, &address_queries)
     }
@@ -2872,6 +2987,8 @@ impl App {
             self.services.iter().filter(|s| s.is_active).count() as u64,
         );
         metrics.insert("services_seen_total".to_string(), m.services_seen_total);
+        metrics.insert("sightings_current".to_string(), self.sightings.len() as u64);
+        metrics.insert("sightings_dropped".to_string(), m.sightings_dropped);
         metrics.insert(
             "services_expired_total".to_string(),
             m.services_expired_total,
@@ -4322,26 +4439,122 @@ impl App {
             ev.questions.len()
         );
         for rec in &ev.answers {
+            // Out-of-scope types never become rows: they are kept only as
+            // sightings behind findings, goodbyes included.
+            if !anomalies::is_mdns_answer_type(rec.rtype) {
+                // Remember the question that most likely triggered the
+                // record, so findings can tell a reply to our own query
+                // from one to someone else's.
+                let mut rec = rec.clone();
+                rec.trigger = self.response_trigger(&rec);
+                self.ingest_sighting(SightingKind::Response, rec);
+                continue;
+            }
             if rec.ttl == 0 {
                 self.mark_goodbye(rec);
                 self.ingest_goodbye(rec, ev);
                 continue;
             }
-            // Unicast-style records (NS/SOA/ANY) remember the question
-            // that most likely triggered them, so findings can tell a
-            // reply to our own query from one to someone else's.
-            if matches!(rec.rtype, 2 | 6 | 255) {
-                let mut rec = rec.clone();
-                rec.trigger = self.response_trigger(&rec);
-                self.ingest_record(&rec, ev);
-            } else {
-                self.ingest_record(rec, ev);
-            }
+            self.ingest_record(rec, ev);
         }
         for q in &ev.questions {
+            if !anomalies::is_mdns_question_type(q.rtype) {
+                // Provenance still notes the ask, so a response it
+                // triggers can name it.
+                self.note_observed(q, ev);
+                self.ingest_sighting(SightingKind::Question, q.clone());
+                continue;
+            }
             self.note_overheard(q, ev);
             self.route_question(q, ev);
         }
+        // Out-of-scope known answers are beliefs, not facts, but still
+        // out-of-scope data on the wire: sighted, never filed as rows.
+        for ka in &ev.query_kas {
+            if !anomalies::is_mdns_answer_type(ka.rtype) {
+                self.ingest_sighting(SightingKind::KnownAnswer, ka.clone());
+            }
+        }
+    }
+
+    /// Hostnames a service lives on, lowercased without the root dot:
+    /// every live SRV target. The selected hostname alone is no evidence:
+    /// it outlives an expired SRV while the PTR is still live.
+    fn service_hosts(svc: &ServiceEntry) -> Vec<String> {
+        let mut hosts = Vec::new();
+        for r in &svc.answers {
+            if r.rtype != 33 || r.ttl <= r.received_at.elapsed().as_secs() as u32 {
+                continue;
+            }
+            if let Some(target) = srv_target(&r.rdata) {
+                let target = anomalies::host_id(target);
+                if !hosts.contains(&target) {
+                    hosts.push(target);
+                }
+            }
+        }
+        hosts
+    }
+
+    /// Finding owners for an out-of-scope record or question:
+    /// * enumeration names belong to the enumeration row;
+    /// * an instance name belongs to that live or pending service
+    ///   (questions also match the service type, like `route_question`);
+    /// * a hostname any live service lives on belongs to the host
+    ///   itself (`anomalies::host_id`), once, not to each service on it.
+    ///
+    /// Empty when nothing matches.
+    fn sighting_owners(&self, sighting: &Sighting) -> Vec<String> {
+        let name = sighting.rec.name.trim_end_matches('.').to_lowercase();
+        let question = sighting.kind == SightingKind::Question;
+        if is_enum_name(&name) {
+            return vec![anomalies::ENUMERATION_SERVICE.to_string()];
+        }
+        let mut owners: Vec<String> = Vec::new();
+        let mut add = |id: String| {
+            if !owners.contains(&id) {
+                owners.push(id);
+            }
+        };
+        for svc in &self.services {
+            let full = format!("{}.{}", svc.instance, svc.service_type).to_lowercase();
+            if full == name || (question && svc.service_type.to_lowercase() == name) {
+                add(anomalies::service_id(&svc.instance, &svc.service_type));
+            }
+            if Self::service_hosts(svc).contains(&name) {
+                add(anomalies::host_id(&name));
+            }
+        }
+        for p in &self.pending_instances {
+            let full = format!("{}.{}", p.instance, p.service_type).to_lowercase();
+            if full == name || (question && p.service_type.to_lowercase() == name) {
+                add(anomalies::service_id(&p.instance, &p.service_type));
+            }
+        }
+        owners
+    }
+
+    /// File an out-of-scope record or question as a sighting. A TTL-0
+    /// response record withdraws its sighting instead (it never reaches
+    /// the goodbye paths, so no real answer row is marked gone); a
+    /// known answer is never a goodbye. Re-filing moves the sighting to
+    /// the back, so the cap evicts the one seen least recently.
+    fn ingest_sighting(&mut self, kind: SightingKind, rec: browse::RawRecord) {
+        if kind == SightingKind::Response && rec.ttl == 0 {
+            let before = self.sightings.len();
+            self.sightings.retain(|s| !s.same_record(kind, &rec));
+            if self.sightings.len() != before {
+                self.touch();
+            }
+            return;
+        }
+        self.sightings.retain(|s| !s.same_identity(kind, &rec));
+        self.sightings.push(Sighting { kind, rec });
+        if self.sightings.len() > SIGHTINGS_CAP {
+            self.sightings.remove(0);
+            self.metrics.sightings_dropped += 1;
+        }
+        self.touch();
     }
 
     /// The question a response record most likely answered: the latest
@@ -5142,25 +5355,25 @@ impl App {
         }
     }
 
+    /// In-scope records other than PTR/SRV/TXT/A/AAAA (NS, CNAME,
+    /// HINFO, NSEC). One hostname backs many services: a host-owned
+    /// record (e.g. HINFO) files on every service of that host, like
+    /// addresses, not just the first.
     fn handle_other(&mut self, rec: &browse::RawRecord, ev: &browse::Event) {
         let name = rec.name.trim_end_matches('.').to_lowercase();
-        for i in 0..self.services.len() {
-            let full = format!(
-                "{}.{}",
-                self.services[i].instance, self.services[i].service_type
-            )
-            .to_lowercase();
-            if full == name
-                || self.services[i]
-                    .hostname
-                    .trim_end_matches('.')
-                    .to_lowercase()
-                    == name
-            {
-                self.services[i].last_event = Some(ev.clone());
-                self.push_record(i, rec);
-                return;
-            }
+        let hits: Vec<usize> = self
+            .services
+            .iter()
+            .enumerate()
+            .filter(|(_, svc)| {
+                format!("{}.{}", svc.instance, svc.service_type).to_lowercase() == name
+                    || svc.hostname.trim_end_matches('.').to_lowercase() == name
+            })
+            .map(|(i, _)| i)
+            .collect();
+        for i in hits {
+            self.services[i].last_event = Some(ev.clone());
+            self.push_record(i, rec);
         }
     }
 
@@ -5270,9 +5483,15 @@ impl App {
                 }
             }
         }
-        if withdrawn && (rec.rtype == 1 || rec.rtype == 28) {
-            // Addresses never reactivate, so a withdrawn service is still
-            // withdrawn here: keep its original grace deadline.
+        // Host-owned records (addresses, and e.g. HINFO for the host
+        // name) say the host is alive, not the service. They never
+        // reactivate, so a withdrawn service is still withdrawn here:
+        // keep its original grace deadline.
+        let host_owned = {
+            let host = self.services[svc_idx].hostname.trim_end_matches('.');
+            !host.is_empty() && rec.name.trim_end_matches('.').eq_ignore_ascii_case(host)
+        };
+        if withdrawn && (rec.rtype == 1 || rec.rtype == 28 || host_owned) {
             self.services[svc_idx].last_seen = prev_seen;
         }
     }
@@ -5344,6 +5563,13 @@ impl App {
         }
         self.pending_instances
             .retain(|p| now.duration_since(p.last_seen) < grace);
+        // Sightings live for their TTL (questions: a fixed window);
+        // owners are resolved at analysis time, so expiry is time only.
+        let before = self.sightings.len();
+        self.sightings.retain(|s| s.is_live(now));
+        if self.sightings.len() != before {
+            self.touch();
+        }
         // Drop schedules for names that no longer exist, so dead services
         // stop costing even an hourly query (RFC 6762 §5.2: no maintenance
         // without active interest). Names are normalized to lowercase so
@@ -5730,16 +5956,27 @@ impl App {
                 };
                 Self::detail_service_id(&target)
             }
-            AnomalyScope::None => return Vec::new(),
+            // No detail row (e.g. an enumeration target whose only
+            // evidence is a sighting): still list the target's findings.
+            AnomalyScope::None => match self.display_detail() {
+                Some(target) => Self::detail_service_id(&target),
+                None => return Vec::new(),
+            },
         };
         let row: Vec<anomalies::Anomaly> = match scope {
             AnomalyScope::Record(rec) => Self::record_anomalies_in(found, rec, &id),
             AnomalyScope::Question(key) => Self::question_anomalies_in(found, key, &id),
             _ => Vec::new(),
         };
+        // Host-owned findings are recorded once, under the host; every
+        // service on that host shows them.
+        let hosts = match self.display_detail() {
+            Some(DetailTarget::Service(svc)) => Self::service_hosts(svc),
+            _ => Vec::new(),
+        };
         found
             .iter()
-            .filter(|a| a.service == id && a.is_surfaced())
+            .filter(|a| (a.service == id || hosts.contains(&a.service)) && a.is_surfaced())
             .map(|a| {
                 let cursor_match = row.contains(a);
                 PaneAnomaly {
@@ -5798,7 +6035,6 @@ impl App {
         id: &str,
     ) -> Vec<anomalies::Anomaly> {
         let name = rec.name.trim_end_matches('.').to_lowercase();
-        let rdata_key = anomalies::anomaly_match_key(rec.rtype, &rec.rdata);
         found
             .iter()
             .filter(|a| a.service == id)
@@ -5810,7 +6046,7 @@ impl App {
                     .is_some_and(|n| n.trim_end_matches('.').to_lowercase() == name)
             })
             .filter(|a| match a.rdata.as_ref() {
-                Some(rdata) => anomalies::anomaly_match_key(rec.rtype, rdata) == rdata_key,
+                Some(rdata) => *rdata == rec.rdata,
                 // Spanning `ttl-unstable` findings carry no rdata: they
                 // match every row of the same name and type. Narrowed to
                 // that kind on purpose — a future rdata-less finding of
@@ -7004,17 +7240,17 @@ mod tests {
     }
 
     #[test]
-    fn unicast_question_routes_as_info_with_display_key() {
+    fn unsupported_question_routes_as_info_with_display_key() {
         // End-to-end through the real routing path: an observed SOA
-        // question lands on the service as an info-level unicast-question
-        // finding (RFC 6762 §3 makes asking compliant), stays off the
-        // service badge, and carries exactly the (name, type, querier)
-        // triple the Questions pane looks up.
+        // question for a service's host lands on that host as an
+        // info-level unsupported-question finding (RFC 6762 §3 makes
+        // asking compliant), stays off every badge, and carries the
+        // (name, type, querier) triple.
         let mut app = App::new().unwrap();
         ingest(&mut app, &ptr_record(120));
         ingest(&mut app, &srv_record(120));
         let querier: SocketAddr = "192.168.1.9:5353".parse().unwrap();
-        let mut q = raw_record("test.local.", 6, "SOA", "", 120);
+        let mut q = raw_record("test.local.", 6, "TYPE6", "", 120);
         q.source = querier;
         app.ingest_event(&browse::Event {
             answers: Vec::new(),
@@ -7028,9 +7264,9 @@ mod tests {
         let item = app
             .anomalies()
             .into_iter()
-            .find(|a| a.kind == anomalies::AnomalyKind::UnicastQuestion)
+            .find(|a| a.kind == anomalies::AnomalyKind::UnsupportedQuestion)
             .expect("expected routed SOA unicast question");
-        assert_eq!(item.service, "Test._http._tcp.local");
+        assert_eq!(item.service, "test.local");
         assert_eq!(item.severity, crate::anomalies::Severity::Info);
         assert_eq!(
             app.anomaly_counts()
@@ -8298,14 +8534,14 @@ mod tests {
     #[test]
     fn metrics_enum_question_keeps_qry_scope() {
         // Questions on the enumeration row keep their QRY scope: the
-        // queried type varies, so suppressing it would collapse NS and
-        // SOA askers into identical rows.
+        // queried type varies, so suppressing it would collapse SOA and
+        // MX askers into identical rows.
         let mut app = App::new().unwrap();
         let stub: SocketAddr = "192.168.1.9:45678".parse().unwrap();
         app.ingest_event(&query_event(
             "_services._dns-sd._udp.local.",
-            2,
-            "NS",
+            6,
+            "TYPE6",
             false,
             Vec::new(),
             stub,
@@ -8313,43 +8549,40 @@ mod tests {
         let row = app
             .metrics_rows()
             .into_iter()
-            .find(|(k, _)| k.ends_with("unicast-question"))
-            .expect("unicast-question row");
+            .find(|(k, _)| k.ends_with("unsupported-question"))
+            .expect("unsupported-question row");
         assert!(
-            row.1.contains("QRY NS _services._dns-sd._udp.local"),
+            row.1.contains("QRY TYPE6 _services._dns-sd._udp.local"),
             "enum question keeps its QRY scope, got: {}",
             row.1
         );
     }
 
     #[test]
-    fn anomalies_pane_omits_info_question_on_enumeration_row() {
+    fn out_of_scope_enumeration_question_is_attributed_to_enumeration() {
         let mut app = App::new().unwrap();
         let stub: SocketAddr = "192.168.1.9:45678".parse().unwrap();
         app.ingest_event(&query_event(
             "_services._dns-sd._udp.local.",
             6,
-            "SOA",
+            "TYPE6",
             false,
             Vec::new(),
             stub,
         ));
         app.evict_expired();
-        let enum_pos = app
-            .display_items()
-            .iter()
-            .position(|it| matches!(it, DisplayItem::Enum { .. }))
-            .expect("enum row");
-        app.selected_display = enum_pos;
-        app.clamp_selection();
-        park_on_question(&mut app, stub);
-        let buf = render_to_buffer(&app, 140, 30);
-        let text = rect_text(&buf, app.anomalies_rect.get());
-        // Info-level question findings live in the overlay only.
         assert!(
-            !text.contains("QRY SOA"),
-            "pane omits info question findings, got: {text:?}"
+            app.enum_entries.iter().all(|e| e.questions.is_empty()),
+            "no Questions row for an out-of-scope type"
         );
+        let item = app
+            .anomalies()
+            .into_iter()
+            .find(|a| a.kind == anomalies::AnomalyKind::UnsupportedQuestion)
+            .expect("finding for the SOA question");
+        assert_eq!(item.service, anomalies::ENUMERATION_SERVICE);
+        assert_eq!(item.severity, anomalies::Severity::Info);
+        assert_eq!(item.rtype_str.as_deref(), Some("TYPE6"));
     }
 
     #[test]
@@ -9968,7 +10201,7 @@ mod tests {
         app.ingest_event(&ev);
         // An observed-only question for a type we never schedule: no
         // local demand exists, so DUE must stay blank, not "expired".
-        let mut soa = raw_record("test.local.", 6, "SOA", "", 120);
+        let mut soa = raw_record("test.local.", 6, "TYPE6", "", 120);
         soa.source = remote_source();
         app.ingest_event(&browse::Event {
             answers: Vec::new(),
@@ -11310,15 +11543,26 @@ mod tests {
     }
 
     #[test]
-    fn anomalies_for_question_keeps_info_findings_out_of_pane() {
+    fn out_of_scope_questions_are_findings_not_rows() {
         let mut app = App::new().unwrap();
         ingest(&mut app, &ptr_record(4500));
         ingest(&mut app, &srv_record(120));
         let src_a = remote_source();
         let src_b: SocketAddr = "192.168.1.100:5353".parse().unwrap();
-        // Two queriers ask multicast for NS: RFC 6762 §3 makes that
-        // compliant, so the info-level findings stay in the overlay and
-        // no question row lists or marks anything.
+        // Two queriers ask multicast for SOA: RFC 6762 §3 makes that
+        // compliant, but SOA is outside mDNS scope: one info finding per
+        // querier, and no Questions row.
+        for src in [src_a, src_b] {
+            app.ingest_event(&query_event(
+                "test.local.",
+                6,
+                "TYPE6",
+                false,
+                Vec::new(),
+                src,
+            ));
+        }
+        // NS and HINFO are in scope: plain rows, no finding.
         app.ingest_event(&query_event(
             "test.local.",
             2,
@@ -11329,48 +11573,33 @@ mod tests {
         ));
         app.ingest_event(&query_event(
             "test.local.",
-            2,
-            "NS",
+            13,
+            "HINFO",
             false,
             Vec::new(),
             src_b,
         ));
-        // Our own inferred send for a multicast type stays quiet.
-        app.route_own_question("test.local", 1, false);
         app.evict_expired();
         select_instance(&mut app, "Test");
-        let raws = app
-            .display_detail()
-            .expect("service displayed")
-            .ordered_answers()
-            .len();
-        assert_eq!(
-            app.anomalies()
-                .iter()
-                .filter(|a| a.kind == anomalies::AnomalyKind::UnicastQuestion)
-                .count(),
-            2,
-            "one info finding per querier"
-        );
-        for src in [src_a, src_b, crate::app::SELF_SOURCE] {
-            let pos = app
-                .display_detail()
-                .expect("service displayed")
-                .ordered_questions()
-                .iter()
-                .position(|q| q.2 == src)
-                .unwrap_or_else(|| panic!("question row for {src}"));
-            let idx = raws + pos;
-            app.detail_selected = idx;
-            app.detail_anchor = app
-                .display_detail()
-                .and_then(|d| App::identity_at_detail(&d, idx));
-            let found = app.anomalies_for_selected();
-            assert!(
-                found.is_empty(),
-                "row for {src} lists no info findings, got: {found:?}"
-            );
-        }
+        let found: Vec<_> = app
+            .anomalies()
+            .into_iter()
+            .filter(|a| a.kind == anomalies::AnomalyKind::UnsupportedQuestion)
+            .collect();
+        assert_eq!(found.len(), 2, "one info finding per querier: {found:?}");
+        assert!(found.iter().all(|a| a.rtype == Some(6)
+            && a.service == "test.local"
+            && a.severity == anomalies::Severity::Info));
+        let detail = app.display_detail().expect("service displayed");
+        let mut rows: Vec<(String, SocketAddr)> = detail
+            .ordered_questions()
+            .iter()
+            .map(|q| (q.1.clone(), q.2))
+            .collect();
+        rows.sort();
+        let mut want = vec![("HINFO".to_string(), src_b), ("NS".to_string(), src_a)];
+        want.sort();
+        assert_eq!(rows, want, "only in-scope questions become rows");
     }
 
     /// Park the left selection on a collapsed host header: scope and
@@ -11628,13 +11857,7 @@ mod tests {
         fn soa_trigger(app: &mut App) -> Option<browse::QueryTrigger> {
             ingest(
                 app,
-                &raw_record(
-                    "fritz.box.",
-                    6,
-                    "SOA",
-                    "fritz.box. admin.fritz.box. 1 2 3 4 10",
-                    10,
-                ),
+                &raw_record("fritz.box.", 6, "TYPE6", "rdlength=49", 10),
             );
             let found = app.anomalies();
             let item = found
@@ -11686,9 +11909,8 @@ mod tests {
 
     #[test]
     fn shared_target_question_is_listed_once_in_global_views() {
-        // One `fritz.box SOA` question files on both services pointing at
-        // fritz.box: each pane keeps its finding, the dump and the metrics
-        // overlay list it once and name the other service.
+        // One `fritz.box SOA` question for the host both services point
+        // at: one finding, owned by the host, listed once everywhere.
         let mut app = App::new().unwrap();
         for svc in ["_fbox._tcp.local.", "_tr064._tcp.local."] {
             let instance = format!("Fritzel.{svc}");
@@ -11702,38 +11924,37 @@ mod tests {
         app.ingest_event(&query_event(
             "fritz.box.",
             6,
-            "SOA",
+            "TYPE6",
             false,
             Vec::new(),
             querier,
         ));
 
-        let per_service: Vec<_> = app
+        let owners: Vec<_> = app
             .anomalies()
             .into_iter()
-            .filter(|a| a.kind == anomalies::AnomalyKind::UnicastQuestion)
+            .filter(|a| a.kind == anomalies::AnomalyKind::UnsupportedQuestion)
             .map(|a| a.service)
             .collect();
-        assert_eq!(per_service.len(), 2, "each service keeps its finding");
+        assert_eq!(owners, vec!["fritz.box"], "one finding, owned by the host");
 
         let dump = app.state_dump();
         let dumped: Vec<_> = dump
             .anomalies
             .iter()
-            .filter(|a| a.kind == "unicast-question")
+            .filter(|a| a.kind == "unsupported-question")
             .collect();
         assert_eq!(dumped.len(), 1, "dump lists the question once");
-        assert_eq!(dumped[0].also_services.len(), 1);
-        assert_ne!(dumped[0].also_services[0], dumped[0].service);
+        assert!(dumped[0].also_services.is_empty());
         assert_eq!(dump.metrics["anomalies_total"], dump.anomalies.len() as u64);
 
         let overlay: Vec<_> = app
             .metrics_rows()
             .into_iter()
-            .filter(|(k, _)| k.ends_with("unicast-question"))
+            .filter(|(k, _)| k.ends_with("unsupported-question"))
             .collect();
         assert_eq!(overlay.len(), 1, "overlay lists the question once");
-        assert!(overlay[0].1.contains("(+1 more)"), "got: {}", overlay[0].1);
+        assert!(!overlay[0].1.contains("more)"), "got: {}", overlay[0].1);
     }
 
     #[test]
@@ -12800,5 +13021,800 @@ mod tests {
         let row = 3 + 2 + 4u16;
         app.click_answers(row);
         assert_eq!(app.detail_selected, 2);
+    }
+
+    // --- Out-of-scope types (#239) ---
+
+    /// A live Test._http._tcp.local service on host test.local.
+    fn test_service_app() -> App {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        app
+    }
+
+    fn service_rows(app: &App, instance: &str) -> Vec<u16> {
+        app.services
+            .iter()
+            .find(|s| s.instance == instance)
+            .expect("service")
+            .answers
+            .iter()
+            .map(|r| r.rtype)
+            .collect()
+    }
+
+    fn findings_of(app: &App, kind: anomalies::AnomalyKind) -> Vec<anomalies::Anomaly> {
+        app.anomalies()
+            .into_iter()
+            .filter(|a| a.kind == kind)
+            .collect()
+    }
+
+    #[test]
+    fn out_of_scope_record_on_host_is_finding_not_row() {
+        let mut app = test_service_app();
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 6, "TYPE6", "rdlength=22", 4500),
+        );
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 15, "TYPE15", "rdlength=9", 4500),
+        );
+        let rows = service_rows(&app, "Test");
+        assert!(!rows.contains(&6) && !rows.contains(&15), "rows: {rows:?}");
+        let soa = findings_of(&app, anomalies::AnomalyKind::UnicastStyleResponse);
+        assert_eq!(soa.len(), 1);
+        assert_eq!(soa[0].service, "test.local", "owned by the host");
+        assert_eq!(soa[0].rdata.as_deref(), Some("rdlength=22"));
+        assert_eq!(
+            soa[0].response.as_ref().map(|r| r.section),
+            Some(browse::RecordSection::Answer)
+        );
+        let mx = findings_of(&app, anomalies::AnomalyKind::UnsupportedType);
+        assert_eq!(mx.len(), 1);
+        assert_eq!(mx[0].service, "test.local");
+        assert_eq!(mx[0].severity, anomalies::Severity::Warning);
+        // Host-owned warnings count once, on the host, not per service.
+        let counts = app.anomaly_counts();
+        assert_eq!(counts.get("test.local"), Some(&2));
+        assert_eq!(counts.get("Test._http._tcp.local"), None);
+        // ...and show in the Anomalies pane of every service on the host.
+        select_instance(&mut app, "Test");
+        let pane: Vec<_> = app
+            .anomalies_for_selected()
+            .into_iter()
+            .map(|p| p.anomaly.kind)
+            .collect();
+        assert!(
+            pane.contains(&anomalies::AnomalyKind::UnsupportedType),
+            "{pane:?}"
+        );
+        assert!(
+            pane.contains(&anomalies::AnomalyKind::UnicastStyleResponse),
+            "{pane:?}"
+        );
+    }
+
+    #[test]
+    fn in_scope_other_types_stay_rows_without_findings() {
+        let mut app = test_service_app();
+        for (rtype, label, rdata) in [
+            (2, "NS", "test.local."),
+            (5, "CNAME", "alias.local."),
+            (13, "HINFO", "X86_64 LINUX"),
+            (47, "NSEC", "test.local. A AAAA"),
+        ] {
+            ingest(
+                &mut app,
+                &raw_record("test.local.", rtype, label, rdata, 120),
+            );
+        }
+        let rows = service_rows(&app, "Test");
+        for rtype in [2, 5, 13, 47] {
+            assert!(rows.contains(&rtype), "type {rtype} row missing: {rows:?}");
+        }
+        assert!(findings_of(&app, anomalies::AnomalyKind::UnicastStyleResponse).is_empty());
+        assert!(findings_of(&app, anomalies::AnomalyKind::UnsupportedType).is_empty());
+    }
+
+    #[test]
+    fn any_record_is_error_without_row() {
+        let mut app = test_service_app();
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 255, "ANY", "rdlength=0", 120),
+        );
+        assert!(!service_rows(&app, "Test").contains(&255));
+        let found = findings_of(&app, anomalies::AnomalyKind::UnicastStyleResponse);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].severity, anomalies::Severity::Error);
+    }
+
+    #[test]
+    fn sighting_on_shared_host_is_recorded_once_for_the_host() {
+        let mut app = test_service_app();
+        ingest(
+            &mut app,
+            &raw_record(
+                "_ipp._tcp.local.",
+                12,
+                "PTR",
+                "Other._ipp._tcp.local.",
+                4500,
+            ),
+        );
+        ingest(
+            &mut app,
+            &raw_record(
+                "Other._ipp._tcp.local.",
+                33,
+                "SRV",
+                "0 0 631 test.local.",
+                120,
+            ),
+        );
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 6, "TYPE6", "rdlength=22", 4500),
+        );
+        let owners: Vec<_> = findings_of(&app, anomalies::AnomalyKind::UnicastStyleResponse)
+            .into_iter()
+            .map(|a| a.service)
+            .collect();
+        assert_eq!(owners, vec!["test.local"], "one finding, owned by the host");
+        // Both services on the host show it in their Anomalies pane.
+        for instance in ["Test", "Other"] {
+            select_instance(&mut app, instance);
+            assert!(
+                app.anomalies_for_selected()
+                    .iter()
+                    .any(|p| p.anomaly.kind == anomalies::AnomalyKind::UnicastStyleResponse),
+                "{instance} pane lacks the host finding"
+            );
+        }
+        // The overlay lists it once.
+        let overlay = app
+            .metrics_rows()
+            .into_iter()
+            .filter(|(k, _)| k.ends_with("unicast-style-response"))
+            .count();
+        assert_eq!(overlay, 1);
+    }
+
+    #[test]
+    fn sighting_for_pending_instance_is_attributed() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        assert!(app.services.is_empty(), "instance still pending");
+        ingest(
+            &mut app,
+            &raw_record("Test._http._tcp.local.", 15, "TYPE15", "rdlength=9", 120),
+        );
+        let found = findings_of(&app, anomalies::AnomalyKind::UnsupportedType);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].service, "Test._http._tcp.local");
+    }
+
+    #[test]
+    fn unmatched_sighting_is_unattributed_and_dumped() {
+        let mut app = App::new().unwrap();
+        ingest(
+            &mut app,
+            &raw_record("fritz.box.", 6, "TYPE6", "rdlength=49", 10),
+        );
+        let found = findings_of(&app, anomalies::AnomalyKind::UnicastStyleResponse);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].service, anomalies::UNATTRIBUTED_SERVICE);
+        let dump = app.state_dump();
+        let row = dump
+            .anomalies
+            .iter()
+            .find(|a| a.kind == "unicast-style-response")
+            .expect("dumped");
+        assert_eq!(row.service, anomalies::UNATTRIBUTED_SERVICE);
+        assert_eq!(row.rtype_str.as_deref(), Some("TYPE6"));
+        assert_eq!(row.rdata.as_deref(), Some("rdlength=49"));
+        assert_eq!(dump.metrics["sightings_current"], 1);
+        assert!(app
+            .metrics_rows()
+            .iter()
+            .any(|(k, v)| k.ends_with("unicast-style-response") && v.contains("unattributed")));
+    }
+
+    #[test]
+    fn rdata_churn_from_one_source_stays_one_sighting() {
+        let mut app = test_service_app();
+        for len in [22, 23, 24] {
+            ingest(
+                &mut app,
+                &raw_record("test.local.", 6, "TYPE6", &format!("rdlength={len}"), 4500),
+            );
+        }
+        assert_eq!(app.sightings.len(), 1);
+        let found = findings_of(&app, anomalies::AnomalyKind::UnicastStyleResponse);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].rdata.as_deref(),
+            Some("rdlength=24"),
+            "newest wins"
+        );
+    }
+
+    #[test]
+    fn sighting_expires_with_ttl_and_goodbye_clears_it() {
+        let mut app = test_service_app();
+        let mut old = raw_record("test.local.", 15, "TYPE15", "rdlength=9", 1);
+        old.received_at = Instant::now() - Duration::from_secs(5);
+        ingest(&mut app, &old);
+        app.evict_expired();
+        assert!(app.sightings.is_empty(), "expired at 100% TTL");
+        assert!(findings_of(&app, anomalies::AnomalyKind::UnsupportedType).is_empty());
+
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 15, "TYPE15", "rdlength=9", 120),
+        );
+        assert_eq!(
+            findings_of(&app, anomalies::AnomalyKind::UnsupportedType).len(),
+            1
+        );
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 15, "TYPE15", "rdlength=9", 0),
+        );
+        assert!(findings_of(&app, anomalies::AnomalyKind::UnsupportedType).is_empty());
+        // The goodbye never touched the service's real rows.
+        let svc = app.services.iter().find(|s| s.instance == "Test").unwrap();
+        assert!(svc.is_active);
+        assert!(svc.answers.iter().all(|r| r.ttl > 0));
+    }
+
+    #[test]
+    fn sightings_are_capped_and_drops_counted() {
+        let mut app = App::new().unwrap();
+        for i in 0..=SIGHTINGS_CAP {
+            ingest(
+                &mut app,
+                &raw_record(&format!("h{i}.example."), 15, "TYPE15", "rdlength=9", 120),
+            );
+        }
+        assert_eq!(app.sightings.len(), SIGHTINGS_CAP);
+        assert_eq!(app.metrics.sightings_dropped, 1);
+        assert!(
+            !app.sightings.iter().any(|s| s.rec.name == "h0.example."),
+            "oldest evicted first"
+        );
+        assert_eq!(app.state_dump().metrics["sightings_dropped"], 1);
+    }
+
+    #[test]
+    fn out_of_scope_records_never_drive_queries() {
+        let mut app = test_service_app();
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 6, "TYPE6", "rdlength=22", 4500),
+        );
+        assert!(!app.requeries.keys().any(|k| k.1 == 6));
+        assert!(!app.continuous.keys().any(|k| k.1 == 6));
+        assert!(!app.refresh_rows.keys().any(|r| r.1 == 6));
+    }
+
+    #[test]
+    fn late_service_claims_earlier_unattributed_sighting() {
+        // An SOA for the host arrives before the host's SRV: unattributed
+        // at first, the host's once a service's SRV names it.
+        let mut app = App::new().unwrap();
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 6, "TYPE6", "rdlength=22", 4500),
+        );
+        let services = |app: &App| -> Vec<String> {
+            findings_of(app, anomalies::AnomalyKind::UnicastStyleResponse)
+                .into_iter()
+                .map(|a| a.service)
+                .collect()
+        };
+        assert_eq!(services(&app), vec![anomalies::UNATTRIBUTED_SERVICE]);
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        assert_eq!(services(&app), vec!["test.local"]);
+    }
+
+    #[test]
+    fn out_of_scope_known_answer_is_sighted_in_its_section() {
+        let mut app = test_service_app();
+        let querier: SocketAddr = "192.168.1.9:5353".parse().unwrap();
+        let mut ka = raw_record("test.local.", 6, "TYPE6", "rdlength=22", 4500);
+        ka.section = browse::RecordSection::KnownAnswer;
+        ka.source = querier;
+        app.ingest_event(&query_event(
+            "test.local.",
+            1,
+            "A",
+            false,
+            vec![ka],
+            querier,
+        ));
+        let found = findings_of(&app, anomalies::AnomalyKind::UnicastStyleResponse);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].service, "test.local");
+        assert_eq!(
+            found[0].severity,
+            anomalies::Severity::Info,
+            "known answers cap at Info"
+        );
+        assert_eq!(
+            found[0].response.as_ref().map(|r| r.section),
+            Some(browse::RecordSection::KnownAnswer)
+        );
+        assert!(
+            found[0].message.contains("Known-Answer"),
+            "{}",
+            found[0].message
+        );
+        assert!(!service_rows(&app, "Test").contains(&6));
+
+        // A known answer with TTL 0 is no goodbye: a responder's own
+        // sighting of the same record survives it.
+        let mut answer = raw_record("test.local.", 6, "TYPE6", "rdlength=22", 4500);
+        answer.source = querier;
+        ingest(&mut app, &answer);
+        let mut ka_zero = raw_record("test.local.", 6, "TYPE6", "rdlength=22", 0);
+        ka_zero.section = browse::RecordSection::KnownAnswer;
+        ka_zero.source = querier;
+        app.ingest_event(&query_event(
+            "test.local.",
+            1,
+            "A",
+            false,
+            vec![ka_zero],
+            querier,
+        ));
+        assert!(
+            findings_of(&app, anomalies::AnomalyKind::UnicastStyleResponse)
+                .iter()
+                .any(|a| a.response.as_ref().map(|r| r.section)
+                    == Some(browse::RecordSection::Answer)),
+            "response sighting survives a TTL-0 known answer"
+        );
+    }
+
+    #[test]
+    fn nsec_question_is_finding_any_question_is_row() {
+        let mut app = test_service_app();
+        let querier: SocketAddr = "192.168.1.9:5353".parse().unwrap();
+        app.ingest_event(&query_event(
+            "test.local.",
+            47,
+            "NSEC",
+            false,
+            Vec::new(),
+            querier,
+        ));
+        app.ingest_event(&query_event(
+            "test.local.",
+            255,
+            "ANY",
+            false,
+            Vec::new(),
+            querier,
+        ));
+        let svc = app.services.iter().find(|s| s.instance == "Test").unwrap();
+        let types: Vec<&str> = svc.questions.iter().map(|q| q.1.as_str()).collect();
+        assert_eq!(types, vec!["ANY"], "only the ANY question is a row");
+        let found = findings_of(&app, anomalies::AnomalyKind::UnsupportedQuestion);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].rtype, Some(47));
+        assert_eq!(found[0].service, "test.local");
+    }
+
+    #[test]
+    fn out_of_scope_record_with_non_utf8_owner_is_flagged() {
+        let mut app = test_service_app();
+        let mut mx = raw_record("test.local.", 15, "TYPE15", "rdlength=9", 120);
+        mx.invalid_utf8 = true;
+        ingest(&mut app, &mx);
+        let found = findings_of(&app, anomalies::AnomalyKind::NonUtf8);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].rtype, Some(15));
+        assert_eq!(found[0].service, "test.local");
+    }
+
+    #[test]
+    fn host_owned_record_files_on_every_sibling_service() {
+        // One host backing two services: its HINFO (and NS/CNAME/NSEC)
+        // belongs to both, like its addresses.
+        let mut app = test_service_app();
+        ingest(
+            &mut app,
+            &raw_record(
+                "_ipp._tcp.local.",
+                12,
+                "PTR",
+                "Other._ipp._tcp.local.",
+                4500,
+            ),
+        );
+        ingest(
+            &mut app,
+            &raw_record(
+                "Other._ipp._tcp.local.",
+                33,
+                "SRV",
+                "0 0 631 test.local.",
+                120,
+            ),
+        );
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 13, "HINFO", "X86_64 LINUX", 120),
+        );
+        for instance in ["Test", "Other"] {
+            assert!(
+                service_rows(&app, instance).contains(&13),
+                "{instance} lacks the host's HINFO row"
+            );
+        }
+        // An instance-owned record still files on its own service only.
+        ingest(
+            &mut app,
+            &raw_record("Test._http._tcp.local.", 5, "CNAME", "alias.local.", 120),
+        );
+        assert!(service_rows(&app, "Test").contains(&5));
+        assert!(!service_rows(&app, "Other").contains(&5));
+    }
+
+    #[test]
+    fn host_owned_record_keeps_withdrawn_sibling_grace() {
+        let mut app = test_service_app();
+        let past = Instant::now() - Duration::from_secs(60);
+        {
+            let svc = app
+                .services
+                .iter_mut()
+                .find(|s| s.instance == "Test")
+                .unwrap();
+            svc.is_active = false;
+            svc.last_seen = past;
+        }
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 13, "HINFO", "X86_64 LINUX", 120),
+        );
+        let svc = app.services.iter().find(|s| s.instance == "Test").unwrap();
+        assert!(!svc.is_active);
+        assert_eq!(
+            svc.last_seen, past,
+            "HINFO must not extend the grace deadline"
+        );
+        assert!(svc.answers.iter().any(|r| r.rtype == 13));
+    }
+
+    #[test]
+    fn known_answer_findings_never_exceed_info() {
+        // A known answer carries the querier's belief and its remaining
+        // TTL: no TTL verdict at all, and the rest stays info.
+        let mut app = test_service_app();
+        let querier: SocketAddr = "192.168.1.9:5353".parse().unwrap();
+        let mut ka = raw_record("test.local.", 15, "TYPE15", "rdlength=9", 5);
+        ka.section = browse::RecordSection::KnownAnswer;
+        ka.invalid_utf8 = true;
+        ka.source = querier;
+        app.ingest_event(&query_event(
+            "test.local.",
+            1,
+            "A",
+            false,
+            vec![ka],
+            querier,
+        ));
+        let found: Vec<_> = app
+            .anomalies()
+            .into_iter()
+            .filter(|a| a.rtype == Some(15))
+            .collect();
+        let kinds: Vec<_> = found.iter().map(|a| a.kind).collect();
+        assert!(
+            kinds.contains(&anomalies::AnomalyKind::UnsupportedType),
+            "{kinds:?}"
+        );
+        assert!(
+            !kinds.iter().any(|k| k.is_ttl()),
+            "remaining TTLs get no TTL verdict: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&anomalies::AnomalyKind::NonUtf8),
+            "{kinds:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .all(|a| a.severity == anomalies::Severity::Info),
+            "{found:?}"
+        );
+        assert_eq!(app.anomaly_counts().get("Test._http._tcp.local"), None);
+    }
+
+    #[test]
+    fn sighting_contexts_stay_apart_and_goodbye_clears_all() {
+        // One responder sends the same SOA in Authority, then in
+        // Additional: two verdicts, neither replaces the other.
+        let mut app = App::new().unwrap();
+        let mut authority = raw_record("fritz.box.", 6, "TYPE6", "rdlength=49", 120);
+        authority.section = browse::RecordSection::Authority;
+        ingest(&mut app, &authority);
+        let mut additional = raw_record("fritz.box.", 6, "TYPE6", "rdlength=49", 120);
+        additional.section = browse::RecordSection::Additional;
+        ingest(&mut app, &additional);
+        let mut sections: Vec<_> = findings_of(&app, anomalies::AnomalyKind::UnicastStyleResponse)
+            .into_iter()
+            .map(|a| (a.response.map(|r| r.section.as_str()), a.severity))
+            .collect();
+        sections.sort_by_key(|(s, _)| *s);
+        assert_eq!(
+            sections,
+            vec![
+                (Some("additional"), anomalies::Severity::Info),
+                (Some("authority"), anomalies::Severity::Warning),
+            ]
+        );
+        ingest(
+            &mut app,
+            &raw_record("fritz.box.", 6, "TYPE6", "rdlength=49", 0),
+        );
+        assert!(findings_of(&app, anomalies::AnomalyKind::UnicastStyleResponse).is_empty());
+    }
+
+    #[test]
+    fn sighting_on_alternate_srv_target_is_owned_by_that_host() {
+        // Two live SRVs for one instance: only one target becomes the
+        // hostname, yet both targets own their findings, and the
+        // service's pane shows both.
+        let mut app = test_service_app();
+        let mut alt = raw_record(
+            "Test._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 80 other.local.",
+            120,
+        );
+        alt.flush_bit = true;
+        alt.source = remote_source();
+        ingest(&mut app, &alt);
+        for host in ["test.local.", "other.local."] {
+            ingest(&mut app, &raw_record(host, 15, "TYPE15", "rdlength=9", 120));
+        }
+        let mut owners: Vec<_> = findings_of(&app, anomalies::AnomalyKind::UnsupportedType)
+            .into_iter()
+            .map(|a| (a.record_name.unwrap(), a.service))
+            .collect();
+        owners.sort();
+        assert_eq!(
+            owners,
+            vec![
+                ("other.local.".to_string(), "other.local".to_string()),
+                ("test.local.".to_string(), "test.local".to_string()),
+            ]
+        );
+        select_instance(&mut app, "Test");
+        let pane = app
+            .anomalies_for_selected()
+            .iter()
+            .filter(|p| p.anomaly.kind == anomalies::AnomalyKind::UnsupportedType)
+            .count();
+        assert_eq!(pane, 2, "the service pane shows both hosts' findings");
+    }
+
+    #[test]
+    fn row_less_target_still_lists_its_findings() {
+        // The enumeration row has no Answers or Questions rows, only a
+        // sighting: its Anomalies pane must still show the finding.
+        let mut app = App::new().unwrap();
+        ingest(
+            &mut app,
+            &raw_record(
+                "_services._dns-sd._udp.local.",
+                6,
+                "TYPE6",
+                "rdlength=22",
+                120,
+            ),
+        );
+        app.evict_expired();
+        let enum_pos = app
+            .display_items()
+            .iter()
+            .position(|it| matches!(it, DisplayItem::Enum { .. }))
+            .expect("enum row");
+        app.selected_display = enum_pos;
+        app.clamp_selection();
+        assert!(app.selected_detail_entry().is_none(), "no detail rows");
+        let pane = app.anomalies_for_selected();
+        assert!(
+            pane.iter().any(
+                |p| p.anomaly.kind == anomalies::AnomalyKind::UnicastStyleResponse
+                    && !p.cursor_match
+            ),
+            "{pane:?}"
+        );
+    }
+
+    #[test]
+    fn host_owned_warning_badges_the_host_header_once() {
+        let mut app = test_service_app();
+        ingest(
+            &mut app,
+            &raw_record(
+                "_ipp._tcp.local.",
+                12,
+                "PTR",
+                "Other._ipp._tcp.local.",
+                4500,
+            ),
+        );
+        let mut other_srv = raw_record(
+            "Other._ipp._tcp.local.",
+            33,
+            "SRV",
+            "0 0 631 test.local.",
+            120,
+        );
+        other_srv.flush_bit = true;
+        ingest(&mut app, &other_srv);
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 6, "TYPE6", "rdlength=22", 4500),
+        );
+        let buf = render_to_buffer(&app, 140, 30);
+        let text = rect_text(&buf, buf.area);
+        let badged: Vec<&str> = text.lines().filter(|l| l.contains("[!1]")).collect();
+        assert_eq!(badged.len(), 1, "one badge, got: {badged:?}");
+        assert!(
+            badged[0].contains("test (2)"),
+            "badge sits on the host header: {badged:?}"
+        );
+    }
+
+    #[test]
+    fn host_sighting_keeps_one_finding_per_source() {
+        // A router's SOA heard from several responders (its IPv4 and
+        // link-local addresses, a repeater): one finding per source, all
+        // owned by the host; serial churn per source stays one finding.
+        let mut app = App::new().unwrap();
+        ingest(
+            &mut app,
+            &raw_record(
+                "_fbox._tcp.local.",
+                12,
+                "PTR",
+                "Fritzel._fbox._tcp.local.",
+                4500,
+            ),
+        );
+        let mut srv = raw_record(
+            "Fritzel._fbox._tcp.local.",
+            33,
+            "SRV",
+            "0 0 49000 fritz.box.",
+            120,
+        );
+        srv.flush_bit = true;
+        ingest(&mut app, &srv);
+        let sources = [
+            "169.254.1.1:5353",
+            "192.168.178.109:5353",
+            "[fe80::7eff:4dff:fe15:7f88%2]:5353",
+        ];
+        for src in sources {
+            for len in [30, 31] {
+                let mut soa = raw_record("fritz.box.", 6, "TYPE6", &format!("rdlength={len}"), 10);
+                soa.source = src.parse().unwrap();
+                soa.iface = "enp0s25".to_string();
+                ingest(&mut app, &soa);
+            }
+        }
+        let found = findings_of(&app, anomalies::AnomalyKind::UnicastStyleResponse);
+        assert!(found.iter().all(|a| a.service == "fritz.box"), "{found:?}");
+        let mut got: Vec<String> = found.into_iter().filter_map(|a| a.source).collect();
+        got.sort();
+        // Named like the old Answers rows: `@iface`, or the zone as-is.
+        let mut want = vec![
+            "169.254.1.1:5353@enp0s25".to_string(),
+            "192.168.178.109:5353@enp0s25".to_string(),
+            "[fe80::7eff:4dff:fe15:7f88%2]:5353".to_string(),
+        ];
+        want.sort();
+        assert_eq!(got, want, "one finding per responder and link");
+        let overlay = app
+            .metrics_rows()
+            .into_iter()
+            .filter(|(k, _)| k.ends_with("unicast-style-response"))
+            .count();
+        assert_eq!(overlay, sources.len());
+    }
+
+    #[test]
+    fn same_source_on_two_links_keeps_a_sighting_per_link() {
+        // One IPv4 address heard on two links: two responders. A goodbye
+        // on one link leaves the other link's finding in place.
+        let mut app = App::new().unwrap();
+        let on = |ifindex: u32, iface: &str, ttl: u32| {
+            let mut soa = raw_record("fritz.box.", 6, "TYPE6", "rdlength=30", ttl);
+            soa.source = "169.254.1.1:5353".parse().unwrap();
+            soa.ifindex = ifindex;
+            soa.iface = iface.to_string();
+            soa
+        };
+        ingest(&mut app, &on(2, "enp0s25", 120));
+        ingest(&mut app, &on(3, "wlan0", 120));
+        let mut sources: Vec<String> =
+            findings_of(&app, anomalies::AnomalyKind::UnicastStyleResponse)
+                .into_iter()
+                .filter_map(|a| a.source)
+                .collect();
+        sources.sort();
+        assert_eq!(
+            sources,
+            vec!["169.254.1.1:5353@enp0s25", "169.254.1.1:5353@wlan0"]
+        );
+        ingest(&mut app, &on(3, "wlan0", 0));
+        let sources: Vec<String> = findings_of(&app, anomalies::AnomalyKind::UnicastStyleResponse)
+            .into_iter()
+            .filter_map(|a| a.source)
+            .collect();
+        assert_eq!(sources, vec!["169.254.1.1:5353@enp0s25"]);
+    }
+
+    #[test]
+    fn expired_srv_no_longer_makes_its_target_an_owned_host() {
+        // The selected SRV expires while PTR and sighting stay live: the
+        // stale hostname owns nothing, so the sighting is unattributed
+        // and the service pane no longer lists it.
+        let mut app = test_service_app();
+        for r in app.services.iter_mut().flat_map(|s| s.answers.iter_mut()) {
+            if r.rtype == 33 {
+                r.received_at = Instant::now() - Duration::from_secs(300);
+            }
+        }
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 15, "TYPE15", "rdlength=9", 4500),
+        );
+        let owners: Vec<_> = findings_of(&app, anomalies::AnomalyKind::UnsupportedType)
+            .into_iter()
+            .map(|a| a.service)
+            .collect();
+        assert_eq!(owners, vec![anomalies::UNATTRIBUTED_SERVICE]);
+        select_instance(&mut app, "Test");
+        assert!(!app
+            .anomalies_for_selected()
+            .iter()
+            .any(|p| p.anomaly.kind == anomalies::AnomalyKind::UnsupportedType));
+    }
+
+    #[test]
+    fn same_querier_on_two_links_keeps_a_question_finding_per_link() {
+        // One querier address asking an out-of-scope question on two
+        // links: two findings, named with their links.
+        let mut app = App::new().unwrap();
+        let querier: SocketAddr = "169.254.1.1:5353".parse().unwrap();
+        for (ifindex, iface) in [(2, "enp0s25"), (3, "wlan0")] {
+            let mut ev = query_event("fritz.box.", 6, "TYPE6", false, Vec::new(), querier);
+            ev.questions[0].ifindex = ifindex;
+            ev.questions[0].iface = iface.to_string();
+            app.ingest_event(&ev);
+        }
+        let mut sources: Vec<String> =
+            findings_of(&app, anomalies::AnomalyKind::UnsupportedQuestion)
+                .into_iter()
+                .filter_map(|a| a.source)
+                .collect();
+        sources.sort();
+        assert_eq!(
+            sources,
+            vec!["169.254.1.1:5353@enp0s25", "169.254.1.1:5353@wlan0"]
+        );
     }
 }

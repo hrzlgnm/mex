@@ -329,18 +329,10 @@ fn partition_anomaly_keys(found: &[crate::anomalies::Anomaly]) -> AnomalyMarks {
         let name = name.trim_end_matches('.').to_lowercase();
         if !a.kind.is_ttl() {
             if let Some(rdata) = a.rdata.as_ref() {
-                content.insert((
-                    name,
-                    rtype,
-                    crate::anomalies::anomaly_match_key(rtype, rdata),
-                ));
+                content.insert((name, rtype, rdata.clone()));
             }
         } else if let Some(rdata) = a.rdata.as_ref() {
-            ttl.insert((
-                name,
-                rtype,
-                crate::anomalies::anomaly_match_key(rtype, rdata),
-            ));
+            ttl.insert((name, rtype, rdata.clone()));
         } else {
             unstable.insert((name, rtype));
         }
@@ -434,10 +426,17 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, 
                     // The hostname is italic: group headers describe
                     // app-side grouping, not wire records. Terminals
                     // without italic support render it plain.
+                    // Host-owned findings count once, on the host header.
+                    let warn = anomaly_counts.get(label.as_str()).copied().unwrap_or(0);
+                    let warn_suffix = if warn > 0 {
+                        format!(" [!{warn}]")
+                    } else {
+                        String::new()
+                    };
                     let line = Line::from(vec![
                         Span::styled(format!("{glyph} "), base),
                         Span::styled(display, base.add_modifier(Modifier::ITALIC)),
-                        Span::styled(format!(" ({count}){addr_suffix}"), base),
+                        Span::styled(format!(" ({count}){addr_suffix}{warn_suffix}"), base),
                     ]);
                     ListItem::new(line)
                 }
@@ -712,23 +711,9 @@ fn fit_row_extent(
     fitted.min(max_offset)
 }
 
-/// Source cell for the Records table: the responder address, suffixed
-/// with the ingress interface when pktinfo provided one, so multi-link
-/// traffic can be told apart. The `%iface` zone notation is only valid
-/// for IPv6 link-local unicast (RFC 4007); everything else uses `@iface`.
-/// A link-local source that already carries a zone (scope id) is shown
-/// as-is instead of gaining a second suffix.
+/// Source cell for the Records table (`RawRecord::source_label`).
 fn source_label(rec: &crate::browse::RawRecord) -> String {
-    if rec.iface.is_empty() {
-        return rec.source.to_string();
-    }
-    match rec.source {
-        SocketAddr::V6(v6) if v6.ip().is_unicast_link_local() && v6.scope_id() == 0 => {
-            format!("{}%{}", rec.source, rec.iface)
-        }
-        SocketAddr::V6(v6) if v6.ip().is_unicast_link_local() => rec.source.to_string(),
-        _ => format!("{}@{}", rec.source, rec.iface),
-    }
+    rec.source_label()
 }
 
 /// Heat color for the TTL cell, aligned to the RFC 6762 §5.2 requery
@@ -825,18 +810,11 @@ fn detail_table_rows<'a>(
         // other sources; only live rows earn the marker.
         let live = rec.ttl > 0 && rec.received_at.elapsed().as_secs() as u32 <= rec.ttl;
         let name = rec.name.trim_end_matches('.').to_lowercase();
-        let content_flagged = live
-            && content_keys.contains(&(
-                name.clone(),
-                rec.rtype,
-                crate::anomalies::anomaly_match_key(rec.rtype, &rec.rdata),
-            ));
+        let content_flagged =
+            live && content_keys.contains(&(name.clone(), rec.rtype, rec.rdata.clone()));
         let ttl_flagged = live
-            && (ttl_keys.contains(&(
-                name.clone(),
-                rec.rtype,
-                crate::anomalies::anomaly_match_key(rec.rtype, &rec.rdata),
-            )) || ttl_unstable.contains(&(name, rec.rtype)));
+            && (ttl_keys.contains(&(name.clone(), rec.rtype, rec.rdata.clone()))
+                || ttl_unstable.contains(&(name, rec.rtype)));
         let flush = if rec.flush_bit { "flush" } else { "" };
         let rem = rec
             .ttl
