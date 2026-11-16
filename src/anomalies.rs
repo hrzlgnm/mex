@@ -258,7 +258,8 @@ pub struct AddressQueryView {
 const ADDRESS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 struct AddressEvidence<'a> {
-    host_has_addr: &'a HashMap<String, bool>,
+    /// Live address families per host: (lowercased host, 1 | 28).
+    host_has_addr: &'a HashSet<(String, u16)>,
     host_addr_latest: &'a HashMap<(String, u16), Instant>,
     pending_hosts: &'a HashSet<String>,
     queries: &'a [AddressQueryView],
@@ -296,7 +297,7 @@ pub fn analyze_observations(
     let now = Instant::now();
     let mut out: Vec<Anomaly> = Vec::new();
 
-    let mut host_has_addr: HashMap<String, bool> = HashMap::new();
+    let mut host_has_addr: HashSet<(String, u16)> = HashSet::new();
     let mut host_addr_latest: HashMap<(String, u16), Instant> = HashMap::new();
     for svc in &snap.services {
         for rec in svc.answers {
@@ -309,7 +310,7 @@ pub fn analyze_observations(
                         .or_insert(rec.received_at);
                 }
                 if is_live(rec, now) {
-                    host_has_addr.insert(key, true);
+                    host_has_addr.insert((key, rec.rtype));
                 }
             }
         }
@@ -562,13 +563,13 @@ fn check_unresolved_target(
         return;
     };
     let host_key = host.to_lowercase();
-    if evidence
-        .host_has_addr
-        .get(&host_key)
-        .copied()
-        .unwrap_or(false)
-        || evidence.pending_hosts.contains(&host_key)
-    {
+    // Resolved if the host has a live address in a family this service
+    // doesn't deny: a sibling's AAAA says nothing about an IPv4-only one.
+    let denied = denied_for_host(&svc.denied_address_types, host);
+    let resolved = [1, 28].into_iter().any(|rtype| {
+        !denied.contains(&rtype) && evidence.host_has_addr.contains(&(host_key.clone(), rtype))
+    });
+    if resolved || evidence.pending_hosts.contains(&host_key) {
         return;
     }
 

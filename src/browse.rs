@@ -2085,13 +2085,17 @@ pub(crate) fn rtype_label(rtype: u16) -> String {
 }
 
 /// Address types (A, AAAA) named in an NSEC row's rendered bitmap
-/// (`next_name TYPE…`), and whether it names any other type. Shared by
+/// (`next_name. TYPE…`), and whether it names any other type. Shared by
 /// address denials (app) and the inverted-bitmap finding (analyzer), so
 /// both read the same rule.
 pub(crate) fn nsec_address_types(rdata: &str) -> (Vec<u16>, bool) {
     let mut address = Vec::new();
     let mut other = false;
-    for t in rdata.split_whitespace().skip(1).filter_map(rtype_from_str) {
+    // The next name may hold spaces (instance names do, e.g. "My A
+    // Printer"), but it always ends in "." and no type mnemonic contains
+    // one: the bitmap is everything after the last ". ".
+    let bitmap = rdata.rsplit_once(". ").map_or("", |(_, types)| types);
+    for t in bitmap.split_whitespace().filter_map(rtype_from_str) {
         match t {
             1 | 28 => address.push(t),
             _ => other = true,
@@ -2187,6 +2191,25 @@ mod tests {
         assert!(!is_local_name("host.example"));
         assert!(!is_local_name("notlocal"));
         assert!(is_local_name(".local"));
+    }
+
+    #[test]
+    fn nsec_bitmap_ignores_words_of_the_next_name() {
+        // Instance names keep spaces; a word like "A" in the name is not a
+        // bitmap type.
+        assert_eq!(
+            nsec_address_types("My A Printer._http._tcp.local. AAAA"),
+            (vec![28], false)
+        );
+        assert_eq!(
+            nsec_address_types("host.local. A AAAA"),
+            (vec![1, 28], false)
+        );
+        assert_eq!(
+            nsec_address_types("Odd. A Name.local. TXT SRV"),
+            (vec![], true)
+        );
+        assert_eq!(nsec_address_types("host.local."), (vec![], false));
     }
 
     #[test]
