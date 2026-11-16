@@ -64,6 +64,11 @@ Headless run (no TTY) logs to stderr.
 * Unique answers (flush bit) dampen the exponential stream to hourly,
   also when cached before the interest appeared (e.g. A/AAAA additionals);
   the 80%-TTL refresh takes over.
+* While no family can transmit (`browse::TransmitState`, set by the
+  listener's pause/resume), both schedules hold: nothing is counted as
+  sent, discovery doesn't back off, refresh attempts aren't used (records
+  still expire at 100% TTL). On resume `continuous` is cleared, so
+  discovery restarts with the startup schedule (jitter, startup QU).
 
 ## Workflow
 
