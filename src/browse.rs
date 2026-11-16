@@ -319,6 +319,7 @@ pub fn spawn(
     // leaves the other running, logged once.
     let v4 = FamilySocket::open(Family::V4, poll.registry());
     let v6 = FamilySocket::open(Family::V6, poll.registry());
+    require_transport(v4.is_some(), v6.is_some())?;
     let mut listener = Listener::new(poll, v4, v6, tx, query_rx, drops.clone(), selection);
     thread::spawn(move || listener.run());
     Ok((
@@ -712,15 +713,40 @@ fn poll_timeout(now: Instant, next_refresh: Instant, pending: bool) -> Duration 
         .max(Duration::from_millis(1))
 }
 
-/// Send every queued query on both families, returning how many were
-/// sent. Wakes may coalesce, so the queue is drained on every pass.
-fn drain_queries(rx: &mpsc::Receiver<QueryRequest>, mut send: impl FnMut(&QueryRequest)) -> usize {
+/// mex can do nothing without a socket: with neither family open,
+/// startup fails instead of running a listener that can never receive
+/// (or shut down) while queries vanish. One open family is enough.
+fn require_transport(v4_open: bool, v6_open: bool) -> Result<()> {
+    if v4_open || v6_open {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "no mDNS socket could be opened (neither IPv4 nor IPv6)"
+        ))
+    }
+}
+
+/// Queries sent per loop pass before the sockets get their turn, so a
+/// burst of queries can't hold off reads (and overflow receive buffers).
+const QUERY_BUDGET: usize = 64;
+
+/// Send up to `budget` queued queries. Returns how many were sent and
+/// whether more may be waiting (the budget was reached). Wakes may
+/// coalesce, so the queue is drained on every pass.
+fn drain_queries(
+    rx: &mpsc::Receiver<QueryRequest>,
+    budget: usize,
+    mut send: impl FnMut(&QueryRequest),
+) -> (usize, bool) {
     let mut sent = 0;
-    while let Ok(req) = rx.try_recv() {
+    while sent < budget {
+        let Ok(req) = rx.try_recv() else {
+            return (sent, false);
+        };
         send(&req);
         sent += 1;
     }
-    sent
+    (sent, true)
 }
 
 /// The single listener: one thread, one poll loop over both family
@@ -742,6 +768,9 @@ struct Listener {
     subnets: SubnetMap,
     unknown: HashSet<u32>,
     next_refresh: Instant,
+    /// The last pass stopped at `QUERY_BUDGET`: more may be queued,
+    /// and the waker won't announce them again.
+    queries_pending: bool,
     buf: Vec<u8>,
 }
 
@@ -769,6 +798,7 @@ impl Listener {
             subnets: HashMap::new(),
             unknown: HashSet::new(),
             next_refresh: Instant::now(),
+            queries_pending: false,
             buf: vec![0u8; 65535],
         }
     }
@@ -787,10 +817,11 @@ impl Listener {
                     return;
                 }
             }
-            let pending = [&self.v4, &self.v6]
-                .into_iter()
-                .flatten()
-                .any(|s| s.pending);
+            let pending = self.queries_pending
+                || [&self.v4, &self.v6]
+                    .into_iter()
+                    .flatten()
+                    .any(|s| s.pending);
             let timeout = poll_timeout(Instant::now(), self.next_refresh, pending);
             if let Err(e) = self.poll.poll(&mut events, Some(timeout)) {
                 if e.kind() != std::io::ErrorKind::Interrupted {
@@ -853,7 +884,7 @@ impl Listener {
         }
     }
 
-    /// Send every queued query on each open family.
+    /// Send queued queries (up to the budget) on each open family.
     fn send_queued(&mut self) {
         let Self {
             v4,
@@ -863,11 +894,12 @@ impl Listener {
             ifaces_v6,
             ..
         } = self;
-        drain_queries(query_rx, |req| {
+        let (_, more) = drain_queries(query_rx, QUERY_BUDGET, |req| {
             for socket in [v4.as_ref(), v6.as_ref()].into_iter().flatten() {
                 send_on_all_interfaces(&socket.pktinfo, req, socket.family, ifaces_v4, ifaces_v6);
             }
         });
+        self.queries_pending = more;
     }
 
     /// Drain one family's socket within the budget. Re-arms readiness
@@ -2856,9 +2888,54 @@ mod tests {
             "woken, not timed out"
         );
         let mut names = Vec::new();
-        assert_eq!(drain_queries(&rx, |q| names.push(q.name.clone())), 2);
+        assert_eq!(
+            drain_queries(&rx, QUERY_BUDGET, |q| names.push(q.name.clone())),
+            (2, false)
+        );
         assert_eq!(names, vec!["_http._tcp.local"; 2]);
-        assert_eq!(drain_queries(&rx, |_| {}), 0, "drained once");
+        assert_eq!(
+            drain_queries(&rx, QUERY_BUDGET, |_| {}),
+            (0, false),
+            "drained once"
+        );
+    }
+
+    #[test]
+    fn query_drain_is_budgeted_per_pass() {
+        // A query burst can't hold off socket reads: one pass sends at
+        // most the budget and reports the rest as pending.
+        let (tx, rx) = mpsc::channel();
+        for i in 0..5 {
+            tx.send(QueryRequest {
+                name: format!("q{i}.local"),
+                record_type: TYPE::A,
+                known_answers: Vec::new(),
+                qu: false,
+            })
+            .unwrap();
+        }
+        let mut sent = Vec::new();
+        assert_eq!(
+            drain_queries(&rx, 3, |q| sent.push(q.name.clone())),
+            (3, true)
+        );
+        assert_eq!(
+            drain_queries(&rx, 3, |q| sent.push(q.name.clone())),
+            (2, false)
+        );
+        assert_eq!(
+            sent,
+            ["q0.local", "q1.local", "q2.local", "q3.local", "q4.local"]
+        );
+    }
+
+    #[test]
+    fn startup_needs_at_least_one_socket() {
+        assert!(require_transport(true, true).is_ok());
+        assert!(require_transport(true, false).is_ok());
+        assert!(require_transport(false, true).is_ok());
+        let err = require_transport(false, false).unwrap_err().to_string();
+        assert!(err.contains("no mDNS socket"), "{err}");
     }
 
     #[test]
