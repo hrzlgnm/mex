@@ -542,14 +542,24 @@ impl Sighting {
         }
     }
 
-    /// Dedup identity without rdata: a newer sighting of the same kind,
-    /// owner, type and source replaces the older one (e.g. SOA serial
-    /// bumps); a response goodbye withdraws it.
-    fn same_identity(&self, kind: SightingKind, rec: &browse::RawRecord) -> bool {
+    /// The record a goodbye withdraws: same kind, owner, type and
+    /// source, in any response context.
+    fn same_record(&self, kind: SightingKind, rec: &browse::RawRecord) -> bool {
         self.kind == kind
             && self.rec.rtype == rec.rtype
             && self.rec.source == rec.source
             && self.rec.name.eq_ignore_ascii_case(&rec.name)
+    }
+
+    /// Dedup identity without rdata: a newer sighting of the same record
+    /// in the same response context (section, multicast vs unicast)
+    /// replaces the older one (e.g. SOA serial bumps). Contexts stay
+    /// apart because they carry different verdicts (e.g. SOA in
+    /// Authority vs Additional).
+    fn same_identity(&self, kind: SightingKind, rec: &browse::RawRecord) -> bool {
+        self.same_record(kind, rec)
+            && self.rec.section == rec.section
+            && self.rec.dst_is_multicast == rec.dst_is_multicast
     }
 }
 
@@ -4479,8 +4489,16 @@ impl App {
         for svc in &self.services {
             let full = format!("{}.{}", svc.instance, svc.service_type).to_lowercase();
             let host = svc.hostname.trim_end_matches('.').to_lowercase();
+            // Any live SRV target counts, not only the selected hostname,
+            // as for address routing (`handle_addr`).
+            let alternate = svc.answers.iter().any(|r| {
+                r.rtype == 33
+                    && r.ttl > r.received_at.elapsed().as_secs() as u32
+                    && srv_target(&r.rdata).is_some_and(|target| target.eq_ignore_ascii_case(&name))
+            });
             if full == name
                 || (!host.is_empty() && host == name)
+                || alternate
                 || (question && svc.service_type.to_lowercase() == name)
             {
                 add(anomalies::service_id(&svc.instance, &svc.service_type));
@@ -4501,14 +4519,15 @@ impl App {
     /// known answer is never a goodbye. Re-filing moves the sighting to
     /// the back, so the cap evicts the one seen least recently.
     fn ingest_sighting(&mut self, kind: SightingKind, rec: browse::RawRecord) {
-        let before = self.sightings.len();
-        self.sightings.retain(|s| !s.same_identity(kind, &rec));
         if kind == SightingKind::Response && rec.ttl == 0 {
+            let before = self.sightings.len();
+            self.sightings.retain(|s| !s.same_record(kind, &rec));
             if self.sightings.len() != before {
                 self.touch();
             }
             return;
         }
+        self.sightings.retain(|s| !s.same_identity(kind, &rec));
         self.sightings.push(Sighting { kind, rec });
         if self.sightings.len() > SIGHTINGS_CAP {
             self.sightings.remove(0);
@@ -5916,7 +5935,12 @@ impl App {
                 };
                 Self::detail_service_id(&target)
             }
-            AnomalyScope::None => return Vec::new(),
+            // No detail row (e.g. an enumeration target whose only
+            // evidence is a sighting): still list the target's findings.
+            AnomalyScope::None => match self.display_detail() {
+                Some(target) => Self::detail_service_id(&target),
+                None => return Vec::new(),
+            },
         };
         let row: Vec<anomalies::Anomaly> = match scope {
             AnomalyScope::Record(rec) => Self::record_anomalies_in(found, rec, &id),
@@ -13426,5 +13450,149 @@ mod tests {
             "HINFO must not extend the grace deadline"
         );
         assert!(svc.answers.iter().any(|r| r.rtype == 13));
+    }
+
+    #[test]
+    fn known_answer_findings_never_exceed_info() {
+        // A known answer carries its remaining TTL and the querier's
+        // belief: ttl-low and non-utf8 stay info like the type verdict.
+        let mut app = test_service_app();
+        let querier: SocketAddr = "192.168.1.9:5353".parse().unwrap();
+        let mut ka = raw_record("test.local.", 15, "TYPE15", "rdlength=9", 5);
+        ka.section = browse::RecordSection::KnownAnswer;
+        ka.invalid_utf8 = true;
+        ka.source = querier;
+        app.ingest_event(&query_event(
+            "test.local.",
+            1,
+            "A",
+            false,
+            vec![ka],
+            querier,
+        ));
+        let found: Vec<_> = app
+            .anomalies()
+            .into_iter()
+            .filter(|a| a.rtype == Some(15))
+            .collect();
+        let kinds: Vec<_> = found.iter().map(|a| a.kind).collect();
+        assert!(
+            kinds.contains(&anomalies::AnomalyKind::UnsupportedType),
+            "{kinds:?}"
+        );
+        assert!(kinds.contains(&anomalies::AnomalyKind::TtlLow), "{kinds:?}");
+        assert!(
+            kinds.contains(&anomalies::AnomalyKind::NonUtf8),
+            "{kinds:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .all(|a| a.severity == anomalies::Severity::Info),
+            "{found:?}"
+        );
+        assert_eq!(app.anomaly_counts().get("Test._http._tcp.local"), None);
+    }
+
+    #[test]
+    fn sighting_contexts_stay_apart_and_goodbye_clears_all() {
+        // One responder sends the same SOA in Authority, then in
+        // Additional: two verdicts, neither replaces the other.
+        let mut app = App::new().unwrap();
+        let mut authority = raw_record("fritz.box.", 6, "TYPE6", "rdlength=49", 120);
+        authority.section = browse::RecordSection::Authority;
+        ingest(&mut app, &authority);
+        let mut additional = raw_record("fritz.box.", 6, "TYPE6", "rdlength=49", 120);
+        additional.section = browse::RecordSection::Additional;
+        ingest(&mut app, &additional);
+        let mut sections: Vec<_> = findings_of(&app, anomalies::AnomalyKind::UnicastStyleResponse)
+            .into_iter()
+            .map(|a| (a.response.map(|r| r.section.as_str()), a.severity))
+            .collect();
+        sections.sort_by_key(|(s, _)| *s);
+        assert_eq!(
+            sections,
+            vec![
+                (Some("additional"), anomalies::Severity::Info),
+                (Some("authority"), anomalies::Severity::Warning),
+            ]
+        );
+        ingest(
+            &mut app,
+            &raw_record("fritz.box.", 6, "TYPE6", "rdlength=49", 0),
+        );
+        assert!(findings_of(&app, anomalies::AnomalyKind::UnicastStyleResponse).is_empty());
+    }
+
+    #[test]
+    fn sighting_on_alternate_srv_target_is_attributed() {
+        // Two live SRVs for one instance: only one target becomes the
+        // hostname, yet both are owned by the service.
+        let mut app = test_service_app();
+        let mut alt = raw_record(
+            "Test._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 80 other.local.",
+            120,
+        );
+        alt.flush_bit = true;
+        alt.source = remote_source();
+        ingest(&mut app, &alt);
+        for host in ["test.local.", "other.local."] {
+            ingest(&mut app, &raw_record(host, 15, "TYPE15", "rdlength=9", 120));
+        }
+        let mut owners: Vec<_> = findings_of(&app, anomalies::AnomalyKind::UnsupportedType)
+            .into_iter()
+            .map(|a| (a.record_name.unwrap(), a.service))
+            .collect();
+        owners.sort();
+        assert_eq!(
+            owners,
+            vec![
+                (
+                    "other.local.".to_string(),
+                    "Test._http._tcp.local".to_string()
+                ),
+                (
+                    "test.local.".to_string(),
+                    "Test._http._tcp.local".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn row_less_target_still_lists_its_findings() {
+        // The enumeration row has no Answers or Questions rows, only a
+        // sighting: its Anomalies pane must still show the finding.
+        let mut app = App::new().unwrap();
+        ingest(
+            &mut app,
+            &raw_record(
+                "_services._dns-sd._udp.local.",
+                6,
+                "TYPE6",
+                "rdlength=22",
+                120,
+            ),
+        );
+        app.evict_expired();
+        let enum_pos = app
+            .display_items()
+            .iter()
+            .position(|it| matches!(it, DisplayItem::Enum { .. }))
+            .expect("enum row");
+        app.selected_display = enum_pos;
+        app.clamp_selection();
+        assert!(app.selected_detail_entry().is_none(), "no detail rows");
+        let pane = app.anomalies_for_selected();
+        assert!(
+            pane.iter().any(
+                |p| p.anomaly.kind == anomalies::AnomalyKind::UnicastStyleResponse
+                    && !p.cursor_match
+            ),
+            "{pane:?}"
+        );
     }
 }

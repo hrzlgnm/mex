@@ -1223,7 +1223,20 @@ pub(crate) fn is_mdns_domain(name: &str) -> bool {
     .any(|zone| lower == *zone || lower.ends_with(&format!(".{zone}")))
 }
 
+/// Per-record checks. A known answer rides in a query (RFC 6762 §7.1):
+/// it is the querier's belief, not a responder's claim, and its TTL is
+/// the remaining one, so every finding it raises is capped at Info.
 fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
+    let first = out.len();
+    check_record_claims(service_id, rec, out);
+    if rec.section == crate::browse::RecordSection::KnownAnswer {
+        for a in &mut out[first..] {
+            a.severity = Severity::Info;
+        }
+    }
+}
+
+fn check_record_claims(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     let name = rec.name.clone();
     let rdata = rec.rdata.clone();
     let src = rec.source.to_string();

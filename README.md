@@ -222,11 +222,14 @@ every service whose instance name or hostname owns it, or to
 `unattributed` when nothing matches (e.g. a router's `fritz.box.` SOA).
 Attribution is resolved live, so a service that appears later claims
 its host's earlier sightings. Out-of-scope types are named only by number
-(`TYPE6` for SOA, `TYPE15` for MX), and their rdata is never decoded:
-mex keeps only its length (`rdlength=<n>`). A record finding lives for
-its TTL and is cleared by a goodbye; repeated records from the same
-source (e.g. SOA serial bumps) stay one finding. At most 256 sightings
-are kept; the metrics overlay counts evictions.
+(`TYPE6` for SOA, `TYPE15` for MX), and their rdata is never decoded,
+so a malformed one cannot drop the rest of its packet: mex keeps only
+its length (`rdlength=<n>`). A record finding lives for its TTL and is
+cleared by a goodbye; repeated records from the same source in the same
+section (e.g. SOA serial bumps) stay one finding. Findings from known
+answers are always info. EDNS0 OPT pseudo-records are not records and
+are ignored. At most 256 sightings are kept; the metrics overlay counts
+evictions.
 
 Reverse-mapping PTRs (`*.in-addr.arpa`, `*.ip6.arpa`) are exempt from
 the shared-record rules: they are unique records. Omitting the flush

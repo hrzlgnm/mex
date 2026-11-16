@@ -940,7 +940,15 @@ pub(crate) fn parse_packet(
     iface: &str,
     ifindex: u32,
 ) -> Option<Event> {
-    let pkt = Packet::parse(raw).ok()?;
+    // Walk the record headers first: out-of-scope records are made
+    // opaque before `Packet::parse`, so their rdata is never decoded and
+    // a malformed one cannot fail the whole packet.
+    let walked = walk_records(raw);
+    let (parse_bytes, wire_records) = match &walked {
+        Some((bytes, records)) => (bytes.as_slice(), records.as_slice()),
+        None => (raw, &[][..]),
+    };
+    let pkt = Packet::parse(parse_bytes).ok()?;
     let dst_is_multicast = mdns_multicast_dest(&dst);
     let is_response = pkt.has_flags(PacketFlag::RESPONSE);
     let ing = Ingress {
@@ -951,10 +959,9 @@ pub(crate) fn parse_packet(
     };
 
     let mut answers = Vec::new();
-    // On-wire RDLENGTH per resource record, in packet order (answer,
-    // authority, additional). Out-of-scope records keep only this.
-    let rdlengths = packet_rdlengths(raw, pkt.questions.len()).unwrap_or_default();
-    let mut rdlength_at = rdlengths.into_iter();
+    // On-wire type and RDLENGTH per resource record, in packet order
+    // (answer, authority, additional).
+    let mut wire_at = wire_records.iter().copied();
 
     // Only responses carry authoritative answers. Queries may carry the
     // same answers as known answers (RFC 6762 §7.1 suppression), which
@@ -978,8 +985,11 @@ pub(crate) fn parse_packet(
                     .map(|r| (RecordSection::Additional, r)),
             )
         {
-            let rdlength = rdlength_at.next();
-            answers.push(record_row(rec, rdlength, section, ing));
+            let wire = wire_at.next();
+            if is_opt(rec, wire) {
+                continue;
+            }
+            answers.push(record_row(rec, wire, section, ing));
         }
     }
 
@@ -988,8 +998,11 @@ pub(crate) fn parse_packet(
     let mut query_kas = Vec::new();
     if !is_response {
         for rec in pkt.answers.iter() {
-            let rdlength = rdlength_at.next();
-            query_kas.push(record_row(rec, rdlength, RecordSection::KnownAnswer, ing));
+            let wire = wire_at.next();
+            if is_opt(rec, wire) {
+                continue;
+            }
+            query_kas.push(record_row(rec, wire, RecordSection::KnownAnswer, ing));
         }
     }
 
@@ -1030,11 +1043,14 @@ struct Ingress<'a> {
 /// mex does not support.
 fn record_row(
     rec: &ResourceRecord<'_>,
-    rdlength: Option<u16>,
+    wire_record: Option<WireRecord>,
     section: RecordSection,
     ing: Ingress<'_>,
 ) -> RawRecord {
-    let rtype = u16::from(rec.rdata.type_code());
+    // The walked type is authoritative: out-of-scope records reach the
+    // parser under `OPAQUE_TYPE`.
+    let rtype = wire_record.map_or_else(|| u16::from(rec.rdata.type_code()), |w| w.rtype);
+    let rdlength = wire_record.map(|w| w.rdlength);
     let in_scope = crate::anomalies::is_mdns_answer_type(rtype);
     // Known answers never reach the hex pane, so they skip the encode.
     let wire = if in_scope && section != RecordSection::KnownAnswer {
@@ -1132,30 +1148,67 @@ fn record_wire(rec: &ResourceRecord<'_>) -> Vec<u8> {
     }
 }
 
-/// On-wire RDLENGTH of every resource record in a packet, in order
-/// (answer, authority, additional), skipping the question section.
-/// The parser hides it, and re-encoding would expand compressed names,
-/// so the packet is walked directly. `None` when the walk falls off
-/// the end, which a packet `Packet::parse` accepted never does.
-fn packet_rdlengths(raw: &[u8], questions: usize) -> Option<Vec<u16>> {
+/// Type and RDLENGTH of one resource record, read from the packet
+/// header fields (never from parsed rdata).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WireRecord {
+    rtype: u16,
+    rdlength: u16,
+}
+
+/// EDNS0 OPT pseudo-record (RFC 6891): carries options such as Apple's
+/// Owner option, not data about any name, so it is never a row or a
+/// sighting.
+const OPT_TYPE: u16 = 41;
+
+/// Private-use type (RFC 6895 §3.1) that out-of-scope records are
+/// relabelled to before parsing, so the parser keeps their rdata as
+/// opaque bytes instead of decoding it.
+const OPAQUE_TYPE: u16 = 65280;
+
+/// Whether a parsed record is the OPT pseudo-record.
+fn is_opt(rec: &ResourceRecord<'_>, wire: Option<WireRecord>) -> bool {
+    wire.map_or_else(|| u16::from(rec.rdata.type_code()), |w| w.rtype) == OPT_TYPE
+}
+
+/// Walk every resource record header in a packet (answer, authority,
+/// additional; questions skipped) and return a copy whose out-of-scope
+/// records (`anomalies::is_mdns_answer_type` false, OPT excepted) carry
+/// `OPAQUE_TYPE`, plus each record's on-wire type and RDLENGTH in
+/// order. Only the TYPE field changes, so names, offsets and
+/// compression pointers stay valid; re-encoding would expand
+/// compressed names and misreport RDLENGTH. `None` when the walk falls
+/// off the end (a truncated or malformed packet).
+fn walk_records(raw: &[u8]) -> Option<(Vec<u8>, Vec<WireRecord>)> {
     let count = |at: usize| -> Option<usize> {
         let b = raw.get(at..at + 2)?;
         Some(usize::from(u16::from_be_bytes([b[0], b[1]])))
     };
+    let questions = count(4)?;
     let records = count(6)? + count(8)? + count(10)?;
     let mut offset = 12;
     for _ in 0..questions {
         offset = packet_name_end(raw, offset)?.checked_add(4)?;
     }
+    let mut bytes = raw.to_vec();
     let mut out = Vec::with_capacity(records);
     for _ in 0..records {
-        let length_at = packet_name_end(raw, offset)?.checked_add(8)?;
+        let type_at = packet_name_end(raw, offset)?;
+        let t = raw.get(type_at..type_at.checked_add(2)?)?;
+        let rtype = u16::from_be_bytes([t[0], t[1]]);
+        let length_at = type_at.checked_add(8)?;
         let b = raw.get(length_at..length_at.checked_add(2)?)?;
         let rdlength = u16::from_be_bytes([b[0], b[1]]);
-        out.push(rdlength);
         offset = length_at + 2 + usize::from(rdlength);
+        if offset > raw.len() {
+            return None;
+        }
+        if rtype != OPT_TYPE && !crate::anomalies::is_mdns_answer_type(rtype) {
+            bytes[type_at..type_at + 2].copy_from_slice(&OPAQUE_TYPE.to_be_bytes());
+        }
+        out.push(WireRecord { rtype, rdlength });
     }
-    Some(out)
+    Some((bytes, out))
 }
 
 pub fn record_fields(wire: &[u8], rtype: u16) -> Vec<RecordField> {
@@ -1995,7 +2048,12 @@ mod tests {
         let ev =
             parse_packet(&raw, test_source(), std::net::IpAddr::V4(MDNS_V4), "br0", 3).unwrap();
         assert_eq!(ev.answers.len(), 3);
-        let wire_lengths = packet_rdlengths(&raw, 0).unwrap();
+        let wire_lengths: Vec<u16> = walk_records(&raw)
+            .unwrap()
+            .1
+            .iter()
+            .map(|w| w.rdlength)
+            .collect();
         let soa = &ev.answers[0];
         assert_eq!(soa.rtype_str, "TYPE6");
         assert_eq!(soa.rdata, format!("rdlength={}", wire_lengths[0]));
@@ -2018,7 +2076,38 @@ mod tests {
     }
 
     #[test]
-    fn packet_rdlengths_skips_questions_and_rejects_truncation() {
+    fn malformed_out_of_scope_rdata_never_drops_the_packet() {
+        // Response: A host.local, SOA host.local with 3 bytes of garbage
+        // rdata, and an EDNS0 OPT pseudo-record in Additional.
+        let name: &[u8] = b"\x04host\x05local\x00";
+        let mut raw = vec![0, 0, 0x84, 0, 0, 0, 0, 2, 0, 0, 0, 1];
+        raw.extend_from_slice(name);
+        raw.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 120, 0, 4, 10, 0, 0, 1]);
+        raw.extend_from_slice(name);
+        raw.extend_from_slice(&[0, 6, 0, 1, 0, 0, 0, 120, 0, 3, 0xff, 0xff, 0xff]);
+        raw.extend_from_slice(&[0, 0, 41, 0x05, 0xa0, 0, 0, 0, 0, 0, 0]);
+        assert!(
+            Packet::parse(&raw).is_err(),
+            "the SOA is malformed: decoding it fails the packet"
+        );
+        let ev = parse_packet(&raw, test_source(), std::net::IpAddr::V4(MDNS_V4), "br0", 3)
+            .expect("packet survives its malformed out-of-scope record");
+        let rows: Vec<(u16, &str)> = ev
+            .answers
+            .iter()
+            .map(|r| (r.rtype, r.rdata.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(1, "10.0.0.1"), (6, "rdlength=3")],
+            "OPT is no row"
+        );
+        assert_eq!(ev.answers[1].rtype_str, "TYPE6");
+        assert_eq!(ev.raw_bytes, raw, "the stored packet stays as received");
+    }
+
+    #[test]
+    fn walk_records_skips_questions_and_rejects_truncation() {
         let mut msg = Packet::new_query(0);
         msg.questions.push(Question::new(
             simple_dns::Name::new_unchecked("host.local."),
@@ -2035,8 +2124,16 @@ mod tests {
             }),
         ));
         let raw = msg.build_bytes_vec().unwrap();
-        assert_eq!(packet_rdlengths(&raw, 1), Some(vec![4]));
-        assert_eq!(packet_rdlengths(&raw[..raw.len() - 6], 1), None);
+        let (bytes, records) = walk_records(&raw).unwrap();
+        assert_eq!(
+            records,
+            vec![WireRecord {
+                rtype: 1,
+                rdlength: 4
+            }]
+        );
+        assert_eq!(bytes, raw, "in-scope records stay untouched");
+        assert_eq!(walk_records(&raw[..raw.len() - 6]), None);
     }
 
     #[test]
