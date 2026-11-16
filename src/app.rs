@@ -709,7 +709,7 @@ pub struct App {
     clamped_gen: Option<u64>,
     /// Cached usable/skipped link snapshot, refreshed on the 10s tick.
     pub link_stats: browse::LinkStats,
-    /// Refused-packet accounting from the listener threads (RFC 6762 §11).
+    /// Refused-packet accounting from the listener thread (RFC 6762 §11).
     pub drop_stats: Arc<browse::DropStats>,
 
     rx: mpsc::Receiver<browse::Event>,
@@ -2648,7 +2648,7 @@ impl App {
         }
     }
 
-    /// Message-level decode failures: counted in the listener threads so
+    /// Message-level decode failures: counted in the listener thread so
     /// a garbage storm reads differently from a quiet network.
     fn malformed_row(&self) -> String {
         let total = self.drop_stats.malformed_total();

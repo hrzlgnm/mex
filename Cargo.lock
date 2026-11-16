@@ -960,6 +960,7 @@ dependencies = [
  "crossterm",
  "if-addrs",
  "log",
+ "mio",
  "nix 0.32.0",
  "ratatui",
  "serde",

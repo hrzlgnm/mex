@@ -66,16 +66,16 @@ use socket_pktinfo::PktInfoUdpSocket;
 const MDNS_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 const MDNS_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
 const MDNS_PORT: u16 = 5353;
-/// How often the listener threads re-enumerate interfaces: picks up
+/// How often the listener re-enumerates interfaces: picks up
 /// bridges and other links that appear at runtime, drops dead ones from
 /// the transmit set, and re-joins flapped ones (replug or down/up with
 /// the same name would otherwise stay deaf: the kernel join does not
 /// survive the interface going away).
 const IFACE_REFRESH: Duration = Duration::from_secs(10);
 
-/// Address family of a listener thread: selects the interface list,
+/// Address family of a listener socket: selects the interface list,
 /// the join call, and the per-packet transmit interface.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Family {
     V4,
     V6,
@@ -235,28 +235,35 @@ pub struct QueryRequest {
     pub qu: bool,
 }
 
-/// Query sender fanning out to both transports, so solicited queries
-/// reach v6-only responders too. A dead listener thread just drops its copy.
+/// Query sender for the listener thread. Each request is queued once
+/// and the poll loop is woken, so it leaves immediately on every usable
+/// link of both families (solicited queries reach v6-only responders
+/// too).
 pub struct QueryTx {
-    v4: mpsc::Sender<QueryRequest>,
-    v6: mpsc::Sender<QueryRequest>,
+    tx: mpsc::Sender<QueryRequest>,
+    waker: Arc<mio::Waker>,
 }
 
 impl QueryTx {
-    /// Fan out to both transports. Returns `true` when at least one
-    /// listener channel accepted the request — the transport may still
-    /// fail to send (encode error, closed socket), which is logged in
-    /// `send_query` and cannot be reflected here.
+    /// Queue a query and wake the listener. Returns `true` when the
+    /// listener accepted the request — the transport may still fail to
+    /// send (encode error, closed socket), which is logged in
+    /// `send_query` and cannot be reflected here. Wakes may coalesce:
+    /// the queue is the source of truth, drained on every loop pass.
     pub fn send(&self, req: QueryRequest) -> bool {
-        let v4_ok = self.v4.send(req.clone()).is_ok();
-        let v6_ok = self.v6.send(req).is_ok();
-        v4_ok || v6_ok
+        if self.tx.send(req).is_err() {
+            return false;
+        }
+        if let Err(e) = self.waker.wake() {
+            log::warn!("mex: cannot wake listener: {e}");
+        }
+        true
     }
 }
 
 /// Refused-packet accounting shared with the App thread: RFC 6762 §11
 /// off-link discards plus messages the DNS codec cannot decode at all.
-/// Listener threads only bump these; rendering reads them.
+/// The listener only bumps these; rendering reads them.
 #[derive(Debug, Default)]
 pub struct DropStats {
     count: AtomicU64,
@@ -304,40 +311,21 @@ pub fn spawn(
     selection: Option<HashSet<String>>,
 ) -> Result<(QueryTx, mpsc::Receiver<Event>, Arc<DropStats>)> {
     let (tx, rx) = mpsc::channel();
-    let (tx_v4, rx_v4) = mpsc::channel();
-    let (tx_v6, rx_v6) = mpsc::channel();
+    let (query_tx, query_rx) = mpsc::channel();
     let drops = Arc::new(DropStats::default());
-
-    let tx4 = tx.clone();
-    let drops4 = drops.clone();
-    let sel4 = selection.clone();
-    thread::spawn(move || {
-        let socket = match create_v4_socket() {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("mex: v4 socket: {e}");
-                return;
-            }
-        };
-        listen(&socket, tx4, rx_v4, drops4, Family::V4, sel4);
-    });
-
-    let drops6 = drops.clone();
-    thread::spawn(move || {
-        let socket = match create_v6_socket() {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("mex: v6 socket: {e}");
-                return;
-            }
-        };
-        listen(&socket, tx, rx_v6, drops6, Family::V6, selection);
-    });
-
+    let poll = mio::Poll::new()?;
+    let waker = Arc::new(mio::Waker::new(poll.registry(), WAKER_TOKEN)?);
+    // Each family opens on its own: one failing (e.g. IPv6 disabled)
+    // leaves the other running, logged once.
+    let v4 = FamilySocket::open(Family::V4, poll.registry());
+    let v6 = FamilySocket::open(Family::V6, poll.registry());
+    require_transport(v4.is_some(), v6.is_some())?;
+    let mut listener = Listener::new(poll, v4, v6, tx, query_rx, drops.clone(), selection);
+    thread::spawn(move || listener.run());
     Ok((
         QueryTx {
-            v4: tx_v4,
-            v6: tx_v6,
+            tx: query_tx,
+            waker,
         },
         rx,
         drops,
@@ -609,6 +597,11 @@ fn create_v6_socket() -> Result<PktInfoUdpSocket> {
     socket.set_nonblocking(true)?;
     socket.set_multicast_loop_v6(false)?;
     socket.set_multicast_hops_v6(255)?;
+    // v6 only: v4 traffic belongs to the v4 socket alone. The pktinfo
+    // wrapper has no setter, so set it through a duplicate handle (same
+    // underlying socket) before bind; platform defaults differ (Linux
+    // and macOS dual-stack, Windows v6-only).
+    socket2::SockRef::from(&socket.try_clone_std()?).set_only_v6(true)?;
     let addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, MDNS_PORT, 0, 0);
     socket.bind(&addr.into())?;
     Ok(socket)
@@ -621,121 +614,373 @@ fn mdns_dest_v6(ifindex: u32) -> SocketAddr {
     SocketAddr::from(SocketAddrV6::new(MDNS_V6, MDNS_PORT, 0, ifindex))
 }
 
-fn listen(
-    socket: &PktInfoUdpSocket,
+/// Poll tokens: one per family socket, plus the query waker.
+const V4_TOKEN: mio::Token = mio::Token(0);
+const V6_TOKEN: mio::Token = mio::Token(1);
+const WAKER_TOKEN: mio::Token = mio::Token(2);
+
+/// Datagrams read from one socket per loop pass before the other gets
+/// its turn, so a burst on one family can't starve the other.
+const READ_BUDGET: usize = 64;
+
+/// One family's socket: the pktinfo socket does every read (ingress
+/// interface) and send; a duplicate of the same socket is registered
+/// with the poll for readiness only, as mdns-sd does.
+struct FamilySocket {
+    family: Family,
+    token: mio::Token,
+    pktinfo: PktInfoUdpSocket,
+    readiness: mio::net::UdpSocket,
+    /// The last pass stopped at `READ_BUDGET`: more may be waiting, and
+    /// edge-triggered readiness won't announce it again.
+    pending: bool,
+}
+
+impl FamilySocket {
+    fn open(family: Family, registry: &mio::Registry) -> Option<Self> {
+        let (label, token) = match family {
+            Family::V4 => ("v4", V4_TOKEN),
+            Family::V6 => ("v6", V6_TOKEN),
+        };
+        let opened = (|| -> Result<Self> {
+            let pktinfo = match family {
+                Family::V4 => create_v4_socket()?,
+                Family::V6 => create_v6_socket()?,
+            };
+            let mut readiness = mio::net::UdpSocket::from_std(pktinfo.try_clone_std()?);
+            registry.register(&mut readiness, token, mio::Interest::READABLE)?;
+            Ok(Self {
+                family,
+                token,
+                pktinfo,
+                readiness,
+                pending: false,
+            })
+        })();
+        match opened {
+            Ok(socket) => Some(socket),
+            Err(e) => {
+                log::error!("mex: {label} socket: {e}");
+                None
+            }
+        }
+    }
+}
+
+/// How one budgeted drain of a socket ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drained {
+    /// Read until `WouldBlock` (or an error): re-arm readiness.
+    Empty,
+    /// Stopped at the budget: more may be waiting.
+    Budget,
+    /// The event receiver is gone: the app has stopped.
+    Closed,
+}
+
+/// One read attempt, as the drain sees it.
+enum ReadStep {
+    /// A datagram was read and handled; keep going.
+    Handled,
+    /// Nothing more to read right now.
+    WouldBlock,
+    /// The event receiver is gone.
+    Closed,
+}
+
+/// Read up to `budget` datagrams with `read`, stopping early on
+/// `WouldBlock` or a closed receiver.
+fn drain_budgeted(budget: usize, mut read: impl FnMut() -> ReadStep) -> Drained {
+    for _ in 0..budget {
+        match read() {
+            ReadStep::Handled => {}
+            ReadStep::WouldBlock => return Drained::Empty,
+            ReadStep::Closed => return Drained::Closed,
+        }
+    }
+    Drained::Budget
+}
+
+/// Poll timeout: zero while a socket has unread datagrams left over
+/// from its budget, else the time until the next interface refresh,
+/// at least 1 ms so a due refresh never spins.
+fn poll_timeout(now: Instant, next_refresh: Instant, pending: bool) -> Duration {
+    if pending {
+        return Duration::ZERO;
+    }
+    next_refresh
+        .saturating_duration_since(now)
+        .max(Duration::from_millis(1))
+}
+
+/// mex can do nothing without a socket: with neither family open,
+/// startup fails instead of running a listener that can never receive
+/// (or shut down) while queries vanish. One open family is enough.
+fn require_transport(v4_open: bool, v6_open: bool) -> Result<()> {
+    if v4_open || v6_open {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "no mDNS socket could be opened (neither IPv4 nor IPv6)"
+        ))
+    }
+}
+
+/// Queries sent per loop pass before the sockets get their turn, so a
+/// burst of queries can't hold off reads (and overflow receive buffers).
+const QUERY_BUDGET: usize = 64;
+
+/// Send up to `budget` queued queries. Returns how many were sent and
+/// whether more may be waiting (the budget was reached). Wakes may
+/// coalesce, so the queue is drained on every pass.
+fn drain_queries(
+    rx: &mpsc::Receiver<QueryRequest>,
+    budget: usize,
+    mut send: impl FnMut(&QueryRequest),
+) -> (usize, bool) {
+    let mut sent = 0;
+    while sent < budget {
+        let Ok(req) = rx.try_recv() else {
+            return (sent, false);
+        };
+        send(&req);
+        sent += 1;
+    }
+    (sent, true)
+}
+
+/// The single listener: one thread, one poll loop over both family
+/// sockets and the query waker. Per-link state (interface lists, name
+/// and subnet maps) is shared by both families and refreshed once per
+/// `IFACE_REFRESH`, which also bounds the poll timeout: an idle network
+/// wakes the thread once per refresh.
+struct Listener {
+    poll: mio::Poll,
+    v4: Option<FamilySocket>,
+    v6: Option<FamilySocket>,
     tx: mpsc::Sender<Event>,
     query_rx: mpsc::Receiver<QueryRequest>,
     drops: Arc<DropStats>,
-    family: Family,
     selection: Option<HashSet<String>>,
-) {
-    let mut buf = vec![0u8; 65535];
-    let mut ifaces_v4: Vec<(String, Ipv4Addr)> = Vec::new();
-    let mut ifaces_v6: Vec<(String, u32)> = Vec::new();
-    let mut ifnames: HashMap<u32, String> = HashMap::new();
-    let mut subnets: SubnetMap = HashMap::new();
-    let mut unknown: HashSet<u32> = HashSet::new();
-    let mut last_refresh: Option<Instant> = None;
+    ifaces_v4: Vec<(String, Ipv4Addr)>,
+    ifaces_v6: Vec<(String, u32)>,
+    ifnames: HashMap<u32, String>,
+    subnets: SubnetMap,
+    unknown: HashSet<u32>,
+    next_refresh: Instant,
+    /// The last pass stopped at `QUERY_BUDGET`: more may be queued,
+    /// and the waker won't announce them again.
+    queries_pending: bool,
+    buf: Vec<u8>,
+}
 
-    loop {
-        if last_refresh
-            .map(|t| t.elapsed() >= IFACE_REFRESH)
-            .unwrap_or(true)
-        {
-            last_refresh = Some(Instant::now());
-            log::debug!("mex: refreshing interface list");
-            (ifnames, subnets) = link_maps();
-            unknown.clear();
-            // Joins run unconditionally every pass: they are idempotent,
-            // and a rejoin is required after an interface went away and
-            // came back (same name, new incarnation).
-            match family {
-                Family::V4 => {
-                    ifaces_v4 = v4_interfaces(selection.as_ref());
-                    for (name, ip) in &ifaces_v4 {
-                        if let Err(e) = socket.join_multicast_v4(&MDNS_V4, ip) {
-                            // Duplicate joins report AddrInUse; the membership
-                            // is already in place, so only log real failures.
-                            if e.kind() != std::io::ErrorKind::AddrInUse {
-                                log::warn!("mex: v4 mcast {name}: {e}");
-                            }
-                        }
-                    }
+impl Listener {
+    fn new(
+        poll: mio::Poll,
+        v4: Option<FamilySocket>,
+        v6: Option<FamilySocket>,
+        tx: mpsc::Sender<Event>,
+        query_rx: mpsc::Receiver<QueryRequest>,
+        drops: Arc<DropStats>,
+        selection: Option<HashSet<String>>,
+    ) -> Self {
+        Self {
+            poll,
+            v4,
+            v6,
+            tx,
+            query_rx,
+            drops,
+            selection,
+            ifaces_v4: Vec::new(),
+            ifaces_v6: Vec::new(),
+            ifnames: HashMap::new(),
+            subnets: HashMap::new(),
+            unknown: HashSet::new(),
+            next_refresh: Instant::now(),
+            queries_pending: false,
+            buf: vec![0u8; 65535],
+        }
+    }
+
+    fn run(&mut self) {
+        let mut events = mio::Events::with_capacity(16);
+        loop {
+            if Instant::now() >= self.next_refresh {
+                self.refresh();
+                self.next_refresh = Instant::now() + IFACE_REFRESH;
+            }
+            self.send_queued();
+            // Sockets left over from a budget-capped pass go first.
+            for family in [Family::V4, Family::V6] {
+                if self.socket(family).is_some_and(|s| s.pending) && !self.read_family(family) {
+                    return;
                 }
-                Family::V6 => {
-                    ifaces_v6 = v6_interfaces(selection.as_ref());
-                    for (name, idx) in &ifaces_v6 {
-                        if let Err(e) = socket.join_multicast_v6(&MDNS_V6, *idx) {
-                            if e.kind() != std::io::ErrorKind::AddrInUse {
-                                log::warn!("mex: v6 mcast {name}: {e}");
-                            }
-                        }
+            }
+            let pending = self.queries_pending
+                || [&self.v4, &self.v6]
+                    .into_iter()
+                    .flatten()
+                    .any(|s| s.pending);
+            let timeout = poll_timeout(Instant::now(), self.next_refresh, pending);
+            if let Err(e) = self.poll.poll(&mut events, Some(timeout)) {
+                if e.kind() != std::io::ErrorKind::Interrupted {
+                    log::error!("mex: poll error: {e}");
+                    thread::sleep(Duration::from_secs(1));
+                }
+                continue;
+            }
+            for event in &events {
+                let family = match event.token() {
+                    V4_TOKEN => Family::V4,
+                    V6_TOKEN => Family::V6,
+                    // Queries are sent at the top of every pass.
+                    _ => continue,
+                };
+                if !self.read_family(family) {
+                    return;
+                }
+            }
+        }
+    }
+
+    fn socket(&self, family: Family) -> Option<&FamilySocket> {
+        match family {
+            Family::V4 => self.v4.as_ref(),
+            Family::V6 => self.v6.as_ref(),
+        }
+    }
+
+    /// Recompute both families' interface lists and the shared link
+    /// maps, and (re)join the mDNS group on every listed link. Joins run
+    /// unconditionally every pass: they are idempotent, and a rejoin is
+    /// required after an interface went away and came back (same name,
+    /// new incarnation).
+    fn refresh(&mut self) {
+        log::debug!("mex: refreshing interface list");
+        (self.ifnames, self.subnets) = link_maps();
+        self.unknown.clear();
+        if let Some(socket) = &self.v4 {
+            self.ifaces_v4 = v4_interfaces(self.selection.as_ref());
+            for (name, ip) in &self.ifaces_v4 {
+                if let Err(e) = socket.pktinfo.join_multicast_v4(&MDNS_V4, ip) {
+                    // Duplicate joins report AddrInUse; the membership
+                    // is already in place, so only log real failures.
+                    if e.kind() != std::io::ErrorKind::AddrInUse {
+                        log::warn!("mex: v4 mcast {name}: {e}");
                     }
                 }
             }
         }
-
-        // drain any pending outgoing queries
-        while let Ok(req) = query_rx.try_recv() {
-            send_on_all_interfaces(socket, &req, family, &ifaces_v4, &ifaces_v6);
-        }
-
-        match socket.recv(&mut buf) {
-            Ok((len, info)) => {
-                // The v6 socket is dual-stack (no IPV6_V6ONLY setter on the
-                // wrapper): v4 traffic also arrives here as v4-mapped. Drop
-                // it so the v4 socket remains the single owner of v4
-                // packets instead of recording everything twice.
-                if is_v4_mapped(&info.addr_src) {
-                    continue;
-                }
-                let raw = buf[..len].to_vec();
-                let ifindex = info.if_index as u32;
-                if !ifnames.contains_key(&ifindex) || !subnets.contains_key(&ifindex) {
-                    // Stale maps (interface appeared mid-window) or an
-                    // index if-addrs never reports: re-query once
-                    // instead of waiting out the 10s refresh.
-                    backfill_link(
-                        ifindex,
-                        &mut ifnames,
-                        &mut subnets,
-                        &mut unknown,
-                        &link_maps,
-                    );
-                }
-                // RFC 6762 §11: multicast-destination packets are local
-                // regardless of source; unicast-destination ones must
-                // come from a local subnet, else silently discard (this
-                // is the spoof guard for our QU unicast replies).
-                if !mdns_multicast_dest(&info.addr_dst)
-                    && !source_on_link(&subnets, ifindex, &info.addr_src.ip())
-                {
-                    drops.note(info.addr_src);
-                    continue;
-                }
-                let iface = ifnames.get(&ifindex).map(String::as_str).unwrap_or("");
-                // Explicit selection drops off-selection ingress, including
-                // unicast replies that bypass multicast group membership.
-                if !interface_selected(iface, selection.as_ref()) {
-                    continue;
-                }
-                match parse_packet(&raw, info.addr_src, info.addr_dst, iface, ifindex) {
-                    Some(ev) => {
-                        if tx.send(ev).is_err() {
-                            break;
-                        }
+        if let Some(socket) = &self.v6 {
+            self.ifaces_v6 = v6_interfaces(self.selection.as_ref());
+            for (name, idx) in &self.ifaces_v6 {
+                if let Err(e) = socket.pktinfo.join_multicast_v6(&MDNS_V6, *idx) {
+                    if e.kind() != std::io::ErrorKind::AddrInUse {
+                        log::warn!("mex: v6 mcast {name}: {e}");
                     }
-                    None => drops.note_malformed(info.addr_src),
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Send queued queries (up to the budget) on each open family.
+    fn send_queued(&mut self) {
+        let Self {
+            v4,
+            v6,
+            query_rx,
+            ifaces_v4,
+            ifaces_v6,
+            ..
+        } = self;
+        let (_, more) = drain_queries(query_rx, QUERY_BUDGET, |req| {
+            for socket in [v4.as_ref(), v6.as_ref()].into_iter().flatten() {
+                send_on_all_interfaces(&socket.pktinfo, req, socket.family, ifaces_v4, ifaces_v6);
             }
+        });
+        self.queries_pending = more;
+    }
+
+    /// Drain one family's socket within the budget. Re-arms readiness
+    /// once it is empty (as mdns-sd does; this keeps Windows readiness
+    /// right too). Returns `false` when the app has stopped.
+    fn read_family(&mut self, family: Family) -> bool {
+        let Some(mut socket) = (match family {
+            Family::V4 => self.v4.take(),
+            Family::V6 => self.v6.take(),
+        }) else {
+            return true;
+        };
+        let drained = drain_budgeted(READ_BUDGET, || self.read_one(&socket.pktinfo));
+        socket.pending = drained == Drained::Budget;
+        if drained == Drained::Empty {
+            if let Err(e) = self.poll.registry().reregister(
+                &mut socket.readiness,
+                socket.token,
+                mio::Interest::READABLE,
+            ) {
+                log::error!("mex: re-arming {family:?} socket: {e}");
+            }
+        }
+        match family {
+            Family::V4 => self.v4 = Some(socket),
+            Family::V6 => self.v6 = Some(socket),
+        }
+        drained != Drained::Closed
+    }
+
+    /// Read and handle one datagram.
+    fn read_one(&mut self, socket: &PktInfoUdpSocket) -> ReadStep {
+        let (len, info) = match socket.recv(&mut self.buf) {
+            Ok(read) => read,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return ReadStep::WouldBlock,
             Err(e) => {
+                // Stop this drain; readiness re-arms and the next datagram
+                // announces itself.
                 log::error!("mex: recv error: {e}");
-                thread::sleep(Duration::from_secs(1));
+                return ReadStep::WouldBlock;
             }
+        };
+        let raw = self.buf[..len].to_vec();
+        let ifindex = info.if_index as u32;
+        if !self.ifnames.contains_key(&ifindex) || !self.subnets.contains_key(&ifindex) {
+            // Stale maps (interface appeared mid-window) or an index
+            // if-addrs never reports: re-query once instead of waiting
+            // out the 10s refresh.
+            backfill_link(
+                ifindex,
+                &mut self.ifnames,
+                &mut self.subnets,
+                &mut self.unknown,
+                &link_maps,
+            );
         }
+        // RFC 6762 §11: multicast-destination packets are local
+        // regardless of source; unicast-destination ones must come from
+        // a local subnet, else silently discard (this is the spoof guard
+        // for our QU unicast replies).
+        if !mdns_multicast_dest(&info.addr_dst)
+            && !source_on_link(&self.subnets, ifindex, &info.addr_src.ip())
+        {
+            self.drops.note(info.addr_src);
+            return ReadStep::Handled;
+        }
+        let iface = self.ifnames.get(&ifindex).map(String::as_str).unwrap_or("");
+        // Explicit selection drops off-selection ingress, including
+        // unicast replies that bypass multicast group membership.
+        if !interface_selected(iface, self.selection.as_ref()) {
+            return ReadStep::Handled;
+        }
+        match parse_packet(&raw, info.addr_src, info.addr_dst, iface, ifindex) {
+            Some(ev) => {
+                if self.tx.send(ev).is_err() {
+                    return ReadStep::Closed;
+                }
+            }
+            None => self.drops.note_malformed(info.addr_src),
+        }
+        ReadStep::Handled
     }
 }
 
@@ -773,13 +1018,6 @@ fn send_on_all_interfaces(
                 send_query(socket, req, mdns_dest_v6(*idx), name);
             }
         }
-    }
-}
-
-fn is_v4_mapped(addr: &SocketAddr) -> bool {
-    match addr.ip() {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().is_some(),
-        _ => false,
     }
 }
 
@@ -2577,6 +2815,154 @@ mod tests {
         assert!(!socket2::Socket::from(std4).multicast_loop_v4().unwrap());
         let std6 = create_v6_socket().unwrap().try_clone_std().unwrap();
         assert!(!socket2::Socket::from(std6).multicast_loop_v6().unwrap());
+    }
+
+    #[test]
+    fn v6_socket_is_v6_only() {
+        // v4 traffic belongs to the v4 socket alone: no v4-mapped
+        // packets on the v6 socket, whatever the platform default.
+        let std6 = create_v6_socket().unwrap().try_clone_std().unwrap();
+        assert!(socket2::Socket::from(std6).only_v6().unwrap());
+    }
+
+    #[test]
+    fn poll_timeout_waits_for_refresh_unless_reads_are_pending() {
+        let now = Instant::now();
+        let refresh = now + Duration::from_secs(7);
+        assert_eq!(poll_timeout(now, refresh, false), Duration::from_secs(7));
+        assert_eq!(poll_timeout(now, refresh, true), Duration::ZERO);
+        // A due (or overdue) refresh never yields a zero timeout: no spin.
+        assert_eq!(poll_timeout(now, now, false), Duration::from_millis(1));
+        assert_eq!(
+            poll_timeout(now + Duration::from_secs(1), now, false),
+            Duration::from_millis(1)
+        );
+    }
+
+    #[test]
+    fn drain_stops_at_would_block_budget_or_closed_receiver() {
+        let mut left = 3;
+        let empty = drain_budgeted(10, || {
+            if left == 0 {
+                return ReadStep::WouldBlock;
+            }
+            left -= 1;
+            ReadStep::Handled
+        });
+        assert_eq!(empty, Drained::Empty);
+        let mut reads = 0;
+        let capped = drain_budgeted(4, || {
+            reads += 1;
+            ReadStep::Handled
+        });
+        assert_eq!((capped, reads), (Drained::Budget, 4));
+        assert_eq!(drain_budgeted(4, || ReadStep::Closed), Drained::Closed);
+    }
+
+    #[test]
+    fn query_send_wakes_the_poll_and_is_drained() {
+        // A queued query wakes the loop at once (no sleep to wait out)
+        // and is sent exactly once.
+        let mut poll = mio::Poll::new().unwrap();
+        let waker = Arc::new(mio::Waker::new(poll.registry(), WAKER_TOKEN).unwrap());
+        let (tx, rx) = mpsc::channel();
+        let query_tx = QueryTx { tx, waker };
+        let req = QueryRequest {
+            name: "_http._tcp.local".to_string(),
+            record_type: TYPE::PTR,
+            known_answers: Vec::new(),
+            qu: false,
+        };
+        assert!(query_tx.send(req.clone()));
+        assert!(query_tx.send(req));
+        let mut events = mio::Events::with_capacity(4);
+        let started = Instant::now();
+        poll.poll(&mut events, Some(Duration::from_secs(5)))
+            .unwrap();
+        assert!(
+            events.iter().any(|e| e.token() == WAKER_TOKEN),
+            "the waker fired"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "woken, not timed out"
+        );
+        let mut names = Vec::new();
+        assert_eq!(
+            drain_queries(&rx, QUERY_BUDGET, |q| names.push(q.name.clone())),
+            (2, false)
+        );
+        assert_eq!(names, vec!["_http._tcp.local"; 2]);
+        assert_eq!(
+            drain_queries(&rx, QUERY_BUDGET, |_| {}),
+            (0, false),
+            "drained once"
+        );
+    }
+
+    #[test]
+    fn query_drain_is_budgeted_per_pass() {
+        // A query burst can't hold off socket reads: one pass sends at
+        // most the budget and reports the rest as pending.
+        let (tx, rx) = mpsc::channel();
+        for i in 0..5 {
+            tx.send(QueryRequest {
+                name: format!("q{i}.local"),
+                record_type: TYPE::A,
+                known_answers: Vec::new(),
+                qu: false,
+            })
+            .unwrap();
+        }
+        let mut sent = Vec::new();
+        assert_eq!(
+            drain_queries(&rx, 3, |q| sent.push(q.name.clone())),
+            (3, true)
+        );
+        assert_eq!(
+            drain_queries(&rx, 3, |q| sent.push(q.name.clone())),
+            (2, false)
+        );
+        assert_eq!(
+            sent,
+            ["q0.local", "q1.local", "q2.local", "q3.local", "q4.local"]
+        );
+    }
+
+    #[test]
+    fn startup_needs_at_least_one_socket() {
+        assert!(require_transport(true, true).is_ok());
+        assert!(require_transport(true, false).is_ok());
+        assert!(require_transport(false, true).is_ok());
+        let err = require_transport(false, false).unwrap_err().to_string();
+        assert!(err.contains("no mDNS socket"), "{err}");
+    }
+
+    #[test]
+    fn listener_runs_with_one_family_missing() {
+        // One family failing to open must not stop the other: a missing
+        // socket is skipped by refresh and reads.
+        let poll = mio::Poll::new().unwrap();
+        let v4 = FamilySocket::open(Family::V4, poll.registry()).expect("v4 socket");
+        let (tx, _rx) = mpsc::channel();
+        let (_query_tx, query_rx) = mpsc::channel();
+        let mut listener = Listener::new(
+            poll,
+            Some(v4),
+            None,
+            tx,
+            query_rx,
+            Arc::new(DropStats::default()),
+            Some(HashSet::new()),
+        );
+        listener.refresh();
+        assert!(listener.ifaces_v6.is_empty());
+        assert!(
+            listener.read_family(Family::V6),
+            "missing family is a no-op"
+        );
+        assert!(listener.read_family(Family::V4), "open family drains");
+        assert!(listener.v4.is_some(), "socket put back after the drain");
     }
 
     #[test]
