@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -226,31 +226,6 @@ enum PauseLog {
     Resumed,
 }
 
-/// Per-family paused state, so pausing and resuming are logged once
-/// per transition, never per skipped query. Families start active, so
-/// starting with no usable link logs one pause.
-#[derive(Debug, Default)]
-struct TransmitPause {
-    v4_paused: bool,
-    v6_paused: bool,
-}
-
-impl TransmitPause {
-    /// Record whether `family` has usable links after a refresh.
-    fn update(&mut self, family: Family, has_links: bool) -> Option<PauseLog> {
-        let paused = match family {
-            Family::V4 => &mut self.v4_paused,
-            Family::V6 => &mut self.v6_paused,
-        };
-        let was_paused = std::mem::replace(paused, !has_links);
-        match (was_paused, has_links) {
-            (false, false) => Some(PauseLog::Paused),
-            (true, true) => Some(PauseLog::Resumed),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordSection {
     Answer,
@@ -412,9 +387,103 @@ pub struct QueryRequest {
 pub struct QueryTx {
     tx: mpsc::Sender<QueryRequest>,
     waker: Arc<mio::Waker>,
+    transmit: Arc<TransmitState>,
+}
+
+/// Whether each family can transmit right now: its socket is open and
+/// it has at least one usable link. The single source of truth: the
+/// listener writes it through `update` on every interface refresh
+/// (the first one runs in `spawn`, before the app's first tick), and
+/// the app only reads it. Starts from socket availability, so starting
+/// with no usable link reports one pause. Both families live in one
+/// atomic, written and read in one step, so a v4-to-v6 handoff in one
+/// refresh never shows "no family" in between.
+#[derive(Debug)]
+pub struct TransmitState {
+    /// `V4_BIT` | `V6_BIT` for the families that can transmit.
+    bits: AtomicU8,
+    /// Tests pin the flags so the real listener can't overwrite them.
+    pinned: AtomicBool,
+}
+
+const V4_BIT: u8 = 0b01;
+const V6_BIT: u8 = 0b10;
+
+fn family_bit(family: Family) -> u8 {
+    match family {
+        Family::V4 => V4_BIT,
+        Family::V6 => V6_BIT,
+    }
+}
+
+fn transmit_bits(v4: bool, v6: bool) -> u8 {
+    (if v4 { V4_BIT } else { 0 }) | (if v6 { V6_BIT } else { 0 })
+}
+
+impl TransmitState {
+    pub fn new(v4: bool, v6: bool) -> Self {
+        Self {
+            bits: AtomicU8::new(transmit_bits(v4, v6)),
+            pinned: AtomicBool::new(false),
+        }
+    }
+
+    /// Per-family flags as (v4, v6), from one load.
+    pub fn flags(&self) -> (bool, bool) {
+        let bits = self.bits.load(Ordering::Relaxed);
+        (bits & V4_BIT != 0, bits & V6_BIT != 0)
+    }
+
+    /// Whether any family can transmit.
+    pub fn any(&self) -> bool {
+        self.bits.load(Ordering::Relaxed) != 0
+    }
+
+    /// Pin both flags for a test: later listener updates are ignored,
+    /// so the result doesn't depend on the host's interfaces.
+    #[cfg(test)]
+    pub fn pin(&self, v4: bool, v6: bool) {
+        self.pinned.store(true, Ordering::Relaxed);
+        self.bits.store(transmit_bits(v4, v6), Ordering::Relaxed);
+    }
+
+    /// Record, after a refresh, whether each family has usable links
+    /// (`None`: its socket never opened, keep it as is), stored in one
+    /// step. Returns the transition to log once per family, in
+    /// (v4, v6) order; pausing and resuming are never logged per
+    /// skipped query.
+    fn update(&self, v4: Option<bool>, v6: Option<bool>) -> [Option<PauseLog>; 2] {
+        if self.pinned.load(Ordering::Relaxed) {
+            return [None, None];
+        }
+        let old = self.bits.load(Ordering::Relaxed);
+        let mut new = old;
+        for (family, has_links) in [(Family::V4, v4), (Family::V6, v6)] {
+            match has_links {
+                Some(true) => new |= family_bit(family),
+                Some(false) => new &= !family_bit(family),
+                None => {}
+            }
+        }
+        // The listener is the only writer: one store publishes both.
+        self.bits.store(new, Ordering::Relaxed);
+        [Family::V4, Family::V6].map(|family| {
+            let bit = family_bit(family);
+            match (old & bit != 0, new & bit != 0) {
+                (true, false) => Some(PauseLog::Paused),
+                (false, true) => Some(PauseLog::Resumed),
+                _ => None,
+            }
+        })
+    }
 }
 
 impl QueryTx {
+    /// The shared per-family transmit state.
+    pub fn transmit(&self) -> &TransmitState {
+        &self.transmit
+    }
+
     /// Queue a query and wake the listener. Returns `true` when the
     /// listener accepted the request — the transport may still fail to
     /// send (encode error, closed socket), which is logged in
@@ -490,12 +559,23 @@ pub fn spawn(
     let v4 = FamilySocket::open(Family::V4, poll.registry());
     let v6 = FamilySocket::open(Family::V6, poll.registry());
     require_transport(v4.is_some(), v6.is_some())?;
-    let mut listener = Listener::new(poll, v4, v6, tx, query_rx, drops.clone(), selection);
+    let transmit = Arc::new(TransmitState::new(v4.is_some(), v6.is_some()));
+    let shared = SharedWithApp {
+        drops: drops.clone(),
+        transmit: transmit.clone(),
+    };
+    let mut listener = Listener::new(poll, v4, v6, tx, query_rx, shared, selection);
+    // First interface refresh before returning: the transmit flags then
+    // reflect usable links by the app's first tick, so no startup query
+    // is counted as sent while nothing can transmit.
+    listener.refresh();
+    listener.next_refresh = Instant::now() + IFACE_REFRESH;
     thread::spawn(move || listener.run());
     Ok((
         QueryTx {
             tx: query_tx,
             waker,
+            transmit,
         },
         rx,
         drops,
@@ -919,6 +999,12 @@ fn drain_queries(
     (sent, true)
 }
 
+/// State the listener updates and the app thread reads.
+struct SharedWithApp {
+    drops: Arc<DropStats>,
+    transmit: Arc<TransmitState>,
+}
+
 /// The single listener: one thread, one poll loop over both family
 /// sockets and the query waker. Per-link state (interface lists, name
 /// and subnet maps) is shared by both families and refreshed once per
@@ -942,7 +1028,7 @@ struct Listener {
     /// and the waker won't announce them again.
     queries_pending: bool,
     send_failures: SendFailures,
-    transmit_pause: TransmitPause,
+    transmit: Arc<TransmitState>,
     buf: Vec<u8>,
 }
 
@@ -953,9 +1039,10 @@ impl Listener {
         v6: Option<FamilySocket>,
         tx: mpsc::Sender<Event>,
         query_rx: mpsc::Receiver<QueryRequest>,
-        drops: Arc<DropStats>,
+        shared: SharedWithApp,
         selection: Option<HashSet<String>>,
     ) -> Self {
+        let SharedWithApp { drops, transmit } = shared;
         Self {
             poll,
             v4,
@@ -972,7 +1059,7 @@ impl Listener {
             next_refresh: Instant::now(),
             queries_pending: false,
             send_failures: SendFailures::default(),
-            transmit_pause: TransmitPause::default(),
+            transmit,
             buf: vec![0u8; 65535],
         }
     }
@@ -1066,16 +1153,14 @@ impl Listener {
             self.ifaces_v6.iter().map(|(name, _)| name.as_str()),
         );
         // A family with an open socket but no usable link sends nothing;
-        // log the pause and the resume once each.
-        for (family, open, has_links) in [
-            (Family::V4, self.v4.is_some(), !self.ifaces_v4.is_empty()),
-            (Family::V6, self.v6.is_some(), !self.ifaces_v6.is_empty()),
-        ] {
-            if !open {
-                continue;
-            }
+        // publish both families in one step and log each pause and
+        // resume once.
+        let v4 = self.v4.as_ref().map(|_| !self.ifaces_v4.is_empty());
+        let v6 = self.v6.as_ref().map(|_| !self.ifaces_v6.is_empty());
+        let transitions = self.transmit.update(v4, v6);
+        for (family, transition) in [Family::V4, Family::V6].into_iter().zip(transitions) {
             let label = family.label();
-            match self.transmit_pause.update(family, has_links) {
+            match transition {
                 Some(PauseLog::Paused) => {
                     log::info!("mex: no usable {label} interface; {label} queries paused")
                 }
@@ -3093,7 +3178,11 @@ mod tests {
         let mut poll = mio::Poll::new().unwrap();
         let waker = Arc::new(mio::Waker::new(poll.registry(), WAKER_TOKEN).unwrap());
         let (tx, rx) = mpsc::channel();
-        let query_tx = QueryTx { tx, waker };
+        let query_tx = QueryTx {
+            tx,
+            waker,
+            transmit: Arc::new(TransmitState::new(true, true)),
+        };
         let req = QueryRequest {
             name: "_http._tcp.local".to_string(),
             record_type: TYPE::PTR,
@@ -3317,19 +3406,42 @@ mod tests {
 
     #[test]
     fn pause_and_resume_log_once_per_transition() {
-        let mut pause = TransmitPause::default();
+        use PauseLog::{Paused, Resumed};
+        let state = TransmitState::new(true, true);
         // Starting with links: nothing to say.
-        assert_eq!(pause.update(Family::V6, true), None);
+        assert_eq!(state.update(None, Some(true)), [None, None]);
         // Links gone: one pause line, then silence while it stays empty.
-        assert_eq!(pause.update(Family::V6, false), Some(PauseLog::Paused));
-        assert_eq!(pause.update(Family::V6, false), None);
+        assert_eq!(state.update(None, Some(false)), [None, Some(Paused)]);
+        assert_eq!(state.update(None, Some(false)), [None, None]);
         // Back: one resume line, then silence.
-        assert_eq!(pause.update(Family::V6, true), Some(PauseLog::Resumed));
-        assert_eq!(pause.update(Family::V6, true), None);
-        assert_eq!(pause.update(Family::V6, false), Some(PauseLog::Paused));
-        // Families are independent; starting empty logs the pause once.
-        assert_eq!(pause.update(Family::V4, false), Some(PauseLog::Paused));
-        assert_eq!(pause.update(Family::V4, false), None);
+        assert_eq!(state.update(None, Some(true)), [None, Some(Resumed)]);
+        assert_eq!(state.update(None, Some(true)), [None, None]);
+        // Families are independent; starting empty logs the pause once,
+        // and a closed socket (None) keeps its family as is.
+        assert_eq!(state.update(Some(false), None), [Some(Paused), None]);
+        assert_eq!(state.update(Some(false), None), [None, None]);
+        assert_eq!(state.flags(), (false, true));
+    }
+
+    #[test]
+    fn handoff_publishes_both_families_in_one_step() {
+        // v4 goes down while v6 comes up in the same refresh: both
+        // flags change in one store, so a reader never sees "no family".
+        let state = TransmitState::new(true, false);
+        assert_eq!(
+            state.update(Some(false), Some(true)),
+            [Some(PauseLog::Paused), Some(PauseLog::Resumed)]
+        );
+        assert_eq!(state.flags(), (false, true));
+        assert!(state.any());
+    }
+
+    #[test]
+    fn pinned_flags_ignore_listener_updates() {
+        let state = TransmitState::new(true, true);
+        state.pin(false, true);
+        assert_eq!(state.update(Some(true), Some(false)), [None, None]);
+        assert_eq!(state.flags(), (false, true));
     }
 
     #[test]
@@ -3464,7 +3576,10 @@ mod tests {
             None,
             tx,
             query_rx,
-            Arc::new(DropStats::default()),
+            SharedWithApp {
+                drops: Arc::new(DropStats::default()),
+                transmit: Arc::new(TransmitState::new(true, false)),
+            },
             Some(HashSet::new()),
         );
         listener.refresh();
