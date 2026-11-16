@@ -329,18 +329,10 @@ fn partition_anomaly_keys(found: &[crate::anomalies::Anomaly]) -> AnomalyMarks {
         let name = name.trim_end_matches('.').to_lowercase();
         if !a.kind.is_ttl() {
             if let Some(rdata) = a.rdata.as_ref() {
-                content.insert((
-                    name,
-                    rtype,
-                    crate::anomalies::anomaly_match_key(rtype, rdata),
-                ));
+                content.insert((name, rtype, rdata.clone()));
             }
         } else if let Some(rdata) = a.rdata.as_ref() {
-            ttl.insert((
-                name,
-                rtype,
-                crate::anomalies::anomaly_match_key(rtype, rdata),
-            ));
+            ttl.insert((name, rtype, rdata.clone()));
         } else {
             unstable.insert((name, rtype));
         }
@@ -825,18 +817,11 @@ fn detail_table_rows<'a>(
         // other sources; only live rows earn the marker.
         let live = rec.ttl > 0 && rec.received_at.elapsed().as_secs() as u32 <= rec.ttl;
         let name = rec.name.trim_end_matches('.').to_lowercase();
-        let content_flagged = live
-            && content_keys.contains(&(
-                name.clone(),
-                rec.rtype,
-                crate::anomalies::anomaly_match_key(rec.rtype, &rec.rdata),
-            ));
+        let content_flagged =
+            live && content_keys.contains(&(name.clone(), rec.rtype, rec.rdata.clone()));
         let ttl_flagged = live
-            && (ttl_keys.contains(&(
-                name.clone(),
-                rec.rtype,
-                crate::anomalies::anomaly_match_key(rec.rtype, &rec.rdata),
-            )) || ttl_unstable.contains(&(name, rec.rtype)));
+            && (ttl_keys.contains(&(name.clone(), rec.rtype, rec.rdata.clone()))
+                || ttl_unstable.contains(&(name, rec.rtype)));
         let flush = if rec.flush_bit { "flush" } else { "" };
         let rem = rec
             .ttl

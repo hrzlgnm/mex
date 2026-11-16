@@ -25,7 +25,8 @@ fn name_has_invalid_utf8(name: &simple_dns::Name<'_>) -> bool {
 /// Whether name-valued rdata holds non-UTF-8 bytes: the same set of
 /// variants `rdata_label` renders as names. TXT values and HINFO strings
 /// are excluded on purpose (opaque binary is legitimate there, and they
-/// never become refresh query names).
+/// never become refresh query names). Only in-scope answer types are
+/// decoded at all (`anomalies::is_mdns_answer_type`).
 fn rdata_has_invalid_utf8(rdata: &RData) -> bool {
     // Each name-wrapper is its own type, so the arms cannot share one
     // binding; every arm just asks the same question of its names.
@@ -33,17 +34,7 @@ fn rdata_has_invalid_utf8(rdata: &RData) -> bool {
         RData::PTR(n) => name_has_invalid_utf8(n),
         RData::CNAME(n) => name_has_invalid_utf8(n),
         RData::NS(n) => name_has_invalid_utf8(n),
-        RData::MD(n) => name_has_invalid_utf8(n),
-        RData::MF(n) => name_has_invalid_utf8(n),
-        RData::MB(n) => name_has_invalid_utf8(n),
-        RData::MG(n) => name_has_invalid_utf8(n),
-        RData::MR(n) => name_has_invalid_utf8(n),
-        RData::NSAP_PTR(n) => name_has_invalid_utf8(n),
-        RData::MX(mx) => name_has_invalid_utf8(&mx.exchange),
-        RData::SOA(soa) => name_has_invalid_utf8(&soa.mname) || name_has_invalid_utf8(&soa.rname),
         RData::SRV(srv) => name_has_invalid_utf8(&srv.target),
-        RData::SVCB(svcb) => name_has_invalid_utf8(&svcb.target),
-        RData::HTTPS(svcb) => name_has_invalid_utf8(&svcb.target),
         RData::NSEC(nsec) => name_has_invalid_utf8(&nsec.next_name),
         _ => false,
     }
@@ -158,8 +149,9 @@ pub struct RawRecord {
     pub section: RecordSection,
     pub received_at: Instant,
     /// The question this response most likely answered, stamped at ingest
-    /// for unicast-style records (NS/SOA/ANY) only; `None` elsewhere or
-    /// when no matching question was seen shortly before.
+    /// for out-of-scope records (`anomalies::is_mdns_answer_type` false)
+    /// only; `None` elsewhere or when no matching question was seen
+    /// shortly before.
     pub trigger: Option<QueryTrigger>,
 }
 
@@ -959,6 +951,10 @@ pub(crate) fn parse_packet(
     };
 
     let mut answers = Vec::new();
+    // On-wire RDLENGTH per resource record, in packet order (answer,
+    // authority, additional). Out-of-scope records keep only this.
+    let rdlengths = packet_rdlengths(raw, pkt.questions.len()).unwrap_or_default();
+    let mut rdlength_at = rdlengths.into_iter();
 
     // Only responses carry authoritative answers. Queries may carry the
     // same answers as known answers (RFC 6762 §7.1 suppression), which
@@ -982,7 +978,8 @@ pub(crate) fn parse_packet(
                     .map(|r| (RecordSection::Additional, r)),
             )
         {
-            answers.push(record_row(rec, record_wire(rec), section, ing));
+            let rdlength = rdlength_at.next();
+            answers.push(record_row(rec, rdlength, section, ing));
         }
     }
 
@@ -991,7 +988,8 @@ pub(crate) fn parse_packet(
     let mut query_kas = Vec::new();
     if !is_response {
         for rec in pkt.answers.iter() {
-            query_kas.push(record_row(rec, Vec::new(), RecordSection::KnownAnswer, ing));
+            let rdlength = rdlength_at.next();
+            query_kas.push(record_row(rec, rdlength, RecordSection::KnownAnswer, ing));
         }
     }
 
@@ -1025,13 +1023,33 @@ struct Ingress<'a> {
     dst_is_multicast: bool,
 }
 
+/// One parsed resource record. Out-of-scope types
+/// (`anomalies::is_mdns_answer_type` false) are never decoded: they keep
+/// owner, type, class bits, TTL and their RDLENGTH (`rdlength=<n>`),
+/// with no rdata bytes, so nothing downstream holds or interprets data
+/// mex does not support.
 fn record_row(
     rec: &ResourceRecord<'_>,
-    wire: Vec<u8>,
+    rdlength: Option<u16>,
     section: RecordSection,
     ing: Ingress<'_>,
 ) -> RawRecord {
     let rtype = u16::from(rec.rdata.type_code());
+    let in_scope = crate::anomalies::is_mdns_answer_type(rtype);
+    // Known answers never reach the hex pane, so they skip the encode.
+    let wire = if in_scope && section != RecordSection::KnownAnswer {
+        record_wire(rec)
+    } else {
+        Vec::new()
+    };
+    let (rdata, rdata_invalid_utf8) = if in_scope {
+        (rdata_label(&rec.rdata), rdata_has_invalid_utf8(&rec.rdata))
+    } else {
+        // `None` only if the packet walk failed, which a packet
+        // `Packet::parse` accepted never does.
+        let label = rdlength.map_or_else(|| "rdlength=?".to_string(), |n| format!("rdlength={n}"));
+        (label, false)
+    };
     RawRecord {
         name: display_name(&rec.name),
         owner_labels: rec
@@ -1056,9 +1074,9 @@ fn record_row(
         // `cache_flush` (RFC 6762 §10.2).
         flush_bit: rec.cache_flush,
         qu: false,
-        invalid_utf8: name_has_invalid_utf8(&rec.name) || rdata_has_invalid_utf8(&rec.rdata),
+        invalid_utf8: name_has_invalid_utf8(&rec.name) || rdata_invalid_utf8,
         ttl: rec.ttl,
-        rdata: rdata_label(&rec.rdata),
+        rdata,
         wire,
         source: ing.source,
         iface: ing.iface.to_string(),
@@ -1112,6 +1130,32 @@ fn record_wire(rec: &ResourceRecord<'_>) -> Vec<u8> {
         Ok(bytes) => bytes.get(12..).unwrap_or_default().to_vec(),
         Err(_) => Vec::new(),
     }
+}
+
+/// On-wire RDLENGTH of every resource record in a packet, in order
+/// (answer, authority, additional), skipping the question section.
+/// The parser hides it, and re-encoding would expand compressed names,
+/// so the packet is walked directly. `None` when the walk falls off
+/// the end, which a packet `Packet::parse` accepted never does.
+fn packet_rdlengths(raw: &[u8], questions: usize) -> Option<Vec<u16>> {
+    let count = |at: usize| -> Option<usize> {
+        let b = raw.get(at..at + 2)?;
+        Some(usize::from(u16::from_be_bytes([b[0], b[1]])))
+    };
+    let records = count(6)? + count(8)? + count(10)?;
+    let mut offset = 12;
+    for _ in 0..questions {
+        offset = packet_name_end(raw, offset)?.checked_add(4)?;
+    }
+    let mut out = Vec::with_capacity(records);
+    for _ in 0..records {
+        let length_at = packet_name_end(raw, offset)?.checked_add(8)?;
+        let b = raw.get(length_at..length_at.checked_add(2)?)?;
+        let rdlength = u16::from_be_bytes([b[0], b[1]]);
+        out.push(rdlength);
+        offset = length_at + 2 + usize::from(rdlength);
+    }
+    Some(out)
 }
 
 pub fn record_fields(wire: &[u8], rtype: u16) -> Vec<RecordField> {
@@ -1363,17 +1407,19 @@ pub(crate) fn is_local_name(name: &str) -> bool {
     trimmed.eq_ignore_ascii_case("local") || local_suffix_offset(trimmed).is_some()
 }
 
-/// Mnemonics for the record/question types mex names, including
-/// QTYPE-only codes such as ANY (255) that have no `TYPE` counterpart —
-/// which is why this stays keyed by raw u16 instead of the query-type
-/// enum. Single source for both directions of the mapping.
+/// Mnemonics for the in-scope record/question types
+/// (`anomalies::is_mdns_answer_type` / `is_mdns_question_type`),
+/// including QTYPE-only codes such as ANY (255) that have no `TYPE`
+/// counterpart — which is why this stays keyed by raw u16 instead of
+/// the query-type enum. Every other type renders as RFC 3597 `TYPEnn`,
+/// so mex never names a type it does not support. Single source for
+/// both directions of the mapping.
 const RTYPE_NAMES: &[(u16, &str)] = &[
     (1, "A"),
     (2, "NS"),
     (5, "CNAME"),
-    (6, "SOA"),
     (12, "PTR"),
-    (15, "MX"),
+    (13, "HINFO"),
     (16, "TXT"),
     (28, "AAAA"),
     (33, "SRV"),
@@ -1431,28 +1477,9 @@ fn rdata_label(data: &RData) -> String {
         RData::PTR(n) => display_name(n),
         RData::CNAME(n) => display_name(n),
         RData::NS(n) => display_name(n),
-        RData::MD(n) => display_name(n),
-        RData::MF(n) => display_name(n),
-        RData::MB(n) => display_name(n),
-        RData::MG(n) => display_name(n),
-        RData::MR(n) => display_name(n),
-        RData::NSAP_PTR(n) => display_name(n),
-        RData::MX(mx) => format!("{} {}", mx.preference, display_name(&mx.exchange)),
-        RData::SOA(soa) => format!(
-            "{} {} {} {} {} {} {}",
-            display_name(&soa.mname),
-            display_name(&soa.rname),
-            soa.serial,
-            soa.refresh,
-            soa.retry,
-            soa.expire,
-            soa.minimum
-        ),
         RData::HINFO(h) => {
             format!("{} {}", h.cpu, h.os)
         }
-        RData::SVCB(svcb) => display_name(&svcb.target),
-        RData::HTTPS(svcb) => display_name(&svcb.target),
         RData::NSEC(nsec) => {
             let types = nsec
                 .types()
@@ -1509,6 +1536,19 @@ mod tests {
             assert_eq!(rtype_from_str(name), Some(code));
         }
         assert_eq!(rtype_label(99), "TYPE99");
+        // Only in-scope types are named: SOA and MX are numbers only.
+        assert_eq!(rtype_label(6), "TYPE6");
+        assert_eq!(rtype_label(15), "TYPE15");
+        assert_eq!(rtype_label(13), "HINFO");
+        assert_eq!(rtype_from_str("SOA"), None);
+        assert_eq!(rtype_from_str("TYPE6"), Some(6));
+        for &(code, _) in RTYPE_NAMES {
+            assert!(
+                crate::anomalies::is_mdns_answer_type(code)
+                    || crate::anomalies::is_mdns_question_type(code),
+                "type {code} is named but out of scope"
+            );
+        }
         assert_eq!(rtype_from_str("TYPE47"), Some(47));
         assert_eq!(rtype_from_str("TYPE99"), Some(99));
         assert_eq!(rtype_from_str("bogus"), None);
@@ -1909,6 +1949,94 @@ mod tests {
         assert_eq!(ev.questions[0].name, "_http._tcp.local.");
         assert!(!ev.query_kas.is_empty());
         assert!(ev.query_kas.len() < 2000);
+    }
+
+    #[test]
+    fn out_of_scope_records_keep_only_rdlength() {
+        use simple_dns::rdata::{HINFO, MX, SOA};
+        use simple_dns::CharacterString;
+        let host = || simple_dns::Name::new_unchecked("host.local.");
+        let mut msg = Packet::new_reply(0);
+        msg.answers.push(ResourceRecord::new(
+            host(),
+            CLASS::IN,
+            4500,
+            RData::SOA(SOA {
+                mname: host(),
+                rname: simple_dns::Name::new_unchecked("admin.host.local."),
+                serial: 1,
+                refresh: 2,
+                retry: 3,
+                expire: 4,
+                minimum: 5,
+            }),
+        ));
+        msg.answers.push(ResourceRecord::new(
+            host(),
+            CLASS::IN,
+            120,
+            RData::MX(MX {
+                preference: 10,
+                exchange: host(),
+            }),
+        ));
+        msg.additional_records.push(ResourceRecord::new(
+            host(),
+            CLASS::IN,
+            120,
+            RData::HINFO(HINFO {
+                cpu: CharacterString::new(b"X86_64").unwrap(),
+                os: CharacterString::new(b"LINUX").unwrap(),
+            }),
+        ));
+        // Compressed on the wire: the SOA's names shrink to pointers, so
+        // its RDLENGTH differs from a re-encoded (expanded) record.
+        let raw = msg.build_bytes_vec_compressed().unwrap();
+        let ev =
+            parse_packet(&raw, test_source(), std::net::IpAddr::V4(MDNS_V4), "br0", 3).unwrap();
+        assert_eq!(ev.answers.len(), 3);
+        let wire_lengths = packet_rdlengths(&raw, 0).unwrap();
+        let soa = &ev.answers[0];
+        assert_eq!(soa.rtype_str, "TYPE6");
+        assert_eq!(soa.rdata, format!("rdlength={}", wire_lengths[0]));
+        assert!(
+            usize::from(wire_lengths[0]) < 2 * "host.local.".len() + 20,
+            "compressed SOA must report its on-wire length, got {}",
+            wire_lengths[0]
+        );
+        assert!(soa.wire.is_empty(), "no rdata bytes kept");
+        let mx = &ev.answers[1];
+        assert_eq!(mx.rtype_str, "TYPE15");
+        assert_eq!(mx.rdata, format!("rdlength={}", wire_lengths[1]));
+        assert!(mx.wire.is_empty());
+        // HINFO is in scope: decoded, named, with its wire bytes.
+        let hinfo = &ev.answers[2];
+        assert_eq!(hinfo.rtype_str, "HINFO");
+        assert_eq!(hinfo.section, RecordSection::Additional);
+        assert!(hinfo.rdata.contains("X86_64") && hinfo.rdata.contains("LINUX"));
+        assert!(!hinfo.wire.is_empty());
+    }
+
+    #[test]
+    fn packet_rdlengths_skips_questions_and_rejects_truncation() {
+        let mut msg = Packet::new_query(0);
+        msg.questions.push(Question::new(
+            simple_dns::Name::new_unchecked("host.local."),
+            QTYPE::TYPE(TYPE::A),
+            QCLASS::CLASS(CLASS::IN),
+            false,
+        ));
+        msg.answers.push(ResourceRecord::new(
+            simple_dns::Name::new_unchecked("host.local."),
+            CLASS::IN,
+            120,
+            RData::A(simple_dns::rdata::A {
+                address: 0x0a00_0001,
+            }),
+        ));
+        let raw = msg.build_bytes_vec().unwrap();
+        assert_eq!(packet_rdlengths(&raw, 1), Some(vec![4]));
+        assert_eq!(packet_rdlengths(&raw[..raw.len() - 6], 1), None);
     }
 
     #[test]

@@ -107,9 +107,13 @@ browsed as before.
   80% elapsed — a refresh is due — red past ~95% or expired), flush bit,
   source, and rdata. Multi-pair TXT records
   expand into unlabeled child rows. Records announced by this host are
-  highlighted; goodbye (TTL 0) records show as expired.
+  highlighted; goodbye (TTL 0) records show as expired. Only the mDNS
+  answer types A, AAAA, NS, CNAME, PTR, TXT, SRV, NSEC and HINFO become
+  rows; see [Out-of-scope types](#out-of-scope-types).
 - **Right middle — Questions.** Recently observed queries asking for this
   service, newest first (capped), with per-query age instead of TTL.
+  Only questions for A, AAAA, NS, CNAME, PTR, TXT, SRV, HINFO and ANY
+  become rows.
   Questions from this host are highlighted like local records.
   Queriers asking from an ephemeral port ([RFC 6762 §5.1](https://www.rfc-editor.org/rfc/rfc6762#section-5.1)) are tagged
   `(one-shot)`: stub resolvers, not full continuous queriers.
@@ -162,7 +166,7 @@ and surfaces each deviation as an anomaly with a severity:
   the metrics overlay and state dumps (e.g. a PTR re-announced with a
   120 s TTL instead of the recommended 4500 s, a unique record missing
   its cache-flush bit, an SRV target outside `.local`, a question for
-  NS/SOA).
+  SOA).
 
 Findings show up in several places: anomalous Answers rows get a `!`
 marker (on the type cell, or on the TTL cell when the TTL itself is
@@ -191,13 +195,38 @@ info for inconclusive lookups).
 | `enum-subtype` (warning) | subtype listed in service enumeration instead of a base type ([RFC 6763 §9](https://www.rfc-editor.org/rfc/rfc6763#section-9)) |
 | `shared-flush` (error) | shared PTR record with the cache-flush bit set ([RFC 6762 §10.2](https://www.rfc-editor.org/rfc/rfc6762#section-10.2), MUST NOT) |
 | `no-flush` (warning when confirmed, else info) | unique SRV/TXT record missing the cache-flush bit ([RFC 6762 §10.2](https://www.rfc-editor.org/rfc/rfc6762#section-10.2), MUST when confirmed); confirmed in the answer or additional section of any response mex receives, including unicast replies, since mex only listens on port 5353 and so never gets legacy unicast responses ([RFC 6762 §6.7](https://www.rfc-editor.org/rfc/rfc6762#section-6.7)) |
-| `unicast-style-response` (error, warning or info) | an mDNS response carrying unicast DNS-style records, one finding per record, naming its section: ANY is error (a query type, never a record type, [RFC 1035 §3.2.3](https://www.rfc-editor.org/rfc/rfc1035#section-3.2.3)); SOA in the Authority section is a warning (a unicast-style negative answer, where mDNS uses NSEC, [RFC 6762 §6.1](https://www.rfc-editor.org/rfc/rfc6762#section-6.1)); other SOA is a warning for names in mDNS domains (`.local` and the link-local reverse zones; mDNS zones have none, [RFC 6762 §12](https://www.rfc-editor.org/rfc/rfc6762#section-12)) and info for names outside them, such as a router's `fritz.box` zone ([RFC 6762 §3](https://www.rfc-editor.org/rfc/rfc6762#section-3)); NS is info (no meaning in mDNS); known answers are always info. State dumps add `section` and, when a question for the same name was seen up to 1 s before, `in_response_to` (`name TYPE`) and `in_response_to_own` (whether this mex instance asked) |
-| `unicast-question` (info) | multicast question for NS/SOA, which never exist in mDNS ([RFC 6762 §12](https://www.rfc-editor.org/rfc/rfc6762#section-12)); asking is compliant, since [RFC 6762 §3](https://www.rfc-editor.org/rfc/rfc6762#section-3) requires `.local` queries on multicast; ANY questions are ownership probes and stay quiet; ephemeral-port queriers are tagged one-shot |
+| `unicast-style-response` (error, warning or info) | an mDNS response carrying unicast DNS-style records, one finding per record, naming its section: ANY is error (a query type, never a record type, [RFC 1035 §3.2.3](https://www.rfc-editor.org/rfc/rfc1035#section-3.2.3)); SOA in the Authority section is a warning (a unicast-style negative answer, where mDNS uses NSEC, [RFC 6762 §6.1](https://www.rfc-editor.org/rfc/rfc6762#section-6.1)); other SOA is a warning for names in mDNS domains (`.local` and the link-local reverse zones; mDNS zones have none, [RFC 6762 §12](https://www.rfc-editor.org/rfc/rfc6762#section-12)) and info for names outside them, such as a router's `fritz.box` zone ([RFC 6762 §3](https://www.rfc-editor.org/rfc/rfc6762#section-3)); known answers are always info. State dumps add `section` and, when a question for the same name was seen up to 1 s before, `in_response_to` (`name TYPE`) and `in_response_to_own` (whether this mex instance asked) |
+| `unsupported-type` (warning; known answers info) | an mDNS response carrying any other out-of-scope record type (MX, unknown `TYPEnn`, …); DNS-SD over mDNS uses only the in-scope types ([RFC 6763 §12](https://www.rfc-editor.org/rfc/rfc6763#section-12)); state dumps add `section` and `in_response_to` like `unicast-style-response` |
+| `unsupported-question` (info) | multicast question for an out-of-scope type: SOA never exists in mDNS ([RFC 6762 §12](https://www.rfc-editor.org/rfc/rfc6762#section-12)), others are outside mDNS scope ([RFC 6763 §12](https://www.rfc-editor.org/rfc/rfc6763#section-12)); asking is compliant, since [RFC 6762 §3](https://www.rfc-editor.org/rfc/rfc6762#section-3) requires `.local` queries on multicast; ANY questions are ownership probes and stay quiet; ephemeral-port queriers are tagged one-shot |
 | `ttl-low` / `ttl-high` (warning) | TTL below 10 s (churn risk) or above 7200 s (stale-cache risk) ([RFC 6762 §10](https://www.rfc-editor.org/rfc/rfc6762#section-10), SHOULD) |
 | `ttl-mismatch` (info) | service PTR at ≤ 120 s instead of the recommended 4500 s base ([RFC 6762 §10](https://www.rfc-editor.org/rfc/rfc6762#section-10), SHOULD) |
 | `ttl-unstable` (warning) | same name and type announced with different TTL bases ([RFC 6762 §10](https://www.rfc-editor.org/rfc/rfc6762#section-10)) |
 | `srv-target` (warning: malformed, info: target needs unicast DNS or is `.`) | SRV target malformed (MUST), resolving outside mDNS, or `.` (service decidedly not available) ([RFC 2782](https://www.rfc-editor.org/rfc/rfc2782)) |
 | `txt-oversize` (warning) | TXT RDATA (wire bytes) over 1300 B, risking fragmentation ([RFC 6763 §6.2](https://www.rfc-editor.org/rfc/rfc6763#section-6.2), SHOULD NOT) |
+
+### Out-of-scope types
+
+mex supports a fixed set of mDNS types:
+
+- **Answers:** A, AAAA, NS, CNAME, PTR, TXT, SRV, NSEC (negative
+  answers, [RFC 6762 §6.1](https://www.rfc-editor.org/rfc/rfc6762#section-6.1))
+  and HINFO (Avahi publishes it with `publish-hinfo=yes`).
+- **Questions:** A, AAAA, NS, CNAME, PTR, TXT, SRV, HINFO and ANY.
+
+Every other type is out of scope. Such a record or question (including
+a known answer carried in a query, whose finding names the Known-Answer
+section and stays info) never becomes an Answers or Questions row; it
+is kept only as evidence for a `unicast-style-response`,
+`unsupported-type` or `unsupported-question` finding, attributed to
+every service whose instance name or hostname owns it, or to
+`unattributed` when nothing matches (e.g. a router's `fritz.box.` SOA).
+Attribution is resolved live, so a service that appears later claims
+its host's earlier sightings. Out-of-scope types are named only by number
+(`TYPE6` for SOA, `TYPE15` for MX), and their rdata is never decoded:
+mex keeps only its length (`rdlength=<n>`). A record finding lives for
+its TTL and is cleared by a goodbye; repeated records from the same
+source (e.g. SOA serial bumps) stay one finding. At most 256 sightings
+are kept; the metrics overlay counts evictions.
 
 Reverse-mapping PTRs (`*.in-addr.arpa`, `*.ip6.arpa`) are exempt from
 the shared-record rules: they are unique records. Omitting the flush
