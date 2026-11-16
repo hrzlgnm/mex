@@ -232,7 +232,8 @@ cleared by a goodbye; repeated records from the same source in the same
 section (e.g. SOA serial bumps) stay one finding, while each responder
 keeps its own, named with its interface like an Answers row
 (`169.254.1.1:5353@enp0s25`). Findings from known
-answers are always info. EDNS0 OPT pseudo-records are not records and
+answers are always info, and a known answer's TTL (the querier's
+remaining one) gets no TTL checks. EDNS0 OPT pseudo-records are not records and
 are ignored. At most 256 sightings are kept; the metrics overlay counts
 evictions.
 

@@ -1245,8 +1245,9 @@ pub(crate) fn is_mdns_domain(name: &str) -> bool {
 }
 
 /// Per-record checks. A known answer rides in a query (RFC 6762 §7.1):
-/// it is the querier's belief, not a responder's claim, and its TTL is
-/// the remaining one, so every finding it raises is capped at Info.
+/// it is the querier's belief, not a responder's claim, so every
+/// finding it raises is capped at Info, and its TTL (the remaining one)
+/// gets no TTL checks at all.
 fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     let first = out.len();
     check_record_claims(service_id, rec, out);
@@ -1420,10 +1421,16 @@ fn check_record_claims(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>
         });
     }
 
+    // A known answer carries the querier's *remaining* TTL (RFC 6762
+    // §7.1), not the responder's: TTL checks say nothing about it.
+    let ttl_is_remaining = rec.section == crate::browse::RecordSection::KnownAnswer;
+
     // TTL band. Recommendations per RFC 6762 §10 (SHOULD): 120s base
     // for SRV/A/AAAA, 4500s for PTR/TXT. Values outside [10s, 7200s] risk
     // churn or stale caches.
-    if rec.ttl < TTL_LOW {
+    if ttl_is_remaining {
+        // No TTL verdicts for known answers.
+    } else if rec.ttl < TTL_LOW {
         out.push(Anomaly {
             kind: AnomalyKind::TtlLow,
             severity: Severity::Warning,
@@ -1472,7 +1479,7 @@ fn check_record_claims(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>
     // This is a SHOULD-level deviation (RFC 6762 §10), not a violation:
     // Info, since 60/120s values are common in real implementations and
     // only increase cache-refresh traffic.
-    if rec.rtype == 12 && rec.ttl <= 120 && !is_reverse_ptr(&rec.name) {
+    if !ttl_is_remaining && rec.rtype == 12 && rec.ttl <= 120 && !is_reverse_ptr(&rec.name) {
         // Enumeration rows all share the owner name, so name the
         // enumerated type: otherwise every finding reads identically.
         // The announcer is appended centrally below.

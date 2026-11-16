@@ -13494,8 +13494,8 @@ mod tests {
 
     #[test]
     fn known_answer_findings_never_exceed_info() {
-        // A known answer carries its remaining TTL and the querier's
-        // belief: ttl-low and non-utf8 stay info like the type verdict.
+        // A known answer carries the querier's belief and its remaining
+        // TTL: no TTL verdict at all, and the rest stays info.
         let mut app = test_service_app();
         let querier: SocketAddr = "192.168.1.9:5353".parse().unwrap();
         let mut ka = raw_record("test.local.", 15, "TYPE15", "rdlength=9", 5);
@@ -13520,7 +13520,10 @@ mod tests {
             kinds.contains(&anomalies::AnomalyKind::UnsupportedType),
             "{kinds:?}"
         );
-        assert!(kinds.contains(&anomalies::AnomalyKind::TtlLow), "{kinds:?}");
+        assert!(
+            !kinds.iter().any(|k| k.is_ttl()),
+            "remaining TTLs get no TTL verdict: {kinds:?}"
+        );
         assert!(
             kinds.contains(&anomalies::AnomalyKind::NonUtf8),
             "{kinds:?}"
