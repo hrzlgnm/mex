@@ -31,7 +31,9 @@ Headless run (no TTY) logs to stderr.
 * `src/app.rs` — browser state, query scheduling, ingest/expire, selection.
   Out-of-scope records, known answers and questions go to `sightings`
   (never rows, never query drivers; capped, expired by TTL/time), with
-  owners resolved at analysis time.
+  owners resolved at analysis time: instance names to their service,
+  hostnames once to the host (`anomalies::host_id`), shown in every
+  sibling service's pane.
 * `src/ui.rs` — ratatui rendering only, no state mutations.
 
 ## Query scheduling (RFC 6762 §5.2, §5.4, §7.1)

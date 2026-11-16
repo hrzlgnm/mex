@@ -1984,8 +1984,10 @@ impl App {
 
     /// Normalized group key for host grouping: lowercased hostname without
     /// trailing dot, `""` when the service has no hostname yet.
+    /// Same normalization as `anomalies::host_id`, so a host group's
+    /// key is also the owner id of its host-owned findings.
     fn host_key(hostname: &str) -> String {
-        hostname.trim_end_matches('.').to_lowercase()
+        anomalies::host_id(hostname)
     }
 
     /// Display name for a host group key: first-seen hostname without its
@@ -4469,11 +4471,37 @@ impl App {
         }
     }
 
-    /// Service ids an out-of-scope record or question is attributed to:
-    /// every live service whose instance name or hostname owns the name
-    /// (questions also match the service type, like `route_question`),
-    /// plus every matching pending instance. Enumeration names belong to
-    /// the enumeration row. Empty when nothing matches.
+    /// Hostnames a service lives on, lowercased without the root dot:
+    /// its selected hostname plus every live SRV target, as for address
+    /// routing (`handle_addr`).
+    fn service_hosts(svc: &ServiceEntry) -> Vec<String> {
+        let mut hosts = Vec::new();
+        let selected = anomalies::host_id(&svc.hostname);
+        if !selected.is_empty() {
+            hosts.push(selected);
+        }
+        for r in &svc.answers {
+            if r.rtype != 33 || r.ttl <= r.received_at.elapsed().as_secs() as u32 {
+                continue;
+            }
+            if let Some(target) = srv_target(&r.rdata) {
+                let target = anomalies::host_id(target);
+                if !hosts.contains(&target) {
+                    hosts.push(target);
+                }
+            }
+        }
+        hosts
+    }
+
+    /// Finding owners for an out-of-scope record or question:
+    /// * enumeration names belong to the enumeration row;
+    /// * an instance name belongs to that live or pending service
+    ///   (questions also match the service type, like `route_question`);
+    /// * a hostname any live service lives on belongs to the host
+    ///   itself (`anomalies::host_id`), once, not to each service on it.
+    ///
+    /// Empty when nothing matches.
     fn sighting_owners(&self, sighting: &Sighting) -> Vec<String> {
         let name = sighting.rec.name.trim_end_matches('.').to_lowercase();
         let question = sighting.kind == SightingKind::Question;
@@ -4488,20 +4516,11 @@ impl App {
         };
         for svc in &self.services {
             let full = format!("{}.{}", svc.instance, svc.service_type).to_lowercase();
-            let host = svc.hostname.trim_end_matches('.').to_lowercase();
-            // Any live SRV target counts, not only the selected hostname,
-            // as for address routing (`handle_addr`).
-            let alternate = svc.answers.iter().any(|r| {
-                r.rtype == 33
-                    && r.ttl > r.received_at.elapsed().as_secs() as u32
-                    && srv_target(&r.rdata).is_some_and(|target| target.eq_ignore_ascii_case(&name))
-            });
-            if full == name
-                || (!host.is_empty() && host == name)
-                || alternate
-                || (question && svc.service_type.to_lowercase() == name)
-            {
+            if full == name || (question && svc.service_type.to_lowercase() == name) {
                 add(anomalies::service_id(&svc.instance, &svc.service_type));
+            }
+            if Self::service_hosts(svc).contains(&name) {
+                add(anomalies::host_id(&name));
             }
         }
         for p in &self.pending_instances {
@@ -5947,9 +5966,15 @@ impl App {
             AnomalyScope::Question(key) => Self::question_anomalies_in(found, key, &id),
             _ => Vec::new(),
         };
+        // Host-owned findings are recorded once, under the host; every
+        // service on that host shows them.
+        let hosts = match self.display_detail() {
+            Some(DetailTarget::Service(svc)) => Self::service_hosts(svc),
+            _ => Vec::new(),
+        };
         found
             .iter()
-            .filter(|a| a.service == id && a.is_surfaced())
+            .filter(|a| (a.service == id || hosts.contains(&a.service)) && a.is_surfaced())
             .map(|a| {
                 let cursor_match = row.contains(a);
                 PaneAnomaly {
@@ -7215,9 +7240,9 @@ mod tests {
     #[test]
     fn unsupported_question_routes_as_info_with_display_key() {
         // End-to-end through the real routing path: an observed SOA
-        // question lands on the service as an info-level
-        // unsupported-question finding (RFC 6762 §3 makes asking
-        // compliant), stays off the service badge, and carries the
+        // question for a service's host lands on that host as an
+        // info-level unsupported-question finding (RFC 6762 §3 makes
+        // asking compliant), stays off every badge, and carries the
         // (name, type, querier) triple.
         let mut app = App::new().unwrap();
         ingest(&mut app, &ptr_record(120));
@@ -7239,7 +7264,7 @@ mod tests {
             .into_iter()
             .find(|a| a.kind == anomalies::AnomalyKind::UnsupportedQuestion)
             .expect("expected routed SOA unicast question");
-        assert_eq!(item.service, "Test._http._tcp.local");
+        assert_eq!(item.service, "test.local");
         assert_eq!(item.severity, crate::anomalies::Severity::Info);
         assert_eq!(
             app.anomaly_counts()
@@ -11561,7 +11586,7 @@ mod tests {
             .collect();
         assert_eq!(found.len(), 2, "one info finding per querier: {found:?}");
         assert!(found.iter().all(|a| a.rtype == Some(6)
-            && a.service == "Test._http._tcp.local"
+            && a.service == "test.local"
             && a.severity == anomalies::Severity::Info));
         let detail = app.display_detail().expect("service displayed");
         let mut rows: Vec<(String, SocketAddr)> = detail
@@ -11882,9 +11907,8 @@ mod tests {
 
     #[test]
     fn shared_target_question_is_listed_once_in_global_views() {
-        // One `fritz.box SOA` question files on both services pointing at
-        // fritz.box: each pane keeps its finding, the dump and the metrics
-        // overlay list it once and name the other service.
+        // One `fritz.box SOA` question for the host both services point
+        // at: one finding, owned by the host, listed once everywhere.
         let mut app = App::new().unwrap();
         for svc in ["_fbox._tcp.local.", "_tr064._tcp.local."] {
             let instance = format!("Fritzel.{svc}");
@@ -11904,13 +11928,13 @@ mod tests {
             querier,
         ));
 
-        let per_service: Vec<_> = app
+        let owners: Vec<_> = app
             .anomalies()
             .into_iter()
             .filter(|a| a.kind == anomalies::AnomalyKind::UnsupportedQuestion)
             .map(|a| a.service)
             .collect();
-        assert_eq!(per_service.len(), 2, "each service keeps its finding");
+        assert_eq!(owners, vec!["fritz.box"], "one finding, owned by the host");
 
         let dump = app.state_dump();
         let dumped: Vec<_> = dump
@@ -11919,8 +11943,7 @@ mod tests {
             .filter(|a| a.kind == "unsupported-question")
             .collect();
         assert_eq!(dumped.len(), 1, "dump lists the question once");
-        assert_eq!(dumped[0].also_services.len(), 1);
-        assert_ne!(dumped[0].also_services[0], dumped[0].service);
+        assert!(dumped[0].also_services.is_empty());
         assert_eq!(dump.metrics["anomalies_total"], dump.anomalies.len() as u64);
 
         let overlay: Vec<_> = app
@@ -11929,7 +11952,7 @@ mod tests {
             .filter(|(k, _)| k.ends_with("unsupported-question"))
             .collect();
         assert_eq!(overlay.len(), 1, "overlay lists the question once");
-        assert!(overlay[0].1.contains("(+1 more)"), "got: {}", overlay[0].1);
+        assert!(!overlay[0].1.contains("more)"), "got: {}", overlay[0].1);
     }
 
     #[test]
@@ -13041,7 +13064,7 @@ mod tests {
         assert!(!rows.contains(&6) && !rows.contains(&15), "rows: {rows:?}");
         let soa = findings_of(&app, anomalies::AnomalyKind::UnicastStyleResponse);
         assert_eq!(soa.len(), 1);
-        assert_eq!(soa[0].service, "Test._http._tcp.local");
+        assert_eq!(soa[0].service, "test.local", "owned by the host");
         assert_eq!(soa[0].rdata.as_deref(), Some("rdlength=22"));
         assert_eq!(
             soa[0].response.as_ref().map(|r| r.section),
@@ -13049,11 +13072,13 @@ mod tests {
         );
         let mx = findings_of(&app, anomalies::AnomalyKind::UnsupportedType);
         assert_eq!(mx.len(), 1);
-        assert_eq!(mx[0].service, "Test._http._tcp.local");
+        assert_eq!(mx[0].service, "test.local");
         assert_eq!(mx[0].severity, anomalies::Severity::Warning);
-        // Warnings surface on the service badge, without a row to mark.
-        assert_eq!(app.anomaly_counts().get("Test._http._tcp.local"), Some(&2));
-        // ...and in the service's Anomalies pane.
+        // Host-owned warnings count once, on the host, not per service.
+        let counts = app.anomaly_counts();
+        assert_eq!(counts.get("test.local"), Some(&2));
+        assert_eq!(counts.get("Test._http._tcp.local"), None);
+        // ...and show in the Anomalies pane of every service on the host.
         select_instance(&mut app, "Test");
         let pane: Vec<_> = app
             .anomalies_for_selected()
@@ -13106,7 +13131,7 @@ mod tests {
     }
 
     #[test]
-    fn sighting_on_shared_host_attributes_to_every_service() {
+    fn sighting_on_shared_host_is_recorded_once_for_the_host() {
         let mut app = test_service_app();
         ingest(
             &mut app,
@@ -13132,15 +13157,28 @@ mod tests {
             &mut app,
             &raw_record("test.local.", 6, "TYPE6", "rdlength=22", 4500),
         );
-        let mut services: Vec<_> = findings_of(&app, anomalies::AnomalyKind::UnicastStyleResponse)
+        let owners: Vec<_> = findings_of(&app, anomalies::AnomalyKind::UnicastStyleResponse)
             .into_iter()
             .map(|a| a.service)
             .collect();
-        services.sort();
-        assert_eq!(
-            services,
-            vec!["Other._ipp._tcp.local", "Test._http._tcp.local"]
-        );
+        assert_eq!(owners, vec!["test.local"], "one finding, owned by the host");
+        // Both services on the host show it in their Anomalies pane.
+        for instance in ["Test", "Other"] {
+            select_instance(&mut app, instance);
+            assert!(
+                app.anomalies_for_selected()
+                    .iter()
+                    .any(|p| p.anomaly.kind == anomalies::AnomalyKind::UnicastStyleResponse),
+                "{instance} pane lacks the host finding"
+            );
+        }
+        // The overlay lists it once.
+        let overlay = app
+            .metrics_rows()
+            .into_iter()
+            .filter(|(k, _)| k.ends_with("unicast-style-response"))
+            .count();
+        assert_eq!(overlay, 1);
     }
 
     #[test]
@@ -13264,7 +13302,7 @@ mod tests {
     #[test]
     fn late_service_claims_earlier_unattributed_sighting() {
         // An SOA for the host arrives before the host's SRV: unattributed
-        // at first, the service's once the SRV names that host.
+        // at first, the host's once a service's SRV names it.
         let mut app = App::new().unwrap();
         ingest(
             &mut app,
@@ -13279,7 +13317,7 @@ mod tests {
         assert_eq!(services(&app), vec![anomalies::UNATTRIBUTED_SERVICE]);
         ingest(&mut app, &ptr_record(4500));
         ingest(&mut app, &srv_record(120));
-        assert_eq!(services(&app), vec!["Test._http._tcp.local"]);
+        assert_eq!(services(&app), vec!["test.local"]);
     }
 
     #[test]
@@ -13299,7 +13337,7 @@ mod tests {
         ));
         let found = findings_of(&app, anomalies::AnomalyKind::UnicastStyleResponse);
         assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].service, "Test._http._tcp.local");
+        assert_eq!(found[0].service, "test.local");
         assert_eq!(
             found[0].severity,
             anomalies::Severity::Info,
@@ -13367,7 +13405,7 @@ mod tests {
         let found = findings_of(&app, anomalies::AnomalyKind::UnsupportedQuestion);
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].rtype, Some(47));
-        assert_eq!(found[0].service, "Test._http._tcp.local");
+        assert_eq!(found[0].service, "test.local");
     }
 
     #[test]
@@ -13379,7 +13417,7 @@ mod tests {
         let found = findings_of(&app, anomalies::AnomalyKind::NonUtf8);
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].rtype, Some(15));
-        assert_eq!(found[0].service, "Test._http._tcp.local");
+        assert_eq!(found[0].service, "test.local");
     }
 
     #[test]
@@ -13525,9 +13563,10 @@ mod tests {
     }
 
     #[test]
-    fn sighting_on_alternate_srv_target_is_attributed() {
+    fn sighting_on_alternate_srv_target_is_owned_by_that_host() {
         // Two live SRVs for one instance: only one target becomes the
-        // hostname, yet both are owned by the service.
+        // hostname, yet both targets own their findings, and the
+        // service's pane shows both.
         let mut app = test_service_app();
         let mut alt = raw_record(
             "Test._http._tcp.local.",
@@ -13550,16 +13589,17 @@ mod tests {
         assert_eq!(
             owners,
             vec![
-                (
-                    "other.local.".to_string(),
-                    "Test._http._tcp.local".to_string()
-                ),
-                (
-                    "test.local.".to_string(),
-                    "Test._http._tcp.local".to_string()
-                ),
+                ("other.local.".to_string(), "other.local".to_string()),
+                ("test.local.".to_string(), "test.local".to_string()),
             ]
         );
+        select_instance(&mut app, "Test");
+        let pane = app
+            .anomalies_for_selected()
+            .iter()
+            .filter(|p| p.anomaly.kind == anomalies::AnomalyKind::UnsupportedType)
+            .count();
+        assert_eq!(pane, 2, "the service pane shows both hosts' findings");
     }
 
     #[test]
@@ -13593,6 +13633,42 @@ mod tests {
                     && !p.cursor_match
             ),
             "{pane:?}"
+        );
+    }
+
+    #[test]
+    fn host_owned_warning_badges_the_host_header_once() {
+        let mut app = test_service_app();
+        ingest(
+            &mut app,
+            &raw_record(
+                "_ipp._tcp.local.",
+                12,
+                "PTR",
+                "Other._ipp._tcp.local.",
+                4500,
+            ),
+        );
+        let mut other_srv = raw_record(
+            "Other._ipp._tcp.local.",
+            33,
+            "SRV",
+            "0 0 631 test.local.",
+            120,
+        );
+        other_srv.flush_bit = true;
+        ingest(&mut app, &other_srv);
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 6, "TYPE6", "rdlength=22", 4500),
+        );
+        let buf = render_to_buffer(&app, 140, 30);
+        let text = rect_text(&buf, buf.area);
+        let badged: Vec<&str> = text.lines().filter(|l| l.contains("[!1]")).collect();
+        assert_eq!(badged.len(), 1, "one badge, got: {badged:?}");
+        assert!(
+            badged[0].contains("test (2)"),
+            "badge sits on the host header: {badged:?}"
         );
     }
 }

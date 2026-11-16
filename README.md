@@ -170,8 +170,10 @@ and surfaces each deviation as an anomaly with a severity:
 
 Findings show up in several places: anomalous Answers rows get a `!`
 marker (on the type cell, or on the TTL cell when the TTL itself is
-the problem), instances carry a `[!N]` badge in the Hosts pane, and the Anomalies pane lists
-every finding for the selected service with a `>` marker on the
+the problem), instances carry a `[!N]` badge in the Hosts pane (host
+headers carry one for findings owned by the hostname itself), and the
+Anomalies pane lists every finding for the selected service and its
+host with a `>` marker on the
 highlighted row's findings. Each line reads
 `<icon> <source>: <kind> <record>: <message> (<rfc>, <requirement>)` —
 the requirement is omitted when the cited text has no RFC 2119 keyword;
@@ -217,11 +219,12 @@ Every other type is out of scope. Such a record or question (including
 a known answer carried in a query, whose finding names the Known-Answer
 section and stays info) never becomes an Answers or Questions row; it
 is kept only as evidence for a `unicast-style-response`,
-`unsupported-type` or `unsupported-question` finding, attributed to
-every service whose instance name or hostname owns it, or to
-`unattributed` when nothing matches (e.g. a router's `fritz.box.` SOA).
-Attribution is resolved live, so a service that appears later claims
-its host's earlier sightings. Out-of-scope types are named only by number
+`unsupported-type` or `unsupported-question` finding, owned by the name
+it was seen for: a service instance, or a hostname (any live SRV target)
+once for all services on that host, or `unattributed` when nothing
+matches (e.g. a router's `fritz.box.` SOA before any service points at
+it). Ownership is resolved live, so a service that appears later claims
+its host's earlier sightings for that host. Out-of-scope types are named only by number
 (`TYPE6` for SOA, `TYPE15` for MX), and their rdata is never decoded,
 so a malformed one cannot drop the rest of its packet: mex keeps only
 its length (`rdlength=<n>`). A record finding lives for its TTL and is

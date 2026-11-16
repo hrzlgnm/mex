@@ -48,6 +48,14 @@ pub fn service_id(instance: &str, service_type: &str) -> String {
     format!("{instance}.{service_type}")
 }
 
+/// Finding owner for a record or question owned by a hostname (an SRV
+/// target): the lowercased name without its root dot. One host backs
+/// many services, so host-owned evidence is recorded once, under the
+/// host, and every service on it shows it in its Anomalies pane.
+pub fn host_id(hostname: &str) -> String {
+    hostname.trim_end_matches('.').to_lowercase()
+}
+
 /// Severity of an anomaly: errors are clear RFC violations, warnings are
 /// likely misconfigurations, informational notes are observations.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

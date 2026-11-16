@@ -426,10 +426,17 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, 
                     // The hostname is italic: group headers describe
                     // app-side grouping, not wire records. Terminals
                     // without italic support render it plain.
+                    // Host-owned findings count once, on the host header.
+                    let warn = anomaly_counts.get(label.as_str()).copied().unwrap_or(0);
+                    let warn_suffix = if warn > 0 {
+                        format!(" [!{warn}]")
+                    } else {
+                        String::new()
+                    };
                     let line = Line::from(vec![
                         Span::styled(format!("{glyph} "), base),
                         Span::styled(display, base.add_modifier(Modifier::ITALIC)),
-                        Span::styled(format!(" ({count}){addr_suffix}"), base),
+                        Span::styled(format!(" ({count}){addr_suffix}{warn_suffix}"), base),
                     ]);
                     ListItem::new(line)
                 }
