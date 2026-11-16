@@ -178,13 +178,76 @@ impl QuerySocket for PktInfoUdpSocket {
     }
 }
 
-/// Link name for send logs; the unpinned fallback (no usable link)
-/// goes out the kernel's default multicast interface.
-fn link_label(iface: &str) -> &str {
-    if iface.is_empty() {
-        "the default interface"
-    } else {
-        iface
+/// One query copy: the link it leaves on, its destination, and the
+/// egress interface pinned for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SendTarget<'a> {
+    link: &'a str,
+    dest: SocketAddr,
+    egress: Egress,
+}
+
+/// One target per usable link of `family`. An empty list means no
+/// target at all: no copy is sent unpinned (it would leave by the
+/// kernel's default multicast interface, possibly one the user did not
+/// select). The interface refresh picks links up again once they gain
+/// an address or come up.
+fn send_targets<'a>(
+    family: Family,
+    ifaces_v4: &'a [(String, Ipv4Addr)],
+    ifaces_v6: &'a [(String, u32)],
+) -> Vec<SendTarget<'a>> {
+    match family {
+        Family::V4 => ifaces_v4
+            .iter()
+            .map(|(name, ip)| SendTarget {
+                link: name,
+                dest: SocketAddr::from(SocketAddrV4::new(MDNS_V4, MDNS_PORT)),
+                egress: Egress::V4(*ip),
+            })
+            .collect(),
+        Family::V6 => ifaces_v6
+            .iter()
+            .map(|(name, idx)| SendTarget {
+                link: name,
+                dest: mdns_dest_v6(*idx),
+                egress: Egress::V6(*idx),
+            })
+            .collect(),
+    }
+}
+
+/// A transmit-state change worth one log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PauseLog {
+    /// The family's link list became empty: its queries stop.
+    Paused,
+    /// The family has a usable link again: its queries resume.
+    Resumed,
+}
+
+/// Per-family paused state, so pausing and resuming are logged once
+/// per transition, never per skipped query. Families start active, so
+/// starting with no usable link logs one pause.
+#[derive(Debug, Default)]
+struct TransmitPause {
+    v4_paused: bool,
+    v6_paused: bool,
+}
+
+impl TransmitPause {
+    /// Record whether `family` has usable links after a refresh.
+    fn update(&mut self, family: Family, has_links: bool) -> Option<PauseLog> {
+        let paused = match family {
+            Family::V4 => &mut self.v4_paused,
+            Family::V6 => &mut self.v6_paused,
+        };
+        let was_paused = std::mem::replace(paused, !has_links);
+        match (was_paused, has_links) {
+            (false, false) => Some(PauseLog::Paused),
+            (true, true) => Some(PauseLog::Resumed),
+            _ => None,
+        }
     }
 }
 
@@ -879,6 +942,7 @@ struct Listener {
     /// and the waker won't announce them again.
     queries_pending: bool,
     send_failures: SendFailures,
+    transmit_pause: TransmitPause,
     buf: Vec<u8>,
 }
 
@@ -908,6 +972,7 @@ impl Listener {
             next_refresh: Instant::now(),
             queries_pending: false,
             send_failures: SendFailures::default(),
+            transmit_pause: TransmitPause::default(),
             buf: vec![0u8; 65535],
         }
     }
@@ -991,17 +1056,35 @@ impl Listener {
                 }
             }
         }
-        // Links gone from the lists forget their send-failure state; the
-        // unpinned fallback ("") counts as listed while a family has no
-        // usable link.
-        let v4_links = self.ifaces_v4.iter().map(|(name, _)| name.as_str());
-        let v4_fallback = self.ifaces_v4.is_empty().then_some("");
-        self.send_failures
-            .retain_links(Family::V4, v4_links.chain(v4_fallback));
-        let v6_links = self.ifaces_v6.iter().map(|(name, _)| name.as_str());
-        let v6_fallback = self.ifaces_v6.is_empty().then_some("");
-        self.send_failures
-            .retain_links(Family::V6, v6_links.chain(v6_fallback));
+        // Links gone from the lists forget their send-failure state.
+        self.send_failures.retain_links(
+            Family::V4,
+            self.ifaces_v4.iter().map(|(name, _)| name.as_str()),
+        );
+        self.send_failures.retain_links(
+            Family::V6,
+            self.ifaces_v6.iter().map(|(name, _)| name.as_str()),
+        );
+        // A family with an open socket but no usable link sends nothing;
+        // log the pause and the resume once each.
+        for (family, open, has_links) in [
+            (Family::V4, self.v4.is_some(), !self.ifaces_v4.is_empty()),
+            (Family::V6, self.v6.is_some(), !self.ifaces_v6.is_empty()),
+        ] {
+            if !open {
+                continue;
+            }
+            let label = family.label();
+            match self.transmit_pause.update(family, has_links) {
+                Some(PauseLog::Paused) => {
+                    log::info!("mex: no usable {label} interface; {label} queries paused")
+                }
+                Some(PauseLog::Resumed) => {
+                    log::info!("mex: {label} interface usable again; {label} queries resumed")
+                }
+                None => {}
+            }
+        }
     }
 
     /// Send queued queries (up to the budget) on each open family.
@@ -1112,10 +1195,10 @@ impl Listener {
     }
 }
 
-/// One copy of the query per local interface, each forced out its own
-/// link: without the per-packet interface the kernel sends everything
-/// via the default multicast interface and other links (e.g. a bridge)
-/// never see our queries.
+/// One copy of the query per usable link, each forced out its own link:
+/// without the per-packet interface the kernel sends everything via the
+/// default multicast interface and other links (e.g. a bridge) never see
+/// our queries. No usable link means no copy (`send_targets`).
 fn send_on_all_interfaces(
     socket: &impl QuerySocket,
     req: &QueryRequest,
@@ -1124,49 +1207,33 @@ fn send_on_all_interfaces(
     ifaces_v6: &[(String, u32)],
     failures: &mut SendFailures,
 ) {
-    let v4_dest = SocketAddr::from(SocketAddrV4::new(MDNS_V4, MDNS_PORT));
-    // One copy per link: (link, destination, egress to pin). An empty link
-    // list falls back to one unpinned copy.
-    let copies: Vec<(&str, SocketAddr, Option<Egress>)> = match family {
-        Family::V4 if ifaces_v4.is_empty() => vec![("", v4_dest, None)],
-        Family::V4 => ifaces_v4
-            .iter()
-            .map(|(name, ip)| (name.as_str(), v4_dest, Some(Egress::V4(*ip))))
-            .collect(),
-        Family::V6 if ifaces_v6.is_empty() => vec![("", mdns_dest_v6(0), None)],
-        Family::V6 => ifaces_v6
-            .iter()
-            .map(|(name, idx)| (name.as_str(), mdns_dest_v6(*idx), Some(Egress::V6(*idx))))
-            .collect(),
-    };
     let family_label = family.label();
-    for (iface, dest, egress) in copies {
-        let link = link_label(iface);
+    for target in send_targets(family, ifaces_v4, ifaces_v6) {
+        let SendTarget { link, dest, egress } = target;
         // The egress pin is socket-wide: set it right before this copy.
         // A failed pin would send the copy out of the default multicast
         // interface instead: skip it.
-        let pin = egress.map(|egress| socket.pin(egress));
-        if let Some(Err(e)) = pin {
+        if let Err(e) = socket.pin(egress) {
             if failures
-                .record_failure(family, iface, SendOp::Pin, e.kind())
+                .record_failure(family, link, SendOp::Pin, e.kind())
                 .is_some()
             {
                 log::error!("mex: {family_label} egress pin on {link} failed: {e}; copy skipped");
             }
             continue;
         }
-        let Some(sent) = send_query(socket, req, dest, iface) else {
+        let Some(sent) = send_query(socket, req, dest, link) else {
             continue;
         };
         match sent {
             Ok(()) => {
-                if failures.record_success(family, iface).is_some() {
+                if failures.record_success(family, link).is_some() {
                     log::info!("mex: {family_label} send on {link} recovered");
                 }
             }
             Err(e) => {
                 if failures
-                    .record_failure(family, iface, SendOp::Send, e.kind())
+                    .record_failure(family, link, SendOp::Send, e.kind())
                     .is_some()
                 {
                     log::error!("mex: {family_label} send on {link} to {dest} failed: {e}");
@@ -3198,6 +3265,71 @@ mod tests {
             None,
             "the successful send already recorded the recovery"
         );
+    }
+
+    #[test]
+    fn no_usable_link_means_no_send_target() {
+        // An empty list never falls back to an unpinned copy (which
+        // would leave by the default interface, maybe an unselected one).
+        assert!(send_targets(Family::V4, &[], &[]).is_empty());
+        assert!(send_targets(Family::V6, &[], &[]).is_empty());
+        let socket = FakeSocket::default();
+        let mut failures = SendFailures::default();
+        for family in [Family::V4, Family::V6] {
+            send_on_all_interfaces(&socket, &ptr_query(), family, &[], &[], &mut failures);
+        }
+        assert!(socket.calls.borrow().is_empty(), "nothing pinned or sent");
+    }
+
+    #[test]
+    fn one_pinned_target_per_usable_link() {
+        let v4 = [
+            ("eth0".to_string(), Ipv4Addr::new(192, 168, 1, 2)),
+            ("wlan0".to_string(), Ipv4Addr::new(10, 0, 0, 2)),
+        ];
+        let v6 = [("eth0".to_string(), 2u32)];
+        let mdns_v4: SocketAddr = "224.0.0.251:5353".parse().unwrap();
+        assert_eq!(
+            send_targets(Family::V4, &v4, &v6),
+            [
+                SendTarget {
+                    link: "eth0",
+                    dest: mdns_v4,
+                    egress: Egress::V4(Ipv4Addr::new(192, 168, 1, 2)),
+                },
+                SendTarget {
+                    link: "wlan0",
+                    dest: mdns_v4,
+                    egress: Egress::V4(Ipv4Addr::new(10, 0, 0, 2)),
+                },
+            ]
+        );
+        assert_eq!(
+            send_targets(Family::V6, &v4, &v6),
+            [SendTarget {
+                link: "eth0",
+                dest: mdns_dest_v6(2),
+                egress: Egress::V6(2),
+            }],
+            "v6 destination carries the link's scope id"
+        );
+    }
+
+    #[test]
+    fn pause_and_resume_log_once_per_transition() {
+        let mut pause = TransmitPause::default();
+        // Starting with links: nothing to say.
+        assert_eq!(pause.update(Family::V6, true), None);
+        // Links gone: one pause line, then silence while it stays empty.
+        assert_eq!(pause.update(Family::V6, false), Some(PauseLog::Paused));
+        assert_eq!(pause.update(Family::V6, false), None);
+        // Back: one resume line, then silence.
+        assert_eq!(pause.update(Family::V6, true), Some(PauseLog::Resumed));
+        assert_eq!(pause.update(Family::V6, true), None);
+        assert_eq!(pause.update(Family::V6, false), Some(PauseLog::Paused));
+        // Families are independent; starting empty logs the pause once.
+        assert_eq!(pause.update(Family::V4, false), Some(PauseLog::Paused));
+        assert_eq!(pause.update(Family::V4, false), None);
     }
 
     #[test]
