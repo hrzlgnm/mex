@@ -29,8 +29,12 @@ Headless run (no TTY) logs to stderr.
   selected-but-down links wait for the rejoin refresh). A family with no
   usable link sends nothing (no unpinned fallback); its pause and resume
   are logged once each.
-  Multicast loop disabled; unicast-dst packets from off-link subnets are
-  refused (RFC 6762 §11) with a metrics counter.
+  Multicast loop enabled, so responders on this host (avahi,
+  python-zeroconf) hear our queries; our own looped-back query copies are
+  dropped by exact bytes (`SentCopies`, one drop per sent copy). The
+  loopback interface stays out unless selected with `-i`. Unicast-dst
+  packets from off-link subnets are refused (RFC 6762 §11) with a metrics
+  counter.
   Only in-scope types (`anomalies::is_mdns_answer_type` /
   `is_mdns_question_type`) are decoded or named; every other record keeps
   just `rdlength=<n>` (on-wire RDLENGTH) and renders as `TYPEnn`; the
