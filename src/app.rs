@@ -5315,25 +5315,25 @@ impl App {
         }
     }
 
+    /// In-scope records other than PTR/SRV/TXT/A/AAAA (NS, CNAME,
+    /// HINFO, NSEC). One hostname backs many services: a host-owned
+    /// record (e.g. HINFO) files on every service of that host, like
+    /// addresses, not just the first.
     fn handle_other(&mut self, rec: &browse::RawRecord, ev: &browse::Event) {
         let name = rec.name.trim_end_matches('.').to_lowercase();
-        for i in 0..self.services.len() {
-            let full = format!(
-                "{}.{}",
-                self.services[i].instance, self.services[i].service_type
-            )
-            .to_lowercase();
-            if full == name
-                || self.services[i]
-                    .hostname
-                    .trim_end_matches('.')
-                    .to_lowercase()
-                    == name
-            {
-                self.services[i].last_event = Some(ev.clone());
-                self.push_record(i, rec);
-                return;
-            }
+        let hits: Vec<usize> = self
+            .services
+            .iter()
+            .enumerate()
+            .filter(|(_, svc)| {
+                format!("{}.{}", svc.instance, svc.service_type).to_lowercase() == name
+                    || svc.hostname.trim_end_matches('.').to_lowercase() == name
+            })
+            .map(|(i, _)| i)
+            .collect();
+        for i in hits {
+            self.services[i].last_event = Some(ev.clone());
+            self.push_record(i, rec);
         }
     }
 
@@ -5443,9 +5443,15 @@ impl App {
                 }
             }
         }
-        if withdrawn && (rec.rtype == 1 || rec.rtype == 28) {
-            // Addresses never reactivate, so a withdrawn service is still
-            // withdrawn here: keep its original grace deadline.
+        // Host-owned records (addresses, and e.g. HINFO for the host
+        // name) say the host is alive, not the service. They never
+        // reactivate, so a withdrawn service is still withdrawn here:
+        // keep its original grace deadline.
+        let host_owned = {
+            let host = self.services[svc_idx].hostname.trim_end_matches('.');
+            !host.is_empty() && rec.name.trim_end_matches('.').eq_ignore_ascii_case(host)
+        };
+        if withdrawn && (rec.rtype == 1 || rec.rtype == 28 || host_owned) {
             self.services[svc_idx].last_seen = prev_seen;
         }
     }
@@ -13350,5 +13356,75 @@ mod tests {
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].rtype, Some(15));
         assert_eq!(found[0].service, "Test._http._tcp.local");
+    }
+
+    #[test]
+    fn host_owned_record_files_on_every_sibling_service() {
+        // One host backing two services: its HINFO (and NS/CNAME/NSEC)
+        // belongs to both, like its addresses.
+        let mut app = test_service_app();
+        ingest(
+            &mut app,
+            &raw_record(
+                "_ipp._tcp.local.",
+                12,
+                "PTR",
+                "Other._ipp._tcp.local.",
+                4500,
+            ),
+        );
+        ingest(
+            &mut app,
+            &raw_record(
+                "Other._ipp._tcp.local.",
+                33,
+                "SRV",
+                "0 0 631 test.local.",
+                120,
+            ),
+        );
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 13, "HINFO", "X86_64 LINUX", 120),
+        );
+        for instance in ["Test", "Other"] {
+            assert!(
+                service_rows(&app, instance).contains(&13),
+                "{instance} lacks the host's HINFO row"
+            );
+        }
+        // An instance-owned record still files on its own service only.
+        ingest(
+            &mut app,
+            &raw_record("Test._http._tcp.local.", 5, "CNAME", "alias.local.", 120),
+        );
+        assert!(service_rows(&app, "Test").contains(&5));
+        assert!(!service_rows(&app, "Other").contains(&5));
+    }
+
+    #[test]
+    fn host_owned_record_keeps_withdrawn_sibling_grace() {
+        let mut app = test_service_app();
+        let past = Instant::now() - Duration::from_secs(60);
+        {
+            let svc = app
+                .services
+                .iter_mut()
+                .find(|s| s.instance == "Test")
+                .unwrap();
+            svc.is_active = false;
+            svc.last_seen = past;
+        }
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 13, "HINFO", "X86_64 LINUX", 120),
+        );
+        let svc = app.services.iter().find(|s| s.instance == "Test").unwrap();
+        assert!(!svc.is_active);
+        assert_eq!(
+            svc.last_seen, past,
+            "HINFO must not extend the grace deadline"
+        );
+        assert!(svc.answers.iter().any(|r| r.rtype == 13));
     }
 }
