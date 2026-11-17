@@ -304,7 +304,11 @@ fn is_live(rec: &RawRecord, now: Instant) -> bool {
 /// Responders on one link announcing different live address sets for one
 /// hostname and family (#247). Sources with identical sets form one
 /// responder group (one device on several transports); a source with no
-/// address of a family is absent from that family. Warning when any
+/// address of a family is absent from that family. Groups that answer
+/// from an address the hostname announces on that link (either family)
+/// are the host itself, one NIC each, and merge into one responder: a
+/// multi-homed host answering per interface (RFC 6762 §6.2, §14) is not
+/// a conflict (#271). Warning when any
 /// disagreeing record claims uniqueness (cache-flush, RFC 6762 §9) or the
 /// name is in an mDNS domain (unique there, §8/§9); Info otherwise
 /// (e.g. `fritz.box` from a mesh: an observation, not a violation).
@@ -320,14 +324,20 @@ fn check_conflicting_answers(
     // Link = interface name plus index: a name can be unknown, and two
     // unnamed links must not merge.
     let mut groups: BTreeMap<(u16, String, u32), (Sets, bool)> = BTreeMap::new();
+    // (link) -> every address the hostname announces there, both families.
+    let mut host_ips: BTreeMap<(String, u32), BTreeSet<std::net::IpAddr>> = BTreeMap::new();
     for rec in &view.records {
         if !matches!(rec.rtype, 1 | 28) || !is_live(rec, now) {
             continue;
         }
-        let addr = rec
-            .rdata
-            .trim()
-            .parse::<std::net::IpAddr>()
+        let ip = rec.rdata.trim().parse::<std::net::IpAddr>();
+        if let Ok(ip) = ip {
+            host_ips
+                .entry((rec.iface.clone(), rec.ifindex))
+                .or_default()
+                .insert(ip);
+        }
+        let addr = ip
             .map(|ip| ip.to_string())
             .unwrap_or_else(|_| rec.rdata.trim().to_string());
         let (sets, flush) = groups
@@ -344,6 +354,25 @@ fn check_conflicting_answers(
         let mut by_set: BTreeMap<BTreeSet<String>, Vec<(SocketAddr, String)>> = BTreeMap::new();
         for (source, (label, addrs)) in sets {
             by_set.entry(addrs).or_default().push((source, label));
+        }
+        // The host's own groups (one per NIC) merge into one responder.
+        let own = host_ips.get(&(iface.clone(), ifindex));
+        let is_host = |sources: &[(SocketAddr, String)]| {
+            own.is_some_and(|ips| sources.iter().any(|(s, _)| ips.contains(&s.ip())))
+        };
+        // Re-keyed by the merged set, so a responder agreeing with the
+        // host as a whole is still the same set.
+        let (host, mut by_set): (BTreeMap<_, _>, BTreeMap<_, _>) = by_set
+            .into_iter()
+            .partition(|(_, sources)| is_host(sources));
+        if !host.is_empty() {
+            let mut host_addrs = BTreeSet::new();
+            let mut host_sources = Vec::new();
+            for (addrs, sources) in host {
+                host_addrs.extend(addrs);
+                host_sources.extend(sources);
+            }
+            by_set.entry(host_addrs).or_default().extend(host_sources);
         }
         if by_set.len() < 2 {
             continue;
