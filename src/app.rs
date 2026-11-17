@@ -124,8 +124,9 @@ struct PendingService {
     answers: Vec<browse::RawRecord>,
     subtypes: Vec<Vec<u8>>,
     questions: Vec<QuestionRow>,
-    /// Rows evicted by the 10-row cap; surfaced in dumps so a capped
-    /// list is never mistaken for a complete packet log.
+    /// Rows evicted by the safety cap (`QUESTION_CAP`) inside the
+    /// question window; surfaced in dumps so a capped list is never
+    /// mistaken for a complete one. Age-outs don't count.
     pub questions_dropped: u64,
     last_seen: Instant,
 }
@@ -492,6 +493,18 @@ const METRICS_WINDOW: Duration = Duration::from_secs(300);
 /// evicted first and counted in `MetricsCounters::sightings_dropped`.
 const SIGHTINGS_CAP: usize = 256;
 
+/// How long a Questions-pane row lives after its querier last asked
+/// (#238). Equal to the long mDNS TTL (4500 s): our own steady demand
+/// (continuous browsing capped hourly, refreshes at 80–95% of a 4500 s
+/// TTL) and any well-behaved steady querier re-ask inside it, so their
+/// rows don't flicker out between asks. Revisit if either changes.
+pub(crate) const QUESTION_WINDOW: Duration = Duration::from_secs(4500);
+
+/// Safety cap per Questions list inside the window: bounds memory
+/// against floods of distinct queriers. Only these evictions count as
+/// drops (`questions_dropped`); ageing out is expected, not truncation.
+const QUESTION_CAP: usize = 100;
+
 /// How long an out-of-scope question sighting lives after its last ask.
 /// Questions carry no TTL; this matches the interest grace window.
 const QUESTION_SIGHTING_LIFETIME: Duration = INTEREST_GRACE;
@@ -846,7 +859,8 @@ pub struct ServiceEntry {
     pub subtypes: Vec<Vec<u8>>,
     pub answers: Vec<browse::RawRecord>,
     /// Recently seen questions asking for this service:
-    /// (name, type, querier, received_at, query packet bytes). Capped.
+    /// (name, type, querier, received_at, query packet bytes). Aged out
+    /// after `QUESTION_WINDOW`, bounded by `QUESTION_CAP`.
     pub questions: Vec<QuestionRow>,
     pub questions_dropped: u64,
     pub last_seen: Instant,
@@ -3500,6 +3514,7 @@ impl App {
                 })
                 .collect(),
             interests,
+            question_window_secs: QUESTION_WINDOW.as_secs(),
             anomalies: found
                 .iter()
                 .map(|(a, also)| {
@@ -5336,7 +5351,8 @@ impl App {
     }
 
     /// File one question row, refreshing the timestamp when the same
-    /// (name, type, source) asks again. Caps the list at 10 rows.
+    /// (name, type, source) asks again. Caps the list at `QUESTION_CAP`
+    /// rows (the window ages rows out separately, in `evict_expired`).
     /// Returns true when an old row was evicted, so callers can count
     /// drops for the dump truncation marker.
     ///
@@ -5376,7 +5392,7 @@ impl App {
             }
             None => {
                 rows.push((name, rtype_str, source, at, bytes));
-                if rows.len() > 10 {
+                if rows.len() > QUESTION_CAP {
                     rows.remove(0);
                     true
                 } else {
@@ -6169,6 +6185,24 @@ impl App {
         let owners = self.live_service_keys();
         self.address_denials
             .retain(|d| d.is_live() && owners.contains(&d.service));
+        // Questions rows age out once their querier stopped asking for
+        // the question window (#238); not a drop, so no counter moves.
+        let fresh = |q: &QuestionRow| now.saturating_duration_since(q.3) <= QUESTION_WINDOW;
+        let mut aged = false;
+        for rows in self
+            .services
+            .iter_mut()
+            .map(|s| &mut s.questions)
+            .chain(self.pending_instances.iter_mut().map(|p| &mut p.questions))
+            .chain(self.enum_entries.iter_mut().map(|e| &mut e.questions))
+        {
+            let before = rows.len();
+            rows.retain(fresh);
+            aged |= rows.len() != before;
+        }
+        if aged {
+            self.touch();
+        }
         // Sightings live for their TTL (questions: a fixed window);
         // owners are resolved at analysis time, so expiry is time only.
         let before = self.sightings.len();
@@ -10641,18 +10675,21 @@ mod tests {
         assert!(srv.last_suppressed_age_secs.is_none());
         assert!(srv.last_observed_age_secs.is_none());
 
-        // Flood one service question from distinct sources past the cap
-        // (the earlier self SRV refresh already holds one row, so 10 more
-        // pushes evict exactly once).
-        for i in 0..10 {
-            let src: std::net::SocketAddr = format!("192.168.1.{}:5353", 10 + i).parse().unwrap();
+        // Flood one service question from distinct sources past the
+        // safety cap (the earlier self SRV refresh already holds one row,
+        // so QUESTION_CAP more pushes evict exactly once).
+        for i in 0..QUESTION_CAP {
+            let src: std::net::SocketAddr =
+                format!("192.168.{}.{}:5353", 1 + i / 200, 10 + i % 200)
+                    .parse()
+                    .unwrap();
             let mut ev = query_event("_http._tcp.local.", 12, "PTR", false, Vec::new(), src);
             ev.questions[0].iface = "br0".to_string();
             app.ingest_event(&ev);
         }
         let dump = app.state_dump();
         let svc = &dump.services[0];
-        assert_eq!(svc.questions.len(), 10);
+        assert_eq!(svc.questions.len(), QUESTION_CAP);
         assert!(svc.questions_truncated);
         assert_eq!(svc.questions_dropped, 1);
         // The interest records who asked last and on which link.
@@ -10664,7 +10701,10 @@ mod tests {
         assert_eq!(ptr.last_origin.as_deref(), Some("observed"));
         assert!(ptr.last_observed_age_secs.is_some());
         assert!(ptr.last_transmitted_age_secs.is_none());
-        assert_eq!(ptr.last_observed_from.as_deref(), Some("192.168.1.19:5353"));
+        assert_eq!(
+            ptr.last_observed_from.as_deref(),
+            Some("192.168.1.109:5353")
+        );
         assert_eq!(ptr.last_observed_iface.as_deref(), Some("br0"));
     }
 
@@ -16523,5 +16563,151 @@ mod tests {
             col(lines[1], "LAST"),
             "{text}"
         );
+    }
+
+    // --- #238: Questions rows age out by a time window ---
+
+    fn querier(i: usize) -> SocketAddr {
+        format!("192.168.{}.{}:5353", 1 + i / 200, 10 + i % 200)
+            .parse()
+            .unwrap()
+    }
+
+    fn ask(app: &mut App, name: &str, source: SocketAddr) {
+        app.ingest_event(&query_event(name, 16, "TXT", false, Vec::new(), source));
+    }
+
+    /// Backdate every question row from `source` by `secs`.
+    fn age_questions(app: &mut App, source: SocketAddr, secs: u64) {
+        let at = Instant::now()
+            .checked_sub(Duration::from_secs(secs))
+            .unwrap_or_else(Instant::now);
+        for rows in app
+            .services
+            .iter_mut()
+            .map(|s| &mut s.questions)
+            .chain(app.pending_instances.iter_mut().map(|p| &mut p.questions))
+            .chain(app.enum_entries.iter_mut().map(|e| &mut e.questions))
+        {
+            for q in rows.iter_mut().filter(|q| q.2 == source) {
+                q.3 = at;
+            }
+        }
+    }
+
+    fn dumped_sources(app: &App) -> Vec<String> {
+        app.state_dump().services[0]
+            .questions
+            .iter()
+            .map(|q| q.source.clone())
+            .collect()
+    }
+
+    const PAST_WINDOW: u64 = QUESTION_WINDOW.as_secs() + 60;
+
+    #[test]
+    fn question_rows_age_out_after_the_window_without_counting_as_drops() {
+        let mut app = test_service_app();
+        let (old, recent) = (querier(1), querier(2));
+        ask(&mut app, "Test._http._tcp.local.", old);
+        ask(&mut app, "Test._http._tcp.local.", recent);
+        age_questions(&mut app, old, PAST_WINDOW);
+        age_questions(&mut app, recent, QUESTION_WINDOW.as_secs() - 60);
+        app.evict_expired();
+        assert_eq!(dumped_sources(&app), vec![recent.to_string()]);
+        let dump = app.state_dump();
+        assert!(
+            !dump.services[0].questions_truncated,
+            "ageing is not truncation"
+        );
+        assert_eq!(dump.services[0].questions_dropped, 0);
+        assert_eq!(dump.question_window_secs, 4500);
+    }
+
+    #[test]
+    fn a_reask_refreshes_the_row() {
+        let mut app = test_service_app();
+        let q = querier(1);
+        ask(&mut app, "Test._http._tcp.local.", q);
+        age_questions(&mut app, q, PAST_WINDOW);
+        ask(&mut app, "Test._http._tcp.local.", q);
+        app.evict_expired();
+        assert_eq!(dumped_sources(&app), vec![q.to_string()]);
+    }
+
+    #[test]
+    fn more_than_ten_queriers_inside_the_window_all_stay() {
+        let mut app = test_service_app();
+        for i in 0..25 {
+            ask(&mut app, "Test._http._tcp.local.", querier(i));
+        }
+        app.evict_expired();
+        assert_eq!(dumped_sources(&app).len(), 25);
+        assert!(!app.state_dump().services[0].questions_truncated);
+    }
+
+    #[test]
+    fn self_rows_follow_the_same_window() {
+        let mut app = test_service_app();
+        app.route_own_question("Test._http._tcp.local.", 16, false);
+        assert_eq!(dumped_sources(&app), vec![SELF_SOURCE_LABEL.to_string()]);
+        // Re-sent at the normal cadence: the row stays.
+        age_questions(&mut app, SELF_SOURCE, QUESTION_WINDOW.as_secs() - 60);
+        app.evict_expired();
+        assert_eq!(dumped_sources(&app).len(), 1);
+        // Not asked for longer than the window: gone.
+        age_questions(&mut app, SELF_SOURCE, PAST_WINDOW);
+        app.evict_expired();
+        assert!(dumped_sources(&app).is_empty());
+    }
+
+    #[test]
+    fn enumeration_questions_age_out_too() {
+        let mut app = App::new().unwrap();
+        let q = querier(1);
+        app.ingest_event(&query_event(
+            "_services._dns-sd._udp.local.",
+            12,
+            "PTR",
+            false,
+            Vec::new(),
+            q,
+        ));
+        let listed = |app: &App| -> usize {
+            app.state_dump()
+                .enum_groups
+                .iter()
+                .map(|g| g.questions.len())
+                .sum()
+        };
+        assert_eq!(listed(&app), 1);
+        age_questions(&mut app, q, PAST_WINDOW);
+        app.evict_expired();
+        assert_eq!(listed(&app), 0);
+    }
+
+    #[test]
+    fn promotion_keeps_parked_rows_and_carries_cap_drops() {
+        let mut app = App::new().unwrap();
+        // PTR without SRV: a pending instance. Only our own sends file
+        // question rows there.
+        ingest(&mut app, &ptr_record(4500));
+        app.route_own_question("Test._http._tcp.local.", 16, false);
+        assert_eq!(app.pending_instances[0].questions.len(), 1);
+        age_questions(&mut app, SELF_SOURCE, 600);
+        // Cap drops recorded while parked carry over on promotion.
+        app.pending_instances[0].questions_dropped = 3;
+        ingest(&mut app, &srv_record(120));
+        app.evict_expired();
+        let dump = app.state_dump();
+        let svc = &dump.services[0];
+        let row = svc
+            .questions
+            .iter()
+            .find(|q| q.source == SELF_SOURCE_LABEL)
+            .expect("parked row kept");
+        assert!(row.age_secs >= 600, "seen-at kept: {}", row.age_secs);
+        assert_eq!(svc.questions_dropped, 3);
+        assert!(svc.questions_truncated);
     }
 }

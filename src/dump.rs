@@ -201,6 +201,10 @@ pub struct StateDump {
     pub pending: Vec<RawGroup>,
     /// Authoritative per-interest query state (uncapped).
     pub interests: Vec<DumpInterest>,
+    /// How long a question row stays listed after its querier last
+    /// asked (#238): the time span every `questions` list covers.
+    /// `questions_truncated` means only the safety cap dropped rows.
+    pub question_window_secs: u64,
     pub anomalies: Vec<DumpAnomaly>,
 }
 
