@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.20.0](https://github.com/hrzlgnm/mex/compare/v0.19.0...v0.20.0) (2026-11-17)
+
+
+### Features
+
+* age out Questions rows by a time window ([#269](https://github.com/hrzlgnm/mex/issues/269)) ([3bcc7ec](https://github.com/hrzlgnm/mex/commit/3bcc7ec7cf656de3966e0735d16c6e368a349cd6))
+* flag conflicting address answers ([#263](https://github.com/hrzlgnm/mex/issues/263)) ([5954689](https://github.com/hrzlgnm/mex/commit/5954689847f9f7fd4fa505b27df320cad760bd12))
+* hide address rows a service's responder denies via NSEC ([#255](https://github.com/hrzlgnm/mex/issues/255)) ([d8646ce](https://github.com/hrzlgnm/mex/commit/d8646ceb9954ecff2b76b589ad763c60505a47c3))
+* name the device behind a source address ([#262](https://github.com/hrzlgnm/mex/issues/262)) ([0657ed8](https://github.com/hrzlgnm/mex/commit/0657ed8454e8a8337bcf53e4e5dd1c7b0b3c4933))
+* show anomalies next to their owner ([#259](https://github.com/hrzlgnm/mex/issues/259)) ([43e31a6](https://github.com/hrzlgnm/mex/commit/43e31a6e2e40af31cef63b5ce10f06950bd83855))
+
+
+### Bug Fixes
+
+* keep per-link copies of a record from one source ([#265](https://github.com/hrzlgnm/mex/issues/265)) ([e46601c](https://github.com/hrzlgnm/mex/commit/e46601c65ea3adc1381f366d2bd0aa74d0eaf84a))
+
+
+### Dependencies
+
+* lock file maintenance ([#268](https://github.com/hrzlgnm/mex/issues/268)) ([7d13ac2](https://github.com/hrzlgnm/mex/commit/7d13ac2959703663efa08767a014c227314c7e84))
+* update rust crate clap to v4.6.8 ([#258](https://github.com/hrzlgnm/mex/issues/258)) ([6a4a59d](https://github.com/hrzlgnm/mex/commit/6a4a59d3eb4d7382d0ec1c80c8c918921a85e3a7))
+
+
+### Code Refactoring
+
+* drop finding rows from the metrics overlay ([#261](https://github.com/hrzlgnm/mex/issues/261)) ([b269431](https://github.com/hrzlgnm/mex/commit/b269431f2b89a2e933a06e0fee75f5607c02b0c0))
+* drop the repeated source and icon from finding rows ([#267](https://github.com/hrzlgnm/mex/issues/267)) ([ded3276](https://github.com/hrzlgnm/mex/commit/ded32766d46f8175956cf1a96e8a92ee61076360))
+* remove the Anomalies pane ([#260](https://github.com/hrzlgnm/mex/issues/260)) ([6dfc462](https://github.com/hrzlgnm/mex/commit/6dfc4628f4cabfdf97879f93b77fddcdf1b4cb8e))
+
 ## [0.19.0](https://github.com/hrzlgnm/mex/compare/v0.18.3...v0.19.0) (2026-11-16)
 
 
