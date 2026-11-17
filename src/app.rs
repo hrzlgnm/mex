@@ -1037,7 +1037,9 @@ pub enum AnswerLine {
     /// A finding shown next to its owner; `record` is the owning record's
     /// index in `ordered_answers`, `None` when it sits under a block.
     Finding {
-        anomaly: anomalies::Anomaly,
+        // Boxed: findings carry responder lists (#247), far larger than
+        // the other line kinds.
+        anomaly: Box<anomalies::Anomaly>,
         record: Option<usize>,
     },
     /// A record row: index into `ordered_answers` (the detail cursor's
@@ -2196,6 +2198,39 @@ impl App {
         items
     }
 
+    /// Every A/AAAA record held for each hostname a live service points
+    /// at (live SRV targets): filed service rows (deduped across the
+    /// services sharing the host), pending addresses and withheld
+    /// (NSEC-denied) addresses. Input of `conflicting-answers` (#247).
+    fn host_address_views(&self) -> Vec<anomalies::HostAddressView<'_>> {
+        let mut hosts: Vec<String> = Vec::new();
+        for svc in &self.services {
+            for host in Self::service_hosts(svc) {
+                if !hosts.contains(&host) {
+                    hosts.push(host);
+                }
+            }
+        }
+        hosts
+            .into_iter()
+            .map(|host| {
+                let mut seen = HashSet::new();
+                let records = self
+                    .services
+                    .iter()
+                    .flat_map(|s| s.answers.iter())
+                    .filter(|r| matches!(r.rtype, 1 | 28) && anomalies::host_id(&r.name) == host)
+                    .chain(self.pending_addrs.get(&host).into_iter().flatten())
+                    .chain(self.withheld_addrs.get(&host).into_iter().flatten())
+                    .filter(|r| {
+                        seen.insert((r.rtype, r.rdata.as_str(), r.source, r.iface.as_str()))
+                    })
+                    .collect();
+                anomalies::HostAddressView { host, records }
+            })
+            .collect()
+    }
+
     /// Device names for source addresses (#246), from live A/AAAA
     /// records: service answers, enumeration rows, pending services,
     /// pending addresses and withheld (NSEC-denied) host addresses. Rebuilt on demand; never cached.
@@ -3043,12 +3078,24 @@ impl App {
                 }
             }
         }
+        let host_addresses = self.host_address_views();
+        let book = self.address_book();
+        let device_names = host_addresses
+            .iter()
+            .flat_map(|v| v.records.iter())
+            .filter_map(|r| {
+                let ip = r.source.ip();
+                book.resolve(ip).map(|d| (ip, d.display()))
+            })
+            .collect();
         let snap = anomalies::Snapshot {
             services,
             enum_answers,
             pending_hosts,
             questions,
             sightings,
+            host_addresses,
+            device_names,
         };
         anomalies::analyze_observations(&snap, &self.raw_events, &address_queries)
     }
@@ -3456,7 +3503,29 @@ impl App {
                             _ => d,
                         }),
                         source: a.source.clone(),
-                        message: a.message.clone(),
+                        responders: a
+                            .responders
+                            .iter()
+                            .map(|r| dump::DumpResponder {
+                                sources: r.sources.clone(),
+                                name: r.name.clone(),
+                                // Same safe-sharing policy as AAAA rdata.
+                                addresses: r
+                                    .addresses
+                                    .iter()
+                                    .map(|addr| dump::redact_ip_literal(addr))
+                                    .collect(),
+                            })
+                            .collect(),
+                        // The conflict message spells out the addresses:
+                        // mask public IPv6 there too.
+                        message: a
+                            .responders
+                            .iter()
+                            .flat_map(|r| r.addresses.iter())
+                            .fold(a.message.clone(), |msg, addr| {
+                                msg.replace(addr.as_str(), &dump::redact_ip_literal(addr))
+                            }),
                         rfc: a.rfc.to_string(),
                         requirement: a.requirement.to_string(),
                         section: a.response.as_ref().map(|r| r.section.as_str().to_string()),
@@ -6455,7 +6524,7 @@ impl App {
                             .eq_ignore_ascii_case(&name)
                     }) {
                         lines.push(AnswerLine::Finding {
-                            anomaly: (*a).clone(),
+                            anomaly: Box::new((*a).clone()),
                             record: None,
                         });
                     }
@@ -6499,7 +6568,7 @@ impl App {
             };
             lines.push(AnswerLine::Block(label.to_string()));
             lines.extend(rowless.into_iter().map(|a| AnswerLine::Finding {
-                anomaly: a.clone(),
+                anomaly: Box::new(a.clone()),
                 record: None,
             }));
         }
@@ -6515,7 +6584,7 @@ impl App {
                     Self::short_hostname(&host)
                 )));
                 lines.extend(host_findings.into_iter().map(|a| AnswerLine::Finding {
-                    anomaly: a.clone(),
+                    anomaly: Box::new(a.clone()),
                     record: None,
                 }));
             }
@@ -6526,7 +6595,7 @@ impl App {
                 row_findings[i]
                     .drain(..)
                     .map(|anomaly| AnswerLine::Finding {
-                        anomaly,
+                        anomaly: Box::new(anomaly),
                         record: Some(i),
                     }),
             );
@@ -14934,7 +15003,7 @@ mod tests {
         app.answers_layout(&target, &app.anomalies())
             .into_iter()
             .filter_map(|l| match l {
-                AnswerLine::Finding { anomaly, record } => Some((anomaly, record)),
+                AnswerLine::Finding { anomaly, record } => Some((*anomaly, record)),
                 _ => None,
             })
             .collect()
@@ -15647,5 +15716,336 @@ mod tests {
             .find(|q| q.source == "[fd00::1]:5353")
             .expect("question row");
         assert_eq!(question.source_names, ["knulp.local"]);
+    }
+
+    // --- #247: conflicting address answers ---
+
+    const BOX_ULA: &str = "fd00::7eff:4dff:fe15:7f88";
+    const BOX_GUA: &str = "2003:a:b:c:7eff:4dff:fe15:7f88";
+    const REP_ULA: &str = "fd00::ca0e:14ff:feff:416";
+    const REP_GUA: &str = "2003:a:b:c:ca0e:14ff:feff:416";
+
+    fn aaaa(host: &str, addr: &str, source: &str) -> browse::RawRecord {
+        from(raw_record(host, 28, "AAAA", addr, 120), source)
+    }
+
+    /// The observed mesh: the box announces its AAAA pair and its A from
+    /// both of its sources, the repeater its own AAAA pair for the same
+    /// name (and no A).
+    fn disagreeing_mesh() -> App {
+        let mut app = fritz_mesh();
+        for source in [BOX_V4, BOX_LL] {
+            for addr in [BOX_ULA, BOX_GUA] {
+                ingest(&mut app, &aaaa("fritz.box.", addr, source));
+            }
+            ingest(
+                &mut app,
+                &from(
+                    raw_record("fritz.box.", 1, "A", "192.168.178.1", 120),
+                    source,
+                ),
+            );
+        }
+        for addr in [REP_ULA, REP_GUA] {
+            ingest(&mut app, &aaaa("fritz.box.", addr, REPEATER));
+        }
+        app
+    }
+
+    fn conflicts(app: &App) -> Vec<anomalies::Anomaly> {
+        findings_of(app, anomalies::AnomalyKind::ConflictingAnswers)
+    }
+
+    #[test]
+    fn mesh_repeater_disagreeing_on_aaaa_is_one_info_finding() {
+        let app = disagreeing_mesh();
+        let found = conflicts(&app);
+        assert_eq!(found.len(), 1, "AAAA only, no A finding: {found:?}");
+        let c = &found[0];
+        assert_eq!(c.service, "fritz.box", "owned by the host");
+        assert_eq!(c.rtype, Some(28));
+        assert_eq!(
+            c.severity,
+            anomalies::Severity::Info,
+            "shared records, not .local"
+        );
+        assert_eq!(c.responders.len(), 2, "{:?}", c.responders);
+        let mut box_sources = vec![BOX_V4.to_string(), BOX_LL.to_string()];
+        box_sources.sort();
+        let mut groups: Vec<(Vec<String>, Vec<String>)> = c
+            .responders
+            .iter()
+            .map(|r| {
+                let mut s = r.sources.clone();
+                s.sort();
+                (s, r.addresses.clone())
+            })
+            .collect();
+        groups.sort();
+        let mut want = vec![
+            (box_sources, {
+                let mut a = vec![BOX_ULA.to_string(), BOX_GUA.to_string()];
+                a.sort();
+                a
+            }),
+            (vec![REPEATER.to_string()], {
+                let mut a = vec![REP_ULA.to_string(), REP_GUA.to_string()];
+                a.sort();
+                a
+            }),
+        ];
+        want.sort();
+        assert_eq!(groups, want);
+        // Device names (#246) annotate the groups in the message.
+        assert!(
+            c.message
+                .starts_with("2 responders disagree on fritz.box AAAA"),
+            "{}",
+            c.message
+        );
+        assert!(c.message.contains("(FritzBoxRepeater)"), "{}", c.message);
+        assert!(c.message.contains("(~fritz)"), "{}", c.message);
+    }
+
+    #[test]
+    fn one_device_on_several_sources_is_not_a_conflict() {
+        let mut app = fritz_mesh();
+        for source in [BOX_V4, BOX_LL] {
+            for addr in [BOX_ULA, BOX_GUA] {
+                ingest(&mut app, &aaaa("fritz.box.", addr, source));
+            }
+        }
+        assert!(conflicts(&app).is_empty());
+    }
+
+    #[test]
+    fn extra_address_on_one_responder_is_a_conflict() {
+        let mut app = fritz_mesh();
+        ingest(&mut app, &aaaa("fritz.box.", BOX_ULA, BOX_V4));
+        ingest(&mut app, &aaaa("fritz.box.", BOX_ULA, REPEATER));
+        assert!(conflicts(&app).is_empty(), "identical sets");
+        ingest(&mut app, &aaaa("fritz.box.", "fd00::dead", REPEATER));
+        assert_eq!(conflicts(&app).len(), 1);
+    }
+
+    #[test]
+    fn local_hostname_or_flush_bit_makes_it_a_warning() {
+        // A `.local` clash with shared records only.
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        ingest(
+            &mut app,
+            &from(
+                raw_record("test.local.", 1, "A", "192.168.1.10", 120),
+                "192.168.1.2:5353",
+            ),
+        );
+        ingest(
+            &mut app,
+            &from(
+                raw_record("test.local.", 1, "A", "192.168.1.11", 120),
+                "192.168.1.3:5353",
+            ),
+        );
+        let found = conflicts(&app);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].severity, anomalies::Severity::Warning);
+        // Outside mDNS domains, a cache-flush bit claims uniqueness.
+        let mut app = fritz_mesh();
+        ingest(&mut app, &aaaa("fritz.box.", BOX_ULA, BOX_V4));
+        let mut rep = aaaa("fritz.box.", REP_ULA, REPEATER);
+        rep.flush_bit = true;
+        ingest(&mut app, &rep);
+        let found = conflicts(&app);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].severity, anomalies::Severity::Warning);
+    }
+
+    #[test]
+    fn responders_on_different_links_do_not_conflict() {
+        let mut app = fritz_mesh();
+        let mut a = aaaa("fritz.box.", BOX_ULA, BOX_V4);
+        a.iface = "eth0".to_string();
+        let mut b = aaaa("fritz.box.", REP_ULA, REPEATER);
+        b.iface = "wlan0".to_string();
+        ingest(&mut app, &a);
+        ingest(&mut app, &b);
+        assert!(conflicts(&app).is_empty());
+    }
+
+    #[test]
+    fn goodbye_or_expiry_of_the_repeater_ends_the_conflict() {
+        let mut app = disagreeing_mesh();
+        assert_eq!(conflicts(&app).len(), 1);
+        for addr in [REP_ULA, REP_GUA] {
+            ingest(
+                &mut app,
+                &from(raw_record("fritz.box.", 28, "AAAA", addr, 0), REPEATER),
+            );
+        }
+        assert!(conflicts(&app).is_empty(), "goodbye ends it");
+        let mut app = disagreeing_mesh();
+        let repeater: SocketAddr = REPEATER.parse().unwrap();
+        for svc in &mut app.services {
+            for rec in &mut svc.answers {
+                if rec.source == repeater && rec.rtype == 28 {
+                    rec.received_at = Instant::now()
+                        .checked_sub(Duration::from_secs(500))
+                        .unwrap_or_else(Instant::now);
+                }
+            }
+        }
+        assert!(conflicts(&app).is_empty(), "expiry ends it");
+    }
+
+    #[test]
+    fn conflict_shows_in_every_sibling_host_block_and_badges_once() {
+        let mut app = disagreeing_mesh();
+        // A second service on the same host.
+        ingest(
+            &mut app,
+            &from(
+                raw_record(
+                    "_tr064._tcp.local.",
+                    12,
+                    "PTR",
+                    "Fritzel._tr064._tcp.local.",
+                    4500,
+                ),
+                BOX_V4,
+            ),
+        );
+        let mut srv = raw_record(
+            "Fritzel._tr064._tcp.local.",
+            33,
+            "SRV",
+            "0 0 49000 fritz.box.",
+            120,
+        );
+        srv.flush_bit = true;
+        ingest(&mut app, &from(srv, BOX_V4));
+        app.evict_expired();
+        assert_eq!(conflicts(&app).len(), 1, "recorded once, for the host");
+        let ids: Vec<usize> = app
+            .services
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.instance == "Fritzel")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(ids.len(), 2);
+        for i in ids {
+            let pos = app
+                .display_items()
+                .iter()
+                .position(|it| matches!(it, DisplayItem::Instance { index } if *index == i))
+                .unwrap();
+            app.selected_display = pos;
+            app.clamp_selection();
+            let lines = answers_text(&app);
+            let block = lines
+                .iter()
+                .position(|l| l.starts_with("│host fritz.box"))
+                .unwrap_or_else(|| panic!("{lines:#?}"));
+            assert!(
+                block_has(&lines, block, "conflicting-answers"),
+                "{lines:#?}"
+            );
+        }
+        let counts = app.anomaly_counts();
+        let host_findings = app
+            .anomalies()
+            .iter()
+            .filter(|a| a.service == "fritz.box")
+            .count();
+        assert_eq!(counts.get("fritz.box"), Some(&host_findings));
+        assert!(
+            app.services.iter().all(|s| !app
+                .anomalies()
+                .iter()
+                .any(|a| a.kind == anomalies::AnomalyKind::ConflictingAnswers
+                    && a.service == anomalies::service_id(&s.instance, &s.service_type))),
+            "instances don't repeat the host's conflict"
+        );
+    }
+
+    #[test]
+    fn dump_lists_responders_once_with_public_addresses_masked() {
+        let app = disagreeing_mesh();
+        let dump = app.state_dump();
+        let found: Vec<_> = dump
+            .anomalies
+            .iter()
+            .filter(|a| a.kind == "conflicting-answers")
+            .collect();
+        assert_eq!(found.len(), 1);
+        let c = found[0];
+        assert_eq!(c.responders.len(), 2);
+        let all: Vec<&String> = c
+            .responders
+            .iter()
+            .flat_map(|r| r.addresses.iter())
+            .collect();
+        assert!(
+            all.iter().any(|a| a.as_str() == BOX_ULA),
+            "ULA kept: {all:?}"
+        );
+        assert!(
+            !all.iter().any(|a| a.as_str() == BOX_GUA),
+            "public masked: {all:?}"
+        );
+        assert!(
+            !c.message.contains(BOX_GUA),
+            "message masked too: {}",
+            c.message
+        );
+        assert!(c
+            .responders
+            .iter()
+            .any(|r| r.name.as_deref() == Some("FritzBoxRepeater")));
+        let json = serde_json::to_value(&dump).unwrap();
+        let other = json["anomalies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["kind"] != "conflicting-answers")
+            .expect("another finding");
+        assert!(other.get("responders").is_none(), "omitted for other kinds");
+    }
+
+    #[test]
+    fn conflict_leaves_address_rows_unchanged() {
+        let app = disagreeing_mesh();
+        let svc = app
+            .services
+            .iter()
+            .find(|s| s.instance == "Fritzel")
+            .unwrap();
+        let aaaa_rows = svc
+            .ordered_answers()
+            .iter()
+            .filter(|r| r.rtype == 28)
+            .count();
+        // Box: 2 addresses x 2 sources, repeater: 2.
+        assert_eq!(aaaa_rows, 6);
+    }
+
+    #[test]
+    fn unsourced_finding_text_spans_the_source_column() {
+        let mut app = disagreeing_mesh();
+        select_instance(&mut app, "Fritzel");
+        let lines = answers_text(&app);
+        let row = lines
+            .iter()
+            .find(|l| l.contains("conflicting-answers"))
+            .unwrap_or_else(|| panic!("{lines:#?}"));
+        // The text starts where SOURCE starts, not in the RDATA column.
+        let header = &lines[1];
+        let col = |line: &str, needle: &str| line[..line.find(needle).unwrap()].chars().count();
+        let src_col = col(header, "SOURCE");
+        let text_col = col(row, "conflicting-answers");
+        assert_eq!(text_col, src_col, "{header}\n{row}");
+        assert!(row.contains("2 responders disagree"), "{row}");
     }
 }

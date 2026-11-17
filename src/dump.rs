@@ -136,6 +136,15 @@ pub struct DumpInterest {
     pub last_observed_iface: Option<String>,
 }
 
+/// One responder group of a `conflicting-answers` finding (#247).
+#[derive(serde::Serialize)]
+pub struct DumpResponder {
+    pub sources: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub addresses: Vec<String>,
+}
+
 #[derive(serde::Serialize)]
 pub struct DumpAnomaly {
     pub kind: String,
@@ -151,6 +160,10 @@ pub struct DumpAnomaly {
     pub rtype_str: Option<String>,
     pub rdata: Option<String>,
     pub source: Option<String>,
+    /// Responder groups and their sorted address sets, for
+    /// `conflicting-answers`; omitted for other kinds.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub responders: Vec<DumpResponder>,
     /// Device names the source address resolves to (#246), preferred
     /// first; omitted when nothing announced names it.
     #[serde(skip_serializing_if = "Vec::is_empty")]

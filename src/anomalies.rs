@@ -99,6 +99,7 @@ pub enum AnomalyKind {
     SrvTarget,
     TypeFormat,
     EnumSubtype,
+    ConflictingAnswers,
 }
 
 impl AnomalyKind {
@@ -120,6 +121,7 @@ impl AnomalyKind {
             AnomalyKind::SrvTarget => "srv-target",
             AnomalyKind::TypeFormat => "type-format",
             AnomalyKind::EnumSubtype => "enum-subtype",
+            AnomalyKind::ConflictingAnswers => "conflicting-answers",
         }
     }
 
@@ -185,6 +187,18 @@ pub struct Anomaly {
     /// on where and why the record arrived (unicast-style responses):
     /// the DNS section, and the question it most likely answered.
     pub response: Option<ResponseContext>,
+    /// Responder groups behind a `conflicting-answers` finding (#247):
+    /// sources announcing one identical address set. Empty otherwise.
+    pub responders: Vec<Responder>,
+}
+
+/// Sources that announce the same address set for a hostname on one
+/// link, with the device name behind them when one is known (#246).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Responder {
+    pub sources: Vec<String>,
+    pub name: Option<String>,
+    pub addresses: Vec<String>,
 }
 
 /// Where a flagged record sat in its response and what asked for it.
@@ -221,6 +235,18 @@ pub struct Snapshot<'a> {
     /// Out-of-scope records kept only as evidence (never answer rows),
     /// with their attributed service id (or `unattributed`).
     pub sightings: Vec<(String, &'a RawRecord)>,
+    /// Live A/AAAA announcements per hostname that a live service points
+    /// at (selected host or live SRV target), for `conflicting-answers`.
+    pub host_addresses: Vec<HostAddressView<'a>>,
+    /// Device names behind responder IPs (#246), for finding messages
+    /// only: never part of a finding's identity.
+    pub device_names: HashMap<std::net::IpAddr, String>,
+}
+
+/// Every A/AAAA record mex holds for one hostname (host id form).
+pub struct HostAddressView<'a> {
+    pub host: String,
+    pub records: Vec<&'a RawRecord>,
 }
 
 /// One observed question for analysis: borrows the row, owns the small
@@ -273,6 +299,103 @@ const TXT_MAX: usize = 1300;
 
 fn is_live(rec: &RawRecord, now: Instant) -> bool {
     rec.ttl > 0 && now.duration_since(rec.received_at).as_secs() as u32 <= rec.ttl
+}
+
+/// Responders on one link announcing different live address sets for one
+/// hostname and family (#247). Sources with identical sets form one
+/// responder group (one device on several transports); a source with no
+/// address of a family is absent from that family. Warning when any
+/// disagreeing record claims uniqueness (cache-flush, RFC 6762 §9) or the
+/// name is in an mDNS domain (unique there, §8/§9); Info otherwise
+/// (e.g. `fritz.box` from a mesh: an observation, not a violation).
+fn check_conflicting_answers(
+    view: &HostAddressView<'_>,
+    names: &HashMap<std::net::IpAddr, String>,
+    now: Instant,
+    out: &mut Vec<Anomaly>,
+) {
+    use std::collections::{BTreeMap, BTreeSet};
+    // (family, link) -> source -> (label, addresses), plus any flush bit.
+    type Sets = BTreeMap<SocketAddr, (String, BTreeSet<String>)>;
+    let mut groups: BTreeMap<(u16, String), (Sets, bool)> = BTreeMap::new();
+    for rec in &view.records {
+        if !matches!(rec.rtype, 1 | 28) || !is_live(rec, now) {
+            continue;
+        }
+        let addr = rec
+            .rdata
+            .trim()
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|_| rec.rdata.trim().to_string());
+        let (sets, flush) = groups.entry((rec.rtype, rec.iface.clone())).or_default();
+        *flush |= rec.flush_bit;
+        sets.entry(rec.source)
+            .or_insert_with(|| (rec.source_label(), BTreeSet::new()))
+            .1
+            .insert(addr);
+    }
+    for ((rtype, iface), (sets, flush)) in groups {
+        // Identical sets are one responder (one device, several sources).
+        let mut by_set: BTreeMap<BTreeSet<String>, Vec<(SocketAddr, String)>> = BTreeMap::new();
+        for (source, (label, addrs)) in sets {
+            by_set.entry(addrs).or_default().push((source, label));
+        }
+        if by_set.len() < 2 {
+            continue;
+        }
+        let responders: Vec<Responder> = by_set
+            .into_iter()
+            .map(|(addrs, sources)| Responder {
+                name: sources
+                    .iter()
+                    .find_map(|(s, _)| names.get(&s.ip()).cloned()),
+                sources: sources.into_iter().map(|(_, label)| label).collect(),
+                addresses: addrs.into_iter().collect(),
+            })
+            .collect();
+        let family = if rtype == 1 { "A" } else { "AAAA" };
+        let severity = if flush || is_mdns_domain(&view.host) {
+            Severity::Warning
+        } else {
+            Severity::Info
+        };
+        let link = if iface.is_empty() {
+            String::new()
+        } else {
+            format!(" on {iface}")
+        };
+        let detail: Vec<String> = responders
+            .iter()
+            .map(|r| {
+                let who = match &r.name {
+                    Some(name) => format!("{} ({name})", r.sources.join(", ")),
+                    None => r.sources.join(", "),
+                };
+                format!("{who} → {}", r.addresses.join(", "))
+            })
+            .collect();
+        out.push(Anomaly {
+            kind: AnomalyKind::ConflictingAnswers,
+            severity,
+            service: view.host.clone(),
+            record_name: Some(view.host.clone()),
+            rtype: Some(rtype),
+            rtype_str: Some(family.to_string()),
+            rdata: None,
+            source: None,
+            message: format!(
+                "{} responders disagree on {} {family}{link}: {}",
+                responders.len(),
+                view.host,
+                detail.join("; ")
+            ),
+            rfc: "RFC 6762 §9",
+            requirement: "",
+            response: None,
+            responders,
+        });
+    }
 }
 
 /// Analyze a snapshot, returning deduped anomalies sorted by severity then kind.
@@ -378,6 +501,7 @@ pub fn analyze_observations(
                     rfc: "RFC 6763 §7",
                     requirement: "MUST",
                     response: None,
+                    responders: Vec::new(),
                 });
             } else if subtype {
                 // RFC 6763 §9 enumerates base service types; a subtype
@@ -396,6 +520,7 @@ pub fn analyze_observations(
                     rfc: "RFC 6763 §9",
                     requirement: "",
                     response: None,
+                    responders: Vec::new(),
                 });
             }
         }
@@ -406,6 +531,10 @@ pub fn analyze_observations(
     // (never Questions rows), bounded and refreshed on re-ask.
     for q in &snap.questions {
         check_question(q, &mut out);
+    }
+
+    for view in &snap.host_addresses {
+        check_conflicting_answers(view, &snap.device_names, now, &mut out);
     }
 
     out.sort_by(|a, b| {
@@ -464,6 +593,9 @@ fn dedup(mut items: Vec<Anomaly>) -> Vec<Anomaly> {
             | AnomalyKind::UnsupportedType
             | AnomalyKind::NoFlush
             | AnomalyKind::UnresolvedSrvTarget => a.message.clone(),
+            // One finding per (host, family, link): the analyzer emits
+            // one per group, and the message names the link.
+            AnomalyKind::ConflictingAnswers => a.message.clone(),
             _ => String::new(),
         };
         // DNS names compare case-insensitively (RFC 6762 §16): a querier
@@ -786,6 +918,7 @@ fn check_unresolved_path(
         rfc: "RFC 6762 §6.1",
         requirement: "",
         response: None,
+        responders: Vec::new(),
     });
 }
 
@@ -814,6 +947,7 @@ fn check_type_format(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>
             rfc: "RFC 6763 §7",
             requirement: "MUST",
             response: None,
+            responders: Vec::new(),
         });
     }
 }
@@ -989,6 +1123,7 @@ fn check_subtypes(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>) {
                 rfc: "RFC 6763 §7.1",
                 requirement: "MUST",
                 response: None,
+                responders: Vec::new(),
             });
         }
     }
@@ -1251,6 +1386,7 @@ fn check_question(q: &QuestionView, out: &mut Vec<Anomaly>) {
         rfc,
         requirement,
         response: None,
+        responders: Vec::new(),
     };
     // Questions for names outside the mDNS domains are not flagged: the
     // only ones filed here ask for a service's SRV target (e.g.
@@ -1324,6 +1460,7 @@ fn check_record_claims(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>
             rfc: "RFC 6762 §16",
             requirement: "MUST NOT",
             response: None,
+            responders: Vec::new(),
         });
     }
 
@@ -1360,6 +1497,7 @@ fn check_record_claims(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>
             section: rec.section,
             trigger: rec.trigger.clone(),
         }),
+        responders: Vec::new(),
     };
     if let Some((severity, reason, rfc, requirement)) =
         unicast_style_verdict(rec.rtype, rec.section, is_mdns_domain(&rec.name))
@@ -1420,6 +1558,7 @@ fn check_record_claims(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>
                 rfc: "RFC 6762 §6.1",
                 requirement: "",
                 response: None,
+                responders: Vec::new(),
             });
         }
     }
@@ -1452,6 +1591,7 @@ fn check_record_claims(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>
             rfc: "RFC 6762 §10.2",
             requirement: "MUST NOT",
             response: None,
+            responders: Vec::new(),
         });
     }
     // Unique records MUST carry the cache-flush bit in responses to port
@@ -1491,6 +1631,7 @@ fn check_record_claims(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>
             rfc: "RFC 6762 §10.2",
             requirement: if confirmed { "MUST" } else { "" },
             response: None,
+            responders: Vec::new(),
         });
     }
 
@@ -1521,6 +1662,7 @@ fn check_record_claims(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>
             rfc: "RFC 6762 §10",
             requirement: "SHOULD",
             response: None,
+            responders: Vec::new(),
         });
     } else if rec.ttl > TTL_HIGH {
         out.push(Anomaly {
@@ -1540,6 +1682,7 @@ fn check_record_claims(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>
             rfc: "RFC 6762 §10",
             requirement: "SHOULD",
             response: None,
+            responders: Vec::new(),
         });
     }
 
@@ -1581,6 +1724,7 @@ fn check_record_claims(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>
             rfc: "RFC 6762 §10",
             requirement: "SHOULD",
             response: None,
+            responders: Vec::new(),
         });
     }
 
@@ -1613,6 +1757,7 @@ fn check_record_claims(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>
                 rfc: "RFC 6763 §6.2",
                 requirement: "SHOULD NOT",
                 response: None,
+                responders: Vec::new(),
             });
         }
     }
@@ -1689,6 +1834,7 @@ fn srv_anomaly_info(service_id: &str, rec: &RawRecord, message: &str) -> Anomaly
         rfc: "RFC 2782",
         requirement: "",
         response: None,
+        responders: Vec::new(),
     }
 }
 
@@ -1706,6 +1852,7 @@ fn srv_anomaly(service_id: &str, rec: &RawRecord, message: &str) -> Anomaly {
         rfc: "RFC 2782",
         requirement: "MUST",
         response: None,
+        responders: Vec::new(),
     }
 }
 
@@ -1780,6 +1927,7 @@ fn check_ttl_stable(svc: &ServiceView, service_id: &str, now: Instant, out: &mut
                 rfc: "RFC 6762 §10",
                 requirement: "",
                 response: None,
+                responders: Vec::new(),
             });
         }
     }
@@ -1894,6 +2042,8 @@ mod tests {
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
             sightings: Vec::new(),
+            host_addresses: Vec::new(),
+            device_names: HashMap::new(),
         };
         analyze(&snap)
     }
@@ -2075,6 +2225,8 @@ mod tests {
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
             sightings: Vec::new(),
+            host_addresses: Vec::new(),
+            device_names: HashMap::new(),
         };
         let item = analyze(&snap)
             .iter()
@@ -2113,6 +2265,8 @@ mod tests {
             pending_hosts: HashSet::new(),
             questions: questions.to_vec(),
             sightings: Vec::new(),
+            host_addresses: Vec::new(),
+            device_names: HashMap::new(),
         };
         analyze(&snap)
     }
@@ -2578,6 +2732,8 @@ mod tests {
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
             sightings: Vec::new(),
+            host_addresses: Vec::new(),
+            device_names: HashMap::new(),
         };
         let item = analyze(&snap)
             .iter()
@@ -2626,6 +2782,7 @@ mod tests {
                 rfc: "RFC 6762 §10.2",
                 requirement: "MUST NOT",
                 response: None,
+                responders: Vec::new(),
             }
         }
         // Same service, same owner and type: the foreign target tells the
@@ -2799,6 +2956,8 @@ mod tests {
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
             sightings: Vec::new(),
+            host_addresses: Vec::new(),
+            device_names: HashMap::new(),
         };
         let item = analyze(&snap)
             .iter()
@@ -3196,6 +3355,8 @@ mod tests {
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
             sightings: Vec::new(),
+            host_addresses: Vec::new(),
+            device_names: HashMap::new(),
         };
         let found = analyze(&snap);
         let item = found
@@ -3226,6 +3387,8 @@ mod tests {
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
             sightings: Vec::new(),
+            host_addresses: Vec::new(),
+            device_names: HashMap::new(),
         };
         assert!(
             !analyze(&snap)
@@ -3251,6 +3414,8 @@ mod tests {
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
             sightings: Vec::new(),
+            host_addresses: Vec::new(),
+            device_names: HashMap::new(),
         };
         let found = analyze(&snap);
         let item = found
@@ -3282,6 +3447,8 @@ mod tests {
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
             sightings: Vec::new(),
+            host_addresses: Vec::new(),
+            device_names: HashMap::new(),
         };
         assert!(!analyze(&snap)
             .iter()
@@ -3324,6 +3491,8 @@ mod tests {
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
             sightings: Vec::new(),
+            host_addresses: Vec::new(),
+            device_names: HashMap::new(),
         };
 
         let found = analyze(&snap);
@@ -3353,6 +3522,8 @@ mod tests {
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
             sightings: Vec::new(),
+            host_addresses: Vec::new(),
+            device_names: HashMap::new(),
         };
         assert!(!analyze(&snap)
             .iter()
@@ -3376,6 +3547,8 @@ mod tests {
             pending_hosts: HashSet::new(),
             questions: Vec::new(),
             sightings: Vec::new(),
+            host_addresses: Vec::new(),
+            device_names: HashMap::new(),
         };
         assert!(analyze(&snap)
             .iter()
