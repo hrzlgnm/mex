@@ -867,9 +867,12 @@ fn source_label(rec: &crate::browse::RawRecord) -> String {
 /// the TTL): yellow while inside the refresh window (elapsed >= 80%,
 /// a requery is due or in flight), red past the final refresh
 /// (elapsed >= 95%) or expired, `None` for a healthy record (keep the
-/// row style).
+/// row style). A goodbye (TTL 0) is a clean withdrawal, not a fault:
+/// dark gray, distinct from both red and the gray of live rows.
 fn ttl_cell_color(rem: u32, ttl: u32) -> Option<Color> {
-    if ttl == 0 || (rem as u64) * 20 <= ttl as u64 {
+    if ttl == 0 {
+        Some(Color::DarkGray)
+    } else if (rem as u64) * 20 <= ttl as u64 {
         Some(Color::Red)
     } else if (rem as u64) * 5 <= ttl as u64 {
         Some(Color::Yellow)
@@ -1640,8 +1643,11 @@ mod tests {
     fn ttl_cell_color_marks_expiry_fraction() {
         // Aligned to the §5.2 requery schedule: yellow inside the
         // 80-95% refresh window, red past the final ~95% refresh.
+        // Expired without a goodbye stays red: the responder went silent.
         assert_eq!(ttl_cell_color(0, 120), Some(Color::Red));
-        assert_eq!(ttl_cell_color(10, 0), Some(Color::Red));
+        // A goodbye (TTL 0) is a clean withdrawal, dimmed rather than red.
+        assert_eq!(ttl_cell_color(0, 0), Some(Color::DarkGray));
+        assert_eq!(ttl_cell_color(10, 0), Some(Color::DarkGray));
         // ttl=120: yellow at rem <= 24 (elapsed >= 80%), red at rem <= 6.
         assert_eq!(ttl_cell_color(25, 120), None);
         assert_eq!(ttl_cell_color(24, 120), Some(Color::Yellow));
