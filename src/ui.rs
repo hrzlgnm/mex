@@ -667,6 +667,8 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, f
         _ => None,
     }));
     let (rows, raw_positions) = detail_table_rows(app, &target, &layout);
+    app.answers_rows
+        .replace(Some(layout.iter().map(|l| l.owning_record()).collect()));
     let total_rows = rows.len();
 
     // Size SOURCE to the longest socket addr so IPv6 fits, clamped to
@@ -850,6 +852,32 @@ fn detail_table_rows<'a>(
         _ => None,
     }));
     let mut raw_positions = Vec::with_capacity(answers.len());
+    // Worst finding per record and cell, in one pass: TTL kinds mark the
+    // TTL cell, everything else the type cell. Gone rows carry no
+    // findings in the layout, so they stay unmarked.
+    let mut marks: Vec<(
+        Option<crate::anomalies::Severity>,
+        Option<crate::anomalies::Severity>,
+    )> = vec![(None, None); answers.len()];
+    for line in layout {
+        if let AnswerLine::Finding {
+            anomaly,
+            record: Some(r),
+        } = line
+        {
+            let Some(mark) = marks.get_mut(*r) else {
+                continue;
+            };
+            let slot = if anomaly.kind.is_ttl() {
+                &mut mark.0
+            } else {
+                &mut mark.1
+            };
+            if slot.is_none_or(|s| anomaly.severity.rank() > s.rank()) {
+                *slot = Some(anomaly.severity);
+            }
+        }
+    }
     for line in layout {
         match line {
             AnswerLine::Info { label, text } => rows.push(
@@ -883,20 +911,7 @@ fn detail_table_rows<'a>(
             }
             AnswerLine::Record(i) => {
                 let rec = answers[*i];
-                // Worst finding per cell: TTL kinds mark the TTL cell,
-                // everything else the type cell. Gone rows carry no
-                // findings in the layout, so they stay unmarked.
-                let own = || {
-                    layout.iter().filter_map(move |l| match l {
-                        AnswerLine::Finding {
-                            anomaly,
-                            record: Some(r),
-                        } if r == i => Some(anomaly),
-                        _ => None,
-                    })
-                };
-                let ttl_mark = worst_of(own().filter(|a| a.kind.is_ttl())).map(|(_, s)| s);
-                let type_mark = worst_of(own().filter(|a| !a.kind.is_ttl())).map(|(_, s)| s);
+                let (ttl_mark, type_mark) = marks[*i];
                 let flush = if rec.flush_bit { "flush" } else { "" };
                 let rem = rec
                     .ttl
@@ -1068,8 +1083,11 @@ fn draw_questions_tab(
         .clamp(8, 15) as u16;
     let mut rows: Vec<Row> = Vec::new();
     let mut question_positions = Vec::with_capacity(body.len());
+    // Row -> question index as drawn: finding rows belong to their question.
+    let mut row_map = Vec::new();
     for (q, (cells, style)) in body.into_iter().enumerate() {
         question_positions.push(rows.len());
+        row_map.extend(std::iter::repeat_n(Some(q), 1 + per_question[q].len()));
         let mut cells = cells.into_iter();
         let mut row_cells = vec![marked_cell(
             cells.next().unwrap_or_default(),
@@ -1082,6 +1100,7 @@ fn draw_questions_tab(
             rows.push(finding_row(a, &identity_count, 3, 4));
         }
     }
+    app.questions_rows.replace(Some(row_map));
 
     let widths = [
         Constraint::Length(8),

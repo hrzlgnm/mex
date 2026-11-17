@@ -838,9 +838,20 @@ pub struct App {
     overheard: HashMap<(String, u16), (Instant, HashSet<String>, String)>,
     detail_svc_key: Option<(String, String)>,
     detail_enum_key: Option<String>,
+    /// Whether the detail cursor last synced onto `(unattributed)`.
+    detail_unattributed: bool,
     detail_anchor: Option<DetailCursorKey>,
     sticky_key: Option<(String, String)>,
     sticky_enum_key: Option<String>,
+    /// `(unattributed)` was the last selected target (sticky like the
+    /// service and enumeration keys).
+    sticky_unattributed: bool,
+    /// Row -> record index of the Answers table as last drawn (`None` per
+    /// info, block or unowned row), so a click hits what was on screen
+    /// even if findings changed since. `None` before the first draw.
+    pub answers_rows: RefCell<Option<Vec<Option<usize>>>>,
+    /// Row -> question index of the Questions table as last drawn.
+    pub questions_rows: RefCell<Option<Vec<Option<usize>>>>,
     /// Selectable enumeration row. Always present so our own enumeration
     /// demand has a home; answers and questions file here instead of
     /// being skipped as noise.
@@ -1097,7 +1108,15 @@ impl AnswerLine {
 /// type and rdata (spanning `ttl-unstable` findings carry no rdata and
 /// match every row of the name and type).
 fn finding_matches_record(a: &anomalies::Anomaly, rec: &browse::RawRecord) -> bool {
-    a.rtype == Some(rec.rtype)
+    // A sourced finding is about one responder's copy: another source's
+    // identical row must not inherit it. Findings carry either the bare
+    // socket address or the interface-qualified label.
+    let same_source = a
+        .source
+        .as_deref()
+        .is_none_or(|src| src == rec.source.to_string() || src == rec.source_label());
+    same_source
+        && a.rtype == Some(rec.rtype)
         && a.record_name.as_ref().is_some_and(|n| {
             n.trim_end_matches('.')
                 .eq_ignore_ascii_case(rec.name.trim_end_matches('.'))
@@ -1202,9 +1221,13 @@ impl App {
             hex_field_hits: RefCell::new(Vec::new()),
             detail_svc_key: None,
             detail_enum_key: None,
+            detail_unattributed: false,
+            answers_rows: RefCell::new(None),
+            questions_rows: RefCell::new(None),
             detail_anchor: None,
             sticky_key: None,
             sticky_enum_key: None,
+            sticky_unattributed: false,
             enum_entries: vec![EnumEntry {
                 name: ENUM_SERVICE.to_string(),
                 answers: Vec::new(),
@@ -4023,8 +4046,13 @@ impl App {
     /// cursor index. Child rows select their parent record; info rows
     /// select nothing. Mirrors `detail_table_rows` in `ui.rs`.
     fn answers_table_row_to_detail(&self, table_row: usize) -> Option<usize> {
-        // The same layout the table is drawn from: finding and TXT child
-        // rows select their parent record, info and block rows nothing.
+        // Finding and TXT child rows select their parent record, info and
+        // block rows nothing. Hit-test the frame as drawn: findings can
+        // change between drawing and the click.
+        if let Some(rows) = self.answers_rows.borrow().as_ref() {
+            return rows.get(table_row).copied().flatten();
+        }
+        // Nothing drawn for this target yet: the current layout.
         let target = self.display_detail()?;
         let found = self.anomalies();
         self.answers_layout(&target, &found)
@@ -4074,17 +4102,24 @@ impl App {
         };
         let raws = target.ordered_answers().len();
         let table_row = self.questions_offset.get().saturating_add(rel);
-        // Each question row is followed by its finding rows (#248).
-        let found = self.anomalies();
-        let mut row = 0;
-        let mut hit = None;
-        for (q, findings) in self.question_findings(&target, &found).iter().enumerate() {
-            if (row..=row + findings.len()).contains(&table_row) {
-                hit = Some(q);
-                break;
+        // Each question row is followed by its finding rows (#248); hit
+        // the frame as drawn, else the current layout.
+        let drawn = self
+            .questions_rows
+            .borrow()
+            .as_ref()
+            .map(|rows| rows.get(table_row).copied().flatten());
+        let hit = drawn.unwrap_or_else(|| {
+            let found = self.anomalies();
+            let mut row = 0;
+            for (q, findings) in self.question_findings(&target, &found).iter().enumerate() {
+                if (row..=row + findings.len()).contains(&table_row) {
+                    return Some(q);
+                }
+                row += 1 + findings.len();
             }
-            row += 1 + findings.len();
-        }
+            None
+        });
         if let Some(question) = hit {
             self.detail_free_scroll = false;
             let idx = raws + question;
@@ -4312,7 +4347,9 @@ impl App {
             return;
         }
         let max = items.len().saturating_sub(1);
-        let mut cur = self.selected_display;
+        // Entries can vanish between frames on time alone (an expiring
+        // `(unattributed)` group): never index past the rebuilt list.
+        let mut cur = self.selected_display.min(max);
 
         // Host headers are not stops; Up/Down lands on instances.
         loop {
@@ -4653,7 +4690,8 @@ impl App {
             .selected_service()
             .map(|s| (s.service_type.clone(), s.instance.clone()));
         let enum_key = self.selected_enum().map(|e| e.name.clone());
-        if svc_key.is_none() && enum_key.is_none() {
+        let unattributed = self.unattributed_selected();
+        if svc_key.is_none() && enum_key.is_none() && !unattributed {
             // Headers show the full unmarked list from the top: no row
             // to track, so a stale manual offset must not linger.
             self.anomalies_offset.set(0);
@@ -4662,9 +4700,16 @@ impl App {
             self.hex_field_hits.borrow_mut().clear();
             return;
         }
-        if self.detail_svc_key != svc_key || self.detail_enum_key != enum_key {
+        if self.detail_svc_key != svc_key
+            || self.detail_enum_key != enum_key
+            || self.detail_unattributed != unattributed
+        {
             self.detail_svc_key = svc_key;
             self.detail_enum_key = enum_key;
+            self.detail_unattributed = unattributed;
+            // The drawn row maps belong to the old target.
+            self.answers_rows.replace(None);
+            self.questions_rows.replace(None);
             self.detail_selected = 0;
             self.detail_offset.set(0);
             self.detail_free_scroll = false;
@@ -6278,10 +6323,17 @@ impl App {
         {
             self.sticky_key = Some(key);
             self.sticky_enum_key = None;
+            self.sticky_unattributed = false;
         }
         if let Some(enum_key) = self.selected_enum().map(|e| e.name.clone()) {
             self.sticky_enum_key = Some(enum_key);
             self.sticky_key = None;
+            self.sticky_unattributed = false;
+        }
+        if self.unattributed_selected() {
+            self.sticky_unattributed = true;
+            self.sticky_key = None;
+            self.sticky_enum_key = None;
         }
         self.sync_detail_cursor();
     }
@@ -6399,10 +6451,7 @@ impl App {
         if let Some(entry) = self.selected_enum() {
             return Some(DetailTarget::Enum(entry));
         }
-        if matches!(
-            self.display_items().get(self.selected_display),
-            Some(DisplayItem::Unattributed)
-        ) {
+        if self.unattributed_selected() {
             return Some(DetailTarget::Unattributed);
         }
         if let Some(key) = self.sticky_key.as_ref() {
@@ -6419,7 +6468,20 @@ impl App {
                 return Some(DetailTarget::Enum(entry));
             }
         }
+        // Folding the group parks on its header; keep showing it while
+        // it exists.
+        if self.sticky_unattributed && self.has_unattributed() {
+            return Some(DetailTarget::Unattributed);
+        }
         None
+    }
+
+    /// Whether the Hosts cursor sits on the `(unattributed)` row.
+    fn unattributed_selected(&self) -> bool {
+        matches!(
+            self.display_items().get(self.selected_display),
+            Some(DisplayItem::Unattributed)
+        )
     }
 
     /// Entry under the Tab cursor in the Records table: a raw record row or
@@ -15769,5 +15831,124 @@ mod tests {
             .display_items()
             .iter()
             .any(|it| matches!(it, DisplayItem::Unattributed)));
+    }
+
+    /// An app with one service and one ownerless sighting; returns the
+    /// `(unattributed)` row's display position.
+    fn app_with_unattributed() -> (App, usize) {
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1; b=2");
+        ingest(
+            &mut app,
+            &raw_record("router.fritz.box.", 6, "TYPE6", "rdlength=30", 4500),
+        );
+        let pos = app
+            .display_items()
+            .iter()
+            .position(|it| matches!(it, DisplayItem::Unattributed))
+            .expect("(unattributed) entry");
+        (app, pos)
+    }
+
+    #[test]
+    fn sourced_finding_stays_on_its_responders_row() {
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1; b=2");
+        // A second responder sends the same TXT correctly (flush bit set):
+        // the first one's no-flush finding must not land on it.
+        let mut good = txt_record("a=1; b=2");
+        good.source = "192.168.1.3:5353".parse().unwrap();
+        good.flush_bit = true;
+        ingest(&mut app, &good);
+        let lines = answers_text(&app);
+        let good_row = lines
+            .iter()
+            .position(|l| l.contains("TXT") && l.contains("192.168.1.3"))
+            .expect("second responder's row");
+        let warn = icon(anomalies::Severity::Warning);
+        assert!(!lines[good_row].contains(warn), "{}", lines[good_row]);
+        assert!(!lines[good_row + 1].contains("no-flush"), "{lines:#?}");
+        let bad_row = lines
+            .iter()
+            .position(|l| l.contains("TXT") && l.contains("192.168.1.2"))
+            .unwrap();
+        assert!(lines[bad_row + 1].contains("no-flush"), "{lines:#?}");
+    }
+
+    #[test]
+    fn vanished_unattributed_row_does_not_panic_navigation() {
+        let (mut app, pos) = app_with_unattributed();
+        app.selected_display = pos;
+        app.clamp_selection();
+        // The sighting ages out between frames; no clamp runs before `k`.
+        app.sightings.clear();
+        assert!(app.selected_display >= app.display_items().len());
+        app.move_selection(-1);
+        assert!(app.selected_display < app.display_items().len());
+        app.move_selection(1);
+        assert!(app.selected_display < app.display_items().len());
+    }
+
+    #[test]
+    fn folding_unattributed_keeps_it_as_the_detail_target() {
+        let (mut app, pos) = app_with_unattributed();
+        assert!(matches!(
+            app.display_detail(),
+            Some(DetailTarget::Service(_))
+        ));
+        app.selected_display = pos;
+        app.clamp_selection();
+        app.toggle_collapse();
+        assert!(matches!(
+            app.display_items().get(app.selected_display),
+            Some(DisplayItem::Host { label }) if label == UNATTRIBUTED_HOST
+        ));
+        assert!(
+            matches!(app.display_detail(), Some(DetailTarget::Unattributed)),
+            "the folded header keeps showing the unattributed findings"
+        );
+        // Selecting a service again replaces it.
+        select_instance(&mut app, "Test");
+        assert!(matches!(
+            app.display_detail(),
+            Some(DetailTarget::Service(_))
+        ));
+    }
+
+    #[test]
+    fn entering_unattributed_resets_the_answers_viewport() {
+        let (mut app, pos) = app_with_unattributed();
+        app.detail_offset.set(5);
+        app.detail_free_scroll = true;
+        app.selected_display = pos;
+        app.clamp_selection();
+        assert_eq!(app.detail_offset.get(), 0);
+        assert!(!app.detail_free_scroll);
+    }
+
+    #[test]
+    fn answers_click_hits_the_row_as_drawn() {
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1; b=2");
+        app.detail_offset.set(0);
+        // Draw a frame without the PTR's ttl-mismatch child: SRV sits on
+        // table row 2 (srvc, PTR, SRV).
+        let drawn: Vec<anomalies::Anomaly> = app
+            .anomalies()
+            .into_iter()
+            .filter(|a| a.kind != anomalies::AnomalyKind::TtlMismatch)
+            .collect();
+        let backend = ratatui::backend::TestBackend::new(160, 40);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| crate::ui::draw_with_findings(f, &app, &drawn))
+            .unwrap();
+        let area = app.answers_rect.get();
+        // The live analyzer still has the PTR finding, which would put a
+        // child row at table row 2; the click must follow the frame.
+        app.click_answers(area.y + 2 + 2);
+        match app.selected_detail_entry() {
+            Some(DetailEntry::Record(r)) => assert_eq!(r.rtype, 33),
+            _ => panic!("cursor on a record"),
+        }
     }
 }
