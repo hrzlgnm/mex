@@ -16443,6 +16443,136 @@ mod tests {
         );
     }
 
+    // --- #271: one host answering per NIC on one link ---
+
+    /// NIC 1 / NIC 2 of one multi-homed host on one bridge: each answers
+    /// from its own addresses with only those addresses (RFC 6762 §6.2).
+    const NIC1_V4: &str = "192.168.42.158";
+    const NIC2_V4: &str = "192.168.43.158";
+    const NIC1_LL: &str = "fe80::219:7cff:fe01:5801";
+    const NIC2_LL: &str = "fe80::219:7cff:fe01:5802";
+
+    /// A `.local` service whose SRV target `test.local` has its address
+    /// records judged by `conflicting-answers`.
+    fn local_host() -> App {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        app
+    }
+
+    fn addr(rtype: u16, ip: &str, source: &str) -> browse::RawRecord {
+        let family = if rtype == 1 { "A" } else { "AAAA" };
+        let mut rec = from(raw_record("test.local.", rtype, family, ip, 120), source);
+        rec.flush_bit = true;
+        rec.iface = "br0".into();
+        rec.ifindex = 8;
+        rec
+    }
+
+    fn v4(ip: &str) -> String {
+        format!("{ip}:5353")
+    }
+
+    fn v6(ip: &str) -> String {
+        format!("[{ip}%8]:5353")
+    }
+
+    #[test]
+    fn host_answering_a_per_nic_is_not_a_conflict() {
+        let mut app = local_host();
+        ingest(&mut app, &addr(1, NIC1_V4, &v4(NIC1_V4)));
+        ingest(&mut app, &addr(1, NIC2_V4, &v4(NIC2_V4)));
+        let found = conflicts(&app);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn host_answering_aaaa_per_nic_over_both_families_is_not_a_conflict() {
+        let mut app = local_host();
+        for (v4_ip, ll) in [(NIC1_V4, NIC1_LL), (NIC2_V4, NIC2_LL)] {
+            ingest(&mut app, &addr(1, v4_ip, &v4(v4_ip)));
+            for source in [v4(v4_ip), v6(ll)] {
+                ingest(&mut app, &addr(28, ll, &source));
+            }
+        }
+        let found = conflicts(&app);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn aaaa_over_v4_only_is_the_host_when_the_v4_source_is_announced() {
+        // No v6 source seen yet: the v4 source, an announced A of the
+        // host, still marks the group as the host's own.
+        let mut app = local_host();
+        for (v4_ip, ll) in [(NIC1_V4, NIC1_LL), (NIC2_V4, NIC2_LL)] {
+            ingest(&mut app, &addr(1, v4_ip, &v4(v4_ip)));
+            ingest(&mut app, &addr(28, ll, &v4(v4_ip)));
+        }
+        let found = conflicts(&app);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// The multi-homed host plus a foreign responder (a proxy answering
+    /// from an address the host does not announce) with its own claim.
+    fn host_and_foreign_responder() -> App {
+        let mut app = local_host();
+        ingest(&mut app, &addr(1, NIC1_V4, &v4(NIC1_V4)));
+        ingest(&mut app, &addr(1, NIC2_V4, &v4(NIC2_V4)));
+        ingest(&mut app, &addr(1, "192.168.42.7", &v4("192.168.42.9")));
+        app
+    }
+
+    #[test]
+    fn multi_homed_host_and_a_foreign_responder_are_two_responders() {
+        let app = host_and_foreign_responder();
+        let found = conflicts(&app);
+        assert_eq!(found.len(), 1, "{found:?}");
+        let c = &found[0];
+        assert_eq!(c.severity, anomalies::Severity::Warning);
+        assert!(
+            c.message
+                .starts_with("2 responders disagree on test.local A"),
+            "{}",
+            c.message
+        );
+        let mut groups: Vec<(Vec<String>, Vec<String>)> = c
+            .responders
+            .iter()
+            .map(|r| {
+                let mut s = r.sources.clone();
+                s.sort();
+                (s, r.addresses.clone())
+            })
+            .collect();
+        groups.sort();
+        let foreign = "192.168.42.9:5353@br0".to_string();
+        let mut host_sources = vec![
+            "192.168.42.158:5353@br0".to_string(),
+            "192.168.43.158:5353@br0".to_string(),
+        ];
+        host_sources.sort();
+        let mut want = vec![
+            (vec![foreign], vec!["192.168.42.7".to_string()]),
+            (host_sources, vec![NIC1_V4.to_string(), NIC2_V4.to_string()]),
+        ];
+        want.sort();
+        assert_eq!(groups, want);
+    }
+
+    #[test]
+    fn foreign_responder_gone_leaves_only_the_host() {
+        let mut app = host_and_foreign_responder();
+        assert_eq!(conflicts(&app).len(), 1);
+        ingest(&mut app, &{
+            let mut bye = addr(1, "192.168.42.7", &v4("192.168.42.9"));
+            bye.ttl = 0;
+            bye
+        });
+        let found = conflicts(&app);
+        assert!(found.is_empty(), "goodbye ends it: {found:?}");
+    }
+
     #[test]
     fn cursor_and_txt_expansion_stay_on_their_link() {
         let mut app = App::new().unwrap();
