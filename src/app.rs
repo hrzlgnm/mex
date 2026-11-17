@@ -15161,4 +15161,39 @@ mod tests {
             assert!(!kinds.contains(&"shared-flush"), "{rdata}: {kinds:?}");
         }
     }
+
+    #[test]
+    fn gone_rows_name_goodbye_and_expiry_in_the_ttl_cell() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        ingest(&mut app, &txt_record("a=1"));
+        app.evict_expired();
+        select_instance(&mut app, "Test");
+        // Withdraw the SRV with a goodbye, let the TXT's TTL elapse.
+        for rec in &mut app.services[0].answers {
+            match rec.rtype {
+                33 => rec.ttl = 0,
+                16 => {
+                    rec.received_at = Instant::now()
+                        .checked_sub(Duration::from_secs(5000))
+                        .unwrap_or_else(Instant::now)
+                }
+                _ => {}
+            }
+        }
+        let lines = answers_text(&app);
+        let row = |prefix: &str| {
+            lines
+                .iter()
+                .find(|l| l.starts_with(prefix))
+                .unwrap_or_else(|| panic!("{prefix} row: {lines:#?}"))
+                .clone()
+        };
+        let srv = row("│SRV");
+        let txt = row("│TXT");
+        assert!(srv.contains(" bye "), "goodbye row: {srv}");
+        assert!(!srv.contains(" exp "), "goodbye is not an expiry: {srv}");
+        assert!(txt.contains(" exp "), "expired row: {txt}");
+    }
 }

@@ -909,7 +909,11 @@ fn detail_table_rows<'a>(
                 let rem = rec
                     .ttl
                     .saturating_sub(rec.received_at.elapsed().as_secs() as u32);
-                let ttl_str = if rem == 0 {
+                // Gone rows name how they went: a goodbye (TTL 0,
+                // withdrawn) reads `bye`, an elapsed TTL `exp`.
+                let ttl_str = if rec.ttl == 0 {
+                    "bye".into()
+                } else if rem == 0 {
                     "exp".into()
                 } else if rem >= 60 {
                     format!("{}m{:02}s", rem / 60, rem % 60)

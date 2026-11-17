@@ -107,7 +107,7 @@ browsed as before.
   80% elapsed — a refresh is due — red past ~95% or expired), flush bit,
   source, and rdata. Multi-pair TXT records
   expand into unlabeled child rows. Records announced by this host are
-  highlighted; goodbye (TTL 0) records show as expired. Only the mDNS
+  highlighted; goodbye (TTL 0) records show `bye` and expired ones `exp` in TTL. Only the mDNS
   answer types A, AAAA, NS, CNAME, PTR, TXT, SRV, NSEC and HINFO become
   rows; see [Out-of-scope types](#out-of-scope-types). An address family
   the service's own responder denies with an NSEC (e.g. an IPv4-only
