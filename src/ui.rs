@@ -22,6 +22,8 @@ use ratatui::Frame;
 
 use crate::anomalies::Anomaly;
 use crate::app::{App, DisplayItem, DragMode, Focus};
+use crate::devices::{AddressBook, DeviceName};
+use std::collections::HashSet;
 
 pub type Terminal = ratatui::Terminal<CrosstermBackend<io::Stdout>>;
 
@@ -370,15 +372,56 @@ fn finding_text(
 fn finding_row(
     a: &Anomaly,
     identity_count: &std::collections::HashMap<(String, u16), usize>,
+    book: &AddressBook,
     source_col: usize,
     data_col: usize,
 ) -> Row<'static> {
     let mut cells: Vec<Cell<'static>> = (0..=data_col).map(|_| Cell::from("")).collect();
     cells[0] = Cell::from(Line::from(vec![Span::raw("  "), level_icon(a.severity)]));
-    cells[source_col] =
-        Cell::from(a.source.clone().unwrap_or_default()).style(Style::default().fg(Color::Gray));
+    // A finding is about one responder: always name it (#246).
+    let source = a
+        .source
+        .as_deref()
+        .map(|src| named(src.to_string(), book.resolve_label(src)))
+        .unwrap_or_default();
+    cells[source_col] = Cell::from(source).style(Style::default().fg(Color::Gray));
     cells[data_col] = Cell::from(finding_text(a, identity_count));
     Row::new(cells)
+}
+
+/// `label (Name)`, or the label alone when no device is named (#246).
+fn named(label: String, device: Option<DeviceName>) -> String {
+    match device {
+        Some(d) => format!("{label} ({})", d.display()),
+        None => label,
+    }
+}
+
+/// Hosts the displayed target lives on (its hostname and live SRV
+/// targets): records answered by these need no device name.
+fn own_hosts(target: &crate::app::DetailTarget<'_>) -> HashSet<String> {
+    match target {
+        crate::app::DetailTarget::Service(svc) => {
+            let mut hosts: HashSet<String> = App::service_hosts(svc).into_iter().collect();
+            hosts.insert(crate::anomalies::host_id(&svc.hostname));
+            hosts
+        }
+        _ => HashSet::new(),
+    }
+}
+
+/// Source cell of a record row: the device name only when it is not the
+/// displayed service's own host, so proxies and foreign responders stand
+/// out while ordinary rows stay uncluttered.
+fn record_source_label(
+    rec: &crate::browse::RawRecord,
+    book: &AddressBook,
+    own: &HashSet<String>,
+) -> String {
+    let device = book
+        .resolve(rec.source.ip())
+        .filter(|d| !own.contains(&d.host_id()));
+    named(source_label(rec), device)
 }
 
 /// A cell's text with the worst finding's icon appended, if any.
@@ -647,20 +690,33 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, f
         crate::app::AnswerLine::Finding { anomaly, .. } => Some(anomaly),
         _ => None,
     }));
-    let (rows, raw_positions) = detail_table_rows(app, &target, &layout);
+    let book = app.address_book();
+    let own = own_hosts(&target);
+    let (rows, raw_positions) = detail_table_rows(app, &target, &layout, &book, &own);
     app.answers_rows
         .replace(Some(layout.iter().map(|l| l.owning_record()).collect()));
     let total_rows = rows.len();
 
-    // Size SOURCE to the longest socket addr so IPv6 fits, clamped to
-    // keep RDATA usable on narrow terminals.
+    // Size SOURCE to the longest label (record rows and finding rows,
+    // device names included) so IPv6 fits, clamped to keep RDATA usable
+    // on narrow terminals.
+    let finding_sources = layout.iter().filter_map(|l| match l {
+        crate::app::AnswerLine::Finding { anomaly, .. } => anomaly
+            .source
+            .as_deref()
+            .map(|src| named(src.to_string(), book.resolve_label(src)).len()),
+        _ => None,
+    });
     let src_w = target
         .all_answers()
         .iter()
-        .map(|r| source_label(r).len())
+        .map(|r| record_source_label(r, &book, &own).len())
+        .chain(finding_sources)
         .max()
         .unwrap_or(14)
-        .clamp(14, 45) as u16;
+        // Device names (#246) lengthen labels: a wider cap keeps
+        // `addr (one-shot, Name)` whole.
+        .clamp(14, 60) as u16;
 
     // TYPE fits `▸ TXT` / `TYPE13` plus the level marker.
     let widths = [
@@ -804,6 +860,8 @@ fn detail_table_rows<'a>(
     app: &'a App,
     target: &'a crate::app::DetailTarget<'a>,
     layout: &[crate::app::AnswerLine],
+    book: &AddressBook,
+    own: &HashSet<String>,
 ) -> (Vec<Row<'a>>, Vec<usize>) {
     use crate::app::AnswerLine;
     let mut rows = Vec::new();
@@ -874,7 +932,7 @@ fn detail_table_rows<'a>(
             AnswerLine::Block(label) => rows
                 .push(Row::new(vec![Cell::from(label.clone()).column_span(5)]).style(block_style)),
             AnswerLine::Finding { anomaly, .. } => {
-                rows.push(finding_row(anomaly, &identity_count, 3, 4));
+                rows.push(finding_row(anomaly, &identity_count, book, 3, 4));
             }
             AnswerLine::TxtPair { pair, last, .. } => {
                 // Children span the full row width so the pair text sits
@@ -935,7 +993,7 @@ fn detail_table_rows<'a>(
                         marked_cell(type_label.to_string(), type_mark, Style::default()),
                         marked_cell(ttl_str, ttl_mark, ttl_style),
                         Cell::from(flush),
-                        Cell::from(source_label(rec)),
+                        Cell::from(record_source_label(rec, book, own)),
                         Cell::from(rec.rdata.clone()),
                     ])
                     .style(style),
@@ -967,6 +1025,7 @@ fn draw_questions_tab(
     // By type, newest first — same grouping as the Answers table. Each
     // row is followed by its findings (keys are name, type, querier: each
     // querier keeps its own finding) and marked with the worst one.
+    let book = app.address_book();
     let per_question = app.question_findings(&target, found);
     let shown = worst_of(per_question.iter().flatten());
     let identity_count = crate::anomalies::identity_counts(per_question.iter().flatten());
@@ -1045,7 +1104,7 @@ fn draw_questions_tab(
                 rtype.clone(),
                 last_txt,
                 due_txt,
-                question_source_label(source),
+                question_source_label(source, &book),
                 name.clone(),
             ],
             style,
@@ -1082,7 +1141,7 @@ fn draw_questions_tab(
         row_cells.extend(cells.map(Cell::from));
         rows.push(Row::new(row_cells).style(style));
         for a in &per_question[q] {
-            rows.push(finding_row(a, &identity_count, 3, 4));
+            rows.push(finding_row(a, &identity_count, &book, 3, 4));
         }
     }
     app.questions_rows.replace(Some(row_map));
@@ -1095,10 +1154,10 @@ fn draw_questions_tab(
             target
                 .ordered_questions()
                 .iter()
-                .map(|(_, _, source, _, _)| question_source_label(source).len())
+                .map(|(_, _, source, _, _)| question_source_label(source, &book).len())
                 .max()
                 .unwrap_or(14)
-                .clamp(14, 45) as u16,
+                .clamp(14, 60) as u16,
         ),
         Constraint::Min(20),
     ];
@@ -1164,15 +1223,19 @@ fn draw_questions_tab(
 }
 
 /// Source cell for the Questions table: our own inferred sends render
-/// as `self`, one-shot resolvers (§5.1, ephemeral source port) get a tag,
-/// everything else as the querier address.
-fn question_source_label(source: &SocketAddr) -> String {
+/// as `self` (never named), one-shot resolvers (§5.1, ephemeral source
+/// port) get a tag, everything else as the querier address; a named
+/// device follows (`addr (Name)`, `addr (one-shot, Name)`).
+fn question_source_label(source: &SocketAddr, book: &AddressBook) -> String {
     if *source == crate::app::SELF_SOURCE {
-        crate::app::SELF_SOURCE_LABEL.to_string()
-    } else if crate::anomalies::is_one_shot_querier(source) {
-        format!("{source} (one-shot)")
-    } else {
-        source.to_string()
+        return crate::app::SELF_SOURCE_LABEL.to_string();
+    }
+    let device = book.resolve(source.ip()).map(|d| d.display());
+    match (crate::anomalies::is_one_shot_querier(source), device) {
+        (true, Some(name)) => format!("{source} (one-shot, {name})"),
+        (true, None) => format!("{source} (one-shot)"),
+        (false, Some(name)) => format!("{source} ({name})"),
+        (false, None) => source.to_string(),
     }
 }
 
@@ -1497,15 +1560,27 @@ mod tests {
 
     #[test]
     fn question_source_label_marks_self() {
-        assert_eq!(question_source_label(&crate::app::SELF_SOURCE), "self");
+        assert_eq!(
+            question_source_label(&crate::app::SELF_SOURCE, &AddressBook::new(HashSet::new())),
+            "self"
+        );
         let addr: SocketAddr = "192.168.1.5:5353".parse().unwrap();
-        assert_eq!(question_source_label(&addr), "192.168.1.5:5353");
+        assert_eq!(
+            question_source_label(&addr, &AddressBook::new(HashSet::new())),
+            "192.168.1.5:5353"
+        );
         // Ephemeral source ports (§5.1) mark one-shot resolvers; other
         // ports render bare.
         let stub: SocketAddr = "192.168.1.5:45678".parse().unwrap();
-        assert_eq!(question_source_label(&stub), "192.168.1.5:45678 (one-shot)");
+        assert_eq!(
+            question_source_label(&stub, &AddressBook::new(HashSet::new())),
+            "192.168.1.5:45678 (one-shot)"
+        );
         let dns: SocketAddr = "192.168.1.5:53".parse().unwrap();
-        assert_eq!(question_source_label(&dns), "192.168.1.5:53");
+        assert_eq!(
+            question_source_label(&dns, &AddressBook::new(HashSet::new())),
+            "192.168.1.5:53"
+        );
     }
 
     #[cfg(unix)]

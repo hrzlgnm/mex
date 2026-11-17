@@ -4,6 +4,7 @@
 mod anomalies;
 mod app;
 mod browse;
+mod devices;
 mod dump;
 mod ui;
 
