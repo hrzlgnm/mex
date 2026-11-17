@@ -16470,19 +16470,19 @@ mod tests {
         rec
     }
 
-    fn v4(ip: &str) -> String {
+    fn v4_source(ip: &str) -> String {
         format!("{ip}:5353")
     }
 
-    fn v6(ip: &str) -> String {
+    fn v6_source(ip: &str) -> String {
         format!("[{ip}%8]:5353")
     }
 
     #[test]
     fn host_answering_a_per_nic_is_not_a_conflict() {
         let mut app = local_host();
-        ingest(&mut app, &addr(1, NIC1_V4, &v4(NIC1_V4)));
-        ingest(&mut app, &addr(1, NIC2_V4, &v4(NIC2_V4)));
+        ingest(&mut app, &addr(1, NIC1_V4, &v4_source(NIC1_V4)));
+        ingest(&mut app, &addr(1, NIC2_V4, &v4_source(NIC2_V4)));
         let found = conflicts(&app);
         assert!(found.is_empty(), "{found:?}");
     }
@@ -16491,8 +16491,8 @@ mod tests {
     fn host_answering_aaaa_per_nic_over_both_families_is_not_a_conflict() {
         let mut app = local_host();
         for (v4_ip, ll) in [(NIC1_V4, NIC1_LL), (NIC2_V4, NIC2_LL)] {
-            ingest(&mut app, &addr(1, v4_ip, &v4(v4_ip)));
-            for source in [v4(v4_ip), v6(ll)] {
+            ingest(&mut app, &addr(1, v4_ip, &v4_source(v4_ip)));
+            for source in [v4_source(v4_ip), v6_source(ll)] {
                 ingest(&mut app, &addr(28, ll, &source));
             }
         }
@@ -16506,8 +16506,8 @@ mod tests {
         // host, still marks the group as the host's own.
         let mut app = local_host();
         for (v4_ip, ll) in [(NIC1_V4, NIC1_LL), (NIC2_V4, NIC2_LL)] {
-            ingest(&mut app, &addr(1, v4_ip, &v4(v4_ip)));
-            ingest(&mut app, &addr(28, ll, &v4(v4_ip)));
+            ingest(&mut app, &addr(1, v4_ip, &v4_source(v4_ip)));
+            ingest(&mut app, &addr(28, ll, &v4_source(v4_ip)));
         }
         let found = conflicts(&app);
         assert!(found.is_empty(), "{found:?}");
@@ -16517,9 +16517,12 @@ mod tests {
     /// from an address the host does not announce) with its own claim.
     fn host_and_foreign_responder() -> App {
         let mut app = local_host();
-        ingest(&mut app, &addr(1, NIC1_V4, &v4(NIC1_V4)));
-        ingest(&mut app, &addr(1, NIC2_V4, &v4(NIC2_V4)));
-        ingest(&mut app, &addr(1, "192.168.42.7", &v4("192.168.42.9")));
+        ingest(&mut app, &addr(1, NIC1_V4, &v4_source(NIC1_V4)));
+        ingest(&mut app, &addr(1, NIC2_V4, &v4_source(NIC2_V4)));
+        ingest(
+            &mut app,
+            &addr(1, "192.168.42.7", &v4_source("192.168.42.9")),
+        );
         app
     }
 
@@ -16565,12 +16568,44 @@ mod tests {
         let mut app = host_and_foreign_responder();
         assert_eq!(conflicts(&app).len(), 1);
         ingest(&mut app, &{
-            let mut bye = addr(1, "192.168.42.7", &v4("192.168.42.9"));
+            let mut bye = addr(1, "192.168.42.7", &v4_source("192.168.42.9"));
             bye.ttl = 0;
             bye
         });
         let found = conflicts(&app);
         assert!(found.is_empty(), "goodbye ends it: {found:?}");
+    }
+
+    #[test]
+    fn proxy_agreeing_with_the_merged_host_is_not_a_conflict() {
+        // A proxy announcing both NICs' addresses agrees with the host
+        // as a whole, though with neither NIC alone.
+        let mut app = local_host();
+        ingest(&mut app, &addr(1, NIC1_V4, &v4_source(NIC1_V4)));
+        ingest(&mut app, &addr(1, NIC2_V4, &v4_source(NIC2_V4)));
+        for ip in [NIC1_V4, NIC2_V4] {
+            ingest(&mut app, &addr(1, ip, &v4_source("192.168.42.9")));
+        }
+        let found = conflicts(&app);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn foreign_responder_expiry_leaves_only_the_host() {
+        let mut app = host_and_foreign_responder();
+        assert_eq!(conflicts(&app).len(), 1);
+        let foreign: SocketAddr = "192.168.42.9:5353".parse().unwrap();
+        for svc in &mut app.services {
+            for rec in &mut svc.answers {
+                if rec.source == foreign {
+                    rec.received_at = Instant::now()
+                        .checked_sub(Duration::from_secs(500))
+                        .unwrap_or_else(Instant::now);
+                }
+            }
+        }
+        let found = conflicts(&app);
+        assert!(found.is_empty(), "expiry ends it: {found:?}");
     }
 
     #[test]

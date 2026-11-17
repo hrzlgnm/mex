@@ -360,21 +360,20 @@ fn check_conflicting_answers(
         let is_host = |sources: &[(SocketAddr, String)]| {
             own.is_some_and(|ips| sources.iter().any(|(s, _)| ips.contains(&s.ip())))
         };
-        let (host, mut others): (Vec<_>, Vec<_>) = by_set
+        // Re-keyed by the merged set, so a responder agreeing with the
+        // host as a whole is still the same set.
+        let (host, mut by_set): (BTreeMap<_, _>, BTreeMap<_, _>) = by_set
             .into_iter()
             .partition(|(_, sources)| is_host(sources));
         if !host.is_empty() {
-            let merged = host.into_iter().fold(
-                (BTreeSet::new(), Vec::new()),
-                |(mut addrs, mut sources), (a, s)| {
-                    addrs.extend(a);
-                    sources.extend(s);
-                    (addrs, sources)
-                },
-            );
-            others.push(merged);
+            let mut host_addrs = BTreeSet::new();
+            let mut host_sources = Vec::new();
+            for (addrs, sources) in host {
+                host_addrs.extend(addrs);
+                host_sources.extend(sources);
+            }
+            by_set.entry(host_addrs).or_default().extend(host_sources);
         }
-        let by_set = others;
         if by_set.len() < 2 {
             continue;
         }
