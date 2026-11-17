@@ -5619,13 +5619,22 @@ impl App {
             }
             // Addresses withheld from every other service (all deny them)
             // are still live addresses of this host.
-            for r in self.withheld_addrs.get(&host_key).into_iter().flatten() {
-                if r.ttl > r.received_at.elapsed().as_secs() as u32 {
-                    backfill.push(r.clone());
-                }
-            }
-            for r in &backfill {
+            let withheld: Vec<browse::RawRecord> = self
+                .withheld_addrs
+                .get(&host_key)
+                .into_iter()
+                .flatten()
+                .filter(|r| r.ttl > r.received_at.elapsed().as_secs() as u32)
+                .cloned()
+                .collect();
+            for r in backfill.iter().chain(&withheld) {
                 self.push_record(idx, r);
+            }
+            // A cached copy filed on a sibling is not a network update: the
+            // host keeps its own copy (the sibling may go away while the
+            // others still deny the family).
+            for r in &withheld {
+                self.withhold_address(r);
             }
         }
 
@@ -5756,8 +5765,12 @@ impl App {
             .iter()
             .enumerate()
             .filter(|(_, svc)| {
+                // Instance name, selected hostname, or any live SRV target
+                // (alternate targets own host records too, as for
+                // addresses).
                 format!("{}.{}", svc.instance, svc.service_type).to_lowercase() == name
                     || svc.hostname.trim_end_matches('.').to_lowercase() == name
+                    || Self::service_hosts(svc).contains(&name)
             })
             .map(|(i, _)| i)
             .collect();
@@ -5975,11 +5988,7 @@ impl App {
                 !records.is_empty()
             });
         }
-        // Denials live for their NSEC's TTL and only while their service
-        // (or pending instance) does; withheld addresses for their TTL.
-        let owners = self.live_service_keys();
-        self.address_denials
-            .retain(|d| d.is_live() && owners.contains(&d.service));
+        // Withheld addresses live for their TTL.
         self.withheld_addrs.retain(|_, rows| {
             rows.retain(|r| r.ttl > 0 && r.received_at.elapsed().as_secs() <= u64::from(r.ttl));
             !rows.is_empty()
@@ -5995,6 +6004,12 @@ impl App {
         }
         self.pending_instances
             .retain(|p| now.duration_since(p.last_seen) < grace);
+        // Denials live for their NSEC's TTL and only while their service
+        // (or pending instance) does: pruned after both were pruned, so a
+        // returning instance never inherits a stale denial.
+        let owners = self.live_service_keys();
+        self.address_denials
+            .retain(|d| d.is_live() && owners.contains(&d.service));
         // Sightings live for their TTL (questions: a fixed window);
         // owners are resolved at analysis time, so expiry is time only.
         let before = self.sightings.len();
@@ -14939,5 +14954,77 @@ mod tests {
             "{}",
             found[0].message
         );
+    }
+
+    #[test]
+    fn hostname_nsec_row_kept_for_an_alternate_srv_target() {
+        // SRV host-a, NSEC host-a, SRV host-b: host-b becomes selected,
+        // the NSEC row still belongs to the service via host-a.
+        let mut app = App::new().unwrap();
+        ingest(
+            &mut app,
+            &raw_record("_dacp._tcp.local.", 12, "PTR", DACP, 4500),
+        );
+        let mut srv_b = raw_record(DACP, 33, "SRV", "0 0 3689 other.local.", 120);
+        srv_b.flush_bit = true;
+        srv_b.source = "192.168.178.9:5353".parse().unwrap();
+        app.ingest_event(&packet(vec![
+            srv_on_knulp(DACP),
+            raw_record("knulp.local.", 47, "NSEC", "knulp.local. A", 120),
+            srv_b,
+        ]));
+        assert!(rows_of(&app, DACP).contains(&47));
+    }
+
+    #[test]
+    fn backfill_keeps_the_hosts_withheld_copy() {
+        let mut app = App::new().unwrap();
+        ingest(
+            &mut app,
+            &raw_record("_dacp._tcp.local.", 12, "PTR", DACP, 4500),
+        );
+        ingest(&mut app, &srv_on_knulp(DACP));
+        ingest(&mut app, &legacy_aaaa_denial());
+        ingest(&mut app, &aaaa_knulp());
+        ingest(
+            &mut app,
+            &raw_record("_smb._tcp.local.", 12, "PTR", SMB, 4500),
+        );
+        ingest(&mut app, &srv_on_knulp(SMB));
+        assert!(rows_of(&app, SMB).contains(&28), "sibling backfilled");
+        // The sibling goes away: the host still lists its live AAAA.
+        app.services.retain(|s| s.instance != "KNULP");
+        assert!(app
+            .host_addresses("knulp.local")
+            .iter()
+            .any(|a| a == "fd00::1"));
+    }
+
+    #[test]
+    fn evicted_owner_takes_its_denial_in_the_same_pass() {
+        let mut app = knulp_app();
+        ingest(&mut app, &legacy_aaaa_denial());
+        // _dacp is withdrawn and past its grace period.
+        for s in app
+            .services
+            .iter_mut()
+            .filter(|s| s.instance == "iTunes_Ctrl")
+        {
+            s.is_active = false;
+            s.last_seen = Instant::now() - Duration::from_secs(600);
+        }
+        app.evict_expired();
+        assert!(app.services.iter().all(|s| s.instance != "iTunes_Ctrl"));
+        // It returns before any later pass: no stale denial.
+        ingest(
+            &mut app,
+            &raw_record("_dacp._tcp.local.", 12, "PTR", DACP, 4500),
+        );
+        ingest(&mut app, &srv_on_knulp(DACP));
+        ingest(
+            &mut app,
+            &raw_record("knulp.local.", 28, "AAAA", "fd00::b", 120),
+        );
+        assert!(rows_of(&app, DACP).contains(&28));
     }
 }

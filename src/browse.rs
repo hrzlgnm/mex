@@ -2094,7 +2094,14 @@ pub(crate) fn nsec_address_types(rdata: &str) -> (Vec<u16>, bool) {
     // The next name may hold spaces (instance names do, e.g. "My A
     // Printer"), but it always ends in "." and no type mnemonic contains
     // one: the bitmap is everything after the last ". ".
-    let bitmap = rdata.rsplit_once(". ").map_or("", |(_, types)| types);
+    // An empty bitmap leaves the rdata ending in the name's "." (no type
+    // mnemonic ends in one); only otherwise does the last ". " start it.
+    let rdata = rdata.trim_end();
+    let bitmap = if rdata.ends_with('.') {
+        ""
+    } else {
+        rdata.rsplit_once(". ").map_or("", |(_, types)| types)
+    };
     for t in bitmap.split_whitespace().filter_map(rtype_from_str) {
         match t {
             1 | 28 => address.push(t),
@@ -2210,6 +2217,11 @@ mod tests {
             (vec![], true)
         );
         assert_eq!(nsec_address_types("host.local."), (vec![], false));
+        // Empty bitmap with a dotted name holding a mnemonic word.
+        assert_eq!(
+            nsec_address_types("Odd. A Name._http._tcp.local."),
+            (vec![], false)
+        );
     }
 
     #[test]
