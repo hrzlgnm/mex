@@ -15167,14 +15167,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn record_findings_sit_under_every_announcing_source() {
-        // One responder announcing a record over IPv6 and IPv4: each
-        // source's row carries its own finding, not only the row of the
-        // first source the analyzer saw.
+    /// Ingest one enumeration subtype PTR per (source, iface, ifindex)
+    /// copy and assert each copy's Answers row carries exactly one
+    /// `enum-subtype` finding, and the analyzer counts one per row.
+    fn assert_enum_subtype_per_copy(copies: &[(&str, &str, u32)]) {
         let mut app = App::new().unwrap();
-        let sources = ["[fe80::1234%2]:5353", "192.168.178.104:5353"];
-        for source in sources {
+        for (source, iface, ifindex) in copies {
             let mut rec = raw_record(
                 "_services._dns-sd._udp.local.",
                 12,
@@ -15183,6 +15181,8 @@ mod tests {
                 120,
             );
             rec.source = source.parse().unwrap();
+            rec.iface = (*iface).to_string();
+            rec.ifindex = *ifindex;
             ingest(&mut app, &rec);
         }
         app.selected_display = app
@@ -15192,22 +15192,52 @@ mod tests {
             .unwrap();
         let target = app.display_detail().unwrap();
         let found = app.anomalies();
+        let is_subtype = |a: &anomalies::Anomaly| a.kind == anomalies::AnomalyKind::EnumSubtype;
+        assert_eq!(
+            found.iter().filter(|a| is_subtype(a)).count(),
+            copies.len(),
+            "one finding per copy, so badges match the rows"
+        );
         let layout = app.answers_layout(&target, &found);
         let answers = target.ordered_answers();
-        for source in sources {
+        for (source, _, ifindex) in copies {
             let row = answers
                 .iter()
-                .position(|r| r.source.to_string() == source)
+                .position(|r| r.source.to_string() == *source && r.ifindex == *ifindex)
                 .unwrap();
-            assert!(
-                layout.iter().any(|l| matches!(
-                    l,
-                    AnswerLine::Finding { anomaly, record: Some(i) }
-                        if *i == row && anomaly.kind == anomalies::AnomalyKind::EnumSubtype
-                )),
-                "enum-subtype missing under {source}"
-            );
+            let under_row = layout
+                .iter()
+                .filter(|l| {
+                    matches!(
+                        l,
+                        AnswerLine::Finding { anomaly, record: Some(i) }
+                            if *i == row && is_subtype(anomaly)
+                    )
+                })
+                .count();
+            assert_eq!(under_row, 1, "enum-subtype under {source} #{ifindex}");
         }
+    }
+
+    #[test]
+    fn record_findings_sit_under_every_announcing_source() {
+        // One responder announcing a record over IPv6 and IPv4: each
+        // source's row carries its own finding, not only the row of the
+        // first source the analyzer saw.
+        assert_enum_subtype_per_copy(&[
+            ("[fe80::1234%2]:5353", "enp12s0", 2),
+            ("192.168.178.104:5353", "enp12s0", 2),
+        ]);
+    }
+
+    #[test]
+    fn record_findings_stay_per_link_for_one_address() {
+        // One address heard on two links: two rows, two findings, each
+        // under its own link's row.
+        assert_enum_subtype_per_copy(&[
+            ("192.168.178.104:5353", "eth0", 2),
+            ("192.168.178.104:5353", "wlan0", 3),
+        ]);
     }
 
     #[test]

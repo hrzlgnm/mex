@@ -530,7 +530,7 @@ pub fn analyze_observations(
                     rtype: Some(rec.rtype),
                     rtype_str: Some(rec.rtype_str.clone()),
                     rdata: Some(rec.rdata.clone()),
-                    source: Some(rec.source.to_string()),
+                    source: Some(rec.source_label()),
                     message: format!("bad enumerated type {target_display}: {reason}"),
                     rfc: "RFC 6763 §7",
                     requirement: "MUST",
@@ -549,7 +549,7 @@ pub fn analyze_observations(
                     rtype: Some(rec.rtype),
                     rtype_str: Some(rec.rtype_str.clone()),
                     rdata: Some(rec.rdata.clone()),
-                    source: Some(rec.source.to_string()),
+                    source: Some(rec.source_label()),
                     message: format!("{target_display} is a subtype; want base type"),
                     rfc: "RFC 6763 §9",
                     requirement: "",
@@ -612,7 +612,9 @@ fn dedup(mut items: Vec<Anomaly>) -> Vec<Anomaly> {
         // findings sit next to the row of the source that sent them
         // (`finding_matches_record`), so a record announced from several
         // sources (IPv4 and IPv6, several NICs) must keep a finding per
-        // source, or only the first source's row would show it.
+        // source, or only the first source's row would show it. Record
+        // findings name the interface-qualified `source_label()`, so one
+        // address heard on two links also keeps a finding per link.
         // Context-gated kinds also key on the message below, where the
         // same rdata via multicast vs unicast (or answer vs authority) is
         // a different verdict and must not collapse.
@@ -1468,7 +1470,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
 fn check_record_claims(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     let name = rec.name.clone();
     let rdata = rec.rdata.clone();
-    let src = rec.source.to_string();
+    let src = rec.source_label();
 
     // Non-UTF-8 names: mDNS names MUST be precomposed UTF-8
     // (RFC 6762 §16), so bytes outside UTF-8 come from a non-compliant
@@ -1748,7 +1750,7 @@ fn check_record_claims(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>
             rtype: Some(rec.rtype),
             rtype_str: Some(rec.rtype_str.clone()),
             rdata: Some(rec.rdata.clone()),
-            source: Some(rec.source.to_string()),
+            source: Some(rec.source_label()),
             message,
             rfc: "RFC 6762 §10",
             requirement: "SHOULD",
@@ -1781,7 +1783,7 @@ fn check_record_claims(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>
                 rtype: Some(rec.rtype),
                 rtype_str: Some(rec.rtype_str.clone()),
                 rdata: Some(rec.rdata.clone()),
-                source: Some(rec.source.to_string()),
+                source: Some(rec.source_label()),
                 message: format!("TXT {payload_len}B, max {TXT_MAX}B"),
                 rfc: "RFC 6763 §6.2",
                 requirement: "SHOULD NOT",
@@ -1858,7 +1860,7 @@ fn srv_anomaly_info(service_id: &str, rec: &RawRecord, message: &str) -> Anomaly
         rtype: Some(rec.rtype),
         rtype_str: Some(rec.rtype_str.clone()),
         rdata: Some(rec.rdata.clone()),
-        source: Some(rec.source.to_string()),
+        source: Some(rec.source_label()),
         message: message.to_string(),
         rfc: "RFC 2782",
         requirement: "",
@@ -1876,7 +1878,7 @@ fn srv_anomaly(service_id: &str, rec: &RawRecord, message: &str) -> Anomaly {
         rtype: Some(rec.rtype),
         rtype_str: Some(rec.rtype_str.clone()),
         rdata: Some(rec.rdata.clone()),
-        source: Some(rec.source.to_string()),
+        source: Some(rec.source_label()),
         message: message.to_string(),
         rfc: "RFC 2782",
         requirement: "MUST",
