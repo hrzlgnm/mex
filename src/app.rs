@@ -14516,7 +14516,7 @@ mod tests {
     }
 
     #[test]
-    fn record_finding_sits_under_its_row_with_the_level_icon() {
+    fn record_finding_sits_under_its_row_marked_once() {
         let mut app = App::new().unwrap();
         service_with_txt(&mut app, "a=1; b=2");
         let no_flush = finding(&app, anomalies::AnomalyKind::NoFlush);
@@ -14532,8 +14532,14 @@ mod tests {
             lines[txt]
         );
         assert!(
-            lines[txt + 1].contains("no-flush") && lines[txt + 1].contains(icon(no_flush.severity)),
+            lines[txt + 1].contains("no-flush"),
             "finding child row follows its record: {lines:#?}"
+        );
+        // The icon shows once, on the parent's marked cell (#266).
+        assert!(
+            !lines[txt + 1].contains(icon(no_flush.severity)),
+            "{}",
+            lines[txt + 1]
         );
         // No `!` suffix anywhere any more.
         assert!(!lines.iter().any(|l| l.contains("TXT!")));
@@ -15226,7 +15232,7 @@ mod tests {
     }
 
     #[test]
-    fn finding_row_names_kind_source_and_level_without_severity_word() {
+    fn finding_row_under_its_record_drops_source_icon_and_severity_word() {
         let mut app = App::new().unwrap();
         // shared-flush is an error: the red level icon carries the
         // severity, so the line spells no severity word.
@@ -15244,15 +15250,31 @@ mod tests {
             .find(|l| l.contains("shared-flush"))
             .unwrap_or_else(|| panic!("finding row: {text}"));
         assert!(!line.contains("error "), "no severity word: {line}");
-        assert!(line.contains("192.168.1.2:5353"), "source column: {line}");
+        assert!(
+            !line.contains("192.168.1.2:5353"),
+            "the parent row names the source: {line}"
+        );
+        assert!(
+            !line.contains('\u{f057}'),
+            "icon only on the parent: {line}"
+        );
         assert!(
             line.contains("PTR _http._tcp.local."),
             "names its row: {line}"
         );
+        // Text starts in the TTL column, right after TYPE.
+        let header = text.lines().nth(1).unwrap();
+        let col = |l: &str, needle: &str| l[..l.find(needle).unwrap()].chars().count();
+        assert_eq!(
+            col(line, "shared-flush"),
+            col(header, "TTL"),
+            "{header}\n{line}"
+        );
+        // The parent PTR row carries the red error mark.
         let y = area.y
             + text
                 .lines()
-                .position(|l| l.contains("shared-flush"))
+                .position(|l| l.contains("Test._http._tcp.local.") && l.contains("PTR"))
                 .unwrap() as u16;
         let icon_fg = (area.x..area.x + area.width)
             .filter_map(|x| buf.cell((x, y)))
@@ -15627,7 +15649,7 @@ mod tests {
     }
 
     #[test]
-    fn answers_name_foreign_responders_only_but_findings_always() {
+    fn answers_name_foreign_responders_only() {
         let mut app = fritz_mesh();
         // The repeater answers for the box's name: foreign responder.
         ingest(
@@ -15658,10 +15680,10 @@ mod tests {
             .position(|l| l.starts_with("│TXT"))
             .unwrap_or_else(|| panic!("{lines:#?}"));
         assert!(!lines[txt].contains("(~fritz)"), "own host: {}", lines[txt]);
-        assert!(
-            lines[txt + 1].contains("no-flush") && lines[txt + 1].contains("(~fritz)"),
-            "finding row names its source: {lines:#?}"
-        );
+        // Its finding child row doesn't repeat the source (#266).
+        assert!(lines[txt + 1].contains("no-flush"), "{lines:#?}");
+        assert!(!lines[txt + 1].contains("(~fritz)"), "{}", lines[txt + 1]);
+        assert!(!lines[txt + 1].contains("fe80::"), "{}", lines[txt + 1]);
     }
 
     #[test]
@@ -16451,5 +16473,55 @@ mod tests {
         // The last live copy saying goodbye still withdraws the service.
         ingest(&mut app, &ptr_wlan(0));
         assert!(!app.services[0].is_active, "withdrawn everywhere");
+    }
+
+    #[test]
+    fn question_finding_row_drops_the_querier_and_starts_in_last() {
+        let mut app = test_service_app();
+        app.evict_expired();
+        select_instance(&mut app, "Test");
+        let querier: SocketAddr = "192.168.1.77:5353".parse().unwrap();
+        app.ingest_event(&query_event(
+            "Test._http._tcp.local.",
+            16,
+            "TXT",
+            false,
+            Vec::new(),
+            querier,
+        ));
+        // No analyzer kind files on a Questions row today; inject one.
+        let mut found = app.anomalies();
+        found.push(anomalies::Anomaly {
+            kind: anomalies::AnomalyKind::UnsupportedQuestion,
+            severity: anomalies::Severity::Info,
+            service: "Test._http._tcp.local".to_string(),
+            record_name: Some("Test._http._tcp.local.".to_string()),
+            rtype: Some(16),
+            rtype_str: Some("TXT".to_string()),
+            rdata: None,
+            source: Some(querier.to_string()),
+            message: "injected question finding".to_string(),
+            rfc: "RFC 6762 §5",
+            requirement: "",
+            response: None,
+            responders: Vec::new(),
+        });
+        let backend = ratatui::backend::TestBackend::new(160, 40);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| crate::ui::draw_with_findings(f, &app, &found))
+            .unwrap();
+        let text = rect_text(term.backend().buffer(), app.questions_rect.get());
+        let lines: Vec<&str> = text.lines().collect();
+        let row = lines
+            .iter()
+            .find(|l| l.contains("injected question finding"))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(!row.contains("192.168.1.77"), "{row}");
+        let col = |l: &str, needle: &str| l[..l.find(needle).unwrap()].chars().count();
+        assert_eq!(
+            col(row, "unsupported-question"),
+            col(lines[1], "LAST"),
+            "{text}"
+        );
     }
 }
