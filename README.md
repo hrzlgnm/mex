@@ -124,7 +124,7 @@ browsed as before.
   packet, falling back to the service's latest packet. `Tab` focuses it
   for scrolling.
 - **Mouse.** Drag the shared pane borders to resize Hosts vs detail and
-  Answers / Questions / Anomalies / Hex (the seam lights up). Click a row to
+  Answers / Questions / Hex (the seam lights up). Click a row to
   focus its pane and move the cursor there; clicking a host header
   folds it. While mouse input is captured, use Shift+drag to select
   text in most terminals.
@@ -133,8 +133,8 @@ browsed as before.
 
 | Key | Action |
 | --- | ------ |
-| `Tab` / `Shift+Tab` | switch pane (Hosts → Answers → Questions → Anomalies → Hex) |
-| `Up` / `Down`, `j` / `k` | move within the focused pane (scroll Hex / Anomalies when focused) |
+| `Tab` / `Shift+Tab` | switch pane (Hosts → Answers → Questions → Hex) |
+| `Up` / `Down`, `j` / `k` | move within the focused pane (scroll Hex when focused) |
 | `h` / `l`, `←` / `→` | jump between host groups |
 | `H` / `L` | first / last host group |
 | `Home` / `End` | first / last row of the focused pane (top / bottom of Hex) |
@@ -165,11 +165,10 @@ and surfaces each deviation as an anomaly with a severity:
 - **warning** — a likely misconfiguration (e.g. a `.local` service with
   no address records, a subtype listed in service enumeration, an SOA
   sent as a unicast-style negative answer).
-- **info** — a SHOULD-level deviation or an observation, shown inline
-  like the others but kept out of the Anomalies pane (e.g. a PTR re-announced with a
-  120 s TTL instead of the recommended 4500 s, a unique record missing
-  its cache-flush bit, an SRV target outside `.local`, a question for
-  SOA).
+- **info** — a SHOULD-level deviation or an observation (e.g. a PTR
+  re-announced with a 120 s TTL instead of the recommended 4500 s, a
+  unique record missing its cache-flush bit, an SRV target outside
+  `.local`, a question for SOA).
 
 Findings sit next to their owner:
 
@@ -193,16 +192,10 @@ Findings sit next to their owner:
   the findings they show.
 
 A finding row reads `<icon>`, then the announcer/querier in the source
-column, then `<kind> <record>: <message> (<rfc>, <requirement>)`.
-
-The Anomalies pane lists every error and warning for the selected
-service and its host with a `>` marker on the
-highlighted row's findings. Each line reads
-`<icon> <source>: <kind> <record>: <message> (<rfc>, <requirement>)` —
-the requirement is omitted when the cited text has no RFC 2119 keyword;
-the announcer/querier address leads, the level icon carries the
-severity (no severity word), and enumeration-row findings omit their
-constant scope. The metrics overlay (`m`) lists all findings with
+column, then `<kind> <record>: <message> (<rfc>, <requirement>)` — the
+requirement is omitted when the cited text has no RFC 2119 keyword, the
+level icon carries the severity (no severity word), and
+enumeration-row findings omit their constant scope. The metrics overlay (`m`) lists all findings with
 severity icons as `<icon> <kind>` → `<source>: <service>
 <record>: <message> (<rfc>)`, and `Ctrl+J` state dumps include the
 full list. A question that asks for a name shared by several services

@@ -21,7 +21,7 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use crate::anomalies::Anomaly;
-use crate::app::{AnomalyScope, App, DisplayItem, DragMode, Focus};
+use crate::app::{App, DisplayItem, DragMode, Focus};
 
 pub type Terminal = ratatui::Terminal<CrosstermBackend<io::Stdout>>;
 
@@ -605,37 +605,30 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, 
 }
 
 fn draw_detail_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, found: &[Anomaly]) {
-    // Right side: Answers table on top, its questions below with their
-    // own captions (age, not TTL), anomalies for the highlighted record
-    // next, hex dump of the selected entry at the bottom. The abutting
-    // pane borders are the drag handles.
+    // Right side: Answers table (with its findings inline) on top, its
+    // questions below with their own captions (age, not TTL), hex dump of
+    // the selected entry at the bottom. The abutting pane borders are the
+    // drag handles.
     let answers = app.answers_pct.clamp(10, 70);
     let questions = app
         .questions_pct
         .clamp(10, 70)
         .min(90u16.saturating_sub(answers));
-    let anomalies = app
-        .anomalies_pct
-        .clamp(10, 70)
-        .min(90u16.saturating_sub(answers.saturating_add(questions)));
     let panes = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Percentage(answers),
             Constraint::Percentage(questions),
-            Constraint::Percentage(anomalies),
             Constraint::Min(0),
         ])
         .split(area);
 
     app.answers_rect.set(panes[0]);
     app.questions_rect.set(panes[1]);
-    app.anomalies_rect.set(panes[2]);
-    app.hex_rect.set(panes[3]);
+    app.hex_rect.set(panes[2]);
     draw_records_tab(frame, panes[0], app, found);
     draw_questions_tab(frame, panes[1], app, found);
-    draw_anomalies_tab(frame, panes[2], app, found);
-    draw_hex_tab(frame, panes[3], app);
+    draw_hex_tab(frame, panes[2], app);
 }
 
 /// Border color: resize hover/drag wins (subtle cyan seam) over focus white.
@@ -1144,7 +1137,7 @@ fn draw_questions_tab(
                     app.focus == Focus::Questions,
                     resize_active(app, DragMode::Vertical)
                         || resize_active(app, DragMode::HorizUpper)
-                        || resize_active(app, DragMode::HorizMiddle),
+                        || resize_active(app, DragMode::HorizLower),
                 )),
         )
         // The hex pane follows the detail cursor whatever holds focus, so
@@ -1199,137 +1192,6 @@ fn fmt_qage(secs: u64) -> String {
         format!("{secs}s")
     }
 }
-
-fn draw_anomalies_tab(
-    frame: &mut Frame,
-    area: ratatui::layout::Rect,
-    app: &App,
-    found: &[Anomaly],
-) {
-    // Findings for the highlighted detail row — or for the displayed
-    // service while resting on a header: severity wording and icon,
-    // kind, message, and RFC reference per row. Follows the detail
-    // cursor and has no cursor of its own; j/k and paging keys scroll.
-    app.anomalies_viewport
-        .set(area.height.saturating_sub(2) as usize);
-    let findings = app.anomalies_for_selected_in(found);
-    let title = match app.display_detail() {
-        Some(target) => format!(" Anomalies: {} ({}) ", target.pane_ident(), findings.len()),
-        None => format!(" Anomalies ({}) ", findings.len()),
-    };
-    let dimmed = Style::default().fg(Color::Gray);
-    // Row identities already claimed in this pane: a repeated
-    // (name, type) names its rdata to tell the findings apart.
-    let identity_count = crate::anomalies::identity_counts(findings.iter().map(|p| &p.anomaly));
-    let finding_lines = |findings: &[crate::app::PaneAnomaly]| -> Vec<Line<'_>> {
-        if findings.is_empty() {
-            return vec![Line::from(Span::styled(
-                "No anomalies for this service",
-                dimmed,
-            ))];
-        }
-        findings
-            .iter()
-            .map(|p| {
-                let a = &p.anomaly;
-                let color = match a.severity {
-                    crate::anomalies::Severity::Error => Color::Red,
-                    crate::anomalies::Severity::Warning => Color::Yellow,
-                    crate::anomalies::Severity::Info => Color::Blue,
-                };
-                // Which row the finding belongs to: the shared helper
-                // omits service-level and enumeration rows (constant or
-                // absent identity) and disambiguates repeated identities
-                // with `= rdata`. Question scopes render as stored (self
-                // sends never produce findings, so no `self` case arises).
-                let scope = crate::anomalies::visible_scope(a, &identity_count);
-                // No severity word: the level icon already carries it.
-                let head = if scope.is_empty() {
-                    a.kind.as_str().to_string()
-                } else {
-                    format!("{} {scope}", a.kind.as_str())
-                };
-                Line::from(vec![
-                    Span::styled(
-                        if p.cursor_match { "> " } else { "  " },
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        crate::app::App::anomaly_level_icon(a.severity).to_string(),
-                        Style::default().fg(color),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(
-                        // `<icon> <source> <kind…> <text>`; unsourced findings
-                        // omit the source slot.
-                        match a.source.as_deref() {
-                            Some(src) => format!("{src}: {head}: {}", a.message),
-                            _ => format!("{head}: {}", a.message),
-                        },
-                        Style::default().fg(Color::White),
-                    ),
-                    Span::styled(
-                        if a.requirement.is_empty() {
-                            format!(" ({})", a.rfc)
-                        } else {
-                            format!(" ({}, {})", a.rfc, a.requirement)
-                        },
-                        Style::default().fg(Color::Gray),
-                    ),
-                ])
-            })
-            .collect()
-    };
-    let lines: Vec<Line<'_>> = match app.anomaly_scope() {
-        // Gone rows name their state instead of findings: a goodbye or
-        // an expiry is information, not an empty result.
-        AnomalyScope::Record(rec) => match crate::app::record_liveness(rec) {
-            crate::app::RecordLiveness::Goodbye => vec![Line::from(Span::styled(
-                "Goodbye received — record withdrawn",
-                dimmed,
-            ))],
-            crate::app::RecordLiveness::Expired => vec![Line::from(Span::styled(
-                "Record expired — TTL elapsed",
-                dimmed,
-            ))],
-            crate::app::RecordLiveness::Live => finding_lines(&findings),
-        },
-        _ => finding_lines(&findings),
-    };
-
-    let total = lines.len();
-    // While tracking, a changed finding list re-anchors the viewport
-    // to the cursor's finding instead of leaving the marker behind.
-    // Manual scrolling clears tracking, so user offsets are untouched.
-    // The pure decision is unit-tested; draw only clamps to viewport.
-    let at = findings.iter().position(|p| p.cursor_match);
-    app.anomalies_offset
-        .set(crate::app::App::tracked_anomalies_offset(
-            app.anomalies_follow.get(),
-            app.anomalies_offset.get(),
-            at,
-            total,
-        ));
-    let offset = clamp_scroll(
-        app.anomalies_offset.get(),
-        total,
-        app.anomalies_viewport.get(),
-    );
-    app.anomalies_offset.set(offset);
-    let para = Paragraph::new(lines).scroll((offset as u16, 0)).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .border_style(border_color(
-                app.focus == Focus::Anomalies,
-                resize_active(app, DragMode::Vertical)
-                    || resize_active(app, DragMode::HorizMiddle)
-                    || resize_active(app, DragMode::HorizLower),
-            )),
-    );
-    frame.render_widget(para, area);
-}
-
 struct HexFieldPosition {
     row: usize,
     col: usize,
