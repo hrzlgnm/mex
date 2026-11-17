@@ -5392,12 +5392,29 @@ impl App {
             }
             None => {
                 rows.push((name, rtype_str, source, at, bytes));
-                if rows.len() > QUESTION_CAP {
-                    rows.remove(0);
-                    true
-                } else {
-                    false
+                if rows.len() <= QUESTION_CAP {
+                    return false;
                 }
+                // Rows already past the window would age out on the next
+                // expiry pass anyway: drop them first, uncounted, so they
+                // never cost a live row its slot.
+                let now = Instant::now();
+                rows.retain(|q| now.saturating_duration_since(q.3) <= QUESTION_WINDOW);
+                if rows.len() <= QUESTION_CAP {
+                    return false;
+                }
+                // Still full of live rows: evict the stalest by seen-at, not
+                // the first in the list (a re-ask refreshes in place, so the
+                // front row can be the freshest).
+                if let Some(stalest) = rows
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, q)| q.3)
+                    .map(|(i, _)| i)
+                {
+                    rows.remove(stalest);
+                }
+                true
             }
         }
     }
@@ -16709,5 +16726,49 @@ mod tests {
         assert!(row.age_secs >= 600, "seen-at kept: {}", row.age_secs);
         assert_eq!(svc.questions_dropped, 3);
         assert!(svc.questions_truncated);
+    }
+
+    #[test]
+    fn expired_rows_never_cost_a_live_row_its_slot() {
+        let mut app = test_service_app();
+        for i in 0..QUESTION_CAP {
+            ask(&mut app, "Test._http._tcp.local.", querier(i));
+        }
+        // A long pause: every row is past the window, none pruned yet.
+        for i in 0..QUESTION_CAP {
+            age_questions(&mut app, querier(i), PAST_WINDOW);
+        }
+        // The first querier re-asks, then a new one arrives.
+        ask(&mut app, "Test._http._tcp.local.", querier(0));
+        ask(&mut app, "Test._http._tcp.local.", querier(500));
+        app.evict_expired();
+        let mut got = dumped_sources(&app);
+        got.sort();
+        let mut want = vec![querier(0).to_string(), querier(500).to_string()];
+        want.sort();
+        assert_eq!(got, want);
+        let dump = app.state_dump();
+        assert_eq!(
+            dump.services[0].questions_dropped, 0,
+            "ageing is not a drop"
+        );
+    }
+
+    #[test]
+    fn a_full_live_list_evicts_its_stalest_row() {
+        let mut app = test_service_app();
+        for i in 0..QUESTION_CAP {
+            ask(&mut app, "Test._http._tcp.local.", querier(i));
+            // Older rows first: querier(0) is the stalest...
+            age_questions(&mut app, querier(i), 1000 - i as u64);
+        }
+        // ...until it re-asks; querier(1) is now the stalest.
+        ask(&mut app, "Test._http._tcp.local.", querier(0));
+        ask(&mut app, "Test._http._tcp.local.", querier(500));
+        let got = dumped_sources(&app);
+        assert!(got.contains(&querier(0).to_string()), "re-asked row kept");
+        assert!(got.contains(&querier(500).to_string()));
+        assert!(!got.contains(&querier(1).to_string()), "stalest evicted");
+        assert_eq!(app.state_dump().services[0].questions_dropped, 1);
     }
 }
