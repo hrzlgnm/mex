@@ -102,7 +102,7 @@ browsed as before.
 - **Right top — Answers.** For the selected service: derived rows
   (`srvc`, `subt`, in *italic* as constructed summaries, not wire
   records), then one row per observed raw record
-  (deduplicated across responders, sorted by type then source) with
+  (one row per source and ingress link, sorted by type then source) with
   remaining TTL (heat-colored by requery schedule: yellow once past
   80% elapsed — a refresh is due — red past ~95% or expired), flush bit,
   source, and rdata. Multi-pair TXT records
