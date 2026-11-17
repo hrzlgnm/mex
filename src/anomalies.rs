@@ -51,7 +51,7 @@ pub fn service_id(instance: &str, service_type: &str) -> String {
 /// Finding owner for a record or question owned by a hostname (an SRV
 /// target): the lowercased name without its root dot. One host backs
 /// many services, so host-owned evidence is recorded once, under the
-/// host, and every service on it shows it in its Anomalies pane.
+/// host, and every service on it shows it in a `host` block.
 pub fn host_id(hostname: &str) -> String {
     hostname.trim_end_matches('.').to_lowercase()
 }
@@ -192,15 +192,6 @@ pub struct Anomaly {
 pub struct ResponseContext {
     pub section: crate::browse::RecordSection,
     pub trigger: Option<crate::browse::QueryTrigger>,
-}
-
-impl Anomaly {
-    /// Whether the finding surfaces outside the metrics overlay: errors
-    /// and warnings mark table rows and fill the Anomalies pane, while
-    /// informational notes stay in the overlay.
-    pub fn is_surfaced(&self) -> bool {
-        !matches!(self.severity, Severity::Info)
-    }
 }
 
 /// A service slice for analysis: borrows browser state, owns nothing.
@@ -1073,8 +1064,8 @@ where
     counts
 }
 
-/// Display scope for a finding, shared by the Anomalies pane and the
-/// metrics overlay: empty for service-level findings and enumeration
+/// Display scope for a finding, shared by the inline finding rows and
+/// the metrics overlay: empty for service-level findings and enumeration
 /// rows (constant owner; the message carries the target instead), the
 /// QRY or `TYPE name` identity otherwise — plus `= rdata` when siblings
 /// share the identity so every row stays tellable-apart, unless the

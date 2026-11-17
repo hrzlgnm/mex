@@ -16,8 +16,8 @@ services, records, queries, raw packets, and anomaly detection. Listens
 passively on UDP port
 5353 (IPv4 + IPv6 multicast) and also sends the standard browse queries
 (service enumeration, PTR/SRV/TXT/A/AAAA). Suspicious records and
-questions are flagged as anomalies, listed per service in the Anomalies
-pane and in the metrics overlay.
+questions are flagged as anomalies, shown under the record they concern
+and in the metrics overlay.
 
 .SH OPTIONS
 .TP
@@ -68,7 +68,7 @@ names the selected row's host.
 For the selected service: derived rows, then one row per observed raw
 record with remaining TTL, flush bit, source, and rdata. Multi-pair TXT
 records expand into unlabeled child rows. Records announced by this host
-are highlighted; goodbye (TTL 0) records show as expired. Each live
+are highlighted; goodbye (TTL 0) records show bye and expired ones exp in the TTL column. Each live
 record's findings follow it as child rows, and the record carries the
 worst finding's level icon (TTL cell for TTL findings, type cell
 otherwise). Findings about the service as a whole, or about its host,
@@ -80,19 +80,13 @@ Recently observed queries asking for the selected service, newest first,
 with per-query age instead of TTL. Questions from this host are highlighted
 like local records.
 .TP
-.B Anomalies (right, below Questions)
-Every error and warning for the selected service, with the row's own
-findings marked. Expired and goodbye rows name their state instead of
-findings. Tab focuses it for scrolling; the pane follows the record
-cursor.
-.TP
 .B Hex (right bottom)
 Wire bytes of the selected record or question packet, falling back to the
 service's latest packet. Tab focuses it for scrolling.
 .TP
 .B Mouse
 Drag the shared pane borders to resize Hosts vs detail, and Answers /
-Questions / Anomalies / Hex (the seam lights up). Click a row to
+Questions / Hex (the seam lights up). Click a row to
 focus its pane and move the cursor there; clicking a host header folds it.
 While mouse input is captured, use Shift+drag to select text in most
 terminals.
@@ -101,7 +95,7 @@ terminals.
 .TP
 .B Pane switching
 .br
-Tab / Shift+Tab      - Switch pane (Hosts \(-> Answers \(-> Questions \(-> Anomalies \(-> Hex)
+Tab / Shift+Tab      - Switch pane (Hosts \(-> Answers \(-> Questions \(-> Hex)
 .TP
 .B Navigation
 .br
