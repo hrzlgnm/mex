@@ -2229,11 +2229,12 @@ impl App {
                     .iter()
                     .flat_map(|s| s.answers.iter())
                     .filter(|r| matches!(r.rtype, 1 | 28) && anomalies::host_id(&r.name) == host)
-                    // Live copies only, before the dedup: a stale copy on
-                    // an earlier service must not shadow a live one.
-                    .filter(|r| record_liveness(r) == RecordLiveness::Live)
                     .chain(self.pending_addrs.get(&host).into_iter().flatten())
                     .chain(self.withheld_addrs.get(&host).into_iter().flatten())
+                    // Live copies only, before the dedup and from every
+                    // source: a stale copy (an earlier service's, or a
+                    // pending one) must not shadow a live one.
+                    .filter(|r| record_liveness(r) == RecordLiveness::Live)
                     .filter(|r| {
                         seen.insert((
                             r.rtype,
@@ -16394,5 +16395,27 @@ mod tests {
             .map(|r| r.ifindex)
             .collect();
         assert_eq!(expanded, vec![3], "expansion is per row");
+    }
+
+    #[test]
+    fn stale_pending_copy_does_not_shadow_a_live_withheld_one() {
+        let mut app = fritz_mesh();
+        ingest(&mut app, &aaaa("fritz.box.", BOX_ULA, BOX_V4));
+        // The repeater's disagreeing address, cached twice under the same
+        // identity: a stale pending copy and a live withheld one.
+        let live = aaaa("fritz.box.", REP_ULA, REPEATER);
+        let mut stale = live.clone();
+        stale.received_at = Instant::now()
+            .checked_sub(Duration::from_secs(500))
+            .unwrap_or_else(Instant::now);
+        app.pending_addrs
+            .entry("fritz.box".to_string())
+            .or_default()
+            .push(stale);
+        app.withheld_addrs
+            .entry("fritz.box".to_string())
+            .or_default()
+            .push(live);
+        assert_eq!(conflicts(&app).len(), 1, "the live withheld copy counts");
     }
 }
