@@ -3518,14 +3518,12 @@ impl App {
                             })
                             .collect(),
                         // The conflict message spells out the addresses:
-                        // mask public IPv6 there too.
-                        message: a
-                            .responders
-                            .iter()
-                            .flat_map(|r| r.addresses.iter())
-                            .fold(a.message.clone(), |msg, addr| {
-                                msg.replace(addr.as_str(), &dump::redact_ip_literal(addr))
-                            }),
+                        // mask public IPv6 there too, word by word.
+                        message: if a.responders.is_empty() {
+                            a.message.clone()
+                        } else {
+                            dump::redact_ip_words(&a.message)
+                        },
                         rfc: a.rfc.to_string(),
                         requirement: a.requirement.to_string(),
                         section: a.response.as_ref().map(|r| r.section.as_str().to_string()),
@@ -16047,5 +16045,30 @@ mod tests {
         let text_col = col(row, "conflicting-answers");
         assert_eq!(text_col, src_col, "{header}\n{row}");
         assert!(row.contains("2 responders disagree"), "{row}");
+    }
+
+    #[test]
+    fn dump_masks_prefix_overlapping_addresses_whole() {
+        // `2003::1` is a prefix of `2003::1:5`: masking must not touch
+        // the longer address through the shorter one.
+        let mut app = fritz_mesh();
+        ingest(&mut app, &aaaa("fritz.box.", "2003::1", BOX_V4));
+        ingest(&mut app, &aaaa("fritz.box.", "2003::1:5", REPEATER));
+        let dump = app.state_dump();
+        let c = dump
+            .anomalies
+            .iter()
+            .find(|a| a.kind == "conflicting-answers")
+            .expect("conflict");
+        let short = dump::redact_ip_literal("2003::1");
+        let long = dump::redact_ip_literal("2003::1:5");
+        assert_ne!(short, long);
+        assert!(c.message.contains(&short), "{}", c.message);
+        assert!(c.message.contains(&long), "{}", c.message);
+        assert!(
+            !c.message.contains("2003::"),
+            "nothing left unmasked: {}",
+            c.message
+        );
     }
 }

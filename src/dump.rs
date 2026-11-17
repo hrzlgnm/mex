@@ -340,6 +340,25 @@ fn is_public_ip_literal(v: &str) -> bool {
 /// hextet (`2003:*REDACTED*:7927`) so prefix and host tail stay useful
 /// for debugging. Anything else (including IPv4 and non-public IPv6)
 /// passes through.
+/// Mask every public IPv6 literal among the words of `text`
+/// (`redact_ip_literal` per word, ignoring a trailing `,` or `;`), leaving
+/// everything else as is. Word-wise, so an address that prefixes another
+/// never rewrites part of the longer one.
+pub fn redact_ip_words(text: &str) -> String {
+    text.split(' ')
+        .map(|word| {
+            let addr = word.trim_end_matches([',', ';']);
+            let tail = &word[addr.len()..];
+            if addr.parse::<std::net::IpAddr>().is_ok() {
+                format!("{}{tail}", redact_ip_literal(addr))
+            } else {
+                word.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub fn redact_ip_literal(rdata: &str) -> String {
     let trimmed = rdata.trim().split('%').next().unwrap_or("");
     match trimmed.parse::<std::net::IpAddr>() {
