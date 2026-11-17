@@ -48,9 +48,18 @@ pub enum DragMode {
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum DisplayItem {
-    Host { label: String },
-    Instance { index: usize },
-    Enum { index: usize },
+    Host {
+        label: String,
+    },
+    Instance {
+        index: usize,
+    },
+    Enum {
+        index: usize,
+    },
+    /// The selectable row under the `(unattributed)` group: findings
+    /// whose evidence names no known service, host or enumeration row.
+    Unattributed,
 }
 
 /// Row selected by the j/k cursor in the Records table.
@@ -365,6 +374,9 @@ fn rand_range(lo_ms: u64, hi_ms: u64) -> Duration {
 pub(crate) const ENUM_SERVICE: &str = "_services._dns-sd._udp.local";
 /// Group header for the selectable enumeration row in the Hosts pane.
 pub const ENUM_HOST: &str = "(enumeration)";
+/// Group header for the `(unattributed)` findings row in the Hosts pane,
+/// present only while such findings exist.
+pub const UNATTRIBUTED_HOST: &str = "(unattributed)";
 
 /// Whether a response carries a non-zero RCODE, which RFC 6762 §18.11
 /// says MUST be silently ignored on receipt.
@@ -979,6 +991,8 @@ impl EnumEntry {
 pub enum DetailTarget<'a> {
     Service(&'a ServiceEntry),
     Enum(&'a EnumEntry),
+    /// Findings with no owner: no records or questions of its own.
+    Unattributed,
 }
 
 impl<'a> DetailTarget<'a> {
@@ -986,6 +1000,7 @@ impl<'a> DetailTarget<'a> {
         match self {
             DetailTarget::Service(s) => s.ordered_answers(),
             DetailTarget::Enum(e) => e.ordered_answers(),
+            DetailTarget::Unattributed => Vec::new(),
         }
     }
 
@@ -995,6 +1010,7 @@ impl<'a> DetailTarget<'a> {
         match self {
             DetailTarget::Service(s) => s.ordered_questions(),
             DetailTarget::Enum(e) => e.ordered_questions(),
+            DetailTarget::Unattributed => Vec::new(),
         }
     }
 
@@ -1002,6 +1018,7 @@ impl<'a> DetailTarget<'a> {
         match self {
             DetailTarget::Service(s) => s.questions.len(),
             DetailTarget::Enum(e) => e.questions.len(),
+            DetailTarget::Unattributed => 0,
         }
     }
 
@@ -1009,6 +1026,7 @@ impl<'a> DetailTarget<'a> {
         match self {
             DetailTarget::Service(s) => &s.answers,
             DetailTarget::Enum(e) => &e.answers,
+            DetailTarget::Unattributed => &[],
         }
     }
 
@@ -1016,6 +1034,7 @@ impl<'a> DetailTarget<'a> {
         match self {
             DetailTarget::Service(s) => s.last_event.as_ref(),
             DetailTarget::Enum(e) => e.last_event.as_ref(),
+            DetailTarget::Unattributed => None,
         }
     }
 
@@ -1032,8 +1051,79 @@ impl<'a> DetailTarget<'a> {
                 }
             }
             DetailTarget::Enum(e) => e.pane_ident(),
+            DetailTarget::Unattributed => UNATTRIBUTED_HOST.to_string(),
         }
     }
+}
+
+/// One line of the Answers table: the single layout both rendering and
+/// mouse mapping use, so they can't drift (#248).
+#[derive(Debug, Clone)]
+pub enum AnswerLine {
+    /// Derived summary row (`srvc`, `subt`, `enum`).
+    Info { label: &'static str, text: String },
+    /// Cursor-skipped header of a finding block: `service`, `host <name>`,
+    /// or, in the unattributed view, the record or question name.
+    Block(String),
+    /// A finding shown next to its owner; `record` is the owning record's
+    /// index in `ordered_answers`, `None` when it sits under a block.
+    Finding {
+        anomaly: anomalies::Anomaly,
+        record: Option<usize>,
+    },
+    /// A record row: index into `ordered_answers` (the detail cursor's
+    /// index space).
+    Record(usize),
+    /// One `key=value` child of a multi-pair TXT record.
+    TxtPair {
+        record: usize,
+        pair: String,
+        last: bool,
+    },
+}
+
+impl AnswerLine {
+    /// The record a click on this line selects, if any.
+    pub fn owning_record(&self) -> Option<usize> {
+        match self {
+            AnswerLine::Record(i) | AnswerLine::TxtPair { record: i, .. } => Some(*i),
+            AnswerLine::Finding { record, .. } => *record,
+            AnswerLine::Info { .. } | AnswerLine::Block(_) => None,
+        }
+    }
+}
+
+/// Whether a finding is about this exact record row: same owner name,
+/// type and rdata (spanning `ttl-unstable` findings carry no rdata and
+/// match every row of the name and type).
+fn finding_matches_record(a: &anomalies::Anomaly, rec: &browse::RawRecord) -> bool {
+    a.rtype == Some(rec.rtype)
+        && a.record_name.as_ref().is_some_and(|n| {
+            n.trim_end_matches('.')
+                .eq_ignore_ascii_case(rec.name.trim_end_matches('.'))
+        })
+        && match a.rdata.as_ref() {
+            Some(rdata) => *rdata == rec.rdata,
+            None => a.kind == anomalies::AnomalyKind::TtlUnstable,
+        }
+}
+
+/// Whether a question finding is about this Questions row (name, type,
+/// querier).
+fn finding_matches_question(
+    a: &anomalies::Anomaly,
+    name: &str,
+    rtype_str: &str,
+    source: &std::net::SocketAddr,
+) -> bool {
+    a.kind.is_question()
+        && a.rtype.is_some()
+        && browse::rtype_from_str(rtype_str) == a.rtype
+        && a.record_name.as_ref().is_some_and(|n| {
+            n.trim_end_matches('.')
+                .eq_ignore_ascii_case(name.trim_end_matches('.'))
+        })
+        && a.source.as_deref() == Some(source.to_string().as_str())
 }
 
 impl App {
@@ -2115,7 +2205,26 @@ impl App {
                 items.push(DisplayItem::Instance { index: idx });
             }
         }
+        // Findings with no owner, after the host groups; only while any
+        // exist, so a clean network shows no extra entry.
+        if self.has_unattributed() {
+            items.push(DisplayItem::Host {
+                label: UNATTRIBUTED_HOST.to_string(),
+            });
+            if !self.collapsed_hosts.contains(UNATTRIBUTED_HOST) {
+                items.push(DisplayItem::Unattributed);
+            }
+        }
         items
+    }
+
+    /// Whether any live sighting has no owner (it would be filed under
+    /// `anomalies::UNATTRIBUTED_SERVICE`). Cheap: no analyzer run.
+    fn has_unattributed(&self) -> bool {
+        let now = Instant::now();
+        self.sightings
+            .iter()
+            .any(|s| s.is_live(now) && self.sighting_owners(s).is_empty())
     }
 
     /// Normalized group key for host grouping: lowercased hostname without
@@ -2134,8 +2243,8 @@ impl App {
         if key.is_empty() {
             return "(unknown host)".to_string();
         }
-        if key == ENUM_HOST {
-            return ENUM_HOST.to_string();
+        if key == ENUM_HOST || key == UNATTRIBUTED_HOST {
+            return key.to_string();
         }
         for s in &self.services {
             if Self::host_key(&s.hostname) == key {
@@ -2251,6 +2360,9 @@ impl App {
     pub fn host_service_count(&self, key: &str) -> usize {
         if key == ENUM_HOST {
             return self.enum_entries.len();
+        }
+        if key == UNATTRIBUTED_HOST {
+            return 1;
         }
         self.services
             .iter()
@@ -2980,20 +3092,25 @@ impl App {
     #[cfg(test)]
     pub fn anomaly_counts(&self) -> HashMap<String, usize> {
         Self::anomaly_counts_in(&self.anomalies())
+            .into_iter()
+            .map(|(owner, (n, _))| (owner, n))
+            .collect()
     }
 
     /// `anomaly_counts` over a precomputed finding set, so a frame runs
     /// the analyzer once instead of once per pane.
-    pub fn anomaly_counts_in(found: &[anomalies::Anomaly]) -> HashMap<String, usize> {
-        let mut counts: HashMap<String, usize> = HashMap::new();
+    pub fn anomaly_counts_in(
+        found: &[anomalies::Anomaly],
+    ) -> HashMap<String, (usize, anomalies::Severity)> {
+        // Every finding counts, info included (#248): each owner's badge
+        // names how many findings sit next to it and the worst level.
+        let mut counts: HashMap<String, (usize, anomalies::Severity)> = HashMap::new();
         for a in found {
-            if !a.is_surfaced() {
-                continue;
+            let entry = counts.entry(a.service.clone()).or_insert((0, a.severity));
+            entry.0 += 1;
+            if a.severity.rank() > entry.1.rank() {
+                entry.1 = a.severity;
             }
-            if a.service == anomalies::ENUMERATION_SERVICE {
-                continue;
-            }
-            *counts.entry(a.service.clone()).or_insert(0) += 1;
         }
         counts
     }
@@ -3414,6 +3531,12 @@ impl App {
             }
             Some(DisplayItem::Enum { .. }) => {
                 let label = ENUM_HOST.to_string();
+                if !self.collapsed_hosts.remove(&label) {
+                    self.collapsed_hosts.insert(label);
+                }
+            }
+            Some(DisplayItem::Unattributed) => {
+                let label = UNATTRIBUTED_HOST.to_string();
                 if !self.collapsed_hosts.remove(&label) {
                     self.collapsed_hosts.insert(label);
                 }
@@ -3859,7 +3982,7 @@ impl App {
             return;
         };
         match item {
-            DisplayItem::Instance { .. } | DisplayItem::Enum { .. } => {
+            DisplayItem::Instance { .. } | DisplayItem::Enum { .. } | DisplayItem::Unattributed => {
                 self.selected_display = idx;
                 self.clamp_selection();
             }
@@ -3900,45 +4023,13 @@ impl App {
     /// cursor index. Child rows select their parent record; info rows
     /// select nothing. Mirrors `detail_table_rows` in `ui.rs`.
     fn answers_table_row_to_detail(&self, table_row: usize) -> Option<usize> {
+        // The same layout the table is drawn from: finding and TXT child
+        // rows select their parent record, info and block rows nothing.
         let target = self.display_detail()?;
-        let info_rows = match &target {
-            DetailTarget::Service(svc) => {
-                let mut seen = HashSet::new();
-                let mut subs = 0;
-                for sub in &svc.subtypes {
-                    if seen.insert(sub) {
-                        subs += 1;
-                    }
-                }
-                1 + subs
-            }
-            DetailTarget::Enum(_) => 1,
-        };
-        if table_row < info_rows {
-            return None;
-        }
-        let mut row = info_rows;
-        for (idx, rec) in target.ordered_answers().into_iter().enumerate() {
-            if table_row == row {
-                return Some(idx);
-            }
-            let children = if self.is_txt_expanded(rec) {
-                let pairs = Self::txt_pair_count(&rec.rdata);
-                if pairs > 1 {
-                    pairs
-                } else {
-                    0
-                }
-            } else {
-                0
-            };
-            // Child rows belong to the parent record.
-            if table_row > row && table_row <= row + children {
-                return Some(idx);
-            }
-            row += 1 + children;
-        }
-        None
+        let found = self.anomalies();
+        self.answers_layout(&target, &found)
+            .get(table_row)?
+            .owning_record()
     }
 
     fn click_answers(&mut self, row: u16) {
@@ -3983,9 +4074,20 @@ impl App {
         };
         let raws = target.ordered_answers().len();
         let table_row = self.questions_offset.get().saturating_add(rel);
-        if table_row < target.questions_len() {
+        // Each question row is followed by its finding rows (#248).
+        let found = self.anomalies();
+        let mut row = 0;
+        let mut hit = None;
+        for (q, findings) in self.question_findings(&target, &found).iter().enumerate() {
+            if (row..=row + findings.len()).contains(&table_row) {
+                hit = Some(q);
+                break;
+            }
+            row += 1 + findings.len();
+        }
+        if let Some(question) = hit {
             self.detail_free_scroll = false;
-            let idx = raws + table_row;
+            let idx = raws + question;
             if self.detail_selected != idx {
                 self.detail_selected = idx;
                 self.restart_for_new_row();
@@ -4078,7 +4180,9 @@ impl App {
     /// uncollapsed again; folding is also available from member rows).
     fn is_selectable(&self, item: &DisplayItem) -> bool {
         match item {
-            DisplayItem::Instance { .. } | DisplayItem::Enum { .. } => true,
+            DisplayItem::Instance { .. } | DisplayItem::Enum { .. } | DisplayItem::Unattributed => {
+                true
+            }
             DisplayItem::Host { label } => self.collapsed_hosts.contains(label),
         }
     }
@@ -4138,6 +4242,7 @@ impl App {
                 Some(Self::host_key(&self.services[*index].hostname))
             }
             DisplayItem::Enum { .. } => Some(ENUM_HOST.to_string()),
+            DisplayItem::Unattributed => Some(UNATTRIBUTED_HOST.to_string()),
         }
     }
 
@@ -4191,6 +4296,7 @@ impl App {
                     .get(*index)
                     .is_some_and(|s| Self::host_key(&s.hostname) == label),
                 DisplayItem::Enum { .. } => label == ENUM_HOST,
+                DisplayItem::Unattributed => label == UNATTRIBUTED_HOST,
             };
             if belongs && self.is_selectable(it) {
                 self.selected_display = i;
@@ -6293,6 +6399,12 @@ impl App {
         if let Some(entry) = self.selected_enum() {
             return Some(DetailTarget::Enum(entry));
         }
+        if matches!(
+            self.display_items().get(self.selected_display),
+            Some(DisplayItem::Unattributed)
+        ) {
+            return Some(DetailTarget::Unattributed);
+        }
         if let Some(key) = self.sticky_key.as_ref() {
             if let Some(svc) = self
                 .services
@@ -6327,6 +6439,8 @@ impl App {
                     return None;
                 }
             }
+            // No rows of its own: nothing for the cursor or hex pane.
+            DetailTarget::Unattributed => return None,
         }
         let raws = target.ordered_answers();
         if self.detail_selected < raws.len() {
@@ -6435,11 +6549,192 @@ impl App {
             .collect()
     }
 
+    /// The Answers table for `target`, line by line (#248): derived info
+    /// rows, then the `service` block (findings of this owner with no row
+    /// of their own), one `host <name>` block per live SRV-target host
+    /// with host-owned findings, then every record row followed by its
+    /// findings and (expanded) TXT pairs. Gone rows carry no findings.
+    /// The unattributed view groups its findings by name instead.
+    pub fn answers_layout(
+        &self,
+        target: &DetailTarget<'_>,
+        found: &[anomalies::Anomaly],
+    ) -> Vec<AnswerLine> {
+        let mut lines = Vec::new();
+        let id = Self::detail_service_id(target);
+        let own: Vec<&anomalies::Anomaly> = found.iter().filter(|a| a.service == id).collect();
+        match target {
+            DetailTarget::Service(svc) => {
+                lines.push(AnswerLine::Info {
+                    label: "srvc",
+                    text: svc.service_type.clone(),
+                });
+                let mut seen = HashSet::new();
+                for sub in svc.subtypes.iter().filter(|sub| seen.insert(*sub)) {
+                    lines.push(AnswerLine::Info {
+                        label: "subt",
+                        text: anomalies::display_subtype(sub),
+                    });
+                }
+            }
+            DetailTarget::Enum(entry) => lines.push(AnswerLine::Info {
+                label: "enum",
+                text: entry.name.clone(),
+            }),
+            DetailTarget::Unattributed => {
+                let mut names: Vec<String> = Vec::new();
+                for a in &own {
+                    let name = a.record_name.clone().unwrap_or_default();
+                    if !names.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                        names.push(name);
+                    }
+                }
+                names.sort_by_key(|n| n.to_lowercase());
+                for name in names {
+                    lines.push(AnswerLine::Block(name.clone()));
+                    for a in own.iter().filter(|a| {
+                        a.record_name
+                            .as_deref()
+                            .unwrap_or_default()
+                            .eq_ignore_ascii_case(&name)
+                    }) {
+                        lines.push(AnswerLine::Finding {
+                            anomaly: (*a).clone(),
+                            record: None,
+                        });
+                    }
+                }
+                return lines;
+            }
+        }
+
+        let answers = target.ordered_answers();
+        let questions = target.ordered_questions();
+        let mut placed = vec![false; own.len()];
+        let mut row_findings: Vec<Vec<anomalies::Anomaly>> = vec![Vec::new(); answers.len()];
+        for (i, rec) in answers.iter().enumerate() {
+            if record_liveness(rec) != RecordLiveness::Live {
+                continue;
+            }
+            for (j, a) in own.iter().enumerate() {
+                if !a.kind.is_question() && finding_matches_record(a, rec) {
+                    row_findings[i].push((*a).clone());
+                    placed[j] = true;
+                }
+            }
+        }
+        for (name, rtype_str, source, _, _) in &questions {
+            for (j, a) in own.iter().enumerate() {
+                if finding_matches_question(a, name, rtype_str, source) {
+                    placed[j] = true;
+                }
+            }
+        }
+        let rowless: Vec<&anomalies::Anomaly> = own
+            .iter()
+            .zip(&placed)
+            .filter(|(_, placed)| !**placed)
+            .map(|(a, _)| *a)
+            .collect();
+        if !rowless.is_empty() {
+            let label = match target {
+                DetailTarget::Enum(_) => "enumeration",
+                _ => "service",
+            };
+            lines.push(AnswerLine::Block(label.to_string()));
+            lines.extend(rowless.into_iter().map(|a| AnswerLine::Finding {
+                anomaly: a.clone(),
+                record: None,
+            }));
+        }
+        if let DetailTarget::Service(svc) = target {
+            for host in Self::service_hosts(svc) {
+                let host_findings: Vec<&anomalies::Anomaly> =
+                    found.iter().filter(|a| a.service == host).collect();
+                if host_findings.is_empty() {
+                    continue;
+                }
+                lines.push(AnswerLine::Block(format!(
+                    "host {}",
+                    Self::short_hostname(&host)
+                )));
+                lines.extend(host_findings.into_iter().map(|a| AnswerLine::Finding {
+                    anomaly: a.clone(),
+                    record: None,
+                }));
+            }
+        }
+        for (i, rec) in answers.iter().enumerate() {
+            lines.push(AnswerLine::Record(i));
+            lines.extend(
+                row_findings[i]
+                    .drain(..)
+                    .map(|anomaly| AnswerLine::Finding {
+                        anomaly,
+                        record: Some(i),
+                    }),
+            );
+            // Multi-pair TXT children only while expanded (a lone pair
+            // is already the parent's rdata).
+            if !(Self::is_expandable_txt(rec) && self.is_txt_expanded(rec)) {
+                continue;
+            }
+            let mut seen_pair = HashSet::new();
+            let mut pairs: Vec<&str> = rec
+                .rdata
+                .split("; ")
+                .filter(|pair| !pair.is_empty() && seen_pair.insert(*pair))
+                .collect();
+            pairs.sort_by(|a, b| {
+                let ka = a.split('=').next().unwrap_or(a);
+                let kb = b.split('=').next().unwrap_or(b);
+                ka.to_lowercase()
+                    .cmp(&kb.to_lowercase())
+                    .then_with(|| ka.cmp(kb))
+                    .then_with(|| a.cmp(b))
+            });
+            if pairs.len() > 1 {
+                let n = pairs.len();
+                for (k, pair) in pairs.into_iter().enumerate() {
+                    lines.push(AnswerLine::TxtPair {
+                        record: i,
+                        pair: pair.to_string(),
+                        last: k + 1 == n,
+                    });
+                }
+            }
+        }
+        lines
+    }
+
+    /// Findings shown under each Questions row of `target`, aligned with
+    /// `ordered_questions` (#248).
+    pub fn question_findings(
+        &self,
+        target: &DetailTarget<'_>,
+        found: &[anomalies::Anomaly],
+    ) -> Vec<Vec<anomalies::Anomaly>> {
+        let id = Self::detail_service_id(target);
+        target
+            .ordered_questions()
+            .iter()
+            .map(|(name, rtype_str, source, _, _)| {
+                found
+                    .iter()
+                    .filter(|a| a.service == id)
+                    .filter(|a| finding_matches_question(a, name, rtype_str, source))
+                    .cloned()
+                    .collect()
+            })
+            .collect()
+    }
+
     /// Service id owning a detail target, matching `Anomaly.service`.
     fn detail_service_id(target: &DetailTarget<'_>) -> String {
         match target {
             DetailTarget::Service(s) => anomalies::service_id(&s.instance, &s.service_type),
             DetailTarget::Enum(_) => anomalies::ENUMERATION_SERVICE.to_string(),
+            DetailTarget::Unattributed => anomalies::UNATTRIBUTED_SERVICE.to_string(),
         }
     }
 
@@ -7692,8 +7987,8 @@ mod tests {
         // End-to-end through the real routing path: an observed SOA
         // question for a service's host lands on that host as an
         // info-level unsupported-question finding (RFC 6762 §3 makes
-        // asking compliant), stays off every badge, and carries the
-        // (name, type, querier) triple.
+        // asking compliant), badges the host once (info counts, #248),
+        // and carries the (name, type, querier) triple.
         let mut app = App::new().unwrap();
         ingest(&mut app, &ptr_record(120));
         ingest(&mut app, &srv_record(120));
@@ -7717,12 +8012,9 @@ mod tests {
         assert_eq!(item.service, "test.local");
         assert_eq!(item.severity, crate::anomalies::Severity::Info);
         assert_eq!(
-            app.anomaly_counts()
-                .get("Test._http._tcp.local")
-                .copied()
-                .unwrap_or(0),
-            0,
-            "info-level question findings stay off the service badge"
+            app.anomaly_counts().get("test.local").copied(),
+            Some(1),
+            "info-level host findings badge the host header once"
         );
         assert_eq!(
             (
@@ -13439,7 +13731,8 @@ mod tests {
         app.questions_rect.set(Rect::new(33, 24, 67, 8));
         app.hex_rect.set(Rect::default());
         app.detail_offset.set(0);
-        // Table rows: 1 info row, then PTR/SRV/TXT in type order.
+        // Table rows: 1 info row, then PTR/SRV/TXT in type order; the PTR
+        // carries one finding child row (info ttl-mismatch).
         let info = 1;
         let raws = app
             .display_detail()
@@ -13447,9 +13740,12 @@ mod tests {
             .ordered_answers()
             .len();
         assert!(raws >= 2);
-        let row = 3 + 2 + (info + 1) as u16;
-        app.click_answers(row);
+        // A click on the finding child row selects its parent record.
+        app.click_answers(3 + 2 + (info + 1) as u16);
         assert_eq!(app.focus, Focus::Answers);
+        assert_eq!(app.detail_selected, 0);
+        let row = 3 + 2 + (info + 2) as u16;
+        app.click_answers(row);
         assert_eq!(app.detail_selected, 1);
     }
 
@@ -14117,7 +14413,11 @@ mod tests {
         );
         let buf = render_to_buffer(&app, 140, 30);
         let text = rect_text(&buf, buf.area);
-        let badged: Vec<&str> = text.lines().filter(|l| l.contains("[!1]")).collect();
+        let warn = App::anomaly_level_icon(anomalies::Severity::Warning);
+        let badged: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains(&format!("[{warn} 1]")))
+            .collect();
         assert_eq!(badged.len(), 1, "one badge, got: {badged:?}");
         assert!(
             badged[0].contains("test (2)"),
@@ -15027,5 +15327,447 @@ mod tests {
             &raw_record("knulp.local.", 28, "AAAA", "fd00::b", 120),
         );
         assert!(rows_of(&app, DACP).contains(&28));
+    }
+
+    // --- #248: findings next to their owner ---
+
+    /// Answers pane text, one line per table row (borders included).
+    fn answers_text(app: &App) -> Vec<String> {
+        let buf = render_to_buffer(app, 160, 40);
+        rect_text(&buf, app.answers_rect.get())
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Whether a finding of `kind` sits in the block headed by line
+    /// `block` (before the next block or record row).
+    fn block_has(lines: &[String], block: usize, kind: &str) -> bool {
+        lines[block + 1..]
+            .iter()
+            .take_while(|l| l.starts_with("│  "))
+            .any(|l| l.contains(kind))
+    }
+
+    fn icon(severity: anomalies::Severity) -> char {
+        App::anomaly_level_icon(severity)
+    }
+
+    /// The live service finding of `kind`, from the analyzer.
+    fn finding(app: &App, kind: anomalies::AnomalyKind) -> anomalies::Anomaly {
+        app.anomalies()
+            .into_iter()
+            .find(|a| a.kind == kind)
+            .unwrap_or_else(|| panic!("expected a {kind} finding"))
+    }
+
+    #[test]
+    fn record_finding_sits_under_its_row_with_the_level_icon() {
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1; b=2");
+        let no_flush = finding(&app, anomalies::AnomalyKind::NoFlush);
+        let lines = answers_text(&app);
+        let txt = lines
+            .iter()
+            .position(|l| l.contains("▸ TXT"))
+            .expect("TXT row");
+        let marker = format!("TXT {}", icon(no_flush.severity));
+        assert!(
+            lines[txt].contains(&marker),
+            "type cell marked: {}",
+            lines[txt]
+        );
+        assert!(
+            lines[txt + 1].contains("no-flush") && lines[txt + 1].contains(icon(no_flush.severity)),
+            "finding child row follows its record: {lines:#?}"
+        );
+        // No `!` suffix anywhere any more.
+        assert!(!lines.iter().any(|l| l.contains("TXT!")));
+    }
+
+    #[test]
+    fn ttl_finding_marks_the_ttl_cell_and_info_shows_inline() {
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1; b=2");
+        let mismatch = finding(&app, anomalies::AnomalyKind::TtlMismatch);
+        assert_eq!(mismatch.severity, anomalies::Severity::Info);
+        let info = icon(anomalies::Severity::Info);
+        let lines = answers_text(&app);
+        let ptr = lines
+            .iter()
+            .position(|l| l.contains("PTR ") && l.contains("Test._http._tcp.local."))
+            .expect("PTR row");
+        assert!(
+            lines[ptr].contains(&format!("s {info}")),
+            "TTL cell carries the info icon: {}",
+            lines[ptr]
+        );
+        assert!(
+            !lines[ptr].contains(&format!("PTR {info}")),
+            "type cell stays plain for a TTL kind: {}",
+            lines[ptr]
+        );
+        assert!(lines[ptr + 1].contains("ttl-mismatch"));
+    }
+
+    #[test]
+    fn worst_finding_picks_the_row_marker() {
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1; b=2");
+        let found = app.anomalies();
+        let target = app.display_detail().unwrap();
+        let txt = target
+            .ordered_answers()
+            .into_iter()
+            .position(|r| r.rtype == 16)
+            .unwrap();
+        // Add an info finding on the same TXT row: the warning still wins.
+        let mut extra = found
+            .iter()
+            .find(|a| a.kind == anomalies::AnomalyKind::NoFlush)
+            .unwrap()
+            .clone();
+        extra.severity = anomalies::Severity::Info;
+        extra.kind = anomalies::AnomalyKind::TypeFormat;
+        let mut with_extra = found.clone();
+        with_extra.push(extra);
+        let layout = app.answers_layout(&target, &with_extra);
+        let row: Vec<_> = layout
+            .iter()
+            .filter_map(|l| match l {
+                AnswerLine::Finding {
+                    anomaly,
+                    record: Some(r),
+                } if *r == txt => Some(anomaly.severity),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(row.len(), 2, "every finding gets its own child row");
+        let buf = {
+            let backend = ratatui::backend::TestBackend::new(160, 40);
+            let mut term = ratatui::Terminal::new(backend).unwrap();
+            term.draw(|f| crate::ui::draw_with_findings(f, &app, &with_extra))
+                .unwrap();
+            term.backend().buffer().clone()
+        };
+        let text = rect_text(&buf, app.answers_rect.get());
+        let warn = icon(anomalies::Severity::Warning);
+        assert!(
+            text.lines().any(|l| l.contains(&format!("TXT {warn}"))),
+            "worst (warning) icon on the row: {text}"
+        );
+    }
+
+    #[test]
+    fn enter_folds_txt_pairs_and_findings_stay_before_them() {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1; b=2");
+        let key = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        app.handle_key(&key(KeyCode::Tab));
+        app.handle_key(&key(KeyCode::Enter));
+        let lines = answers_text(&app);
+        let txt = lines.iter().position(|l| l.contains("▾ TXT")).unwrap();
+        assert!(lines[txt + 1].contains("no-flush"), "{lines:#?}");
+        assert!(lines[txt + 2].contains("├─ a=1"), "{lines:#?}");
+        assert!(lines[txt + 3].contains("└─ b=2"), "{lines:#?}");
+        app.handle_key(&key(KeyCode::Enter));
+        let lines = answers_text(&app);
+        let txt = lines.iter().position(|l| l.contains("▸ TXT")).unwrap();
+        assert!(
+            lines[txt + 1].contains("no-flush"),
+            "finding survives the fold"
+        );
+        assert!(!lines.iter().any(|l| l.contains("├─ a=1")));
+    }
+
+    #[test]
+    fn cursor_skips_finding_rows() {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1; b=2");
+        let key = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        app.handle_key(&key(KeyCode::Tab));
+        let _ = answers_text(&app);
+        // TXT -> SRV, then PTR (with its ttl-mismatch child) -> SRV: one
+        // step each way.
+        app.handle_key(&key(KeyCode::Char('k')));
+        match app.selected_detail_entry() {
+            Some(DetailEntry::Record(r)) => assert_eq!(r.rtype, 33),
+            _ => panic!("cursor on a record"),
+        }
+        app.handle_key(&key(KeyCode::Char('k')));
+        match app.selected_detail_entry() {
+            Some(DetailEntry::Record(r)) => assert_eq!(r.rtype, 12),
+            _ => panic!("cursor on a record"),
+        }
+        app.handle_key(&key(KeyCode::Char('j')));
+        match app.selected_detail_entry() {
+            Some(DetailEntry::Record(r)) => assert_eq!(r.rtype, 33),
+            _ => panic!("cursor on a record"),
+        }
+        // The highlighted (REVERSED) row is the SRV row, not a child.
+        let buf = render_to_buffer(&app, 160, 40);
+        let area = app.answers_rect.get();
+        let reversed: String = (area.y..area.y + area.height)
+            .filter(|&y| {
+                buf.cell((area.x + 2, y))
+                    .is_some_and(|c| c.modifier.contains(ratatui::style::Modifier::REVERSED))
+            })
+            .map(|y| {
+                (area.x..area.x + area.width)
+                    .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(reversed.starts_with("│SRV"), "highlighted: {reversed}");
+    }
+
+    #[test]
+    fn gone_row_carries_no_marker_or_findings() {
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1; b=2");
+        // A goodbye copy from another responder shares the live row's
+        // identity: only the live row is marked.
+        let mut gone = app.services[0]
+            .answers
+            .iter()
+            .find(|r| r.rtype == 16)
+            .unwrap()
+            .clone();
+        gone.source = "192.168.1.3:5353".parse().unwrap();
+        gone.ttl = 0;
+        app.services[0].answers.push(gone);
+        let lines = answers_text(&app);
+        let txt_rows: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains("▸ TXT"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(txt_rows.len(), 2);
+        let (live, dead): (Vec<usize>, Vec<usize>) = txt_rows
+            .into_iter()
+            .partition(|&i| !lines[i].contains("192.168.1.3"));
+        assert!(lines[live[0] + 1].contains("no-flush"));
+        let warn = icon(anomalies::Severity::Warning);
+        assert!(!lines[dead[0]].contains(warn), "{}", lines[dead[0]]);
+        assert!(
+            !lines
+                .get(dead[0] + 1)
+                .is_some_and(|l| l.contains("no-flush")),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn service_block_holds_rowless_findings_only_when_present() {
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1; b=2");
+        assert!(
+            !answers_text(&app).iter().any(|l| l.starts_with("│service")),
+            "no block without service-level findings"
+        );
+        ingest(
+            &mut app,
+            &raw_record("Test._http._tcp.local.", 6, "TYPE6", "rdlength=22", 4500),
+        );
+        let lines = answers_text(&app);
+        let block = lines
+            .iter()
+            .position(|l| l.starts_with("│service"))
+            .expect("service block");
+        assert!(
+            block_has(&lines, block, "unicast-style-response"),
+            "{lines:#?}"
+        );
+        let first_record = lines.iter().position(|l| l.contains("PTR ")).unwrap();
+        assert!(block < first_record, "block sits at the top");
+    }
+
+    #[test]
+    fn host_block_shows_host_findings_on_every_sibling() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(120));
+        ingest(&mut app, &srv_record(120));
+        ingest(
+            &mut app,
+            &raw_record(
+                "_ipp._tcp.local.",
+                12,
+                "PTR",
+                "Other._ipp._tcp.local.",
+                4500,
+            ),
+        );
+        ingest(
+            &mut app,
+            &raw_record(
+                "Other._ipp._tcp.local.",
+                33,
+                "SRV",
+                "0 0 631 test.local.",
+                120,
+            ),
+        );
+        ingest(
+            &mut app,
+            &raw_record("test.local.", 6, "TYPE6", "rdlength=22", 4500),
+        );
+        app.evict_expired();
+        for instance in ["Test", "Other"] {
+            select_instance(&mut app, instance);
+            let lines = answers_text(&app);
+            let block = lines
+                .iter()
+                .position(|l| l.starts_with("│host test"))
+                .unwrap_or_else(|| panic!("host block on {instance}: {lines:#?}"));
+            assert!(
+                block_has(&lines, block, "unicast-style-response"),
+                "{lines:#?}"
+            );
+        }
+        // Recorded once, under the host, in the dump's finding list.
+        let hosts: Vec<_> = app
+            .anomalies()
+            .into_iter()
+            .filter(|a| a.kind == anomalies::AnomalyKind::UnicastStyleResponse)
+            .map(|a| a.service)
+            .collect();
+        assert_eq!(hosts, vec!["test.local".to_string()]);
+    }
+
+    #[test]
+    fn badges_count_info_and_enumeration_findings() {
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1; b=2");
+        let stub: SocketAddr = "192.168.1.9:45678".parse().unwrap();
+        app.ingest_event(&query_event(
+            "_services._dns-sd._udp.local.",
+            6,
+            "TYPE6",
+            false,
+            Vec::new(),
+            stub,
+        ));
+        let found = app.anomalies();
+        let own = found
+            .iter()
+            .filter(|a| a.service == "Test._http._tcp.local")
+            .count();
+        let buf = render_to_buffer(&app, 160, 40);
+        let hosts = rect_text(&buf, app.left_rect.get());
+        let warn = icon(anomalies::Severity::Warning);
+        let info = icon(anomalies::Severity::Info);
+        let test_row = hosts.lines().find(|l| l.contains("Test [")).unwrap();
+        assert!(
+            test_row.contains(&format!("[{warn} {own}]")),
+            "info findings count, warning is the worst: {test_row}"
+        );
+        let enum_row = hosts.lines().find(|l| l.contains("[enum]")).unwrap();
+        assert!(enum_row.contains(&format!("[{info} 1]")), "{enum_row}");
+    }
+
+    #[test]
+    fn pane_titles_count_shown_findings() {
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1; b=2");
+        let target = app.display_detail().unwrap();
+        let found = app.anomalies();
+        let n = app
+            .answers_layout(&target, &found)
+            .iter()
+            .filter(|l| matches!(l, AnswerLine::Finding { .. }))
+            .count();
+        assert!(n >= 2);
+        let lines = answers_text(&app);
+        let warn = icon(anomalies::Severity::Warning);
+        assert!(
+            lines[0].contains(&format!("· {warn} {n}")),
+            "title: {}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn unattributed_entry_lists_ownerless_findings_until_an_owner_appears() {
+        let mut app = App::new().unwrap();
+        service_with_txt(&mut app, "a=1; b=2");
+        assert!(!app
+            .display_items()
+            .iter()
+            .any(|it| matches!(it, DisplayItem::Unattributed)));
+        ingest(
+            &mut app,
+            &raw_record("Late._http._tcp.local.", 6, "TYPE6", "rdlength=22", 4500),
+        );
+        let items = app.display_items();
+        let pos = items
+            .iter()
+            .position(|it| matches!(it, DisplayItem::Unattributed))
+            .expect("(unattributed) entry");
+        assert!(matches!(
+            &items[pos - 1],
+            DisplayItem::Host { label } if label == UNATTRIBUTED_HOST
+        ));
+        // The header carries its own badge.
+        let worst = app
+            .anomalies()
+            .into_iter()
+            .filter(|a| a.service == anomalies::UNATTRIBUTED_SERVICE)
+            .map(|a| a.severity)
+            .max_by_key(|s| s.rank())
+            .unwrap();
+        let n = app
+            .anomalies()
+            .iter()
+            .filter(|a| a.service == anomalies::UNATTRIBUTED_SERVICE)
+            .count();
+        let buf = render_to_buffer(&app, 160, 40);
+        let hosts = rect_text(&buf, app.left_rect.get());
+        let header = hosts
+            .lines()
+            .find(|l| l.contains("(unattributed)"))
+            .unwrap();
+        assert!(
+            header.contains(&format!("[{} {n}]", icon(worst))),
+            "{header}"
+        );
+        // Selecting it lists the findings grouped by name.
+        app.selected_display = pos;
+        let lines = answers_text(&app);
+        let block = lines
+            .iter()
+            .position(|l| l.starts_with("│Late._http._tcp.local."))
+            .unwrap_or_else(|| panic!("{lines:#?}"));
+        assert!(
+            block_has(&lines, block, "unicast-style-response"),
+            "{lines:#?}"
+        );
+        // Once the service appears, the finding moves and the entry goes.
+        ingest(
+            &mut app,
+            &raw_record(
+                "_http._tcp.local.",
+                12,
+                "PTR",
+                "Late._http._tcp.local.",
+                4500,
+            ),
+        );
+        assert!(!app
+            .display_items()
+            .iter()
+            .any(|it| matches!(it, DisplayItem::Unattributed)));
     }
 }

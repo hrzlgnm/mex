@@ -66,6 +66,11 @@ pub enum Severity {
 }
 
 impl Severity {
+    /// Order for picking the worst of several findings (error highest).
+    pub fn rank(self) -> u8 {
+        severity_rank(self)
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Severity::Info => "info",

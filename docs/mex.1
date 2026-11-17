@@ -58,14 +58,22 @@ Display version information and exit.
 .B Hosts (left)
 Collapsible tree grouped by hostname. Each header shows the service count
 and primary address; each row shows the instance name with a short
-service type and port. The selection is inverted, and the pane title always
+service type and port. Instances, the enumeration row and host headers
+carry a [<icon> N] badge counting their findings, with the worst level
+icon. An (unattributed) entry lists findings with no owner while any
+exist. The selection is inverted, and the pane title always
 names the selected row's host.
 .TP
 .B Answers (right top)
 For the selected service: derived rows, then one row per observed raw
 record with remaining TTL, flush bit, source, and rdata. Multi-pair TXT
 records expand into unlabeled child rows. Records announced by this host
-are highlighted; goodbye (TTL 0) records show as expired.
+are highlighted; goodbye (TTL 0) records show as expired. Each live
+record's findings follow it as child rows, and the record carries the
+worst finding's level icon (TTL cell for TTL findings, type cell
+otherwise). Findings about the service as a whole, or about its host,
+sit in service and host blocks at the top. The cursor skips finding
+rows; the title counts the findings shown.
 .TP
 .B Questions (right middle)
 Recently observed queries asking for the selected service, newest first,
@@ -73,7 +81,7 @@ with per-query age instead of TTL. Questions from this host are highlighted
 like local records.
 .TP
 .B Anomalies (right, below Questions)
-Every surfaced finding for the selected service, with the row's own
+Every error and warning for the selected service, with the row's own
 findings marked. Expired and goodbye rows name their state instead of
 findings. Tab focuses it for scrolling; the pane follows the record
 cursor.
