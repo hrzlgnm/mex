@@ -99,6 +99,9 @@ pub(crate) fn record_liveness(rec: &browse::RawRecord) -> RecordLiveness {
 /// Identity of the cursor row, so the selection survives resorting of the
 /// table (TTL countdowns and re-announcements constantly reshuffle rows).
 /// Matches the dedup identities used at ingest.
+/// Identity of one expandable TXT row: per link, like every row (#264).
+type TxtKey = (String, String, std::net::SocketAddr, u32);
+
 #[derive(Clone, PartialEq, Eq)]
 enum DetailCursorKey {
     Record {
@@ -106,6 +109,7 @@ enum DetailCursorKey {
         rtype: u16,
         rdata: String,
         source: std::net::SocketAddr,
+        ifindex: u32,
     },
     Question {
         name: String,
@@ -786,7 +790,7 @@ pub struct App {
     /// (name, rdata, source). Absent = collapsed (the default), so
     /// multi-pair TXT rows render as a single `▸ TXT` line until
     /// `Enter` expands them into `▾ TXT` plus child rows.
-    expanded_txt: HashSet<(String, String, std::net::SocketAddr)>,
+    expanded_txt: HashSet<TxtKey>,
     local_ips: HashSet<std::net::IpAddr>,
     /// Recently overheard QM questions from other queriers (RFC 6762 §7.3):
     /// key (lowercased name, type) -> (seen_at, remote KA targets lowercased
@@ -861,16 +865,19 @@ impl ServiceEntry {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for rec in self.answers.iter().rev() {
-            if seen.insert((&rec.name, rec.rtype, &rec.rdata, rec.source)) {
+            // One row per link too (#264): the same record from one source
+            // on two links is two observations.
+            if seen.insert((&rec.name, rec.rtype, &rec.rdata, rec.source, rec.ifindex)) {
                 out.push(rec);
             }
         }
         out.sort_by(|a, b| {
-            (&a.rtype_str, a.source, &a.name, &a.rdata).cmp(&(
+            (&a.rtype_str, a.source, &a.name, &a.rdata, a.ifindex).cmp(&(
                 &b.rtype_str,
                 b.source,
                 &b.name,
                 &b.rdata,
+                b.ifindex,
             ))
         });
         out
@@ -919,16 +926,18 @@ impl EnumEntry {
                 &rec.rdata,
                 &rec.ptr_target_labels,
                 rec.source,
+                rec.ifindex,
             )) {
                 out.push(rec);
             }
         }
         out.sort_by(|a, b| {
-            (&a.rtype_str, a.source, &a.name, &a.rdata).cmp(&(
+            (&a.rtype_str, a.source, &a.name, &a.rdata, a.ifindex).cmp(&(
                 &b.rtype_str,
                 b.source,
                 &b.name,
                 &b.rdata,
+                b.ifindex,
             ))
         });
         out
@@ -4595,6 +4604,7 @@ impl App {
                 rtype: r.rtype,
                 rdata: r.rdata.clone(),
                 source: r.source,
+                ifindex: r.ifindex,
             });
         }
         target
@@ -4617,8 +4627,13 @@ impl App {
                 rtype,
                 rdata,
                 source,
+                ifindex,
             } => raws.iter().position(|r| {
-                &r.name == name && r.rtype == *rtype && &r.rdata == rdata && r.source == *source
+                &r.name == name
+                    && r.rtype == *rtype
+                    && &r.rdata == rdata
+                    && r.source == *source
+                    && r.ifindex == *ifindex
             }),
             DetailCursorKey::Question {
                 name,
@@ -4941,7 +4956,10 @@ impl App {
         let host = rec.name.trim_end_matches('.').to_lowercase();
         if let Some(rows) = self.withheld_addrs.get_mut(&host) {
             rows.retain(|r| {
-                !(r.rtype == rec.rtype && r.rdata == rec.rdata && r.source == rec.source)
+                !(r.rtype == rec.rtype
+                    && r.rdata == rec.rdata
+                    && r.source == rec.source
+                    && r.ifindex == rec.ifindex)
             });
             if rows.is_empty() {
                 self.withheld_addrs.remove(&host);
@@ -4954,7 +4972,12 @@ impl App {
     fn withhold_address(&mut self, rec: &browse::RawRecord) {
         let host = rec.name.trim_end_matches('.').to_lowercase();
         let rows = self.withheld_addrs.entry(host).or_default();
-        rows.retain(|r| !(r.rtype == rec.rtype && r.rdata == rec.rdata && r.source == rec.source));
+        rows.retain(|r| {
+            !(r.rtype == rec.rtype
+                && r.rdata == rec.rdata
+                && r.source == rec.source
+                && r.ifindex == rec.ifindex)
+        });
         if rec.ttl > 0 {
             rows.push(rec.clone());
         }
@@ -5198,6 +5221,7 @@ impl App {
                         && r.rtype == rec.rtype
                         && same_ptr_target(r, rec)
                         && r.source == rec.source
+                        && r.ifindex == rec.ifindex
                 }) {
                     entry.answers[pos] = rec.clone();
                 } else {
@@ -5213,7 +5237,10 @@ impl App {
             let host = rec.name.trim_end_matches('.').to_lowercase();
             if let Some(records) = self.pending_addrs.get_mut(&host) {
                 for pending in records.iter_mut().filter(|p| {
-                    p.rtype == rec.rtype && p.rdata == rec.rdata && p.source == rec.source
+                    p.rtype == rec.rtype
+                        && p.rdata == rec.rdata
+                        && p.source == rec.source
+                        && p.ifindex == rec.ifindex
                 }) {
                     *pending = rec.clone();
                 }
@@ -5487,6 +5514,7 @@ impl App {
                         && r.rtype == rec.rtype
                         && same_ptr_target(r, rec)
                         && r.source == rec.source
+                        && r.ifindex == rec.ifindex
                 }) {
                     entry.answers[pos] = rec.clone();
                 } else {
@@ -5854,6 +5882,7 @@ impl App {
                 pending.rtype == rec.rtype
                     && pending.rdata == rec.rdata
                     && pending.source == rec.source
+                    && pending.ifindex == rec.ifindex
             }) {
                 *pending = rec.clone();
             } else {
@@ -5902,7 +5931,8 @@ impl App {
                 p.answers.retain(|r| {
                     !(r.rtype == rec.rtype
                         && r.name.eq_ignore_ascii_case(&rec.name)
-                        && r.source == rec.source)
+                        && r.source == rec.source
+                        && r.ifindex == rec.ifindex)
                 });
                 p.answers.push(rec.clone());
                 p.last_seen = Instant::now();
@@ -5992,12 +6022,15 @@ impl App {
             // runs first anyway.
             s.is_active = true;
         }
-        // replace stale record with same name+rtype+rdata+source to keep list clean
+        // Replace the stale copy of the same record (name, type, rdata,
+        // source, link): per link, so one source heard on two links keeps
+        // a row on each (#264).
         if let Some(pos) = s.answers.iter().position(|r| {
             r.name == rec.name
                 && r.rtype == rec.rtype
                 && r.rdata == rec.rdata
                 && r.source == rec.source
+                && r.ifindex == rec.ifindex
         }) {
             s.answers[pos] = rec.clone();
         } else {
@@ -6317,8 +6350,8 @@ impl App {
         rec.rtype == 16 && Self::txt_pair_count(&rec.rdata) > 1
     }
 
-    fn txt_key(rec: &browse::RawRecord) -> (String, String, std::net::SocketAddr) {
-        (rec.name.clone(), rec.rdata.clone(), rec.source)
+    fn txt_key(rec: &browse::RawRecord) -> TxtKey {
+        (rec.name.clone(), rec.rdata.clone(), rec.source, rec.ifindex)
     }
 
     /// Collapsed by default: only answers explicitly expanded via `Enter`
@@ -16156,5 +16189,210 @@ mod tests {
             }
         }
         assert_eq!(conflicts(&app).len(), 1, "the live copy still counts");
+    }
+
+    // --- #264: one source heard on two links keeps a copy per link ---
+
+    fn on_link(mut rec: browse::RawRecord, iface: &str, ifindex: u32) -> browse::RawRecord {
+        rec.iface = iface.to_string();
+        rec.ifindex = ifindex;
+        rec
+    }
+
+    fn a_on(host: &str, addr: &str, iface: &str, ifindex: u32, ttl: u32) -> browse::RawRecord {
+        on_link(raw_record(host, 1, "A", addr, ttl), iface, ifindex)
+    }
+
+    /// Answers rows (rendered) that carry `needle`.
+    fn rows_with(app: &App, needle: &str) -> Vec<String> {
+        answers_text(app)
+            .into_iter()
+            .filter(|l| l.contains(needle))
+            .collect()
+    }
+
+    fn two_link_service() -> App {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        ingest(
+            &mut app,
+            &a_on("test.local.", "192.168.1.10", "eth0", 2, 120),
+        );
+        ingest(
+            &mut app,
+            &a_on("test.local.", "192.168.1.10", "wlan0", 3, 120),
+        );
+        app.evict_expired();
+        select_instance(&mut app, "Test");
+        app
+    }
+
+    #[test]
+    fn one_source_on_two_links_keeps_a_row_per_link() {
+        let app = two_link_service();
+        let rows = rows_with(&app, "192.168.1.10");
+        assert_eq!(rows.len(), 2, "{rows:#?}");
+        assert!(rows.iter().any(|r| r.contains("@eth0")), "{rows:#?}");
+        assert!(rows.iter().any(|r| r.contains("@wlan0")), "{rows:#?}");
+        // The dump lists both too.
+        let dump = app.state_dump();
+        let ifaces: Vec<&str> = dump.services[0]
+            .answers
+            .iter()
+            .filter(|r| r.rtype == 1)
+            .map(|r| r.iface.as_str())
+            .collect();
+        assert_eq!(ifaces.len(), 2, "{ifaces:?}");
+    }
+
+    #[test]
+    fn reannouncement_refreshes_only_its_link() {
+        let mut app = two_link_service();
+        for rec in &mut app.services[0].answers {
+            if rec.rtype == 1 {
+                rec.received_at = Instant::now()
+                    .checked_sub(Duration::from_secs(60))
+                    .unwrap_or_else(Instant::now);
+            }
+        }
+        ingest(
+            &mut app,
+            &a_on("test.local.", "192.168.1.10", "eth0", 2, 120),
+        );
+        let rows = rows_with(&app, "192.168.1.10");
+        let eth0 = rows.iter().find(|r| r.contains("@eth0")).unwrap();
+        let wlan0 = rows.iter().find(|r| r.contains("@wlan0")).unwrap();
+        assert!(eth0.contains("2m00s"), "refreshed: {eth0}");
+        assert!(wlan0.contains("1m00s"), "untouched: {wlan0}");
+    }
+
+    #[test]
+    fn goodbye_on_one_link_withdraws_only_that_row() {
+        let mut app = two_link_service();
+        ingest(
+            &mut app,
+            &a_on("test.local.", "192.168.1.10", "wlan0", 3, 0),
+        );
+        let rows = rows_with(&app, "192.168.1.10");
+        assert_eq!(rows.len(), 2, "{rows:#?}");
+        let wlan0 = rows.iter().find(|r| r.contains("@wlan0")).unwrap();
+        let eth0 = rows.iter().find(|r| r.contains("@eth0")).unwrap();
+        assert!(wlan0.contains(" bye "), "{wlan0}");
+        assert!(eth0.contains("2m00s"), "{eth0}");
+    }
+
+    #[test]
+    fn pending_address_keeps_its_links_until_claimed() {
+        let mut app = App::new().unwrap();
+        // Addresses first, on two links, before any service points there.
+        ingest(
+            &mut app,
+            &a_on("test.local.", "192.168.1.10", "eth0", 2, 120),
+        );
+        ingest(
+            &mut app,
+            &a_on("test.local.", "192.168.1.10", "wlan0", 3, 120),
+        );
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        app.flush_pending_addrs();
+        app.evict_expired();
+        select_instance(&mut app, "Test");
+        assert_eq!(rows_with(&app, "192.168.1.10").len(), 2);
+    }
+
+    #[test]
+    fn withheld_address_survives_a_goodbye_on_the_other_link() {
+        let mut app = App::new().unwrap();
+        ingest(
+            &mut app,
+            &raw_record("_dacp._tcp.local.", 12, "PTR", DACP, 4500),
+        );
+        ingest(&mut app, &srv_on_knulp(DACP));
+        ingest(&mut app, &legacy_aaaa_denial());
+        ingest(&mut app, &on_link(aaaa_knulp(), "eth0", 2));
+        ingest(&mut app, &on_link(aaaa_knulp(), "wlan0", 3));
+        assert!(!rows_of(&app, DACP).contains(&28), "denied on the service");
+        let mut bye = on_link(aaaa_knulp(), "eth0", 2);
+        bye.ttl = 0;
+        ingest(&mut app, &bye);
+        assert!(
+            app.host_addresses("knulp.local")
+                .iter()
+                .any(|a| a == "fd00::1"),
+            "still announced on wlan0"
+        );
+    }
+
+    #[test]
+    fn conflict_on_a_second_link_is_not_hidden_by_an_overwrite() {
+        let mut app = fritz_mesh();
+        // The box announces the same address on both links, wlan0 first;
+        // the repeater disagrees on wlan0 only.
+        let mut wlan = aaaa("fritz.box.", BOX_ULA, BOX_V4);
+        wlan.iface = "wlan0".into();
+        wlan.ifindex = 3;
+        let mut eth = wlan.clone();
+        eth.iface = "eth0".into();
+        eth.ifindex = 2;
+        let mut rep = aaaa("fritz.box.", REP_ULA, REPEATER);
+        rep.iface = "wlan0".into();
+        rep.ifindex = 3;
+        ingest(&mut app, &wlan);
+        ingest(&mut app, &rep);
+        ingest(&mut app, &eth);
+        let found = conflicts(&app);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].message.contains("on wlan0"),
+            "{}",
+            found[0].message
+        );
+    }
+
+    #[test]
+    fn cursor_and_txt_expansion_stay_on_their_link() {
+        let mut app = App::new().unwrap();
+        ingest(&mut app, &ptr_record(4500));
+        ingest(&mut app, &srv_record(120));
+        let txt = |iface: &str, ifindex| {
+            on_link(
+                raw_record("Test._http._tcp.local.", 16, "TXT", "a=1; b=2", 4500),
+                iface,
+                ifindex,
+            )
+        };
+        ingest(&mut app, &txt("eth0", 2));
+        ingest(&mut app, &txt("wlan0", 3));
+        app.evict_expired();
+        select_instance(&mut app, "Test");
+        let wlan_idx = app
+            .display_detail()
+            .unwrap()
+            .ordered_answers()
+            .iter()
+            .position(|r| r.rtype == 16 && r.ifindex == 3)
+            .unwrap();
+        app.detail_selected = wlan_idx;
+        app.detail_anchor = app
+            .display_detail()
+            .and_then(|d| App::identity_at_detail(&d, wlan_idx));
+        assert!(app.toggle_txt_expanded());
+        // A refresh of the eth0 copy reorders nothing away from wlan0.
+        ingest(&mut app, &txt("eth0", 2));
+        app.clamp_selection();
+        match app.selected_detail_entry() {
+            Some(DetailEntry::Record(r)) => assert_eq!(r.ifindex, 3, "cursor stays on wlan0"),
+            _ => panic!("cursor on a record"),
+        }
+        let target = app.display_detail().unwrap();
+        let rows = target.ordered_answers();
+        let expanded: Vec<u32> = rows
+            .iter()
+            .filter(|r| r.rtype == 16 && app.is_txt_expanded(r))
+            .map(|r| r.ifindex)
+            .collect();
+        assert_eq!(expanded, vec![3], "expansion is per row");
     }
 }
