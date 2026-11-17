@@ -23,6 +23,13 @@ pub struct DumpAnswer {
     pub ttl_remaining: u32,
     pub rdata: String,
     pub source: String,
+    /// Device names the source address resolves to (#246), preferred
+    /// first; omitted when nothing announced names it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub source_names: Vec<String>,
+    /// The name was matched by IPv6 interface ID, not exactly.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub source_name_inferred: bool,
     pub iface: String,
     pub ifindex: u32,
     pub flush: bool,
@@ -37,6 +44,13 @@ pub struct DumpQuestion {
     pub name: String,
     pub rtype_str: String,
     pub source: String,
+    /// Device names the source address resolves to (#246), preferred
+    /// first; omitted when nothing announced names it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub source_names: Vec<String>,
+    /// The name was matched by IPv6 interface ID, not exactly.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub source_name_inferred: bool,
     pub received_at: String,
     pub age_secs: u64,
 }
@@ -137,6 +151,13 @@ pub struct DumpAnomaly {
     pub rtype_str: Option<String>,
     pub rdata: Option<String>,
     pub source: Option<String>,
+    /// Device names the source address resolves to (#246), preferred
+    /// first; omitted when nothing announced names it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub source_names: Vec<String>,
+    /// The name was matched by IPv6 interface ID, not exactly.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub source_name_inferred: bool,
     pub message: String,
     pub rfc: String,
     pub requirement: String,

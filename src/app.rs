@@ -18,6 +18,7 @@ use simple_dns::TYPE;
 
 use crate::anomalies;
 use crate::browse;
+use crate::devices::AddressBook;
 use crate::dump;
 use crate::ui;
 
@@ -2195,6 +2196,30 @@ impl App {
         items
     }
 
+    /// Device names for source addresses (#246), from live A/AAAA
+    /// records: service answers, enumeration rows, pending services and
+    /// pending addresses. Rebuilt on demand; never cached.
+    pub fn address_book(&self) -> AddressBook {
+        let host_keys = self
+            .services
+            .iter()
+            .map(|s| Self::host_key(&s.hostname))
+            .filter(|k| !k.is_empty())
+            .collect();
+        let mut book = AddressBook::new(host_keys);
+        let records = self
+            .services
+            .iter()
+            .flat_map(|s| s.answers.iter())
+            .chain(self.enum_entries.iter().flat_map(|e| e.answers.iter()))
+            .chain(self.pending_instances.iter().flat_map(|p| p.answers.iter()))
+            .chain(self.pending_addrs.values().flatten());
+        for rec in records {
+            book.add(rec);
+        }
+        book
+    }
+
     /// Whether any live sighting has no owner (it would be filed under
     /// `anomalies::UNATTRIBUTED_SERVICE`). Cheap: no analyzer run.
     fn has_unattributed(&self) -> bool {
@@ -3086,8 +3111,11 @@ impl App {
         out
     }
 
-    fn dump_answer_row(rec: &browse::RawRecord) -> dump::DumpAnswer {
+    fn dump_answer_row(rec: &browse::RawRecord, book: &AddressBook) -> dump::DumpAnswer {
+        let device = book.resolve(rec.source.ip());
         dump::DumpAnswer {
+            source_names: device.as_ref().map(|d| d.names.clone()).unwrap_or_default(),
+            source_name_inferred: device.as_ref().is_some_and(|d| d.inferred),
             name: rec.name.clone(),
             rtype: rec.rtype,
             rtype_str: rec.rtype_str.clone(),
@@ -3113,8 +3141,14 @@ impl App {
         }
     }
 
-    fn dump_question_row(q: &QuestionRow) -> dump::DumpQuestion {
+    fn dump_question_row(q: &QuestionRow, book: &AddressBook) -> dump::DumpQuestion {
+        // Our own inferred sends stay `self`, unnamed.
+        let device = (q.2 != SELF_SOURCE)
+            .then(|| book.resolve(q.2.ip()))
+            .flatten();
         dump::DumpQuestion {
+            source_names: device.as_ref().map(|d| d.names.clone()).unwrap_or_default(),
+            source_name_inferred: device.as_ref().is_some_and(|d| d.inferred),
             name: q.0.clone(),
             rtype_str: q.1.clone(),
             source: if q.2 == SELF_SOURCE {
@@ -3127,7 +3161,7 @@ impl App {
         }
     }
 
-    fn dump_service(&self, svc: &ServiceEntry) -> dump::DumpService {
+    fn dump_service(&self, svc: &ServiceEntry, book: &AddressBook) -> dump::DumpService {
         let mut subtypes: Vec<String> = svc
             .subtypes
             .iter()
@@ -3157,9 +3191,13 @@ impl App {
             answers: svc
                 .ordered_answers()
                 .into_iter()
-                .map(Self::dump_answer_row)
+                .map(|r| Self::dump_answer_row(r, book))
                 .collect(),
-            questions: svc.questions.iter().map(Self::dump_question_row).collect(),
+            questions: svc
+                .questions
+                .iter()
+                .map(|q| Self::dump_question_row(q, book))
+                .collect(),
             questions_truncated: svc.questions_dropped > 0,
             questions_dropped: svc.questions_dropped,
             address_denials: self.dump_denials(&service_key(&svc.instance, &svc.service_type)),
@@ -3184,6 +3222,7 @@ impl App {
 
     /// Snapshot of mex's own browse state.
     fn state_dump(&self) -> dump::StateDump {
+        let book = self.address_book();
         let mut service_types: Vec<String> = self.known_types.iter().cloned().collect();
         service_types.sort();
         let mut metrics = std::collections::BTreeMap::new();
@@ -3345,7 +3384,11 @@ impl App {
                 application_name: crate::APP_NAME.to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
-            services: self.services.iter().map(|s| self.dump_service(s)).collect(),
+            services: self
+                .services
+                .iter()
+                .map(|s| self.dump_service(s, &book))
+                .collect(),
             service_types,
             metrics,
             passive: self.passive,
@@ -3354,8 +3397,16 @@ impl App {
                 .iter()
                 .map(|e| dump::RawGroup {
                     name: e.name.clone(),
-                    answers: e.answers.iter().map(Self::dump_answer_row).collect(),
-                    questions: e.questions.iter().map(Self::dump_question_row).collect(),
+                    answers: e
+                        .answers
+                        .iter()
+                        .map(|r| Self::dump_answer_row(r, &book))
+                        .collect(),
+                    questions: e
+                        .questions
+                        .iter()
+                        .map(|q| Self::dump_question_row(q, &book))
+                        .collect(),
                     questions_truncated: e.questions_dropped > 0,
                     questions_dropped: e.questions_dropped,
                 })
@@ -3365,8 +3416,16 @@ impl App {
                 .iter()
                 .map(|p| dump::RawGroup {
                     name: format!("{}.{}", p.instance, p.service_type),
-                    answers: p.answers.iter().map(Self::dump_answer_row).collect(),
-                    questions: p.questions.iter().map(Self::dump_question_row).collect(),
+                    answers: p
+                        .answers
+                        .iter()
+                        .map(|r| Self::dump_answer_row(r, &book))
+                        .collect(),
+                    questions: p
+                        .questions
+                        .iter()
+                        .map(|q| Self::dump_question_row(q, &book))
+                        .collect(),
                     questions_truncated: p.questions_dropped > 0,
                     questions_dropped: p.questions_dropped,
                 })
@@ -3374,36 +3433,41 @@ impl App {
             interests,
             anomalies: found
                 .iter()
-                .map(|(a, also)| dump::DumpAnomaly {
-                    kind: a.kind.as_str().to_string(),
-                    severity: a.severity.as_str().to_string(),
-                    service: a.service.clone(),
-                    also_services: also.iter().map(|s| s.to_string()).collect(),
-                    record_name: a.record_name.clone(),
-                    rtype: a.rtype,
-                    rtype_str: a.rtype_str.clone(),
-                    // Reuse the safe-sharing redaction policy: TXT pairs
-                    // redacted, public IPv6 literals masked.
-                    rdata: a.rdata.clone().map(|d| match a.rtype {
-                        Some(16) => dump::redact_txt_rdata(&d),
-                        Some(28) => dump::redact_ip_literal(&d),
-                        _ => d,
-                    }),
-                    source: a.source.clone(),
-                    message: a.message.clone(),
-                    rfc: a.rfc.to_string(),
-                    requirement: a.requirement.to_string(),
-                    section: a.response.as_ref().map(|r| r.section.as_str().to_string()),
-                    in_response_to: a
-                        .response
-                        .as_ref()
-                        .and_then(|r| r.trigger.as_ref())
-                        .map(|t| t.question.clone()),
-                    in_response_to_own: a
-                        .response
-                        .as_ref()
-                        .and_then(|r| r.trigger.as_ref())
-                        .map(|t| t.own),
+                .map(|(a, also)| {
+                    let device = a.source.as_deref().and_then(|s| book.resolve_label(s));
+                    dump::DumpAnomaly {
+                        source_names: device.as_ref().map(|d| d.names.clone()).unwrap_or_default(),
+                        source_name_inferred: device.as_ref().is_some_and(|d| d.inferred),
+                        kind: a.kind.as_str().to_string(),
+                        severity: a.severity.as_str().to_string(),
+                        service: a.service.clone(),
+                        also_services: also.iter().map(|s| s.to_string()).collect(),
+                        record_name: a.record_name.clone(),
+                        rtype: a.rtype,
+                        rtype_str: a.rtype_str.clone(),
+                        // Reuse the safe-sharing redaction policy: TXT pairs
+                        // redacted, public IPv6 literals masked.
+                        rdata: a.rdata.clone().map(|d| match a.rtype {
+                            Some(16) => dump::redact_txt_rdata(&d),
+                            Some(28) => dump::redact_ip_literal(&d),
+                            _ => d,
+                        }),
+                        source: a.source.clone(),
+                        message: a.message.clone(),
+                        rfc: a.rfc.to_string(),
+                        requirement: a.requirement.to_string(),
+                        section: a.response.as_ref().map(|r| r.section.as_str().to_string()),
+                        in_response_to: a
+                            .response
+                            .as_ref()
+                            .and_then(|r| r.trigger.as_ref())
+                            .map(|t| t.question.clone()),
+                        in_response_to_own: a
+                            .response
+                            .as_ref()
+                            .and_then(|r| r.trigger.as_ref())
+                            .map(|t| t.own),
+                    }
                 })
                 .collect(),
         }
@@ -4820,7 +4884,7 @@ impl App {
     /// Hostnames a service lives on, lowercased without the root dot:
     /// every live SRV target. The selected hostname alone is no evidence:
     /// it outlives an expired SRV while the PTR is still live.
-    fn service_hosts(svc: &ServiceEntry) -> Vec<String> {
+    pub(crate) fn service_hosts(svc: &ServiceEntry) -> Vec<String> {
         let mut hosts = Vec::new();
         for r in &svc.answers {
             if r.rtype != 33 || r.ttl <= r.received_at.elapsed().as_secs() as u32 {
@@ -7075,7 +7139,11 @@ mod tests {
         app.ingest_event(&event);
 
         assert_eq!(app.services[0].subtypes, vec![vec![0xff, b'%']]);
-        assert_eq!(app.dump_service(&app.services[0]).subtypes, [r"\xFF%"]);
+        assert_eq!(
+            app.dump_service(&app.services[0], &app.address_book())
+                .subtypes,
+            [r"\xFF%"]
+        );
         assert!(!app
             .anomalies()
             .iter()
@@ -7296,7 +7364,10 @@ mod tests {
             now,
             Vec::new(),
         );
-        assert_eq!(App::dump_question_row(&own).source, SELF_SOURCE_LABEL);
+        assert_eq!(
+            App::dump_question_row(&own, &AddressBook::new(HashSet::new())).source,
+            SELF_SOURCE_LABEL
+        );
         let remote = (
             "_http._tcp.local".to_string(),
             "PTR".to_string(),
@@ -7304,7 +7375,10 @@ mod tests {
             now,
             Vec::new(),
         );
-        assert_eq!(App::dump_question_row(&remote).source, "192.168.1.5:5353");
+        assert_eq!(
+            App::dump_question_row(&remote, &AddressBook::new(HashSet::new())).source,
+            "192.168.1.5:5353"
+        );
     }
 
     #[test]
@@ -9006,7 +9080,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("QRY TYPE6 _services._dns-sd._udp.local")),
+                .any(|l| l.contains("QRY TYPE6 _services._dns-sd")),
             "enum question keeps its QRY scope, got: {lines:#?}"
         );
     }
@@ -15187,6 +15261,336 @@ mod tests {
         assert_eq!(
             dump.anomalies.len(),
             anomalies::collapse_questions(&found).len()
+        );
+    }
+
+    // --- #246: the device behind a source address ---
+
+    const BOX_V4: &str = "169.254.1.1:5353";
+    const BOX_LL: &str = "[fe80::7eff:4dff:fe15:7f88]:5353";
+    const REPEATER: &str = "192.168.178.109:5353";
+
+    fn from(mut rec: browse::RawRecord, source: &str) -> browse::RawRecord {
+        rec.source = source.parse().unwrap();
+        rec
+    }
+
+    /// The observed FRITZ! mesh: `Fritzel` points at `fritz.box`; the
+    /// main box announces `fritz.box AAAA fd00::…:7f88` (never its
+    /// link-local address), the repeater its own A record.
+    fn fritz_mesh() -> App {
+        let mut app = App::new().unwrap();
+        ingest(
+            &mut app,
+            &from(
+                raw_record(
+                    "_fbox._tcp.local.",
+                    12,
+                    "PTR",
+                    "Fritzel._fbox._tcp.local.",
+                    4500,
+                ),
+                BOX_V4,
+            ),
+        );
+        let mut srv = raw_record(
+            "Fritzel._fbox._tcp.local.",
+            33,
+            "SRV",
+            "0 0 49000 fritz.box.",
+            120,
+        );
+        srv.flush_bit = true;
+        ingest(&mut app, &from(srv, BOX_V4));
+        ingest(
+            &mut app,
+            &from(
+                raw_record("fritz.box.", 28, "AAAA", "fd00::7eff:4dff:fe15:7f88", 120),
+                BOX_V4,
+            ),
+        );
+        ingest(
+            &mut app,
+            &from(
+                raw_record(
+                    "FritzBoxRepeater.fritz.box.",
+                    1,
+                    "A",
+                    "192.168.178.109",
+                    120,
+                ),
+                REPEATER,
+            ),
+        );
+        app.evict_expired();
+        app
+    }
+
+    /// The router zone's SOA, heard from `source`.
+    fn soa_from(app: &mut App, source: &str) {
+        ingest(
+            app,
+            &from(
+                raw_record("fritz.box.", 6, "TYPE6", "rdlength=49", 4500),
+                source,
+            ),
+        );
+    }
+
+    /// The finding row in the Answers pane whose source column starts
+    /// with `source`.
+    fn finding_line(app: &App, source: &str) -> String {
+        let lines = answers_text(app);
+        lines
+            .iter()
+            .find(|l| l.contains(source) && l.contains("unicast-style-response"))
+            .unwrap_or_else(|| panic!("finding row from {source}: {lines:#?}"))
+            .clone()
+    }
+
+    #[test]
+    fn host_block_findings_name_their_source_device() {
+        let mut app = fritz_mesh();
+        for source in [REPEATER, BOX_LL, BOX_V4] {
+            soa_from(&mut app, source);
+        }
+        select_instance(&mut app, "Fritzel");
+        // Exact match on the repeater's own A record.
+        assert!(
+            finding_line(&app, REPEATER).contains(&format!("{REPEATER} (FritzBoxRepeater)")),
+            "{}",
+            finding_line(&app, REPEATER)
+        );
+        // Link-local source, matched by interface ID: inferred.
+        assert!(
+            finding_line(&app, BOX_LL).contains(&format!("{BOX_LL} (~fritz)")),
+            "{}",
+            finding_line(&app, BOX_LL)
+        );
+        // Never announced: stays bare.
+        let bare = finding_line(&app, BOX_V4);
+        assert!(!bare.contains(&format!("{BOX_V4} (")), "{bare}");
+        // Naming never changes finding identity or counts.
+        assert_eq!(
+            findings_of(&app, anomalies::AnomalyKind::UnicastStyleResponse).len(),
+            3
+        );
+    }
+
+    #[test]
+    fn own_announcement_beats_a_proxy_and_dump_lists_every_name() {
+        let mut app = fritz_mesh();
+        // The main box answers for the repeater's address under another
+        // name: the repeater's own announcement still names `.109`.
+        ingest(
+            &mut app,
+            &from(
+                raw_record("Proxied.local.", 1, "A", "192.168.178.109", 120),
+                BOX_V4,
+            ),
+        );
+        soa_from(&mut app, REPEATER);
+        select_instance(&mut app, "Fritzel");
+        let line = finding_line(&app, REPEATER);
+        assert!(line.contains("(FritzBoxRepeater)"), "{line}");
+        let dump = app.state_dump();
+        let finding = dump
+            .anomalies
+            .iter()
+            .find(|a| a.source.as_deref() == Some(REPEATER))
+            .expect("repeater finding");
+        assert_eq!(
+            finding.source_names,
+            ["FritzBoxRepeater.fritz.box", "Proxied.local"]
+        );
+        assert!(!finding.source_name_inferred);
+    }
+
+    #[test]
+    fn several_own_names_prefer_local_then_alphabetical() {
+        let mut app = fritz_mesh();
+        ingest(
+            &mut app,
+            &from(
+                raw_record("Repeater.local.", 1, "A", "192.168.178.109", 120),
+                REPEATER,
+            ),
+        );
+        soa_from(&mut app, REPEATER);
+        select_instance(&mut app, "Fritzel");
+        assert!(finding_line(&app, REPEATER).contains("(Repeater)"));
+        let dump = app.state_dump();
+        let finding = dump
+            .anomalies
+            .iter()
+            .find(|a| a.source.as_deref() == Some(REPEATER))
+            .unwrap();
+        assert_eq!(
+            finding.source_names,
+            ["Repeater.local", "FritzBoxRepeater.fritz.box"]
+        );
+    }
+
+    #[test]
+    fn expiry_and_goodbye_remove_the_name() {
+        for gone in ["goodbye", "expired"] {
+            let mut app = fritz_mesh();
+            soa_from(&mut app, REPEATER);
+            // The repeater's A record waits in the pending addresses (no
+            // service points at it).
+            for rec in app.pending_addrs.values_mut().flatten() {
+                {
+                    if rec.rtype == 1 {
+                        if gone == "goodbye" {
+                            rec.ttl = 0;
+                        } else {
+                            rec.received_at = Instant::now()
+                                .checked_sub(Duration::from_secs(500))
+                                .unwrap_or_else(Instant::now);
+                        }
+                    }
+                }
+            }
+            select_instance(&mut app, "Fritzel");
+            let line = finding_line(&app, REPEATER);
+            assert!(!line.contains("(FritzBoxRepeater)"), "{gone}: {line}");
+        }
+    }
+
+    #[test]
+    fn questions_pane_names_queriers_and_keeps_one_shot() {
+        let mut app = fritz_mesh();
+        select_instance(&mut app, "Fritzel");
+        for source in [REPEATER, "192.168.178.109:45678"] {
+            app.ingest_event(&query_event(
+                "Fritzel._fbox._tcp.local.",
+                16,
+                "TXT",
+                false,
+                Vec::new(),
+                source.parse().unwrap(),
+            ));
+        }
+        let buf = render_to_buffer(&app, 200, 40);
+        let text = rect_text(&buf, app.questions_rect.get());
+        assert!(
+            text.contains(&format!("{REPEATER} (FritzBoxRepeater)")),
+            "{text}"
+        );
+        assert!(
+            text.contains("192.168.178.109:45678 (one-shot, FritzBoxRepeater)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn answers_name_foreign_responders_only_but_findings_always() {
+        let mut app = fritz_mesh();
+        // The repeater answers for the box's name: foreign responder.
+        ingest(
+            &mut app,
+            &from(
+                raw_record("fritz.box.", 28, "AAAA", "fd00::ca0e:14ff:feff:416", 120),
+                REPEATER,
+            ),
+        );
+        // The box itself (link-local, inferred `fritz`) re-sends the TXT
+        // without the flush bit: its own host, but a finding.
+        ingest(
+            &mut app,
+            &from(
+                raw_record("Fritzel._fbox._tcp.local.", 16, "TXT", "a=1", 4500),
+                BOX_LL,
+            ),
+        );
+        select_instance(&mut app, "Fritzel");
+        let lines = answers_text(&app);
+        let foreign = lines
+            .iter()
+            .find(|l| l.contains("fd00::ca0e:14ff:feff:416"))
+            .unwrap();
+        assert!(foreign.contains("(FritzBoxRepeater)"), "{foreign}");
+        let txt = lines
+            .iter()
+            .position(|l| l.starts_with("│TXT"))
+            .unwrap_or_else(|| panic!("{lines:#?}"));
+        assert!(!lines[txt].contains("(~fritz)"), "own host: {}", lines[txt]);
+        assert!(
+            lines[txt + 1].contains("no-flush") && lines[txt + 1].contains("(~fritz)"),
+            "finding row names its source: {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn unattributed_findings_name_their_source() {
+        let mut app = fritz_mesh();
+        ingest(
+            &mut app,
+            &from(
+                raw_record("other.example.", 6, "TYPE6", "rdlength=30", 4500),
+                REPEATER,
+            ),
+        );
+        let pos = app
+            .display_items()
+            .iter()
+            .position(|it| matches!(it, DisplayItem::Unattributed))
+            .expect("(unattributed) entry");
+        app.selected_display = pos;
+        app.clamp_selection();
+        assert!(finding_line(&app, REPEATER).contains("(FritzBoxRepeater)"));
+    }
+
+    #[test]
+    fn dump_adds_name_fields_only_when_named() {
+        let mut app = fritz_mesh();
+        for source in [REPEATER, BOX_LL, BOX_V4] {
+            soa_from(&mut app, source);
+        }
+        let json = serde_json::to_value(app.state_dump()).unwrap();
+        let anomalies = json["anomalies"].as_array().unwrap();
+        let by_source = |src: &str| {
+            anomalies
+                .iter()
+                .find(|a| a["source"] == src)
+                .unwrap_or_else(|| panic!("finding from {src}"))
+        };
+        assert_eq!(
+            by_source(REPEATER)["source_names"],
+            serde_json::json!(["FritzBoxRepeater.fritz.box"])
+        );
+        assert!(by_source(REPEATER).get("source_name_inferred").is_none());
+        assert_eq!(
+            by_source(BOX_LL)["source_names"],
+            serde_json::json!(["fritz.box"])
+        );
+        assert_eq!(by_source(BOX_LL)["source_name_inferred"], true);
+        let bare = by_source(BOX_V4);
+        assert!(bare.get("source_names").is_none(), "{bare}");
+        assert!(bare.get("source_name_inferred").is_none(), "{bare}");
+        // Answer rows: the repeater answering for the box's name is named.
+        ingest(
+            &mut app,
+            &from(
+                raw_record("fritz.box.", 28, "AAAA", "fd00::ca0e:14ff:feff:416", 120),
+                REPEATER,
+            ),
+        );
+        let json = serde_json::to_value(app.state_dump()).unwrap();
+        let rows: Vec<&serde_json::Value> = json["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|s| s["answers"].as_array().unwrap().iter())
+            .collect();
+        let a = rows
+            .iter()
+            .find(|r| r["source"] == REPEATER)
+            .expect("repeater row");
+        assert_eq!(a["source"], REPEATER);
+        assert_eq!(
+            a["source_names"],
+            serde_json::json!(["FritzBoxRepeater.fritz.box"])
         );
     }
 }

@@ -51,6 +51,11 @@ Headless run (no TTY) logs to stderr.
   (legacy zeroconf form) keeps that address type off that one service
   (`push_record` gate, retroactive removal); the host header keeps it via
   `withheld_addrs`, and the service drives no query interest for it.
+* `src/devices.rs` — device names behind source addresses (#246): an
+  `AddressBook` built on demand from live A/AAAA records
+  (`App::address_book`), exact match first (own announcement beats a
+  proxy), then IPv6 interface-ID match for link-local sources
+  (inferred). Presentation and dumps only; never feeds the analyzer.
 * `src/ui.rs` — ratatui rendering only, no state mutations.
 
 ## Query scheduling (RFC 6762 §5.2, §5.4, §7.1)

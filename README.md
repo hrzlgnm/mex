@@ -120,6 +120,16 @@ browsed as before.
   Questions from this host are highlighted like local records.
   Queriers asking from an ephemeral port ([RFC 6762 §5.1](https://www.rfc-editor.org/rfc/rfc6762#section-5.1)) are tagged
   `(one-shot)`: stub resolvers, not full continuous queriers.
+- **Device names.** A source address is named after the device that
+  announces it: `192.168.178.109:5353 (FritzBoxRepeater)`. The name
+  comes from a live A/AAAA record carrying that address (the device's
+  own announcement wins over a proxy's), shortened to its first label.
+  An IPv6 link-local source that no record names exactly is matched by
+  its interface ID against the device's global/ULA AAAA and marked
+  inferred (`(~fritz)`). Unannounced addresses stay bare. Finding rows
+  and queriers are always named; answer rows only when the responder is
+  not the service's own host. Dumps carry every candidate name
+  (`source_names`, `source_name_inferred`).
 - **Right bottom — Hex.** Wire bytes of the selected record or question
   packet, falling back to the service's latest packet. `Tab` focuses it
   for scrolling.
