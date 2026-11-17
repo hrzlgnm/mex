@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.20.1](https://github.com/hrzlgnm/mex/compare/v0.20.0...v0.20.1) (2026-11-17)
+
+
+### Bug Fixes
+
+* count a multi-homed host's per-NIC answers as one responder ([#273](https://github.com/hrzlgnm/mex/issues/273)) ([c8e1ef1](https://github.com/hrzlgnm/mex/commit/c8e1ef1ea721d1f47848b048398d91dffed6ade6))
+* show goodbye TTL cells in dark gray instead of red ([#272](https://github.com/hrzlgnm/mex/issues/272)) ([e482b24](https://github.com/hrzlgnm/mex/commit/e482b248c4185e804bca7b37f0f406d6825f1dc5))
+
 ## [0.20.0](https://github.com/hrzlgnm/mex/compare/v0.19.0...v0.20.0) (2026-11-17)
 
 
