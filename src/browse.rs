@@ -1,7 +1,7 @@
 // Copyright 2026 hrzlgnm
 // SPDX-License-Identifier: MIT
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -106,6 +106,65 @@ enum SendOp {
     Pin,
     /// Sending the query copy.
     Send,
+}
+
+/// How long a sent query copy can take to loop back to us.
+const OWN_COPY_WINDOW: Duration = Duration::from_secs(2);
+
+/// Bound on remembered sent copies (one per link per query).
+const OWN_COPY_CAP: usize = 512;
+
+/// Recently sent query copies, by exact bytes. With multicast loop on,
+/// every copy we send comes back from a local address; address alone
+/// can't tell it from a local responder's own query (avahi asks from the
+/// same `ip:5353`), so our copies are matched by content. Each sent copy
+/// drops exactly one received copy, so an identical query from another
+/// local querier is still seen.
+#[derive(Debug, Default)]
+struct SentCopies {
+    recent: VecDeque<(u64, Instant)>,
+}
+
+fn copy_digest(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+impl SentCopies {
+    /// Remember one copy that was actually sent.
+    fn record(&mut self, bytes: &[u8], now: Instant) {
+        self.prune(now);
+        if self.recent.len() >= OWN_COPY_CAP {
+            self.recent.pop_front();
+        }
+        self.recent.push_back((copy_digest(bytes), now));
+    }
+
+    /// Whether `bytes` is one of our own copies looping back; consumes
+    /// the match so it can only drop one received packet.
+    fn take(&mut self, bytes: &[u8], now: Instant) -> bool {
+        self.prune(now);
+        let digest = copy_digest(bytes);
+        match self.recent.iter().position(|(d, _)| *d == digest) {
+            Some(i) => {
+                self.recent.remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while self
+            .recent
+            .front()
+            .is_some_and(|(_, at)| now.saturating_duration_since(*at) > OWN_COPY_WINDOW)
+        {
+            self.recent.pop_front();
+        }
+    }
 }
 
 /// Send-failure dedup per (family, link): a broken link logs each
@@ -828,10 +887,12 @@ fn create_v4_socket() -> Result<PktInfoUdpSocket> {
     let socket = PktInfoUdpSocket::new(Domain::IPV4)?;
     socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
-    // Querier-only: our own transmissions must not loop back and be
-    // re-ingested as sightings (suppression already ignores self, and
-    // the Questions pane has no use for our own queries either).
-    socket.set_multicast_loop_v4(false)?;
+    // Multicast loop on: on Unix the option governs whether our own
+    // outgoing multicast reaches sockets on this host, so with it off,
+    // responders here (avahi, python-zeroconf) never hear our queries.
+    // (On Windows it applies to receive instead.) Our own looped-back
+    // copies are dropped on receive by `SentCopies`.
+    socket.set_multicast_loop_v4(true)?;
     // RFC 6762 §11 sends with IP TTL 255 (a SHOULD for responses, and
     // ecosystem convention for queries too): link-local scope is
     // unaffected, but legacy checkers discard anything else.
@@ -845,7 +906,8 @@ fn create_v6_socket() -> Result<PktInfoUdpSocket> {
     let socket = PktInfoUdpSocket::new(Domain::IPV6)?;
     socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
-    socket.set_multicast_loop_v6(false)?;
+    // Loop on, as for v4: local responders must hear our queries.
+    socket.set_multicast_loop_v6(true)?;
     socket.set_multicast_hops_v6(255)?;
     // v6 only: v4 traffic belongs to the v4 socket alone. The pktinfo
     // wrapper has no setter, so set it through a duplicate handle (same
@@ -1028,6 +1090,8 @@ struct Listener {
     /// and the waker won't announce them again.
     queries_pending: bool,
     send_failures: SendFailures,
+    /// Our own sent query copies, dropped when they loop back.
+    sent_copies: SentCopies,
     transmit: Arc<TransmitState>,
     buf: Vec<u8>,
 }
@@ -1059,6 +1123,7 @@ impl Listener {
             next_refresh: Instant::now(),
             queries_pending: false,
             send_failures: SendFailures::default(),
+            sent_copies: SentCopies::default(),
             transmit,
             buf: vec![0u8; 65535],
         }
@@ -1181,6 +1246,7 @@ impl Listener {
             ifaces_v4,
             ifaces_v6,
             send_failures,
+            sent_copies,
             ..
         } = self;
         let (_, more) = drain_queries(query_rx, QUERY_BUDGET, |req| {
@@ -1192,6 +1258,7 @@ impl Listener {
                     ifaces_v4,
                     ifaces_v6,
                     send_failures,
+                    sent_copies,
                 );
             }
         });
@@ -1239,6 +1306,11 @@ impl Listener {
             }
         };
         let raw = self.buf[..len].to_vec();
+        // Our own query copy looping back (multicast loop is on so local
+        // responders hear us): not a remote querier, drop it.
+        if self.sent_copies.take(&raw, Instant::now()) {
+            return ReadStep::Handled;
+        }
         let ifindex = info.if_index as u32;
         if !self.ifnames.contains_key(&ifindex) || !self.subnets.contains_key(&ifindex) {
             // Stale maps (interface appeared mid-window) or an index
@@ -1291,6 +1363,7 @@ fn send_on_all_interfaces(
     ifaces_v4: &[(String, Ipv4Addr)],
     ifaces_v6: &[(String, u32)],
     failures: &mut SendFailures,
+    sent_copies: &mut SentCopies,
 ) {
     let family_label = family.label();
     for target in send_targets(family, ifaces_v4, ifaces_v6) {
@@ -1307,11 +1380,12 @@ fn send_on_all_interfaces(
             }
             continue;
         }
-        let Some(sent) = send_query(socket, req, dest, link) else {
+        let Some((bytes, sent)) = send_query(socket, req, dest, link) else {
             continue;
         };
         match sent {
             Ok(()) => {
+                sent_copies.record(&bytes, Instant::now());
                 if failures.record_success(family, link).is_some() {
                     log::info!("mex: {family_label} send on {link} recovered");
                 }
@@ -1493,16 +1567,18 @@ pub(crate) fn inferred_question_packet(name: &str, rtype: u16, qu: bool) -> Opti
     build_query(&qname, record_type, qu, &[])
 }
 
-/// Encode and send one query copy. `None` when encoding failed (already
-/// logged in `encode_query`), so nothing was sent.
+/// Encode and send one query copy, returning its bytes with the send
+/// result. `None` when encoding failed (already logged in
+/// `encode_query`), so nothing was sent.
 fn send_query(
     socket: &impl QuerySocket,
     req: &QueryRequest,
     dest: SocketAddr,
     egress_iface: &str,
-) -> Option<std::io::Result<()>> {
+) -> Option<(Vec<u8>, std::io::Result<()>)> {
     let bytes = encode_query(req, egress_iface)?;
-    Some(socket.send_to(&bytes, dest))
+    let sent = socket.send_to(&bytes, dest);
+    Some((bytes, sent))
 }
 
 pub(crate) fn parse_packet(
@@ -1539,7 +1615,7 @@ pub(crate) fn parse_packet(
     // Only responses carry authoritative answers. Queries may carry the
     // same answers as known answers (RFC 6762 §7.1 suppression), which
     // are beliefs, not facts: the querier (e.g. another browser on the
-    // link; multicast loop is disabled so never ourselves) is not their
+    // link; our own looped-back copies are dropped on receive) is not their
     // source. Filing them would conjure phantom sightings on links the
     // device never touched.
     if is_response {
@@ -3171,13 +3247,75 @@ mod tests {
     }
 
     #[test]
-    fn multicast_loop_is_disabled() {
-        // Querier-only: own transmissions must not loop back and be
-        // re-ingested. Failure here is loud (startup errors propagate).
+    fn multicast_loop_is_enabled() {
+        // Loop on, so responders on this host hear our queries; our own
+        // copies are dropped by `SentCopies`. Failure here is loud
+        // (startup errors propagate).
         let std4 = create_v4_socket().unwrap().try_clone_std().unwrap();
-        assert!(!socket2::Socket::from(std4).multicast_loop_v4().unwrap());
+        assert!(socket2::Socket::from(std4).multicast_loop_v4().unwrap());
         let std6 = create_v6_socket().unwrap().try_clone_std().unwrap();
-        assert!(!socket2::Socket::from(std6).multicast_loop_v6().unwrap());
+        assert!(socket2::Socket::from(std6).multicast_loop_v6().unwrap());
+    }
+
+    #[test]
+    fn own_copy_is_dropped_once_and_identical_foreign_query_kept() {
+        // avahi on this host may send the very same query bytes from the
+        // same ip:5353: one sent copy drops exactly one received copy.
+        let now = Instant::now();
+        let mut copies = SentCopies::default();
+        let query = [0u8, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 7];
+        copies.record(&query, now);
+        assert!(copies.take(&query, now), "our looped-back copy");
+        assert!(
+            !copies.take(&query, now),
+            "a second identical one is someone else's"
+        );
+        assert!(!copies.take(&[1, 2, 3], now), "never sent");
+    }
+
+    #[test]
+    fn own_copies_expire_and_are_bounded() {
+        let start = Instant::now();
+        let mut copies = SentCopies::default();
+        copies.record(b"old", start);
+        let later = start + OWN_COPY_WINDOW + Duration::from_millis(1);
+        assert!(!copies.take(b"old", later), "too old to be our loopback");
+        for i in 0..=OWN_COPY_CAP {
+            copies.record(&i.to_be_bytes(), later);
+        }
+        assert_eq!(copies.recent.len(), OWN_COPY_CAP);
+        assert!(!copies.take(&0usize.to_be_bytes(), later), "oldest evicted");
+        assert!(copies.take(&OWN_COPY_CAP.to_be_bytes(), later));
+    }
+
+    #[test]
+    fn only_successfully_sent_copies_are_remembered() {
+        let links = [("eth0".to_string(), 2u32)];
+        let mut failures = SendFailures::default();
+        let mut copies = SentCopies::default();
+        let socket = FakeSocket::default();
+        socket.failing_send.set(true);
+        send_on_all_interfaces(
+            &socket,
+            &ptr_query(),
+            Family::V6,
+            &[],
+            &links,
+            &mut failures,
+            &mut copies,
+        );
+        assert!(copies.recent.is_empty(), "a failed send never loops back");
+        socket.failing_send.set(false);
+        send_on_all_interfaces(
+            &socket,
+            &ptr_query(),
+            Family::V6,
+            &[],
+            &links,
+            &mut failures,
+            &mut copies,
+        );
+        assert_eq!(copies.recent.len(), 1);
     }
 
     #[test]
@@ -3316,6 +3454,7 @@ mod tests {
             &[],
             &links,
             &mut failures,
+            &mut SentCopies::default(),
         );
         assert_eq!(
             *socket.calls.borrow(),
@@ -3345,6 +3484,7 @@ mod tests {
             &links,
             &[],
             &mut failures,
+            &mut SentCopies::default(),
         );
         assert_eq!(
             *socket.calls.borrow(),
@@ -3380,6 +3520,7 @@ mod tests {
             &[],
             &links,
             &mut failures,
+            &mut SentCopies::default(),
         );
         assert_eq!(
             failures.record_failure(
@@ -3399,6 +3540,7 @@ mod tests {
             &[],
             &links,
             &mut failures,
+            &mut SentCopies::default(),
         );
         assert_eq!(
             failures.record_success(Family::V6, "eth0"),
@@ -3416,7 +3558,15 @@ mod tests {
         let socket = FakeSocket::default();
         let mut failures = SendFailures::default();
         for family in [Family::V4, Family::V6] {
-            send_on_all_interfaces(&socket, &ptr_query(), family, &[], &[], &mut failures);
+            send_on_all_interfaces(
+                &socket,
+                &ptr_query(),
+                family,
+                &[],
+                &[],
+                &mut failures,
+                &mut SentCopies::default(),
+            );
         }
         assert!(socket.calls.borrow().is_empty(), "nothing pinned or sent");
     }

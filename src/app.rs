@@ -430,8 +430,9 @@ const LOCAL_IPS_REFRESH: Duration = Duration::from_secs(10);
 const PENDING_ADDR_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Sentinel querier address marking questions inferred from our own send
-/// path (multicast loop is disabled, so our transmissions never arrive
-/// as events). Port 0 can never be a real mDNS querier.
+/// path (our own looped-back copies are dropped by the listener, so our
+/// transmissions never arrive as events). Port 0 can never be a real mDNS
+/// querier.
 pub const SELF_SOURCE: std::net::SocketAddr =
     std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
 
@@ -5246,8 +5247,8 @@ impl App {
     }
 
     /// File a question we sent ourselves, inferred from the send path:
-    /// multicast loop is disabled so our transmissions never arrive as
-    /// events. Store a minimal query packet for the question fields rather
+    /// the listener drops our own looped-back copies, so our transmissions
+    /// never arrive as events. Store a minimal query packet for the question fields rather
     /// than reusing unrelated latest-event bytes. Filed for real sends and
     /// §7.3 suppressions alike: both are browse demand. Discovery sends
     /// precede the service, so matching pending instances park them until
