@@ -2160,6 +2160,33 @@ pub(crate) fn rtype_label(rtype: u16) -> String {
     rtype_name(rtype).map_or_else(|| format!("TYPE{rtype}"), str::to_string)
 }
 
+/// Address types (A, AAAA) named in an NSEC row's rendered bitmap
+/// (`next_name. TYPE…`), and whether it names any other type. Shared by
+/// address denials (app) and the inverted-bitmap finding (analyzer), so
+/// both read the same rule.
+pub(crate) fn nsec_address_types(rdata: &str) -> (Vec<u16>, bool) {
+    let mut address = Vec::new();
+    let mut other = false;
+    // The next name may hold spaces (instance names do, e.g. "My A
+    // Printer"), but it always ends in "." and no type mnemonic contains
+    // one: the bitmap is everything after the last ". ".
+    // An empty bitmap leaves the rdata ending in the name's "." (no type
+    // mnemonic ends in one); only otherwise does the last ". " start it.
+    let rdata = rdata.trim_end();
+    let bitmap = if rdata.ends_with('.') {
+        ""
+    } else {
+        rdata.rsplit_once(". ").map_or("", |(_, types)| types)
+    };
+    for t in bitmap.split_whitespace().filter_map(rtype_from_str) {
+        match t {
+            1 | 28 => address.push(t),
+            _ => other = true,
+        }
+    }
+    (address, other)
+}
+
 /// Numeric type for a displayed label (`A` → 1, …, `TYPE47` → 47); the
 /// inverse of `rtype_label`. `None` means unrecognised: callers stay
 /// quiet rather than guessing.
@@ -2247,6 +2274,30 @@ mod tests {
         assert!(!is_local_name("host.example"));
         assert!(!is_local_name("notlocal"));
         assert!(is_local_name(".local"));
+    }
+
+    #[test]
+    fn nsec_bitmap_ignores_words_of_the_next_name() {
+        // Instance names keep spaces; a word like "A" in the name is not a
+        // bitmap type.
+        assert_eq!(
+            nsec_address_types("My A Printer._http._tcp.local. AAAA"),
+            (vec![28], false)
+        );
+        assert_eq!(
+            nsec_address_types("host.local. A AAAA"),
+            (vec![1, 28], false)
+        );
+        assert_eq!(
+            nsec_address_types("Odd. A Name.local. TXT SRV"),
+            (vec![], true)
+        );
+        assert_eq!(nsec_address_types("host.local."), (vec![], false));
+        // Empty bitmap with a dotted name holding a mnemonic word.
+        assert_eq!(
+            nsec_address_types("Odd. A Name._http._tcp.local."),
+            (vec![], false)
+        );
     }
 
     #[test]

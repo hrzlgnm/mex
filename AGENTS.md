@@ -46,6 +46,11 @@ Headless run (no TTY) logs to stderr.
   owners resolved at analysis time: instance names to their service,
   hostnames once to the host (`anomalies::host_id`), shown in every
   sibling service's pane.
+  NSEC address denials (`address_denials`): a hostname NSEC arriving with
+  a service's SRV (RFC form) or an instance NSEC listing only A/AAAA
+  (legacy zeroconf form) keeps that address type off that one service
+  (`push_record` gate, retroactive removal); the host header keeps it via
+  `withheld_addrs`, and the service drives no query interest for it.
 * `src/ui.rs` — ratatui rendering only, no state mutations.
 
 ## Query scheduling (RFC 6762 §5.2, §5.4, §7.1)

@@ -82,6 +82,7 @@ pub enum AnomalyKind {
     UnicastStyleResponse,
     UnsupportedType,
     UnsupportedQuestion,
+    NsecInvertedBitmap,
     TtlLow,
     TtlHigh,
     TtlMismatch,
@@ -102,6 +103,7 @@ impl AnomalyKind {
             AnomalyKind::UnicastStyleResponse => "unicast-style-response",
             AnomalyKind::UnsupportedType => "unsupported-type",
             AnomalyKind::UnsupportedQuestion => "unsupported-question",
+            AnomalyKind::NsecInvertedBitmap => "nsec-inverted-bitmap",
             AnomalyKind::TtlLow => "ttl-low",
             AnomalyKind::TtlHigh => "ttl-high",
             AnomalyKind::TtlMismatch => "ttl-mismatch",
@@ -202,6 +204,10 @@ pub struct ServiceView<'a> {
     pub service_type: &'a str,
     pub answers: &'a [RawRecord],
     pub subtypes: &'a [Vec<u8>],
+    /// Address types (1, 28) the service's own responder denies via NSEC
+    /// (#245), each for one host or (`None`) every host of the service:
+    /// their lookups are not judged.
+    pub denied_address_types: Vec<(u16, Option<String>)>,
 }
 
 /// Snapshot input for the analyzer. Built by the caller from live browser
@@ -252,7 +258,8 @@ pub struct AddressQueryView {
 const ADDRESS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 struct AddressEvidence<'a> {
-    host_has_addr: &'a HashMap<String, bool>,
+    /// Live address families per host: (lowercased host, 1 | 28).
+    host_has_addr: &'a HashSet<(String, u16)>,
     host_addr_latest: &'a HashMap<(String, u16), Instant>,
     pending_hosts: &'a HashSet<String>,
     queries: &'a [AddressQueryView],
@@ -290,7 +297,7 @@ pub fn analyze_observations(
     let now = Instant::now();
     let mut out: Vec<Anomaly> = Vec::new();
 
-    let mut host_has_addr: HashMap<String, bool> = HashMap::new();
+    let mut host_has_addr: HashSet<(String, u16)> = HashSet::new();
     let mut host_addr_latest: HashMap<(String, u16), Instant> = HashMap::new();
     for svc in &snap.services {
         for rec in svc.answers {
@@ -303,7 +310,7 @@ pub fn analyze_observations(
                         .or_insert(rec.received_at);
                 }
                 if is_live(rec, now) {
-                    host_has_addr.insert(key, true);
+                    host_has_addr.insert((key, rec.rtype));
                 }
             }
         }
@@ -487,12 +494,30 @@ fn dedup(mut items: Vec<Anomaly>) -> Vec<Anomaly> {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AddressQueryOutcome {
+    /// The service's own responder denies this type via NSEC (#245).
+    Denied,
     NoData,
     NoResponse,
     Inconclusive,
     NotQueried,
     Pending,
     ExpiredAnswer,
+}
+
+/// The address types denied for one SRV target: denials for that host
+/// and those for every host of the service.
+pub(crate) fn denied_for_host(denied: &[(u16, Option<String>)], host: &str) -> Vec<u16> {
+    let mut types: Vec<u16> = denied
+        .iter()
+        .filter(|(_, h)| {
+            h.as_deref()
+                .is_none_or(|h| h.eq_ignore_ascii_case(host.trim_end_matches('.')))
+        })
+        .map(|(t, _)| *t)
+        .collect();
+    types.sort_unstable();
+    types.dedup();
+    types
 }
 
 fn check_unresolved_srv_target(
@@ -538,13 +563,13 @@ fn check_unresolved_target(
         return;
     };
     let host_key = host.to_lowercase();
-    if evidence
-        .host_has_addr
-        .get(&host_key)
-        .copied()
-        .unwrap_or(false)
-        || evidence.pending_hosts.contains(&host_key)
-    {
+    // Resolved if the host has a live address in a family this service
+    // doesn't deny: a sibling's AAAA says nothing about an IPv4-only one.
+    let denied = denied_for_host(&svc.denied_address_types, host);
+    let resolved = [1, 28].into_iter().any(|rtype| {
+        !denied.contains(&rtype) && evidence.host_has_addr.contains(&(host_key.clone(), rtype))
+    });
+    if resolved || evidence.pending_hosts.contains(&host_key) {
         return;
     }
 
@@ -573,7 +598,15 @@ fn check_unresolved_target(
     interfaces.sort_unstable();
     interfaces.dedup();
     for interface in interfaces {
-        check_unresolved_path(srv, service_id, host, &host_key, interface, evidence, out);
+        check_unresolved_path(
+            srv,
+            service_id,
+            host,
+            interface,
+            &denied_for_host(&svc.denied_address_types, host),
+            evidence,
+            out,
+        );
     }
 }
 
@@ -581,11 +614,17 @@ fn check_unresolved_path(
     srv: &RawRecord,
     service_id: &str,
     host: &str,
-    host_key: &str,
     interface: &str,
+    denied: &[u16],
     evidence: &AddressEvidence<'_>,
     out: &mut Vec<Anomaly>,
 ) {
+    // Both families denied by the service itself: nothing to look up.
+    if denied.contains(&1) && denied.contains(&28) {
+        return;
+    }
+    let host_key = host.to_lowercase();
+    let host_key = host_key.as_str();
     let on_path = |record: &RawRecord| interface.is_empty() || record.iface == interface;
     // RFC 6762 §18.11: responses with a non-zero RCODE MUST be silently
     // ignored, so they never count as evidence (no NXDOMAIN in mDNS;
@@ -603,6 +642,9 @@ fn check_unresolved_path(
     let outcomes: Vec<_> = [1, 28]
         .into_iter()
         .map(|rtype| {
+            if denied.contains(&rtype) {
+                return (rtype, AddressQueryOutcome::Denied, None);
+            }
             let query = evidence.queries.iter().filter(|query| {
                 query.service == service_id
                     && query
@@ -687,10 +729,14 @@ fn check_unresolved_path(
     let (a_outcome, a_context) = (&outcomes[0].1, &outcomes[0].2);
     let (aaaa_outcome, aaaa_context) = (&outcomes[1].1, &outcomes[1].2);
     // The only explicit negative in mDNS is an NSEC denying both address
-    // types (RFC 6762 §6.1).
-    let explicit_negative = matches!(a_outcome, AddressQueryOutcome::NoData)
-        && matches!(aaaa_outcome, AddressQueryOutcome::NoData);
+    // types (RFC 6762 §6.1); a type the service itself denies counts as
+    // denied too.
+    let negative = |o: &AddressQueryOutcome| {
+        matches!(o, AddressQueryOutcome::NoData | AddressQueryOutcome::Denied)
+    };
+    let explicit_negative = negative(a_outcome) && negative(aaaa_outcome);
     let outcome_text = |outcome: AddressQueryOutcome| match outcome {
+        AddressQueryOutcome::Denied => "denied by NSEC",
         AddressQueryOutcome::NoData => "NODATA",
         AddressQueryOutcome::NoResponse => "no response",
         AddressQueryOutcome::Inconclusive => "unattributed mDNS response",
@@ -1351,6 +1397,37 @@ fn check_record_claims(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>
         ));
     }
 
+    // Older python-zeroconf: an NSEC owned by the instance name whose
+    // bitmap lists only the *missing* address types. RFC 6762 §6.1 has
+    // the bitmap list the types that exist, so read literally it claims
+    // the instance has only A/AAAA, contradicting its SRV/TXT. mex treats
+    // it as a denial (#245); flag the inversion as an observation.
+    if rec.rtype == 47
+        && rec
+            .name
+            .trim_end_matches('.')
+            .eq_ignore_ascii_case(service_id)
+    {
+        let (address, other) = crate::browse::nsec_address_types(&rec.rdata);
+        if !address.is_empty() && !other {
+            out.push(Anomaly {
+                kind: AnomalyKind::NsecInvertedBitmap,
+                severity: Severity::Info,
+                service: service_id.to_string(),
+                record_name: Some(name.clone()),
+                rtype: Some(rec.rtype),
+                rtype_str: Some(rec.rtype_str.clone()),
+                rdata: Some(rdata.clone()),
+                source: Some(src.clone()),
+                message: "instance NSEC lists only missing address types (inverted bitmap)"
+                    .to_string(),
+                rfc: "RFC 6762 §6.1",
+                requirement: "",
+                response: None,
+            });
+        }
+    }
+
     // Cache-flush bit misuse: shared records must not set it. Reverse
     // mapping PTRs are the exception: the RFC treats them as unique (no
     // other host may claim the same address), so the bit is correct there.
@@ -1813,6 +1890,7 @@ mod tests {
             service_type,
             answers,
             subtypes,
+            denied_address_types: Vec::new(),
         }];
         let snap = Snapshot {
             services,
@@ -1822,6 +1900,17 @@ mod tests {
             sightings: Vec::new(),
         };
         analyze(&snap)
+    }
+
+    #[test]
+    fn denied_types_are_scoped_to_their_host() {
+        // An RFC denial for host X must not suppress the lookup for an
+        // alternate SRV target Y; a legacy denial (None) covers every host.
+        let denied = vec![(28, Some("knulp.local".to_string())), (1, None)];
+        assert_eq!(denied_for_host(&denied, "knulp.local."), vec![1, 28]);
+        assert_eq!(denied_for_host(&denied, "KNULP.local"), vec![1, 28]);
+        assert_eq!(denied_for_host(&denied, "other.local"), vec![1]);
+        assert!(denied_for_host(&[], "knulp.local").is_empty());
     }
 
     #[test]
