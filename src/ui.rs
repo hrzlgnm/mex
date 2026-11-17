@@ -255,7 +255,7 @@ fn draw_metrics_overlay(frame: &mut Frame, app: &App, found: &[Anomaly]) {
                 Row::new(vec![Cell::from(k).style(section_style), Cell::from("")])
             } else {
                 Row::new(vec![
-                    Cell::from(format!(" {k}")).style(metrics_key_style(&k, key_style)),
+                    Cell::from(format!(" {k}")).style(key_style),
                     Cell::from(shift_str(&v, hscroll)).style(val_style),
                 ])
             }
@@ -291,18 +291,6 @@ fn shift_str(s: &str, skip: usize) -> String {
         return s.to_string();
     }
     s.chars().skip(skip).collect()
-}
-
-/// Key color for metrics rows: anomaly rows carry a Nerd Font level icon
-/// (see `App::anomaly_level_icon`) and take its severity color, so the
-/// level reads without the old severity word.
-fn metrics_key_style(key: &str, base: Style) -> Style {
-    match key.chars().next() {
-        Some('\u{f057}') => Style::default().fg(Color::Red),
-        Some('\u{f071}') => Style::default().fg(Color::Yellow),
-        Some('\u{f05a}') => Style::default().fg(Color::Blue),
-        _ => base,
-    }
 }
 
 /// Severity color shared by markers, badges and finding rows.
@@ -1620,23 +1608,5 @@ mod tests {
         );
         assert_eq!(shift_str("\u{f057} missing-addr", 1), " missing-addr");
         assert_eq!(shift_str("\u{f057} missing-addr", 2), "missing-addr");
-    }
-
-    #[test]
-    fn anomaly_keys_take_severity_colors() {
-        use crate::anomalies::Severity;
-        let base = Style::default().fg(Color::Gray);
-        // Every level icon maps to a distinct color, and plain keys keep
-        // the base style. Built from the shared helper so icon and color
-        // cannot drift apart.
-        let mut seen = std::collections::HashSet::new();
-        for sev in [Severity::Error, Severity::Warning, Severity::Info] {
-            let key = format!("{} some-kind", App::anomaly_level_icon(sev));
-            let styled = metrics_key_style(&key, base);
-            assert_ne!(styled, base, "{key:?} must not use the base style");
-            assert!(seen.insert(format!("{styled:?}")), "colors must differ");
-        }
-        assert_eq!(metrics_key_style("uptime", base), base);
-        assert_eq!(metrics_key_style("Anomalies", base), base);
     }
 }
