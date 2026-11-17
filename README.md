@@ -114,7 +114,9 @@ browsed as before.
   service on a host that also has IPv6) shows no rows on that service;
   sibling services and the host header keep it.
 - **Right middle — Questions.** Recently observed queries asking for this
-  service, newest first (capped), with per-query age instead of TTL.
+  service, newest first, with per-query age instead of TTL. A row
+  stays while its querier asked within the last 75 minutes (the long
+  mDNS TTL), so steady queriers keep theirs; up to 100 per list.
   Only questions for A, AAAA, NS, CNAME, PTR, TXT, SRV, HINFO and ANY
   become rows.
   Questions from this host are highlighted like local records.
