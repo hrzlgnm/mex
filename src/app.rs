@@ -2220,10 +2220,19 @@ impl App {
                     .iter()
                     .flat_map(|s| s.answers.iter())
                     .filter(|r| matches!(r.rtype, 1 | 28) && anomalies::host_id(&r.name) == host)
+                    // Live copies only, before the dedup: a stale copy on
+                    // an earlier service must not shadow a live one.
+                    .filter(|r| record_liveness(r) == RecordLiveness::Live)
                     .chain(self.pending_addrs.get(&host).into_iter().flatten())
                     .chain(self.withheld_addrs.get(&host).into_iter().flatten())
                     .filter(|r| {
-                        seen.insert((r.rtype, r.rdata.as_str(), r.source, r.iface.as_str()))
+                        seen.insert((
+                            r.rtype,
+                            r.rdata.as_str(),
+                            r.source,
+                            r.iface.as_str(),
+                            r.ifindex,
+                        ))
                     })
                     .collect();
                 anomalies::HostAddressView { host, records }
@@ -16070,5 +16079,82 @@ mod tests {
             "nothing left unmasked: {}",
             c.message
         );
+    }
+
+    #[test]
+    fn unnamed_links_stay_apart_by_index() {
+        let mut app = fritz_mesh();
+        let mut a = aaaa("fritz.box.", BOX_ULA, BOX_V4);
+        a.ifindex = 7;
+        let mut b = aaaa("fritz.box.", REP_ULA, REPEATER);
+        b.ifindex = 8;
+        ingest(&mut app, &a);
+        ingest(&mut app, &b);
+        assert!(conflicts(&app).is_empty(), "no names, different links");
+        // Same unnamed link: a conflict, named by its index.
+        let mut c = aaaa("fritz.box.", REP_GUA, REPEATER);
+        c.ifindex = 7;
+        ingest(&mut app, &c);
+        let found = conflicts(&app);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].message.contains(" on #7"), "{}", found[0].message);
+    }
+
+    #[test]
+    fn stale_copy_on_an_earlier_service_does_not_hide_a_live_one() {
+        let mut app = disagreeing_mesh();
+        // A second service on the host, filed after Fritzel.
+        ingest(
+            &mut app,
+            &from(
+                raw_record(
+                    "_tr064._tcp.local.",
+                    12,
+                    "PTR",
+                    "Fritzel._tr064._tcp.local.",
+                    4500,
+                ),
+                BOX_V4,
+            ),
+        );
+        let mut srv = raw_record(
+            "Fritzel._tr064._tcp.local.",
+            33,
+            "SRV",
+            "0 0 49000 fritz.box.",
+            120,
+        );
+        srv.flush_bit = true;
+        ingest(&mut app, &from(srv, BOX_V4));
+        app.evict_expired();
+        let repeater: SocketAddr = REPEATER.parse().unwrap();
+        let first = app
+            .services
+            .iter()
+            .position(|s| {
+                s.answers
+                    .iter()
+                    .any(|r| r.rtype == 28 && r.source == repeater)
+            })
+            .unwrap();
+        let later = app
+            .services
+            .iter()
+            .rposition(|s| {
+                s.answers
+                    .iter()
+                    .any(|r| r.rtype == 28 && r.source == repeater)
+            })
+            .unwrap();
+        assert_ne!(first, later, "both services hold a copy");
+        // The earlier service's copies go stale; the later one's stay live.
+        for rec in &mut app.services[first].answers {
+            if rec.rtype == 28 && rec.source == repeater {
+                rec.received_at = Instant::now()
+                    .checked_sub(Duration::from_secs(500))
+                    .unwrap_or_else(Instant::now);
+            }
+        }
+        assert_eq!(conflicts(&app).len(), 1, "the live copy still counts");
     }
 }

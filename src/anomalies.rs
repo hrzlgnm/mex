@@ -317,7 +317,9 @@ fn check_conflicting_answers(
     use std::collections::{BTreeMap, BTreeSet};
     // (family, link) -> source -> (label, addresses), plus any flush bit.
     type Sets = BTreeMap<SocketAddr, (String, BTreeSet<String>)>;
-    let mut groups: BTreeMap<(u16, String), (Sets, bool)> = BTreeMap::new();
+    // Link = interface name plus index: a name can be unknown, and two
+    // unnamed links must not merge.
+    let mut groups: BTreeMap<(u16, String, u32), (Sets, bool)> = BTreeMap::new();
     for rec in &view.records {
         if !matches!(rec.rtype, 1 | 28) || !is_live(rec, now) {
             continue;
@@ -328,14 +330,16 @@ fn check_conflicting_answers(
             .parse::<std::net::IpAddr>()
             .map(|ip| ip.to_string())
             .unwrap_or_else(|_| rec.rdata.trim().to_string());
-        let (sets, flush) = groups.entry((rec.rtype, rec.iface.clone())).or_default();
+        let (sets, flush) = groups
+            .entry((rec.rtype, rec.iface.clone(), rec.ifindex))
+            .or_default();
         *flush |= rec.flush_bit;
         sets.entry(rec.source)
             .or_insert_with(|| (rec.source_label(), BTreeSet::new()))
             .1
             .insert(addr);
     }
-    for ((rtype, iface), (sets, flush)) in groups {
+    for ((rtype, iface, ifindex), (sets, flush)) in groups {
         // Identical sets are one responder (one device, several sources).
         let mut by_set: BTreeMap<BTreeSet<String>, Vec<(SocketAddr, String)>> = BTreeMap::new();
         for (source, (label, addrs)) in sets {
@@ -360,10 +364,10 @@ fn check_conflicting_answers(
         } else {
             Severity::Info
         };
-        let link = if iface.is_empty() {
-            String::new()
-        } else {
-            format!(" on {iface}")
+        let link = match (iface.is_empty(), ifindex) {
+            (false, _) => format!(" on {iface}"),
+            (true, 0) => String::new(),
+            (true, index) => format!(" on #{index}"),
         };
         let detail: Vec<String> = responders
             .iter()
