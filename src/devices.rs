@@ -14,6 +14,9 @@ use crate::browse::RawRecord;
 /// Live address announcements: (address, owner name, announcing IP).
 pub struct AddressBook {
     entries: Vec<(IpAddr, String, IpAddr)>,
+    /// Dedup for `entries`: a book is built twice per frame, so adding
+    /// must stay linear in the record count.
+    seen: HashSet<(IpAddr, String, IpAddr)>,
     /// Hosts-pane group keys: preferred when several names tie.
     host_keys: HashSet<String>,
 }
@@ -51,6 +54,7 @@ impl AddressBook {
     pub fn new(host_keys: HashSet<String>) -> Self {
         Self {
             entries: Vec::new(),
+            seen: HashSet::new(),
             host_keys,
         }
     }
@@ -71,7 +75,7 @@ impl AddressBook {
             return;
         }
         let entry = (addr, owner, rec.source.ip());
-        if !self.entries.contains(&entry) {
+        if self.seen.insert(entry.clone()) {
             self.entries.push(entry);
         }
     }

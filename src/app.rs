@@ -2197,8 +2197,8 @@ impl App {
     }
 
     /// Device names for source addresses (#246), from live A/AAAA
-    /// records: service answers, enumeration rows, pending services and
-    /// pending addresses. Rebuilt on demand; never cached.
+    /// records: service answers, enumeration rows, pending services,
+    /// pending addresses and withheld (NSEC-denied) host addresses. Rebuilt on demand; never cached.
     pub fn address_book(&self) -> AddressBook {
         let host_keys = self
             .services
@@ -2213,7 +2213,10 @@ impl App {
             .flat_map(|s| s.answers.iter())
             .chain(self.enum_entries.iter().flat_map(|e| e.answers.iter()))
             .chain(self.pending_instances.iter().flat_map(|p| p.answers.iter()))
-            .chain(self.pending_addrs.values().flatten());
+            .chain(self.pending_addrs.values().flatten())
+            // Denied on every service (#245) but still the host's live
+            // addresses: the host header shows them, so naming does too.
+            .chain(self.withheld_addrs.values().flatten());
         for rec in records {
             book.add(rec);
         }
@@ -5126,6 +5129,19 @@ impl App {
                 }
             }
             return;
+        }
+        // An address still waiting for its service is withdrawn too: the
+        // same (type, rdata, source) identity `handle_addr` updates by,
+        // so a responder only withdraws its own announcement.
+        if matches!(rec.rtype, 1 | 28) {
+            let host = rec.name.trim_end_matches('.').to_lowercase();
+            if let Some(records) = self.pending_addrs.get_mut(&host) {
+                for pending in records.iter_mut().filter(|p| {
+                    p.rtype == rec.rtype && p.rdata == rec.rdata && p.source == rec.source
+                }) {
+                    *pending = rec.clone();
+                }
+            }
         }
         let mut names = vec![rec.name.trim_end_matches('.').to_lowercase()];
         if rec.rtype == 12 {
@@ -15436,18 +15452,23 @@ mod tests {
         for gone in ["goodbye", "expired"] {
             let mut app = fritz_mesh();
             soa_from(&mut app, REPEATER);
-            // The repeater's A record waits in the pending addresses (no
-            // service points at it).
-            for rec in app.pending_addrs.values_mut().flatten() {
-                {
+            if gone == "goodbye" {
+                // A real goodbye packet from the repeater.
+                ingest(
+                    &mut app,
+                    &from(
+                        raw_record("FritzBoxRepeater.fritz.box.", 1, "A", "192.168.178.109", 0),
+                        REPEATER,
+                    ),
+                );
+            } else {
+                // The repeater's A record waits in the pending addresses
+                // (no service points at it); let its TTL elapse.
+                for rec in app.pending_addrs.values_mut().flatten() {
                     if rec.rtype == 1 {
-                        if gone == "goodbye" {
-                            rec.ttl = 0;
-                        } else {
-                            rec.received_at = Instant::now()
-                                .checked_sub(Duration::from_secs(500))
-                                .unwrap_or_else(Instant::now);
-                        }
+                        rec.received_at = Instant::now()
+                            .checked_sub(Duration::from_secs(500))
+                            .unwrap_or_else(Instant::now);
                     }
                 }
             }
@@ -15592,5 +15613,39 @@ mod tests {
             a["source_names"],
             serde_json::json!(["FritzBoxRepeater.fritz.box"])
         );
+    }
+
+    #[test]
+    fn withheld_host_address_still_names_its_device() {
+        // Only one service on knulp, and it denies AAAA (legacy NSEC):
+        // the AAAA is withheld from every service but stays a live host
+        // address, so a querier at it is still named.
+        let mut app = App::new().unwrap();
+        ingest(
+            &mut app,
+            &raw_record("_dacp._tcp.local.", 12, "PTR", DACP, 4500),
+        );
+        ingest(&mut app, &srv_on_knulp(DACP));
+        ingest(&mut app, &legacy_aaaa_denial());
+        let mut aaaa = aaaa_knulp();
+        aaaa.source = "[fd00::1]:5353".parse().unwrap();
+        ingest(&mut app, &aaaa);
+        assert!(!rows_of(&app, DACP).contains(&28), "denied on the service");
+        app.ingest_event(&query_event(
+            DACP,
+            16,
+            "TXT",
+            false,
+            Vec::new(),
+            "[fd00::1]:5353".parse().unwrap(),
+        ));
+        let dump = app.state_dump();
+        let question = dump
+            .services
+            .iter()
+            .flat_map(|s| s.questions.iter())
+            .find(|q| q.source == "[fd00::1]:5353")
+            .expect("question row");
+        assert_eq!(question.source_names, ["knulp.local"]);
     }
 }
