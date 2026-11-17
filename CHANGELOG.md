@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.20.2](https://github.com/hrzlgnm/mex/compare/v0.20.1...v0.20.2) (2026-11-17)
+
+
+### Bug Fixes
+
+* show record findings under every announcing source ([#275](https://github.com/hrzlgnm/mex/issues/275)) ([86dc930](https://github.com/hrzlgnm/mex/commit/86dc930d70765720f323b13dd349d800d4cd1a80))
+
 ## [0.20.1](https://github.com/hrzlgnm/mex/compare/v0.20.0...v0.20.1) (2026-11-17)
 
 
