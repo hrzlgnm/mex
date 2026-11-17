@@ -1,7 +1,6 @@
 // Copyright 2026 hrzlgnm
 // SPDX-License-Identifier: MIT
 
-use std::collections::HashSet;
 use std::io;
 use std::io::IsTerminal;
 use std::net::SocketAddr;
@@ -100,18 +99,22 @@ pub fn suspend(term: &mut Terminal) -> io::Result<bool> {
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
+    // The analyzer is the costliest derived view; run it once per frame
+    // and share the result with every pane that marks findings.
+    draw_with_findings(frame, app, &app.anomalies());
+}
+
+/// One frame from a given finding set (tests inject crafted findings).
+pub(crate) fn draw_with_findings(frame: &mut Frame, app: &App, found: &[Anomaly]) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(0)])
         .split(frame.area());
 
-    // The analyzer is the costliest derived view; run it once per frame
-    // and share the result with every pane that marks findings.
-    let found = app.anomalies();
     draw_header(frame, chunks[0], app);
-    draw_body(frame, chunks[1], app, &found);
+    draw_body(frame, chunks[1], app, found);
     if app.show_metrics {
-        draw_metrics_overlay(frame, app, &found);
+        draw_metrics_overlay(frame, app, found);
     }
     if let Some(text) = app.status_popup() {
         draw_status_popup(frame, text);
@@ -302,42 +305,108 @@ fn metrics_key_style(key: &str, base: Style) -> Style {
     }
 }
 
-/// Marker sets for Answers rows: content findings by (name, type,
-/// rdata), record-scoped TTL findings by (name, type, rdata), spanning
-/// TTL findings (`ttl-unstable`) by (name, type).
-type AnomalyMarks = (
-    HashSet<(String, u16, String)>,
-    HashSet<(String, u16, String)>,
-    HashSet<(String, u16)>,
-);
-
-/// Partition error/warning findings into content findings (mark the type
-/// cell) vs TTL findings (mark the TTL cell). Record-scoped TTL findings
-/// match by (name, type, rdata); `ttl-unstable` spans rows so it matches
-/// by (name, type). Informational notes never mark. Pure helper.
-fn partition_anomaly_keys(found: &[crate::anomalies::Anomaly]) -> AnomalyMarks {
-    let mut content = HashSet::new();
-    let mut ttl = HashSet::new();
-    let mut unstable = HashSet::new();
-    for a in found {
-        if !a.is_surfaced() {
-            continue;
-        }
-        let (Some(name), Some(rtype)) = (a.record_name.as_ref(), a.rtype) else {
-            continue;
-        };
-        let name = name.trim_end_matches('.').to_lowercase();
-        if !a.kind.is_ttl() {
-            if let Some(rdata) = a.rdata.as_ref() {
-                content.insert((name, rtype, rdata.clone()));
-            }
-        } else if let Some(rdata) = a.rdata.as_ref() {
-            ttl.insert((name, rtype, rdata.clone()));
-        } else {
-            unstable.insert((name, rtype));
-        }
+/// Severity color shared by markers, badges and finding rows.
+fn severity_color(s: crate::anomalies::Severity) -> Color {
+    match s {
+        crate::anomalies::Severity::Error => Color::Red,
+        crate::anomalies::Severity::Warning => Color::Yellow,
+        crate::anomalies::Severity::Info => Color::Blue,
     }
-    (content, ttl, unstable)
+}
+
+/// Count and worst severity of a finding set, `None` when empty.
+fn worst_of<'a>(
+    findings: impl IntoIterator<Item = &'a Anomaly>,
+) -> Option<(usize, crate::anomalies::Severity)> {
+    findings.into_iter().fold(None, |acc, a| match acc {
+        None => Some((1, a.severity)),
+        Some((n, s)) if a.severity.rank() > s.rank() => Some((n + 1, a.severity)),
+        Some((n, s)) => Some((n + 1, s)),
+    })
+}
+
+/// Level icon span, severity-colored.
+fn level_icon(s: crate::anomalies::Severity) -> Span<'static> {
+    Span::styled(
+        App::anomaly_level_icon(s).to_string(),
+        Style::default().fg(severity_color(s)),
+    )
+}
+
+/// ` [<worst icon> N]` Hosts-pane badge (#248), nothing for no findings.
+fn badge_spans(count: Option<&(usize, crate::anomalies::Severity)>) -> Vec<Span<'static>> {
+    match count {
+        Some(&(n, s)) if n > 0 => vec![Span::raw(" ["), level_icon(s), Span::raw(format!(" {n}]"))],
+        _ => Vec::new(),
+    }
+}
+
+/// ` · <worst icon> N` pane-title suffix for the findings a pane shows.
+fn title_count_spans(count: Option<(usize, crate::anomalies::Severity)>) -> Vec<Span<'static>> {
+    match count {
+        Some((n, s)) => vec![Span::raw("· "), level_icon(s), Span::raw(format!(" {n} "))],
+        None => Vec::new(),
+    }
+}
+
+/// Data cell of a finding child row:
+/// `<kind>[ <scope>]: <message> (<rfc>[, <requirement>])`.
+fn finding_text(
+    a: &Anomaly,
+    identity_count: &std::collections::HashMap<(String, u16), usize>,
+) -> Line<'static> {
+    let scope = crate::anomalies::visible_scope(a, identity_count);
+    let head = if scope.is_empty() {
+        a.kind.as_str().to_string()
+    } else {
+        format!("{} {scope}", a.kind.as_str())
+    };
+    Line::from(vec![
+        Span::styled(
+            format!("{head}: {}", a.message),
+            Style::default().fg(Color::White),
+        ),
+        Span::styled(
+            if a.requirement.is_empty() {
+                format!(" ({})", a.rfc)
+            } else {
+                format!(" ({}, {})", a.rfc, a.requirement)
+            },
+            Style::default().fg(Color::Gray),
+        ),
+    ])
+}
+
+/// Child row for one finding: icon in the type column, the announcer or
+/// querier in the source column, the finding text in the data column.
+fn finding_row(
+    a: &Anomaly,
+    identity_count: &std::collections::HashMap<(String, u16), usize>,
+    source_col: usize,
+    data_col: usize,
+) -> Row<'static> {
+    let mut cells: Vec<Cell<'static>> = (0..=data_col).map(|_| Cell::from("")).collect();
+    cells[0] = Cell::from(Line::from(vec![Span::raw("  "), level_icon(a.severity)]));
+    cells[source_col] =
+        Cell::from(a.source.clone().unwrap_or_default()).style(Style::default().fg(Color::Gray));
+    cells[data_col] = Cell::from(finding_text(a, identity_count));
+    Row::new(cells)
+}
+
+/// A cell's text with the worst finding's icon appended, if any.
+fn marked_cell(
+    text: String,
+    mark: Option<crate::anomalies::Severity>,
+    style: Style,
+) -> Cell<'static> {
+    match mark {
+        Some(s) => Cell::from(Line::from(vec![
+            Span::styled(text, style),
+            Span::raw(" "),
+            level_icon(s),
+        ])),
+        None => Cell::from(Span::styled(text, style)),
+    }
 }
 
 /// Transient confirmation popup (state dump result): centered, 3 rows,
@@ -393,7 +462,9 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, 
     let is_last_instance = |pos: usize| {
         !matches!(
             items.get(pos + 1),
-            Some(DisplayItem::Instance { .. }) | Some(DisplayItem::Enum { .. })
+            Some(DisplayItem::Instance { .. })
+                | Some(DisplayItem::Enum { .. })
+                | Some(DisplayItem::Unattributed)
         )
     };
 
@@ -426,19 +497,22 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, 
                     // The hostname is italic: group headers describe
                     // app-side grouping, not wire records. Terminals
                     // without italic support render it plain.
-                    // Host-owned findings count once, on the host header.
-                    let warn = anomaly_counts.get(label.as_str()).copied().unwrap_or(0);
-                    let warn_suffix = if warn > 0 {
-                        format!(" [!{warn}]")
+                    // Host-owned findings count once, on the host header;
+                    // the `(unattributed)` header carries its findings.
+                    let owner = if label == crate::app::UNATTRIBUTED_HOST {
+                        crate::anomalies::UNATTRIBUTED_SERVICE
                     } else {
-                        String::new()
+                        label.as_str()
                     };
-                    let line = Line::from(vec![
+                    let mut spans = vec![
                         Span::styled(format!("{glyph} "), base),
                         Span::styled(display, base.add_modifier(Modifier::ITALIC)),
-                        Span::styled(format!(" ({count}){addr_suffix}{warn_suffix}"), base),
-                    ]);
-                    ListItem::new(line)
+                        Span::styled(format!(" ({count}){addr_suffix}"), base),
+                    ];
+                    if label != crate::app::ENUM_HOST {
+                        spans.extend(badge_spans(anomaly_counts.get(owner)));
+                    }
+                    ListItem::new(Line::from(spans))
                 }
                 DisplayItem::Instance { index } => {
                     let svc = &app.services[*index];
@@ -454,30 +528,30 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, 
                     } else {
                         format!("[{short}]")
                     };
-                    let style = Style::default();
-                    let warn = anomaly_counts
-                        .get(&format!("{}.{}", svc.instance, svc.service_type))
-                        .copied()
-                        .unwrap_or(0);
-                    let suffix = if warn > 0 {
-                        format!(" [!{warn}]")
-                    } else {
-                        String::new()
-                    };
-                    ListItem::new(Line::from(Span::styled(
-                        format!("{branch} {active} {} {badge}{suffix}", svc.instance),
-                        style,
-                    )))
+                    let mut spans = vec![Span::raw(format!(
+                        "{branch} {active} {} {badge}",
+                        svc.instance
+                    ))];
+                    spans.extend(badge_spans(anomaly_counts.get(
+                        &crate::anomalies::service_id(&svc.instance, &svc.service_type),
+                    )));
+                    ListItem::new(Line::from(spans))
                 }
                 DisplayItem::Enum { index } => {
                     let entry = &app.enum_entries[*index];
                     let last = is_last_instance(i);
                     let branch = if last { "└─" } else { "├─" };
-                    let style = Style::default();
-                    ListItem::new(Line::from(Span::styled(
-                        format!("{branch} ● {} [enum]", entry.name.trim_end_matches('.')),
-                        style,
-                    )))
+                    let mut spans = vec![Span::raw(format!(
+                        "{branch} ● {} [enum]",
+                        entry.name.trim_end_matches('.')
+                    ))];
+                    spans.extend(badge_spans(
+                        anomaly_counts.get(crate::anomalies::ENUMERATION_SERVICE),
+                    ));
+                    ListItem::new(Line::from(spans))
+                }
+                DisplayItem::Unattributed => {
+                    ListItem::new(Line::from(Span::raw("└─ ● findings without an owner")))
                 }
             }
         })
@@ -499,6 +573,9 @@ fn draw_service_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, 
         }
         Some(DisplayItem::Host { label }) => {
             format!(" Hosts: {} ", app.host_display_name(label))
+        }
+        Some(DisplayItem::Unattributed) => {
+            format!(" Hosts: {} ", crate::app::UNATTRIBUTED_HOST)
         }
         None => " Hosts ".to_string(),
     };
@@ -584,7 +661,14 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, f
         return;
     };
 
-    let (rows, raw_positions) = detail_table_rows(app, &target, found);
+    let layout = app.answers_layout(&target, found);
+    let shown = worst_of(layout.iter().filter_map(|l| match l {
+        crate::app::AnswerLine::Finding { anomaly, .. } => Some(anomaly),
+        _ => None,
+    }));
+    let (rows, raw_positions) = detail_table_rows(app, &target, &layout);
+    app.answers_rows
+        .replace(Some(layout.iter().map(|l| l.owning_record()).collect()));
     let total_rows = rows.len();
 
     // Size SOURCE to the longest socket addr so IPv6 fits, clamped to
@@ -597,8 +681,9 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, f
         .unwrap_or(14)
         .clamp(14, 45) as u16;
 
+    // TYPE fits `▸ TXT` / `TYPE13` plus the level marker.
     let widths = [
-        Constraint::Length(6),
+        Constraint::Length(8),
         Constraint::Length(12),
         Constraint::Length(6),
         Constraint::Length(src_w),
@@ -610,6 +695,8 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, f
     } else {
         format!("Answers: {}", target.pane_ident())
     };
+    let mut title_spans = vec![Span::raw(format!(" {block_title} "))];
+    title_spans.extend(title_count_spans(shown));
     // Visible data rows: borders plus the header row are chrome.
     app.record_viewport
         .set(area.height.saturating_sub(3) as usize);
@@ -625,7 +712,7 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, f
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" {block_title} "))
+                .title(Line::from(title_spans))
                 .border_style(border_color(
                     app.focus == Focus::Answers,
                     resize_active(app, DragMode::Vertical)
@@ -735,13 +822,17 @@ fn ttl_cell_color(rem: u32, ttl: u32) -> Option<Color> {
 fn detail_table_rows<'a>(
     app: &'a App,
     target: &'a crate::app::DetailTarget<'a>,
-    found: &[Anomaly],
+    layout: &[crate::app::AnswerLine],
 ) -> (Vec<Row<'a>>, Vec<usize>) {
+    use crate::app::AnswerLine;
     let mut rows = Vec::new();
 
     let info_style = Style::default()
         .fg(Color::Green)
         .add_modifier(Modifier::ITALIC);
+    let block_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD | Modifier::ITALIC);
     // TXT pair children show verbatim wire content, so they stay
     // upright: only the constructed header rows are italic.
     let pair_style = Style::default().fg(Color::Green);
@@ -750,163 +841,120 @@ fn detail_table_rows<'a>(
         .fg(Color::Green)
         .add_modifier(Modifier::BOLD);
 
-    match target {
-        crate::app::DetailTarget::Service(svc) => {
-            rows.push(
-                Row::new(vec![
-                    Cell::from("srvc"),
-                    Cell::from(""),
-                    Cell::from(""),
-                    Cell::from(""),
-                    Cell::from(svc.service_type.clone()),
-                ])
-                .style(info_style),
-            );
-
-            let mut seen_sub = HashSet::new();
-            for sub in &svc.subtypes {
-                if !seen_sub.insert(sub) {
-                    continue;
-                }
-                let subtype = crate::anomalies::display_subtype(sub);
-                rows.push(
-                    Row::new(vec![
-                        Cell::from("subt"),
-                        Cell::from(""),
-                        Cell::from(""),
-                        Cell::from(""),
-                        Cell::from(subtype),
-                    ])
-                    .style(info_style),
-                );
+    // Raw answers, deduped and sorted by type then TTL (ordering lives on
+    // the target so the j/k cursor and hex lookup share it). The layout
+    // places finding child rows (always shown) before TXT pair children
+    // (`Enter` folds those); the cursor skips every child row.
+    // raw_positions maps each raw record to its table row.
+    let answers = target.ordered_answers();
+    let identity_count = crate::anomalies::identity_counts(layout.iter().filter_map(|l| match l {
+        AnswerLine::Finding { anomaly, .. } => Some(anomaly),
+        _ => None,
+    }));
+    let mut raw_positions = Vec::with_capacity(answers.len());
+    // Worst finding per record and cell, in one pass: TTL kinds mark the
+    // TTL cell, everything else the type cell. Gone rows carry no
+    // findings in the layout, so they stay unmarked.
+    let mut marks: Vec<(
+        Option<crate::anomalies::Severity>,
+        Option<crate::anomalies::Severity>,
+    )> = vec![(None, None); answers.len()];
+    for line in layout {
+        if let AnswerLine::Finding {
+            anomaly,
+            record: Some(r),
+        } = line
+        {
+            let Some(mark) = marks.get_mut(*r) else {
+                continue;
+            };
+            let slot = if anomaly.kind.is_ttl() {
+                &mut mark.0
+            } else {
+                &mut mark.1
+            };
+            if slot.is_none_or(|s| anomaly.severity.rank() > s.rank()) {
+                *slot = Some(anomaly.severity);
             }
-        }
-        crate::app::DetailTarget::Enum(entry) => {
-            rows.push(
-                Row::new(vec![
-                    Cell::from("enum"),
-                    Cell::from(""),
-                    Cell::from(""),
-                    Cell::from(""),
-                    Cell::from(entry.name.clone()),
-                ])
-                .style(info_style),
-            );
         }
     }
-
-    // Raw answers, deduped and sorted by type then TTL.
-    // (Ordering lives on the target so the j/k cursor and hex lookup share it.)
-    // Multi-pair TXT answers carry their key=value pairs as collapsible
-    // child rows (collapsed by default, `Enter` expands); the cursor skips
-    // child rows. raw_positions maps each raw record to its table row.
-    // Anomalous rows (error/warning only) get a `!` suffix: on the TTL
-    // cell when the TTL itself is the problem, otherwise on the type.
-    let (content_keys, ttl_keys, ttl_unstable) = partition_anomaly_keys(found);
-    let unique_recs = target.ordered_answers();
-    let mut raw_positions = Vec::with_capacity(unique_recs.len());
-    for rec in unique_recs {
-        // Expired and goodbye rows share identity with live findings from
-        // other sources; only live rows earn the marker.
-        let live = rec.ttl > 0 && rec.received_at.elapsed().as_secs() as u32 <= rec.ttl;
-        let name = rec.name.trim_end_matches('.').to_lowercase();
-        let content_flagged =
-            live && content_keys.contains(&(name.clone(), rec.rtype, rec.rdata.clone()));
-        let ttl_flagged = live
-            && (ttl_keys.contains(&(name.clone(), rec.rtype, rec.rdata.clone()))
-                || ttl_unstable.contains(&(name, rec.rtype)));
-        let flush = if rec.flush_bit { "flush" } else { "" };
-        let rem = rec
-            .ttl
-            .saturating_sub(rec.received_at.elapsed().as_secs() as u32);
-        let ttl_str = if rem == 0 {
-            "exp".into()
-        } else if rem >= 60 {
-            format!("{}m{:02}s", rem / 60, rem % 60)
-        } else {
-            format!("{rem}s")
-        };
-        let ttl_str = if ttl_flagged {
-            format!("{ttl_str}!")
-        } else {
-            ttl_str
-        };
-        // Records announced by this host (source is a local interface
-        // address) get a brighter style so own publications stand out.
-        let style = if app.is_local_record(rec) {
-            local_style
-        } else {
-            dim
-        };
-        raw_positions.push(rows.len());
-        let ttl_cell = match ttl_cell_color(rem, rec.ttl) {
-            Some(color) => Cell::from(ttl_str.clone()).style(Style::default().fg(color)),
-            None => Cell::from(ttl_str.clone()),
-        };
-        let expandable = crate::app::App::is_expandable_txt(rec);
-        let base_label = if expandable {
-            if app.is_txt_expanded(rec) {
-                "▾ TXT"
-            } else {
-                "▸ TXT"
+    for line in layout {
+        match line {
+            AnswerLine::Info { label, text } => rows.push(
+                Row::new(vec![
+                    Cell::from(*label),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(text.clone()),
+                ])
+                .style(info_style),
+            ),
+            AnswerLine::Block(label) => rows
+                .push(Row::new(vec![Cell::from(label.clone()).column_span(5)]).style(block_style)),
+            AnswerLine::Finding { anomaly, .. } => {
+                rows.push(finding_row(anomaly, &identity_count, 3, 4));
             }
-        } else {
-            rec.rtype_str.as_str()
-        };
-        let type_label = if content_flagged {
-            format!("{base_label}!")
-        } else {
-            base_label.to_string()
-        };
-        rows.push(
-            Row::new(vec![
-                Cell::from(type_label),
-                ttl_cell,
-                Cell::from(flush),
-                Cell::from(source_label(rec)),
-                Cell::from(rec.rdata.clone()),
-            ])
-            .style(style),
-        );
-        if expandable && !app.is_txt_expanded(rec) {
-            continue;
-        }
-        if rec.rtype == 16 {
-            let mut seen_pair = HashSet::new();
-            let mut pairs: Vec<&str> = rec
-                .rdata
-                .split("; ")
-                .filter(|pair| !pair.is_empty() && seen_pair.insert(*pair))
-                .collect();
-            pairs.sort_by(|a, b| {
-                let ka = a.split('=').next().unwrap_or(a);
-                let kb = b.split('=').next().unwrap_or(b);
-                ka.to_lowercase()
-                    .cmp(&kb.to_lowercase())
-                    .then_with(|| ka.cmp(kb))
-                    .then_with(|| a.cmp(b))
-            });
-            // A lone pair is already fully shown in the parent row.
-            // Children span the full row width so the pair text sits
-            // next to the tree glyph at the left instead of in RDATA
-            // (far right behind the SOURCE column).
-            if pairs.len() > 1 {
-                for (n, pair) in pairs.iter().enumerate() {
-                    let branch = if n + 1 == pairs.len() {
-                        "  └─"
+            AnswerLine::TxtPair { pair, last, .. } => {
+                // Children span the full row width so the pair text sits
+                // next to the tree glyph instead of in RDATA.
+                let branch = if *last { "  └─" } else { "  ├─" };
+                rows.push(
+                    Row::new(vec![Cell::from(Line::from(vec![
+                        Span::raw(branch),
+                        Span::raw(" "),
+                        Span::raw(pair.clone()),
+                    ]))
+                    .column_span(5)])
+                    .style(pair_style),
+                );
+            }
+            AnswerLine::Record(i) => {
+                let rec = answers[*i];
+                let (ttl_mark, type_mark) = marks[*i];
+                let flush = if rec.flush_bit { "flush" } else { "" };
+                let rem = rec
+                    .ttl
+                    .saturating_sub(rec.received_at.elapsed().as_secs() as u32);
+                let ttl_str = if rem == 0 {
+                    "exp".into()
+                } else if rem >= 60 {
+                    format!("{}m{:02}s", rem / 60, rem % 60)
+                } else {
+                    format!("{rem}s")
+                };
+                // Records announced by this host (source is a local
+                // interface address) get a brighter style so own
+                // publications stand out.
+                let style = if app.is_local_record(rec) {
+                    local_style
+                } else {
+                    dim
+                };
+                raw_positions.push(rows.len());
+                let ttl_style = match ttl_cell_color(rem, rec.ttl) {
+                    Some(color) => Style::default().fg(color),
+                    None => Style::default(),
+                };
+                let type_label = if crate::app::App::is_expandable_txt(rec) {
+                    if app.is_txt_expanded(rec) {
+                        "▾ TXT"
                     } else {
-                        "  ├─"
-                    };
-                    rows.push(
-                        Row::new(vec![Cell::from(Line::from(vec![
-                            Span::raw(branch),
-                            Span::raw(" "),
-                            Span::raw(*pair),
-                        ]))
-                        .column_span(5)])
-                        .style(pair_style),
-                    );
-                }
+                        "▸ TXT"
+                    }
+                } else {
+                    rec.rtype_str.as_str()
+                };
+                rows.push(
+                    Row::new(vec![
+                        marked_cell(type_label.to_string(), type_mark, Style::default()),
+                        marked_cell(ttl_str, ttl_mark, ttl_style),
+                        Cell::from(flush),
+                        Cell::from(source_label(rec)),
+                        Cell::from(rec.rdata.clone()),
+                    ])
+                    .style(style),
+                );
             }
         }
     }
@@ -931,30 +979,18 @@ fn draw_questions_tab(
         .fg(Color::Green)
         .add_modifier(Modifier::BOLD);
 
-    // By type, newest first — same grouping as the Answers table.
-    // Anomalous question rows (error/warning only) get a `!` suffix on the
-    // type, mirroring the Answers table. Keys are (name, type, querier):
-    // each querier keeps its own finding, so every row can mark.
-    let question_keys: HashSet<(String, u16, String)> = found
-        .iter()
-        .filter(|a| a.kind.is_question())
-        .filter(|a| a.is_surfaced())
-        .filter_map(|a| {
-            let rtype = a.rtype?;
-            Some((
-                a.record_name
-                    .as_deref()?
-                    .trim_end_matches('.')
-                    .to_lowercase(),
-                rtype,
-                a.source.clone()?,
-            ))
-        })
-        .collect();
+    // By type, newest first — same grouping as the Answers table. Each
+    // row is followed by its findings (keys are name, type, querier: each
+    // querier keeps its own finding) and marked with the worst one.
+    let per_question = app.question_findings(&target, found);
+    let shown = worst_of(per_question.iter().flatten());
+    let identity_count = crate::anomalies::identity_counts(per_question.iter().flatten());
     // Cells plus row style first: LAST/DUE widths size to content
     // (like SOURCE below) instead of clipping long states.
     let mut body: Vec<(Vec<String>, Style)> = Vec::new();
-    for (name, rtype, source, seen_at, _) in target.ordered_questions() {
+    let mut marks = Vec::new();
+    for (q, (name, rtype, source, seen_at, _)) in target.ordered_questions().into_iter().enumerate()
+    {
         // Latest event and owning timer for this interest, from the
         // authoritative per-interest state (app.rs): rows stay dumb.
         let self_row = *source == crate::app::SELF_SOURCE;
@@ -1017,23 +1053,11 @@ fn draw_questions_tab(
             dim
         };
         // Port 0 is never a real querier, so inferred self sends never
-        // match a finding; unparsable type labels stay quiet.
-        let flagged = !self_row
-            && crate::browse::rtype_from_str(rtype).is_some_and(|t| {
-                question_keys.contains(&(
-                    name.trim_end_matches('.').to_lowercase(),
-                    t,
-                    source.to_string(),
-                ))
-            });
-        let type_label = if flagged {
-            format!("{rtype}!")
-        } else {
-            rtype.clone()
-        };
+        // match a finding.
+        marks.push(worst_of(&per_question[q]).map(|(_, s)| s));
         body.push((
             vec![
-                type_label,
+                rtype.clone(),
                 last_txt,
                 due_txt,
                 question_source_label(source),
@@ -1057,15 +1081,29 @@ fn draw_questions_tab(
         .max()
         .unwrap_or(3)
         .clamp(8, 15) as u16;
-    let rows: Vec<Row> = body
-        .into_iter()
-        .map(|(cells, style)| {
-            Row::new(cells.into_iter().map(Cell::from).collect::<Vec<_>>()).style(style)
-        })
-        .collect();
+    let mut rows: Vec<Row> = Vec::new();
+    let mut question_positions = Vec::with_capacity(body.len());
+    // Row -> question index as drawn: finding rows belong to their question.
+    let mut row_map = Vec::new();
+    for (q, (cells, style)) in body.into_iter().enumerate() {
+        question_positions.push(rows.len());
+        row_map.extend(std::iter::repeat_n(Some(q), 1 + per_question[q].len()));
+        let mut cells = cells.into_iter();
+        let mut row_cells = vec![marked_cell(
+            cells.next().unwrap_or_default(),
+            marks[q],
+            Style::default(),
+        )];
+        row_cells.extend(cells.map(Cell::from));
+        rows.push(Row::new(row_cells).style(style));
+        for a in &per_question[q] {
+            rows.push(finding_row(a, &identity_count, 3, 4));
+        }
+    }
+    app.questions_rows.replace(Some(row_map));
 
     let widths = [
-        Constraint::Length(6),
+        Constraint::Length(8),
         Constraint::Length(last_w),
         Constraint::Length(due_w),
         Constraint::Length(
@@ -1097,7 +1135,11 @@ fn draw_questions_tab(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" Questions: {} ", target.pane_ident()))
+                .title(Line::from(
+                    std::iter::once(Span::raw(format!(" Questions: {} ", target.pane_ident())))
+                        .chain(title_count_spans(shown))
+                        .collect::<Vec<_>>(),
+                ))
                 .border_style(border_color(
                     app.focus == Focus::Questions,
                     resize_active(app, DragMode::Vertical)
@@ -1117,7 +1159,9 @@ fn draw_questions_tab(
     // Highlight the detail-cursor question row, if the cursor is on one,
     // so the hex source stays identifiable whatever holds focus.
     let selected_table_row = if cursor_in_questions {
-        Some(app.detail_selected - raw_count)
+        question_positions
+            .get(app.detail_selected - raw_count)
+            .copied()
     } else {
         None
     };
@@ -1728,58 +1772,5 @@ mod tests {
         }
         assert_eq!(metrics_key_style("uptime", base), base);
         assert_eq!(metrics_key_style("Anomalies", base), base);
-    }
-
-    #[test]
-    fn partition_anomaly_keys_splits_ttl_from_content() {
-        use crate::anomalies::{Anomaly, Severity};
-        let finding = |kind: crate::anomalies::AnomalyKind,
-                       severity: Severity,
-                       rdata: Option<&str>|
-         -> Anomaly {
-            Anomaly {
-                kind,
-                severity,
-                service: "svc._http._tcp.local.".to_string(),
-                record_name: Some("Host.local.".to_string()),
-                rtype: Some(1),
-                rtype_str: Some("A".to_string()),
-                rdata: rdata.map(str::to_string),
-                source: Some("192.168.1.2:5353".to_string()),
-                message: "test".to_string(),
-                rfc: "RFC 6762 §5.2",
-                requirement: "SHOULD",
-                response: None,
-            }
-        };
-        let found = vec![
-            finding(
-                crate::anomalies::AnomalyKind::SharedFlush,
-                Severity::Warning,
-                Some("192.168.1.2"),
-            ),
-            finding(
-                crate::anomalies::AnomalyKind::TtlLow,
-                Severity::Warning,
-                Some("192.168.1.2"),
-            ),
-            finding(
-                crate::anomalies::AnomalyKind::TtlUnstable,
-                Severity::Warning,
-                None,
-            ),
-            finding(
-                crate::anomalies::AnomalyKind::TtlHigh,
-                Severity::Info,
-                Some("192.168.1.2"),
-            ),
-        ];
-        let (content, ttl, unstable) = partition_anomaly_keys(&found);
-        assert_eq!(content.len(), 1);
-        assert!(content.contains(&("host.local".to_string(), 1, "192.168.1.2".to_string())));
-        assert_eq!(ttl.len(), 1);
-        assert!(ttl.contains(&("host.local".to_string(), 1, "192.168.1.2".to_string())));
-        assert_eq!(unstable.len(), 1);
-        assert!(unstable.contains(&("host.local".to_string(), 1)));
     }
 }

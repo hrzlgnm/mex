@@ -165,18 +165,38 @@ and surfaces each deviation as an anomaly with a severity:
 - **warning** — a likely misconfiguration (e.g. a `.local` service with
   no address records, a subtype listed in service enumeration, an SOA
   sent as a unicast-style negative answer).
-- **info** — a SHOULD-level deviation or an observation, shown only in
-  the metrics overlay and state dumps (e.g. a PTR re-announced with a
+- **info** — a SHOULD-level deviation or an observation, shown inline
+  like the others but kept out of the Anomalies pane (e.g. a PTR re-announced with a
   120 s TTL instead of the recommended 4500 s, a unique record missing
   its cache-flush bit, an SRV target outside `.local`, a question for
   SOA).
 
-Findings show up in several places: anomalous Answers rows get a `!`
-marker (on the type cell, or on the TTL cell when the TTL itself is
-the problem), instances carry a `[!N]` badge in the Hosts pane (host
-headers carry one for findings owned by the hostname itself), and the
-Anomalies pane lists every finding for the selected service and its
-host with a `>` marker on the
+Findings sit next to their owner:
+
+- A record's findings follow its Answers row as child rows (before any
+  TXT pairs, never folded by `Enter`); the row itself carries the level
+  icon of its worst finding, severity-colored, on the TTL cell for TTL
+  kinds and on the type cell otherwise. Goodbye and expired rows carry
+  neither.
+- Findings about the service as a whole sit in a `service` block at the
+  top of the Answers pane (an `enumeration` block on the enumeration
+  entry); findings owned by the service's host sit in a `host <name>`
+  block, on every service of that host.
+- Findings with no owner (no service, host or enumeration entry matches)
+  are listed under an `(unattributed)` Hosts-pane entry, grouped by
+  name, shown only while such findings exist.
+- The cursor skips finding rows and blocks.
+- Hosts-pane instances and `[enum]` carry a `[<worst icon> N]` badge
+  counting every finding, info included; host headers and
+  `(unattributed)` carry one for their own findings, counted once.
+- The Answers and Questions pane titles append `· <worst icon> N` for
+  the findings they show.
+
+A finding row reads `<icon>`, then the announcer/querier in the source
+column, then `<kind> <record>: <message> (<rfc>, <requirement>)`.
+
+The Anomalies pane lists every error and warning for the selected
+service and its host with a `>` marker on the
 highlighted row's findings. Each line reads
 `<icon> <source>: <kind> <record>: <message> (<rfc>, <requirement>)` —
 the requirement is omitted when the cited text has no RFC 2119 keyword;
