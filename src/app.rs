@@ -6094,7 +6094,19 @@ impl App {
                 .iter()
                 .any(|n| n == &full || n == &svc.instance.to_lowercase())
             {
-                svc.is_active = false;
+                // Another live copy of the withdrawn record (another
+                // source, or the same source on another link, #264) keeps
+                // the service up: only this copy's row goes `bye`.
+                let still_announced = svc.answers.iter().any(|r| {
+                    r.rtype == rec.rtype
+                        && r.name.eq_ignore_ascii_case(&rec.name)
+                        && (rec.rtype != 12 || r.rdata.eq_ignore_ascii_case(&rec.rdata))
+                        && !(r.source == rec.source && r.ifindex == rec.ifindex)
+                        && record_liveness(r) == RecordLiveness::Live
+                });
+                if !still_announced {
+                    svc.is_active = false;
+                }
                 return;
             }
         }
@@ -16417,5 +16429,27 @@ mod tests {
             .or_default()
             .push(live);
         assert_eq!(conflicts(&app).len(), 1, "the live withheld copy counts");
+    }
+
+    #[test]
+    fn goodbye_on_one_link_keeps_a_service_announced_on_another_active() {
+        let mut app = App::new().unwrap();
+        let ptr = |ttl| on_link(ptr_record(ttl), "eth0", 2);
+        let ptr_wlan = |ttl| on_link(ptr_record(ttl), "wlan0", 3);
+        ingest(&mut app, &ptr(4500));
+        ingest(&mut app, &ptr_wlan(4500));
+        ingest(&mut app, &srv_record(120));
+        app.evict_expired();
+        select_instance(&mut app, "Test");
+        ingest(&mut app, &ptr(0));
+        assert!(app.services[0].is_active, "still announced on wlan0");
+        let rows = rows_with(&app, "Test._http._tcp.local.");
+        let eth0 = rows.iter().find(|r| r.contains("@eth0")).unwrap();
+        let wlan0 = rows.iter().find(|r| r.contains("@wlan0")).unwrap();
+        assert!(eth0.contains(" bye "), "{eth0}");
+        assert!(!wlan0.contains(" bye "), "{wlan0}");
+        // The last live copy saying goodbye still withdraws the service.
+        ingest(&mut app, &ptr_wlan(0));
+        assert!(!app.services[0].is_active, "withdrawn everywhere");
     }
 }
