@@ -2717,8 +2717,9 @@ impl App {
             kv(&mut rows, &format!("talker {src}"), format!("{count} pkts"));
         }
 
-        // Anomalies last: the list can be long, and the overlay scrolls
-        // (j/k, PgUp/PgDn), so every finding is listed instead of capped.
+        // Anomalies last: only the session-wide summary. Each finding
+        // sits next to its owner in the main panes (#248), and `Ctrl+J`
+        // dumps the full list.
         section(&mut rows, "Anomalies");
         // One question filed on several services is one finding here:
         // the overlay is session-wide, not per service.
@@ -2741,45 +2742,6 @@ impl App {
                 format!("{errors} error · {warnings} warning · {infos} info")
             },
         );
-        // Row identities already claimed in this overlay: repeated
-        // identities name their rdata, mirroring the inline finding rows.
-        let identity_count = anomalies::identity_counts(collapsed.iter().map(|(a, _)| *a));
-        for (a, also) in &collapsed {
-            let service = if also.is_empty() {
-                a.service.clone()
-            } else {
-                format!("{} (+{} more)", a.service, also.len())
-            };
-            // `<source> <service> <scope> <text>`; unsourced findings omit
-            // the source slot, and the key's icon carries the level. The
-            // scope helper omits constant/absent row identities and names
-            // rdata where siblings share the identity. Every row carries
-            // its RFC reference: the key shows no requirement level, and
-            // info-level findings surface nowhere else.
-            let scope = anomalies::visible_scope(a, &identity_count);
-            let scoped = if scope.is_empty() {
-                a.message.clone()
-            } else {
-                format!("{scope}: {}", a.message)
-            };
-            // `<source> <service> <scope> <text>`; unsourced findings omit
-            // the source slot, and the key's icon carries the level. The
-            // colon sits before the message when no scope intervenes.
-            let sep = if scope.is_empty() { ":" } else { "" };
-            let value = match a.source.as_deref() {
-                Some(src) => format!("{src}: {service}{sep} {scoped} ({})", a.rfc),
-                _ => format!("{service}{sep} {scoped} ({})", a.rfc),
-            };
-            kv(
-                &mut rows,
-                &format!(
-                    "{} {}",
-                    Self::anomaly_level_icon(a.severity),
-                    a.kind.as_str()
-                ),
-                value,
-            );
-        }
 
         rows
     }
@@ -8989,7 +8951,7 @@ mod tests {
     }
 
     #[test]
-    fn metrics_overlay_omits_self_referential_rdata() {
+    fn finding_row_omits_self_referential_rdata() {
         // PTR rdata usually names its own service (here each PTR seeds
         // its own service identity); repeating it after the scope adds no
         // identity beyond the service column, so it stays short — while
@@ -9008,22 +8970,18 @@ mod tests {
         second.flush_bit = true;
         ingest(&mut app, &second);
         ingest(&mut app, &srv_record(120));
-        let values: Vec<String> = app
-            .metrics_rows()
-            .into_iter()
-            .filter(|(k, _)| k.ends_with("shared-flush"))
-            .map(|(_, v)| v)
-            .collect();
-        assert_eq!(values.len(), 2, "both findings listed, got: {values:?}");
-        assert!(
-            !values.iter().any(|v| v.contains(" = ")),
-            "self rdata stays short, got: {values:?}"
-        );
-        assert_ne!(values[0], values[1], "rows must differ, got: {values:?}");
+        app.evict_expired();
+        select_instance(&mut app, "Test");
+        let lines = answers_text(&app);
+        let row = lines
+            .iter()
+            .find(|l| l.contains("shared-flush"))
+            .unwrap_or_else(|| panic!("finding row: {lines:#?}"));
+        assert!(!row.contains(" = "), "self rdata stays short, got: {row}");
     }
 
     #[test]
-    fn metrics_enum_question_keeps_qry_scope() {
+    fn enum_question_finding_keeps_qry_scope() {
         // Questions on the enumeration row keep their QRY scope: the
         // queried type varies, so suppressing it would collapse SOA and
         // MX askers into identical rows.
@@ -9037,15 +8995,19 @@ mod tests {
             Vec::new(),
             stub,
         ));
-        let row = app
-            .metrics_rows()
-            .into_iter()
-            .find(|(k, _)| k.ends_with("unsupported-question"))
-            .expect("unsupported-question row");
+        let pos = app
+            .display_items()
+            .iter()
+            .position(|it| matches!(it, DisplayItem::Enum { .. }))
+            .expect("enum row");
+        app.selected_display = pos;
+        app.clamp_selection();
+        let lines = answers_text(&app);
         assert!(
-            row.1.contains("QRY TYPE6 _services._dns-sd._udp.local"),
-            "enum question keeps its QRY scope, got: {}",
-            row.1
+            lines
+                .iter()
+                .any(|l| l.contains("QRY TYPE6 _services._dns-sd._udp.local")),
+            "enum question keeps its QRY scope, got: {lines:#?}"
         );
     }
 
@@ -11214,42 +11176,6 @@ mod tests {
     }
 
     #[test]
-    fn metrics_anomaly_rows_use_level_icons() {
-        // Same fixture as above: a unique PTR with the flush bit is a
-        // shared-record violation, so the metrics overlay lists it with
-        // a Nerd Font level icon instead of the severity word.
-        let mut app = App::new().unwrap();
-        let mut bad = ptr_record(120);
-        bad.flush_bit = true;
-        ingest(&mut app, &bad);
-        let found = app.anomalies();
-        let a = found
-            .iter()
-            .find(|a| a.kind == anomalies::AnomalyKind::SharedFlush)
-            .expect("finding");
-        let icon = App::anomaly_level_icon(a.severity);
-        let rows = app.metrics_rows();
-        let (k, v) = rows
-            .iter()
-            .find(|(k, _)| k.starts_with(icon))
-            .expect("anomaly row");
-        assert_eq!(k, &format!("{icon} shared-flush"));
-        assert!(
-            v.starts_with("192.168.1.2:5353: "),
-            "source leads the value, got: {v}"
-        );
-        assert!(v.contains(&a.service), "value names the service, got: {v}");
-        assert!(
-            v.contains("PTR _http._tcp.local."),
-            "value names the pointed-to row, got: {v}"
-        );
-        assert!(
-            !k.contains(a.severity.as_str()),
-            "no severity word left, got: {k}"
-        );
-    }
-
-    #[test]
     fn metrics_service_counters() {
         let mut app = App::new().unwrap();
         assert_eq!(app.metrics.services_seen_total, 0);
@@ -12162,13 +12088,13 @@ mod tests {
         assert!(dumped[0].also_services.is_empty());
         assert_eq!(dump.metrics["anomalies_total"], dump.anomalies.len() as u64);
 
-        let overlay: Vec<_> = app
-            .metrics_rows()
-            .into_iter()
-            .filter(|(k, _)| k.ends_with("unsupported-question"))
-            .collect();
-        assert_eq!(overlay.len(), 1, "overlay lists the question once");
-        assert!(!overlay[0].1.contains("more)"), "got: {}", overlay[0].1);
+        // The overlay summary counts it once, like the dump: its total
+        // equals the deduplicated dump list, not the per-service filings.
+        let total: usize = summary(&app)
+            .split(" · ")
+            .filter_map(|part| part.split(' ').next()?.parse::<usize>().ok())
+            .sum();
+        assert_eq!(total, dump.anomalies.len(), "{}", summary(&app));
     }
 
     #[test]
@@ -12918,13 +12844,21 @@ mod tests {
                 "{instance} pane lacks the host finding"
             );
         }
-        // The overlay lists it once.
-        let overlay = app
-            .metrics_rows()
-            .into_iter()
-            .filter(|(k, _)| k.ends_with("unicast-style-response"))
+        // The overlay summary counts it once.
+        let warnings = app
+            .anomalies()
+            .iter()
+            .filter(|a| a.severity == anomalies::Severity::Warning)
             .count();
-        assert_eq!(overlay, 1);
+        assert!(
+            summary(&app).contains(&format!("{warnings} warning")),
+            "{}",
+            summary(&app)
+        );
+        assert_eq!(
+            findings_of(&app, anomalies::AnomalyKind::UnicastStyleResponse).len(),
+            1
+        );
     }
 
     #[test]
@@ -12961,10 +12895,17 @@ mod tests {
         assert_eq!(row.rtype_str.as_deref(), Some("TYPE6"));
         assert_eq!(row.rdata.as_deref(), Some("rdlength=49"));
         assert_eq!(dump.metrics["sightings_current"], 1);
-        assert!(app
-            .metrics_rows()
+        // Shown under the `(unattributed)` entry, grouped by name.
+        let pos = app
+            .display_items()
             .iter()
-            .any(|(k, v)| k.ends_with("unicast-style-response") && v.contains("unattributed")));
+            .position(|it| matches!(it, DisplayItem::Unattributed))
+            .expect("(unattributed) entry");
+        app.selected_display = pos;
+        app.clamp_selection();
+        assert!(shown(&app)
+            .iter()
+            .any(|(a, _)| a.kind == anomalies::AnomalyKind::UnicastStyleResponse));
     }
 
     #[test]
@@ -13475,12 +13416,14 @@ mod tests {
         ];
         want.sort();
         assert_eq!(got, want, "one finding per responder and link");
-        let overlay = app
-            .metrics_rows()
-            .into_iter()
-            .filter(|(k, _)| k.ends_with("unicast-style-response"))
+        // The service's host block shows one row per responder.
+        app.evict_expired();
+        select_instance(&mut app, "Fritzel");
+        let rows = shown(&app)
+            .iter()
+            .filter(|(a, _)| a.kind == anomalies::AnomalyKind::UnicastStyleResponse)
             .count();
-        assert_eq!(overlay, sources.len());
+        assert_eq!(rows, sources.len());
     }
 
     #[test]
@@ -15195,5 +15138,55 @@ mod tests {
         assert!(srv.contains(" bye "), "goodbye row: {srv}");
         assert!(!srv.contains(" exp "), "goodbye is not an expiry: {srv}");
         assert!(txt.contains(" exp "), "expired row: {txt}");
+    }
+
+    /// The metrics overlay's `Anomalies` summary value.
+    fn summary(app: &App) -> String {
+        let rows = app.metrics_rows();
+        let at = rows
+            .iter()
+            .position(|(k, v)| k == "Anomalies" && v.is_empty())
+            .expect("Anomalies section");
+        rows[at + 1..]
+            .iter()
+            .find(|(k, _)| k == "summary")
+            .map(|(_, v)| v.clone())
+            .expect("summary row")
+    }
+
+    #[test]
+    fn metrics_overlay_keeps_the_summary_and_lists_no_findings() {
+        let mut app = App::new().unwrap();
+        assert_eq!(summary(&app), "none");
+        let mut bad = ptr_record(4500);
+        bad.flush_bit = true;
+        ingest(&mut app, &bad);
+        ingest(&mut app, &srv_record(120));
+        let found = app.anomalies();
+        let count = |sev| found.iter().filter(|a| a.severity == sev).count();
+        assert_eq!(
+            summary(&app),
+            format!(
+                "{} error · {} warning · {} info",
+                count(anomalies::Severity::Error),
+                count(anomalies::Severity::Warning),
+                count(anomalies::Severity::Info)
+            )
+        );
+        assert!(count(anomalies::Severity::Error) >= 1);
+        // The summary is the section's only row: no per-finding rows.
+        let rows = app.metrics_rows();
+        let at = rows.iter().position(|(k, _)| k == "Anomalies").unwrap();
+        let section: Vec<_> = rows[at + 1..]
+            .iter()
+            .take_while(|(_, v)| !v.is_empty())
+            .collect();
+        assert_eq!(section.len(), 1, "{section:?}");
+        // Every finding still reaches the state dump.
+        let dump = app.state_dump();
+        assert_eq!(
+            dump.anomalies.len(),
+            anomalies::collapse_questions(&found).len()
+        );
     }
 }
