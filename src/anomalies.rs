@@ -432,8 +432,9 @@ fn check_conflicting_answers(
 }
 
 /// Analyze a snapshot, returning deduped anomalies sorted by severity then kind.
-/// Dedup key is (kind, service, name, type, rdata): the same record seen from
-/// several sources yields one anomaly, keeping the first source for context.
+/// Dedup key is (kind, service, name, type, rdata, source): the same record
+/// seen from several sources yields one anomaly per source, so each source's
+/// Answers row shows its own finding.
 #[cfg(test)]
 pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
     analyze_observations(snap, &[], &[])
@@ -529,7 +530,7 @@ pub fn analyze_observations(
                     rtype: Some(rec.rtype),
                     rtype_str: Some(rec.rtype_str.clone()),
                     rdata: Some(rec.rdata.clone()),
-                    source: Some(rec.source.to_string()),
+                    source: Some(rec.source_label()),
                     message: format!("bad enumerated type {target_display}: {reason}"),
                     rfc: "RFC 6763 §7",
                     requirement: "MUST",
@@ -548,7 +549,7 @@ pub fn analyze_observations(
                     rtype: Some(rec.rtype),
                     rtype_str: Some(rec.rtype_str.clone()),
                     rdata: Some(rec.rdata.clone()),
-                    source: Some(rec.source.to_string()),
+                    source: Some(rec.source_label()),
                     message: format!("{target_display} is a subtype; want base type"),
                     rfc: "RFC 6763 §9",
                     requirement: "",
@@ -605,22 +606,19 @@ fn dedup(mut items: Vec<Anomaly>) -> Vec<Anomaly> {
             }
             _ => a.rdata.clone().unwrap_or_default(),
         };
-        // Questions carry no rdata: tell queriers apart by source, so each
-        // querier keeps its own finding and every row can mark.
-        // Out-of-scope records have no Answers row to list their
-        // responders, so their findings are the only per-source record:
-        // keep one per source too.
-        // Other answers keep the established behavior (one finding no
-        // matter how many sources announce it, the rows show them) —
-        // except context-gated kinds, where the same rdata via multicast
-        // vs unicast (or answer vs authority) is a different verdict and
-        // must not collapse.
-        let source_key = match a.kind {
-            AnomalyKind::UnsupportedQuestion
-            | AnomalyKind::UnicastStyleResponse
-            | AnomalyKind::UnsupportedType => a.source.clone().unwrap_or_default(),
-            _ => String::new(),
-        };
+        // One finding per source: questions carry no rdata, so queriers
+        // differ only by source; out-of-scope records have no Answers row,
+        // so their findings are the only per-source record; and record
+        // findings sit next to the row of the source that sent them
+        // (`finding_matches_record`), so a record announced from several
+        // sources (IPv4 and IPv6, several NICs) must keep a finding per
+        // source, or only the first source's row would show it. Record
+        // findings name the interface-qualified `source_label()`, so one
+        // address heard on two links also keeps a finding per link.
+        // Context-gated kinds also key on the message below, where the
+        // same rdata via multicast vs unicast (or answer vs authority) is
+        // a different verdict and must not collapse.
+        let source_key = a.source.clone().unwrap_or_default();
         let context_key = match a.kind {
             AnomalyKind::UnicastStyleResponse
             | AnomalyKind::UnsupportedType
@@ -1472,7 +1470,7 @@ fn check_record(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
 fn check_record_claims(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
     let name = rec.name.clone();
     let rdata = rec.rdata.clone();
-    let src = rec.source.to_string();
+    let src = rec.source_label();
 
     // Non-UTF-8 names: mDNS names MUST be precomposed UTF-8
     // (RFC 6762 §16), so bytes outside UTF-8 come from a non-compliant
@@ -1752,7 +1750,7 @@ fn check_record_claims(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>
             rtype: Some(rec.rtype),
             rtype_str: Some(rec.rtype_str.clone()),
             rdata: Some(rec.rdata.clone()),
-            source: Some(rec.source.to_string()),
+            source: Some(rec.source_label()),
             message,
             rfc: "RFC 6762 §10",
             requirement: "SHOULD",
@@ -1785,7 +1783,7 @@ fn check_record_claims(service_id: &str, rec: &RawRecord, out: &mut Vec<Anomaly>
                 rtype: Some(rec.rtype),
                 rtype_str: Some(rec.rtype_str.clone()),
                 rdata: Some(rec.rdata.clone()),
-                source: Some(rec.source.to_string()),
+                source: Some(rec.source_label()),
                 message: format!("TXT {payload_len}B, max {TXT_MAX}B"),
                 rfc: "RFC 6763 §6.2",
                 requirement: "SHOULD NOT",
@@ -1862,7 +1860,7 @@ fn srv_anomaly_info(service_id: &str, rec: &RawRecord, message: &str) -> Anomaly
         rtype: Some(rec.rtype),
         rtype_str: Some(rec.rtype_str.clone()),
         rdata: Some(rec.rdata.clone()),
-        source: Some(rec.source.to_string()),
+        source: Some(rec.source_label()),
         message: message.to_string(),
         rfc: "RFC 2782",
         requirement: "",
@@ -1880,7 +1878,7 @@ fn srv_anomaly(service_id: &str, rec: &RawRecord, message: &str) -> Anomaly {
         rtype: Some(rec.rtype),
         rtype_str: Some(rec.rtype_str.clone()),
         rdata: Some(rec.rdata.clone()),
-        source: Some(rec.source.to_string()),
+        source: Some(rec.source_label()),
         message: message.to_string(),
         rfc: "RFC 2782",
         requirement: "MUST",
