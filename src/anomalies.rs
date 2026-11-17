@@ -432,8 +432,9 @@ fn check_conflicting_answers(
 }
 
 /// Analyze a snapshot, returning deduped anomalies sorted by severity then kind.
-/// Dedup key is (kind, service, name, type, rdata): the same record seen from
-/// several sources yields one anomaly, keeping the first source for context.
+/// Dedup key is (kind, service, name, type, rdata, source): the same record
+/// seen from several sources yields one anomaly per source, so each source's
+/// Answers row shows its own finding.
 #[cfg(test)]
 pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
     analyze_observations(snap, &[], &[])
@@ -605,22 +606,17 @@ fn dedup(mut items: Vec<Anomaly>) -> Vec<Anomaly> {
             }
             _ => a.rdata.clone().unwrap_or_default(),
         };
-        // Questions carry no rdata: tell queriers apart by source, so each
-        // querier keeps its own finding and every row can mark.
-        // Out-of-scope records have no Answers row to list their
-        // responders, so their findings are the only per-source record:
-        // keep one per source too.
-        // Other answers keep the established behavior (one finding no
-        // matter how many sources announce it, the rows show them) —
-        // except context-gated kinds, where the same rdata via multicast
-        // vs unicast (or answer vs authority) is a different verdict and
-        // must not collapse.
-        let source_key = match a.kind {
-            AnomalyKind::UnsupportedQuestion
-            | AnomalyKind::UnicastStyleResponse
-            | AnomalyKind::UnsupportedType => a.source.clone().unwrap_or_default(),
-            _ => String::new(),
-        };
+        // One finding per source: questions carry no rdata, so queriers
+        // differ only by source; out-of-scope records have no Answers row,
+        // so their findings are the only per-source record; and record
+        // findings sit next to the row of the source that sent them
+        // (`finding_matches_record`), so a record announced from several
+        // sources (IPv4 and IPv6, several NICs) must keep a finding per
+        // source, or only the first source's row would show it.
+        // Context-gated kinds also key on the message below, where the
+        // same rdata via multicast vs unicast (or answer vs authority) is
+        // a different verdict and must not collapse.
+        let source_key = a.source.clone().unwrap_or_default();
         let context_key = match a.kind {
             AnomalyKind::UnicastStyleResponse
             | AnomalyKind::UnsupportedType

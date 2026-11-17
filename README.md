@@ -189,7 +189,8 @@ Findings sit next to their owner:
   TXT pairs, never folded by `Enter`); the row itself carries the level
   icon of its worst finding, severity-colored, on the TTL cell for TTL
   kinds and on the type cell otherwise. Goodbye and expired rows carry
-  neither.
+  neither. A record announced from several sources (IPv4 and IPv6, or
+  several interfaces) carries its findings on each source's row.
 - Findings about the service as a whole sit in a `service` block at the
   top of the Answers pane (an `enumeration` block on the enumeration
   entry); findings owned by the service's host sit in a `host <name>`

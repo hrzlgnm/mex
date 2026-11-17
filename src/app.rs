@@ -15168,6 +15168,49 @@ mod tests {
     }
 
     #[test]
+    fn record_findings_sit_under_every_announcing_source() {
+        // One responder announcing a record over IPv6 and IPv4: each
+        // source's row carries its own finding, not only the row of the
+        // first source the analyzer saw.
+        let mut app = App::new().unwrap();
+        let sources = ["[fe80::1234%2]:5353", "192.168.178.104:5353"];
+        for source in sources {
+            let mut rec = raw_record(
+                "_services._dns-sd._udp.local.",
+                12,
+                "PTR",
+                "_T35._sub._matterd._udp.local.",
+                120,
+            );
+            rec.source = source.parse().unwrap();
+            ingest(&mut app, &rec);
+        }
+        app.selected_display = app
+            .display_items()
+            .iter()
+            .position(|d| matches!(d, DisplayItem::Enum { .. }))
+            .unwrap();
+        let target = app.display_detail().unwrap();
+        let found = app.anomalies();
+        let layout = app.answers_layout(&target, &found);
+        let answers = target.ordered_answers();
+        for source in sources {
+            let row = answers
+                .iter()
+                .position(|r| r.source.to_string() == source)
+                .unwrap();
+            assert!(
+                layout.iter().any(|l| matches!(
+                    l,
+                    AnswerLine::Finding { anomaly, record: Some(i) }
+                        if *i == row && anomaly.kind == anomalies::AnomalyKind::EnumSubtype
+                )),
+                "enum-subtype missing under {source}"
+            );
+        }
+    }
+
+    #[test]
     fn info_ttl_base_mismatch_shows_inline() {
         let mut app = App::new().unwrap();
         ingest(&mut app, &ptr_record(120));
