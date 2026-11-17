@@ -136,6 +136,15 @@ pub struct DumpInterest {
     pub last_observed_iface: Option<String>,
 }
 
+/// One responder group of a `conflicting-answers` finding (#247).
+#[derive(serde::Serialize)]
+pub struct DumpResponder {
+    pub sources: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub addresses: Vec<String>,
+}
+
 #[derive(serde::Serialize)]
 pub struct DumpAnomaly {
     pub kind: String,
@@ -151,6 +160,10 @@ pub struct DumpAnomaly {
     pub rtype_str: Option<String>,
     pub rdata: Option<String>,
     pub source: Option<String>,
+    /// Responder groups and their sorted address sets, for
+    /// `conflicting-answers`; omitted for other kinds.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub responders: Vec<DumpResponder>,
     /// Device names the source address resolves to (#246), preferred
     /// first; omitted when nothing announced names it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -327,6 +340,25 @@ fn is_public_ip_literal(v: &str) -> bool {
 /// hextet (`2003:*REDACTED*:7927`) so prefix and host tail stay useful
 /// for debugging. Anything else (including IPv4 and non-public IPv6)
 /// passes through.
+/// Mask every public IPv6 literal among the words of `text`
+/// (`redact_ip_literal` per word, ignoring a trailing `,` or `;`), leaving
+/// everything else as is. Word-wise, so an address that prefixes another
+/// never rewrites part of the longer one.
+pub fn redact_ip_words(text: &str) -> String {
+    text.split(' ')
+        .map(|word| {
+            let addr = word.trim_end_matches([',', ';']);
+            let tail = &word[addr.len()..];
+            if addr.parse::<std::net::IpAddr>().is_ok() {
+                format!("{}{tail}", redact_ip_literal(addr))
+            } else {
+                word.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub fn redact_ip_literal(rdata: &str) -> String {
     let trimmed = rdata.trim().split('%').next().unwrap_or("");
     match trimmed.parse::<std::net::IpAddr>() {

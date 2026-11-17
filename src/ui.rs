@@ -378,12 +378,19 @@ fn finding_row(
 ) -> Row<'static> {
     let mut cells: Vec<Cell<'static>> = (0..=data_col).map(|_| Cell::from("")).collect();
     cells[0] = Cell::from(Line::from(vec![Span::raw("  "), level_icon(a.severity)]));
+    let Some(src) = a.source.as_deref() else {
+        // Unsourced findings (e.g. `conflicting-answers`, whose message
+        // names every responder) take the empty source column too, so
+        // their long text isn't clipped to the data column.
+        cells.truncate(source_col);
+        cells.push(
+            Cell::from(finding_text(a, identity_count))
+                .column_span((data_col - source_col + 1) as u16),
+        );
+        return Row::new(cells);
+    };
     // A finding is about one responder: always name it (#246).
-    let source = a
-        .source
-        .as_deref()
-        .map(|src| named(src.to_string(), book.resolve_label(src)))
-        .unwrap_or_default();
+    let source = named(src.to_string(), book.resolve_label(src));
     cells[source_col] = Cell::from(source).style(Style::default().fg(Color::Gray));
     cells[data_col] = Cell::from(finding_text(a, identity_count));
     Row::new(cells)
@@ -687,7 +694,7 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, f
 
     let layout = app.answers_layout(&target, found);
     let shown = worst_of(layout.iter().filter_map(|l| match l {
-        crate::app::AnswerLine::Finding { anomaly, .. } => Some(anomaly),
+        crate::app::AnswerLine::Finding { anomaly, .. } => Some(&**anomaly),
         _ => None,
     }));
     let book = app.address_book();
@@ -887,7 +894,7 @@ fn detail_table_rows<'a>(
     // raw_positions maps each raw record to its table row.
     let answers = target.ordered_answers();
     let identity_count = crate::anomalies::identity_counts(layout.iter().filter_map(|l| match l {
-        AnswerLine::Finding { anomaly, .. } => Some(anomaly),
+        AnswerLine::Finding { anomaly, .. } => Some(&**anomaly),
         _ => None,
     }));
     let mut raw_positions = Vec::with_capacity(answers.len());
