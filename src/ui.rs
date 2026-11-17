@@ -375,7 +375,17 @@ fn finding_row(
     book: &AddressBook,
     source_col: usize,
     data_col: usize,
+    under_parent: bool,
 ) -> Row<'static> {
+    if under_parent {
+        // Under its record or question (#266): the parent row already
+        // shows the source and carries the severity mark, so the text
+        // alone runs from the second column to the end.
+        return Row::new(vec![
+            Cell::from(""),
+            Cell::from(finding_text(a, identity_count)).column_span(data_col as u16),
+        ]);
+    }
     let mut cells: Vec<Cell<'static>> = (0..=data_col).map(|_| Cell::from("")).collect();
     cells[0] = Cell::from(Line::from(vec![Span::raw("  "), level_icon(a.severity)]));
     let Some(src) = a.source.as_deref() else {
@@ -389,7 +399,8 @@ fn finding_row(
         );
         return Row::new(cells);
     };
-    // A finding is about one responder: always name it (#246).
+    // No parent row names the responder here (`service` / `host`
+    // blocks, `(unattributed)`): name it, device included (#246).
     let source = named(src.to_string(), book.resolve_label(src));
     cells[source_col] = Cell::from(source).style(Style::default().fg(Color::Gray));
     cells[data_col] = Cell::from(finding_text(a, identity_count));
@@ -707,8 +718,12 @@ fn draw_records_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, f
     // Size SOURCE to the longest label (record rows and finding rows,
     // device names included) so IPv6 fits, clamped to keep RDATA usable
     // on narrow terminals.
+    // Only findings without a parent row draw a source (#266).
     let finding_sources = layout.iter().filter_map(|l| match l {
-        crate::app::AnswerLine::Finding { anomaly, .. } => anomaly
+        crate::app::AnswerLine::Finding {
+            anomaly,
+            record: None,
+        } => anomaly
             .source
             .as_deref()
             .map(|src| named(src.to_string(), book.resolve_label(src)).len()),
@@ -938,8 +953,15 @@ fn detail_table_rows<'a>(
             ),
             AnswerLine::Block(label) => rows
                 .push(Row::new(vec![Cell::from(label.clone()).column_span(5)]).style(block_style)),
-            AnswerLine::Finding { anomaly, .. } => {
-                rows.push(finding_row(anomaly, &identity_count, book, 3, 4));
+            AnswerLine::Finding { anomaly, record } => {
+                rows.push(finding_row(
+                    anomaly,
+                    &identity_count,
+                    book,
+                    3,
+                    4,
+                    record.is_some(),
+                ));
             }
             AnswerLine::TxtPair { pair, last, .. } => {
                 // Children span the full row width so the pair text sits
@@ -1148,7 +1170,7 @@ fn draw_questions_tab(
         row_cells.extend(cells.map(Cell::from));
         rows.push(Row::new(row_cells).style(style));
         for a in &per_question[q] {
-            rows.push(finding_row(a, &identity_count, &book, 3, 4));
+            rows.push(finding_row(a, &identity_count, &book, 3, 4, true));
         }
     }
     app.questions_rows.replace(Some(row_map));

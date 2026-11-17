@@ -126,9 +126,9 @@ browsed as before.
   own announcement wins over a proxy's), shortened to its first label.
   An IPv6 link-local source that no record names exactly is matched by
   its interface ID against the device's global/ULA AAAA and marked
-  inferred (`(~fritz)`). Unannounced addresses stay bare. Finding rows
-  and queriers are always named; answer rows only when the responder is
-  not the service's own host. Dumps carry every candidate name
+  inferred (`(~fritz)`). Unannounced addresses stay bare. Queriers and
+  block / `(unattributed)` finding rows are always named; answer rows
+  only when the responder is not the service's own host. Dumps carry every candidate name
   (`source_names`, `source_name_inferred`).
 - **Right bottom — Hex.** Wire bytes of the selected record or question
   packet, falling back to the service's latest packet. `Tab` focuses it
@@ -201,11 +201,15 @@ Findings sit next to their owner:
 - The Answers and Questions pane titles append `· <worst icon> N` for
   the findings they show.
 
-A finding row reads `<icon>`, then the announcer/querier in the source
-column, then `<kind> <record>: <message> (<rfc>, <requirement>)` — the
-requirement is omitted when the cited text has no RFC 2119 keyword, the
-level icon carries the severity (no severity word), and
-enumeration-row findings omit their constant scope. The metrics overlay
+A finding row reads `<kind> <record>: <message> (<rfc>, <requirement>)`
+— the requirement is omitted when the cited text has no RFC 2119 keyword,
+the level icon carries the severity (no severity word), and
+enumeration-row findings omit their constant scope. Under its record or
+question, a finding row starts in the second column (TTL / LAST) and
+repeats neither the source nor the icon: the parent row shows both. In
+`service` / `host` blocks and the `(unattributed)` view, where no parent
+row names the responder, it shows `<icon>` and the announcer/querier
+(with its device name) in the source column. The metrics overlay
 (`m`) shows only a session-wide summary (`N error · N warning · N info`);
 `Ctrl+J` state dumps include the full list. A question that asks for a
 name shared by several services (e.g. an SRV target) shows on each of
