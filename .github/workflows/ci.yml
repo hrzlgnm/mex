@@ -125,15 +125,21 @@ jobs:
           persist-credentials: false
 
       # Every source, workflow and config file that can hold a comment
-      # starts with the Copyright / SPDX-License-Identifier header.
+      # carries the Copyright / SPDX-License-Identifier header. The
+      # identifier must sit in the first or last 5 lines (header or
+      # footer; room for a shebang): a mention mid-file does not count.
       - name: 📜 Check SPDX headers
         shell: bash
         run: |
-          missing=$(git ls-files -z -- '*.rs' '*.yml' '*.yaml' '*.toml' '*.sh' '*.json5' \
-            | xargs -0 -r grep -L 'SPDX-License-Identifier' || true)
-          if [ -n "$missing" ]; then
-            echo "::error::Files without an SPDX-License-Identifier header:"
-            echo "$missing"
+          missing=()
+          while IFS= read -r -d '' f; do
+            if ! { head -n 5 -- "$f"; tail -n 5 -- "$f"; } | grep -q 'SPDX-License-Identifier'; then
+              missing+=("$f")
+            fi
+          done < <(git ls-files -z -- '*.rs' '*.yml' '*.yaml' '*.toml' '*.sh' '*.json5')
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Files without an SPDX-License-Identifier header or footer:"
+            printf '%s\n' "${missing[@]}"
             exit 1
           fi
 
