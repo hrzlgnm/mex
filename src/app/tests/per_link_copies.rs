@@ -87,7 +87,10 @@ fn withheld_address_survives_a_goodbye_on_the_other_link() {
     ingest(&mut app, &legacy_aaaa_denial());
     ingest(&mut app, &on_link(aaaa_knulp(), "eth0", 2));
     ingest(&mut app, &on_link(aaaa_knulp(), "wlan0", 3));
-    assert!(!rows_of(&app, DACP).contains(&28), "denied on the service");
+    assert!(
+        !live_rows(&app, DACP).contains(&28),
+        "denied on the service"
+    );
     let mut bye = on_link(aaaa_knulp(), "eth0", 2);
     bye.ttl = 0;
     ingest(&mut app, &bye);

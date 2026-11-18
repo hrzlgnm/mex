@@ -13,7 +13,7 @@ fn out_of_scope_record_on_host_is_finding_not_row() {
         &mut app,
         &raw_record("test.local.", 15, "TYPE15", "rdlength=9", 4500),
     );
-    let rows = service_rows(&app, "Test");
+    let rows = all_rows(&app, "Test");
     assert!(!rows.contains(&6) && !rows.contains(&15), "rows: {rows:?}");
     let soa = findings_of(&app, anomalies::AnomalyKind::UnicastStyleResponse);
     assert_eq!(soa.len(), 1);
@@ -58,7 +58,7 @@ fn in_scope_other_types_stay_rows_without_findings() {
             &raw_record("test.local.", rtype, label, rdata, 120),
         );
     }
-    let rows = service_rows(&app, "Test");
+    let rows = all_rows(&app, "Test");
     for rtype in [2, 5, 13, 47] {
         assert!(rows.contains(&rtype), "type {rtype} row missing: {rows:?}");
     }
@@ -73,7 +73,7 @@ fn any_record_is_error_without_row() {
         &mut app,
         &raw_record("test.local.", 255, "ANY", "rdlength=0", 120),
     );
-    assert!(!service_rows(&app, "Test").contains(&255));
+    assert!(!all_rows(&app, "Test").contains(&255));
     let found = findings_of(&app, anomalies::AnomalyKind::UnicastStyleResponse);
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].severity, anomalies::Severity::Error);
@@ -316,7 +316,7 @@ fn out_of_scope_known_answer_is_sighted_in_its_section() {
         "{}",
         found[0].message
     );
-    assert!(!service_rows(&app, "Test").contains(&6));
+    assert!(!all_rows(&app, "Test").contains(&6));
 
     // A known answer with TTL 0 is no goodbye: a responder's own
     // sighting of the same record survives it.
@@ -414,7 +414,7 @@ fn host_owned_record_files_on_every_sibling_service() {
     );
     for instance in ["Test", "Other"] {
         assert!(
-            service_rows(&app, instance).contains(&13),
+            all_rows(&app, instance).contains(&13),
             "{instance} lacks the host's HINFO row"
         );
     }
@@ -423,8 +423,8 @@ fn host_owned_record_files_on_every_sibling_service() {
         &mut app,
         &raw_record("Test._http._tcp.local.", 5, "CNAME", "alias.local.", 120),
     );
-    assert!(service_rows(&app, "Test").contains(&5));
-    assert!(!service_rows(&app, "Other").contains(&5));
+    assert!(all_rows(&app, "Test").contains(&5));
+    assert!(!all_rows(&app, "Other").contains(&5));
 }
 
 #[test]
@@ -780,15 +780,4 @@ fn same_querier_on_two_links_keeps_a_question_finding_per_link() {
         sources,
         vec!["169.254.1.1:5353@enp0s25", "169.254.1.1:5353@wlan0"]
     );
-}
-
-fn service_rows(app: &App, instance: &str) -> Vec<u16> {
-    app.services
-        .iter()
-        .find(|s| s.instance == instance)
-        .expect("service")
-        .answers
-        .iter()
-        .map(|r| r.rtype)
-        .collect()
 }
