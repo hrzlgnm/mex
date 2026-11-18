@@ -51,6 +51,14 @@ Headless run (no TTY) logs to stderr.
   (legacy zeroconf form) keeps that address type off that one service
   (`push_record` gate, retroactive removal); the host header keeps it via
   `withheld_addrs`, and the service drives no query interest for it.
+  `App` methods live in child modules by job: `schedule` (continuous
+  browsing, cache refresh, known answers, §7.3 suppression), `ingest`
+  (record handlers, `push_record`, goodbyes), `denials`, `sightings`,
+  `questions` (question routing), `input` (keys, mouse, selection),
+  `view` (read-only accessors for `ui`), `metrics`, `findings`
+  (analyzer snapshot), `state_dump`. `app.rs` keeps the types, constants,
+  free helpers, construction, run loops and eviction. Child-module
+  methods are `pub(super)` (same reach as a private `app` method).
   Its tests live in `src/app/tests/`: shared fixtures in `mod.rs`, one
   file per topic (scheduling, ingest, input, …, or the issue they cover).
 * `src/devices.rs` — device names behind source addresses (#246): an

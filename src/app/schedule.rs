@@ -1,0 +1,833 @@
+use super::*;
+
+impl App {
+    /// Per-interest summary for the TUI: latest event age/kind,
+    /// owning timer and deadline, plus whether local demand ever
+    /// existed. Unknown names yield an empty summary with blank cells.
+    pub fn interest_summary(&self, name: &str, rtype: u16) -> InterestSummary {
+        let now = Instant::now();
+        let view = self.interest_view(&Self::provenance_key(name, rtype));
+        InterestSummary {
+            timer: view.timer,
+            next_due_in_secs: view
+                .next_due
+                .map(|d| d.saturating_duration_since(now).as_secs()),
+            had_local_demand: view
+                .state
+                .as_ref()
+                .is_some_and(|s| s.transmitted.is_some() || s.suppressed.is_some()),
+            last_transmitted_at: view.at(QueryOrigin::Transmitted),
+            last_suppressed_at: view.at(QueryOrigin::Suppressed),
+        }
+    }
+
+    pub(super) fn remaining_ttl(rec: &browse::RawRecord) -> u32 {
+        rec.ttl
+            .saturating_sub(rec.received_at.elapsed().as_secs() as u32)
+    }
+
+    /// Known PTR answers for a service type (or enumeration), RFC 6762 §7.1:
+    /// only answers with at least half of the original TTL remaining, sent
+    /// with their remaining TTL so responders can suppress duplicates.
+    /// Unique types (SRV/TXT/A/AAAA) are intentionally omitted: §7.1 notes
+    /// known-answer suppression is for shared answers. Each answer carries
+    /// the interface it was observed on; the transport only sends it back
+    /// out that same link, where it can actually suppress something.
+    pub(super) fn known_ptrs(&self, owner: &str) -> Vec<browse::KnownAnswer> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        let mut push_rec = |rec: &browse::RawRecord, out: &mut Vec<browse::KnownAnswer>| {
+            if rec.rtype != 12 || rec.ttl == 0 {
+                return;
+            }
+            let remaining = Self::remaining_ttl(rec);
+            if remaining * 2 < rec.ttl {
+                return;
+            }
+            let target = rec.rdata.trim_end_matches('.').to_string();
+            if seen.insert((target.clone(), rec.iface.clone())) {
+                out.push(browse::KnownAnswer {
+                    target,
+                    ttl: remaining,
+                    iface: rec.iface.clone(),
+                });
+            }
+        };
+        for s in &self.services {
+            if !s.service_type.eq_ignore_ascii_case(owner) {
+                continue;
+            }
+            for rec in &s.answers {
+                push_rec(rec, &mut out);
+            }
+        }
+        for p in &self.pending_instances {
+            if !p.service_type.eq_ignore_ascii_case(owner) {
+                continue;
+            }
+            for rec in &p.answers {
+                push_rec(rec, &mut out);
+            }
+        }
+        out
+    }
+
+    pub(super) fn known_enum_answers(&self) -> Vec<browse::KnownAnswer> {
+        let now = Instant::now();
+        let mut out = Vec::new();
+        for (svc_type, (ttl, received, iface)) in &self.enum_known {
+            let elapsed = now.duration_since(*received).as_secs() as u32;
+            let remaining = ttl.saturating_sub(elapsed);
+            if *ttl == 0 || remaining * 2 < *ttl {
+                continue;
+            }
+            out.push(browse::KnownAnswer {
+                target: svc_type.clone(),
+                ttl: remaining,
+                iface: iface.clone(),
+            });
+        }
+        out
+    }
+
+    pub(super) fn requery_expiring(&mut self) {
+        self.update_refreshes(true);
+    }
+
+    /// Track live rows' refresh state and rebuild the per-question
+    /// summaries; with `send`, also fire due refresh queries. Without
+    /// it (transmission on hold) nothing is sent and no attempt is used:
+    /// expired or replaced rows just drop out.
+    pub(super) fn update_refreshes(&mut self, send: bool) {
+        let now = Instant::now();
+        // Live rows inside their 80% window with attempts left, grouped by
+        // question, each flagged whether its own next attempt is due.
+        // Several rows (sources, rdata) share one question; each keeps
+        // its own TTL and count, so one row can neither set another's
+        // pace nor use up its attempts. Expired rows (elapsed > TTL) are
+        // not refreshed: RFC 6762 §5.2 deletes the record at 100% after
+        // four unanswered queries.
+        let mut pending: HashMap<(String, u16), Vec<PendingRow>> = HashMap::new();
+        let mut live_rows: HashSet<RefreshRow> = HashSet::new();
+        let tracked = &self.refresh_rows;
+        let mut scan = |rec: &browse::RawRecord| {
+            if rec.ttl == 0 {
+                return;
+            }
+            match rec.rtype {
+                12 | 33 | 16 | 1 | 28 => {}
+                _ => return,
+            }
+            let elapsed = rec.received_at.elapsed().as_secs() as u32;
+            if elapsed > rec.ttl {
+                return;
+            }
+            let row = refresh_row(rec);
+            // One A/AAAA row is filed under every service of its host;
+            // count it once, or a single query would use up several of
+            // its attempts.
+            if !live_rows.insert(row.clone()) || !in_refresh_window(elapsed, rec.ttl) {
+                return;
+            }
+            let state = tracked.get(&row);
+            if state.is_some_and(|s| s.attempts >= REFRESH_ATTEMPTS) {
+                return;
+            }
+            let due = state.is_none_or(|s| now >= s.next_due);
+            pending
+                .entry((row.0.clone(), row.1))
+                .or_default()
+                .push((row, rec.ttl, due));
+        };
+        for svc in &self.services {
+            svc.answers.iter().for_each(&mut scan);
+        }
+        for entry in &self.enum_entries {
+            entry.answers.iter().for_each(&mut scan);
+        }
+        // No maintenance without a live record (RFC 6762 §5.2 deletes at
+        // 100%); a replaced row is gone with its old identity.
+        self.refresh_rows.retain(|r, _| live_rows.contains(r));
+        let fired: Vec<_> = if send {
+            pending
+                .iter()
+                .filter(|(_, rows)| rows.iter().any(|(_, _, due)| *due))
+                .map(|(key, _)| key.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if !fired.is_empty() {
+            log::debug!(
+                "mex: cache refresh triggered for {} interest(s)",
+                fired.len()
+            );
+        }
+        for key in fired {
+            if !self.send_refresh(&key, now) {
+                continue;
+            }
+            // 0-2% random variation so queriers do not stay in lockstep
+            // (RFC 6762 §5.2: 80-82%, 85-87%, 90-92%, 95-97%). No 1s floor
+            // here: the >=1s rule applies to the continuous stream, while
+            // refresh spacing is 5% of the TTL (floors would push small
+            // TTLs past 100%). Only rows whose own attempt was due count
+            // this query; the others keep their pace.
+            let jitter_pct = rand_u32() % 201;
+            for (row, ttl, due) in &pending[&key] {
+                if !due {
+                    continue;
+                }
+                let state = self.refresh_rows.entry(row.clone()).or_insert(RowRefresh {
+                    next_due: now,
+                    attempts: 0,
+                });
+                state.attempts += 1;
+                state.next_due = now + refresh_step(*ttl, jitter_pct);
+            }
+        }
+        // Per-question summary for the UI: rows that used up their four
+        // attempts drop out and are left to expire at 100%.
+        self.requeries.clear();
+        for (key, rows) in pending {
+            let summary = rows
+                .iter()
+                .filter_map(|(row, _, _)| self.refresh_rows.get(row))
+                .filter(|s| s.attempts < REFRESH_ATTEMPTS)
+                .fold(None, |acc: Option<(Instant, u8)>, s| {
+                    Some(match acc {
+                        Some((due, n)) => (due.min(s.next_due), n.max(s.attempts)),
+                        None => (s.next_due, s.attempts),
+                    })
+                });
+            if let Some(summary) = summary {
+                self.requeries.insert(key, summary);
+            }
+        }
+    }
+
+    /// Transmit one refresh query for `key`, or count it as sent when an
+    /// overheard query already asked it (RFC 6762 §7.3). Returns whether
+    /// the attempt counts (false only for an unsupported record type).
+    pub(super) fn send_refresh(&mut self, key: &(String, u16), now: Instant) -> bool {
+        let Some(rt) = browse::record_type_from_u16(key.1) else {
+            return false;
+        };
+        let ka = if rt == TYPE::PTR {
+            if is_enum_name(&key.0) {
+                self.known_enum_answers()
+            } else {
+                self.known_ptrs(&key.0)
+            }
+        } else {
+            Vec::new()
+        };
+        if self.suppressed_by_overheard(key, &ka) {
+            log::debug!("mex: suppressed refresh query for {} (overheard)", key.0);
+            self.metrics.suppressed_refresh += 1;
+            self.metrics.suppressed_times.push_back(now);
+            self.note_query(&key.0, key.1, QueryOrigin::Suppressed, now);
+        } else {
+            self.metrics.q_sent_refresh += 1;
+            self.metrics.ka_sent += ka.len() as u64;
+            if self.query_tx.send(browse::QueryRequest {
+                name: key.0.clone(),
+                record_type: rt,
+                known_answers: ka,
+                qu: false,
+            }) {
+                self.note_query(&key.0, key.1, QueryOrigin::Transmitted, now);
+            } else {
+                log::warn!(
+                    "mex: dropped refresh query for {} (listener channels closed)",
+                    key.0
+                );
+            }
+        }
+        self.route_own_question(&key.0, key.1, false);
+        // A refresh query also elicits new answers, so postpone the
+        // exponential stream for the same question: otherwise the two
+        // timers can fire on the same tick and emit back-to-back
+        // duplicates (RFC 6762 §5.2 spacing).
+        self.postpone_continuous_for_refresh(key, now);
+        true
+    }
+
+    /// Map key for `continuous` and `requeries`: lowercased name per
+    /// RFC 6763 §7 / RFC 1035 §2.3.1 (service types and subtypes compare
+    /// case-insensitively; host names too). The query itself keeps wire
+    /// case via `qname` / the desired-map value.
+    pub(super) fn continuous_key(name: &str, rtype: u16) -> (String, u16) {
+        (name.to_lowercase(), rtype)
+    }
+
+    /// Provenance map key: dot-trimmed lowercased name plus type, so
+    /// wire case and trailing dots collapse the way the scheduler keys
+    /// do (RFC 6763 §7).
+    pub(super) fn provenance_key(name: &str, rtype: u16) -> (String, u16) {
+        (name.trim_end_matches('.').to_lowercase(), rtype)
+    }
+
+    /// Record a query event for an interest: we transmitted it or §7.3
+    /// suppression stood in for it, stamped at action time.
+    pub(super) fn note_query(&mut self, name: &str, rtype: u16, origin: QueryOrigin, at: Instant) {
+        let mut query_interfaces: Vec<String> = self
+            .link_stats
+            .v4
+            .iter()
+            .map(|(name, _)| name.clone())
+            .chain(self.link_stats.v6.iter().map(|(name, _)| name.clone()))
+            .filter(|name| {
+                self.interfaces
+                    .as_ref()
+                    .is_none_or(|selected| selected.contains(name))
+            })
+            .collect();
+        query_interfaces.sort();
+        query_interfaces.dedup();
+        let query_interfaces = query_interfaces.join(", ");
+        let entry = self
+            .query_history
+            .entry(Self::provenance_key(name, rtype))
+            .or_default();
+        match origin {
+            QueryOrigin::Transmitted => {
+                entry.transmitted = Some(at);
+                entry.transmitted_interfaces = query_interfaces;
+            }
+            QueryOrigin::Suppressed => entry.suppressed = Some(at),
+            QueryOrigin::Observed => {
+                // Observed questions carry their own packet timestamp
+                // and source; use `note_observed` instead.
+            }
+        }
+    }
+
+    /// Record an observed remote question with its packet timestamp,
+    /// querier, and ingress interface, so dumps can identify which link
+    /// and browser asked (RFC 6762 §5.4/§11 context).
+    pub(super) fn note_observed(&mut self, q: &browse::RawRecord, ev: &browse::Event) {
+        let entry = self
+            .query_history
+            .entry(Self::provenance_key(&q.name, q.rtype))
+            .or_default();
+        entry.observed = Some(ObservedQuery {
+            at: q.received_at,
+            from: ev.source,
+            iface: q.iface.clone(),
+        });
+    }
+
+    /// Whether a live (unexpired, nonzero-TTL) answer row exists for a
+    /// normalized interest key, across services, enumeration, and
+    /// pending instances.
+    pub(super) fn has_live_answer(&self, key: &(String, u16)) -> bool {
+        let live_row = |rec: &browse::RawRecord| {
+            // Canonical key comparison (not ASCII-only): `É` and `é`
+            // must hit the same interest.
+            Self::provenance_key(&rec.name, rec.rtype).0 == key.0
+                && rec.ttl > 0
+                && Self::remaining_ttl(rec) > 0
+        };
+        self.services
+            .iter()
+            .any(|s| s.answers.iter().any(&live_row))
+            || self
+                .enum_entries
+                .iter()
+                .any(|e| e.answers.iter().any(&live_row))
+            || self
+                .pending_instances
+                .iter()
+                .any(|p| p.answers.iter().any(&live_row))
+            || self.pending_addrs.values().flatten().any(live_row)
+    }
+
+    /// Earliest point at which the refresh scan will trigger for an
+    /// interest: 80% of TTL past each live row's receipt, minimum
+    /// across rows. Matches the scan's coverage exactly (services +
+    /// enumeration answers, browsable types only) so the projection
+    /// never predicts a refresh the scheduler would not send. `None`
+    /// in passive mode: a passive browser transmits nothing, so no
+    /// refresh is ever due.
+    pub(super) fn next_refresh_due(&self, key: &(String, u16)) -> Option<Instant> {
+        if self.passive {
+            return None;
+        }
+        let deadline = |rec: &browse::RawRecord| {
+            if rec.ttl == 0 {
+                return None;
+            }
+            match rec.rtype {
+                12 | 33 | 16 | 1 | 28 => {}
+                _ => return None,
+            }
+            if rec.rtype != key.1
+                || Self::provenance_key(&rec.name, rec.rtype).0 != key.0
+                || rec.received_at.elapsed().as_secs() as u32 > rec.ttl
+            {
+                return None;
+            }
+            // Rows that used up their four attempts only wait to expire.
+            if self
+                .refresh_rows
+                .get(&refresh_row(rec))
+                .is_some_and(|s| s.attempts >= REFRESH_ATTEMPTS)
+            {
+                return None;
+            }
+            // Earliest whole second satisfying the scan's trigger.
+            Some(rec.received_at + Duration::from_secs((rec.ttl as u64 * 4).div_ceil(5)))
+        };
+        let earliest = self
+            .services
+            .iter()
+            .flat_map(|s| s.answers.iter())
+            .chain(self.enum_entries.iter().flat_map(|e| e.answers.iter()))
+            .filter_map(deadline)
+            .min()?;
+        // A row already past 80% with no entry yet fires on the next
+        // tick: clamp to now instead of showing a stale past deadline.
+        Some(earliest.max(Instant::now()))
+    }
+
+    /// Authoritative per-interest snapshot for dumps and the TUI.
+    /// Refresh state wins over the continuous stream (urgent TTL
+    /// maintenance outranks hourly rediscovery); with no schedule the
+    /// interest is terminal. Status distinguishes a pending send from
+    /// suppression, and a quiet interest with live answers (answered)
+    /// from one with nothing left (abandoned).
+    pub(super) fn interest_view(&self, key: &(String, u16)) -> InterestView {
+        // Canonicalize once: map keys keep wire case or are lowercased
+        // depending on the map, and eq_ignore_ascii_case only folds
+        // a-z, so compare through `provenance_key` everywhere (`É`
+        // and `é` must hit the same interest).
+        let key = Self::provenance_key(&key.0, key.1);
+        let state = self.query_history.get(&key).cloned();
+        let (attempt, refresh_due) = self
+            .requeries
+            .iter()
+            .find(|(k, _)| Self::provenance_key(&k.0, k.1) == key)
+            .map(|(_, (due, count))| (*count, Some(*due)))
+            .unwrap_or((0, None));
+        let browse_due = self
+            .continuous
+            .iter()
+            .find(|(k, _)| Self::provenance_key(&k.0, k.1) == key)
+            .map(|(_, e)| e.next_due);
+        let (timer, next_due) = match (refresh_due, browse_due) {
+            (Some(due), _) => (TimerKind::Refresh, Some(due)),
+            (None, Some(due)) => match self.next_refresh_due(&key) {
+                // Projected refresh beats the browse stream: the
+                // earlier maintenance owns DUE.
+                Some(proj) if proj < due => (TimerKind::Refresh, Some(proj)),
+                _ => (TimerKind::Browse, Some(due)),
+            },
+            // No schedule at all, but live rows would still trigger one:
+            // the scheduler fires regardless of continuous membership
+            // (except passive mode, which never transmits).
+            (None, None) => match self.next_refresh_due(&key) {
+                Some(proj) => (TimerKind::Refresh, Some(proj)),
+                None => (TimerKind::Expired, None),
+            },
+        };
+        let last_own = state.as_ref().and_then(|s| {
+            [
+                (QueryOrigin::Transmitted, s.transmitted),
+                (QueryOrigin::Suppressed, s.suppressed),
+            ]
+            .into_iter()
+            .filter_map(|(o, t)| t.map(|t| (o, t)))
+            .max_by_key(|(_, t)| *t)
+            .map(|(o, _)| o)
+        });
+        // Requery entries are only inserted alongside a send or a
+        // suppression decision (never speculatively), so a pending
+        // refresh always has a last own action; the Transmitted arm
+        // below is the defensive fallback, not a reachable default.
+        let status = match (refresh_due.is_some(), last_own) {
+            (true, Some(QueryOrigin::Suppressed)) => InterestStatus::Suppressed,
+            (true, _) => InterestStatus::Transmitted,
+            (false, _) if self.has_live_answer(&key) => InterestStatus::Answered,
+            (false, _) => InterestStatus::Abandoned,
+        };
+        InterestView {
+            state,
+            attempt,
+            next_due,
+            timer,
+            status,
+        }
+    }
+
+    /// Strip a dot-separated suffix case-insensitively, returning the
+    /// wire-case prefix without the separating dot. The split offset must
+    /// be a character boundary: instance names may hold multi-byte UTF-8
+    /// (RFC 6763 §4.1.1), so byte-slicing inside a character would panic.
+    pub(super) fn strip_suffix_ci<'a>(full: &'a str, suffix: &str) -> Option<&'a str> {
+        if full.len() <= suffix.len() {
+            return None;
+        }
+        let off = full.len() - suffix.len();
+        if !full.is_char_boundary(off) {
+            return None;
+        }
+        let (prefix, tail) = full.split_at(off);
+        if !tail.eq_ignore_ascii_case(suffix) {
+            return None;
+        }
+        prefix.strip_suffix('.')
+    }
+
+    /// Desired continuous-browse queries: enumeration plus every live PTR /
+    /// SRV / TXT / A / AAAA interest, as key -> wire-case name. Derived
+    /// from live state each tick so dead services stop costing queries
+    /// (RFC 6762 §5.2: no maintenance without active interest).
+    pub(super) fn desired_continuous(&self) -> HashMap<(String, u16), String> {
+        let mut desired = HashMap::new();
+        let mut want = |name: String, rtype: u16| {
+            let key = Self::continuous_key(&name, rtype);
+            desired.entry(key).or_insert(name);
+        };
+        want(ENUM_SERVICE.to_string(), 12);
+        for t in &self.known_types {
+            want(t.clone(), 12);
+        }
+        for p in &self.pending_instances {
+            want(p.service_type.clone(), 12);
+            let full = format!("{}.{}", p.instance, p.service_type);
+            want(full.clone(), 33);
+            want(full, 16);
+        }
+        for svc in &self.services {
+            want(svc.service_type.clone(), 12);
+            let full = format!("{}.{}", svc.instance, svc.service_type);
+            want(full.clone(), 33);
+            want(full, 16);
+            if !svc.hostname.is_empty() {
+                // A denied address type is no interest of this service:
+                // only other services (or other demand) keep asking.
+                let host = svc.hostname.trim_end_matches('.').to_string();
+                let key = service_key(&svc.instance, &svc.service_type);
+                let host_key = host.to_lowercase();
+                for rtype in [1, 28] {
+                    if !self
+                        .address_denials
+                        .iter()
+                        .any(|d| d.covers(&key, rtype, &host_key))
+                    {
+                        want(host.clone(), rtype);
+                    }
+                }
+            }
+        }
+        desired
+    }
+
+    pub(super) fn poll_continuous(&mut self) {
+        let now = Instant::now();
+        let desired = self.desired_continuous();
+        // Drop interests that went away (no queries without active interest).
+        self.continuous.retain(|k, _| desired.contains_key(k));
+        for (key, qname) in desired {
+            let (due, send_name) = match self.continuous.get(&key) {
+                Some(entry) => (now >= entry.next_due, entry.qname.clone()),
+                None => {
+                    // RFC 6762 §5.2: first query delayed 20-120ms random.
+                    // A unique answer cached before the interest appeared
+                    // (e.g. A/AAAA shipped as additionals with the SRV)
+                    // means no other answers are forthcoming: start
+                    // dampened, as the flush-bit path would, and let the
+                    // 80%-TTL refresh maintain it. The interest is still
+                    // demand: file its self row now so the Questions pane
+                    // shows it pending (LAST "—", DUE the refresh) instead
+                    // of hiding it until the first refresh fires.
+                    let (next_due, interval) = if self.has_fresh_unique_answer(&key) {
+                        self.route_own_question(&qname, key.1, false);
+                        (now + MAX_CONTINUOUS_INTERVAL, MAX_CONTINUOUS_INTERVAL)
+                    } else {
+                        (now + rand_range(20, 120), Duration::from_secs(1))
+                    };
+                    self.continuous.insert(
+                        key.clone(),
+                        ContinuousQuery {
+                            next_due,
+                            interval,
+                            qname: qname.clone(),
+                        },
+                    );
+                    (false, qname)
+                }
+            };
+            if !due {
+                continue;
+            }
+            let Some(rt) = browse::record_type_from_u16(key.1) else {
+                continue;
+            };
+            let ka = if rt == TYPE::PTR {
+                if is_enum_name(&key.0) {
+                    self.known_enum_answers()
+                } else {
+                    self.known_ptrs(&key.0)
+                }
+            } else {
+                Vec::new()
+            };
+            // QU on the first transmission of the enumeration query
+            // (RFC 6762 §5.4 startup batch); everything afterwards is QM.
+            // First-transmission (interval still 1s) rather than a single
+            // flag so the QU survives the 20-120ms first-query delay.
+            let qu = key.1 == 12
+                && is_enum_name(&key.0)
+                && self
+                    .continuous
+                    .get(&key)
+                    .is_some_and(|e| e.interval == Duration::from_secs(1));
+            // RFC 6762 §7.3: another querier just asked the same QM
+            // question with no KA we wouldn't send — treat ours as sent.
+            // QU elicits unicast and is never suppressed.
+            if !qu && self.suppressed_by_overheard(&key, &ka) {
+                log::debug!("mex: suppressed continuous query for {} (overheard)", key.0);
+                let now = Instant::now();
+                self.metrics.suppressed_continuous += 1;
+                self.metrics.suppressed_times.push_back(now);
+                self.note_query(&key.0, key.1, QueryOrigin::Suppressed, now);
+                self.route_own_question(&key.0, key.1, false);
+                self.advance_continuous(&key, now);
+                continue;
+            }
+            if qu {
+                self.startup_qu_sent = true;
+                // Keep the flag for the passive-mode test; per-name QU above
+                // no longer depends on it.
+            }
+            self.metrics.q_sent_continuous += 1;
+            log::debug!(
+                "mex: sending continuous query for {} (qu={})",
+                send_name,
+                qu
+            );
+            if qu {
+                self.metrics.qu_sent += 1;
+            }
+            self.metrics.ka_sent += ka.len() as u64;
+            if self.query_tx.send(browse::QueryRequest {
+                name: send_name.clone(),
+                record_type: rt,
+                known_answers: ka,
+                qu,
+            }) {
+                self.note_query(&send_name, key.1, QueryOrigin::Transmitted, now);
+            } else {
+                log::warn!(
+                    "mex: dropped continuous query for {} (listener channels closed)",
+                    send_name
+                );
+            }
+            self.route_own_question(&send_name, key.1, qu);
+            // RFC 6762 §5.2: at least 1s between the first two, then at
+            // least doubling, capped at one query per hour. Send using the
+            // current interval, then double for the following gap, so the
+            // stream is 1s, 2s, 4s, ... (doubling before use would skip
+            // the 1s gap and start at 2s).
+            self.advance_continuous(&key, now);
+        }
+    }
+
+    pub(super) fn send_queries(&mut self) {
+        // Passive mode transmits nothing: no QU batch, no continuous
+        // stream, no TTL refreshes. Filing received data and the link
+        // refresh below still run.
+        if !self.passive {
+            // Learn service types before scheduling so new PTR owners are
+            // browsed without waiting for a record-bearing service entry.
+            // Lowercased: `_HTTP` and `_http` are the same type (RFC 6763 §7).
+            for svc in &self.services {
+                self.known_types.insert(svc.service_type.to_lowercase());
+            }
+            for p in &self.pending_instances {
+                self.known_types.insert(p.service_type.to_lowercase());
+            }
+            for t in self.enum_known.keys() {
+                self.known_types.insert(t.clone());
+            }
+
+            // While no family can transmit, queries would be queued and
+            // dropped by the listener: hold both schedules instead, so
+            // nothing is counted as sent, discovery doesn't back off, and
+            // refresh attempts aren't used up (records still expire at
+            // 100% TTL). When a family resumes, restart discovery with the
+            // RFC 6762 §5.2 startup schedule, as for an interface coming
+            // up: clearing the streams re-creates them through the normal
+            // first-query path (20–120 ms jitter, dampening, startup QU).
+            let can_transmit = self.query_tx.transmit().any();
+            if !can_transmit {
+                if !self.transmit_held {
+                    log::info!("mex: no family can transmit; queries on hold");
+                }
+                self.transmit_held = true;
+                // Keep the refresh bookkeeping honest without sending:
+                // expired or replaced rows drop out, live rows keep their
+                // attempts and next due time.
+                self.update_refreshes(false);
+            } else {
+                if self.transmit_held {
+                    log::info!("mex: transmission resumed; restarting discovery");
+                    self.continuous.clear();
+                    self.transmit_held = false;
+                    // Links just came back: take a fresh interface
+                    // snapshot first, so resumed queries record the
+                    // interfaces they really went out on.
+                    self.refresh_link_snapshot();
+                }
+                self.requery_expiring();
+                self.poll_continuous();
+            }
+        }
+
+        // Refresh in case interfaces/addresses changed (cheap: ~1 fork/min).
+        // Independent of query backoff.
+        if self.last_ip_refresh.elapsed() >= LOCAL_IPS_REFRESH {
+            self.refresh_link_snapshot();
+        }
+    }
+
+    /// The question a response record most likely answered: the latest
+    /// question for its owner name, any type, ours (transmitted) or a
+    /// remote querier's (observed), at most `TRIGGER_WINDOW` before the
+    /// record arrived. mDNS responses carry no question section
+    /// (RFC 6762 §6), so timing is all there is. Provenance keeps only the
+    /// latest timestamp per interest, which is why this runs at ingest.
+    pub(super) fn response_trigger(&self, rec: &browse::RawRecord) -> Option<browse::QueryTrigger> {
+        let name = Self::provenance_key(&rec.name, rec.rtype).0;
+        self.query_history
+            .iter()
+            .filter(|((n, _), _)| *n == name)
+            .flat_map(|((_, rtype), state)| {
+                [
+                    (state.transmitted, true),
+                    (state.observed.as_ref().map(|o| o.at), false),
+                ]
+                .into_iter()
+                .filter_map(move |(at, own)| at.map(|at| (at, own, *rtype)))
+            })
+            .filter(|(at, _, _)| {
+                *at <= rec.received_at && rec.received_at.duration_since(*at) <= TRIGGER_WINDOW
+            })
+            .max_by_key(|(at, _, _)| *at)
+            .map(|(_, own, rtype)| browse::QueryTrigger {
+                question: format!(
+                    "{}. {}",
+                    rec.name.trim_end_matches('.'),
+                    browse::rtype_label(rtype)
+                ),
+                own,
+            })
+    }
+
+    /// Record an overheard QM question for duplicate question suppression
+    /// (RFC 6762 §7.3). Own loopback and QU questions are never stored.
+    /// The remote Known-Answer set is stored dot-trimmed and lowercased;
+    /// the subset check runs at send time against the KA we would send.
+    pub(super) fn note_overheard(&mut self, q: &browse::RawRecord, ev: &browse::Event) {
+        if q.qu {
+            return;
+        }
+        if self.is_local_source(&ev.source) {
+            return;
+        }
+        let key = (q.name.trim_end_matches('.').to_lowercase(), q.rtype);
+        let mut remote = HashSet::new();
+        for ka in &ev.query_kas {
+            if ka.rtype == q.rtype && ka.name.eq_ignore_ascii_case(&q.name) {
+                remote.insert(ka.rdata.trim_end_matches('.').to_lowercase());
+            }
+        }
+        self.overheard
+            .insert(key, (Instant::now(), remote, q.iface.clone()));
+    }
+
+    /// RFC 6762 §7.3: if we overheard the same QM question recently and its
+    /// Known-Answer section holds nothing we wouldn't send ourselves,
+    /// treat our query as sent. Consumes the entry so one overheard query
+    /// suppresses one transmission. `local_ka` is the KA list we computed
+    /// for the send; filtering is scoped to the link the overheard query
+    /// arrived on.
+    pub(super) fn suppressed_by_overheard(
+        &mut self,
+        key: &(String, u16),
+        local_ka: &[browse::KnownAnswer],
+    ) -> bool {
+        let lookup = (key.0.trim_end_matches('.').to_lowercase(), key.1);
+        let (seen, remote, iface) = match self.overheard.get(&lookup) {
+            Some(v) => v.clone(),
+            None => return false,
+        };
+        if seen.elapsed() >= OVERHEARD_WINDOW {
+            return false;
+        }
+        let mut local = HashSet::new();
+        for ka in local_ka {
+            if ka.iface.is_empty() || iface.is_empty() || ka.iface == iface {
+                local.insert(ka.target.trim_end_matches('.').to_lowercase());
+            }
+        }
+        if remote.iter().all(|r| local.contains(r)) {
+            self.overheard.remove(&lookup);
+            return true;
+        }
+        false
+    }
+
+    /// Advance the exponential stream as if a query had been sent (shared
+    /// by real sends and §7.3 suppression).
+    /// Whether a live unique (cache-flush) answer for `key` is cached and
+    /// still before its 80%-TTL refresh window.
+    pub(super) fn has_fresh_unique_answer(&self, key: &(String, u16)) -> bool {
+        self.services.iter().flat_map(|s| &s.answers).any(|r| {
+            if !r.flush_bit
+                || r.ttl == 0
+                || r.rtype != key.1
+                || r.name.trim_end_matches('.').to_lowercase() != key.0
+            {
+                return false;
+            }
+            let elapsed = r.received_at.elapsed().as_secs() as u32;
+            !in_refresh_window(elapsed, r.ttl)
+        })
+    }
+
+    pub(super) fn advance_continuous(&mut self, key: &(String, u16), now: Instant) {
+        if let Some(entry) = self.continuous.get_mut(key) {
+            let current = entry.interval.max(Duration::from_secs(1));
+            entry.next_due = now + current;
+            entry.interval = (current * 2).min(MAX_CONTINUOUS_INTERVAL);
+        }
+    }
+
+    /// Postpone the exponential stream after a refresh (real or suppressed)
+    /// so the two §5.2 timers don't emit back-to-back duplicates.
+    pub(super) fn postpone_continuous_for_refresh(&mut self, key: &(String, u16), now: Instant) {
+        let mut postponed = false;
+        for (ckey, entry) in self.continuous.iter_mut() {
+            if ckey.1 == key.1 && ckey.0.eq_ignore_ascii_case(&key.0) {
+                let floor = now + entry.interval.max(Duration::from_secs(1));
+                if entry.next_due < floor {
+                    entry.next_due = floor;
+                }
+                postponed = true;
+            }
+        }
+        if !postponed {
+            let ckey = Self::continuous_key(&key.0, key.1);
+            if let std::collections::hash_map::Entry::Vacant(e) = self.continuous.entry(ckey) {
+                e.insert(ContinuousQuery {
+                    next_due: now + Duration::from_secs(1),
+                    interval: Duration::from_secs(1),
+                    qname: key.0.clone(),
+                });
+            }
+        }
+    }
+}
