@@ -255,3 +255,141 @@ pub(super) fn init_logging(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// Serializes tests that reconfigure the process-wide logger, avoiding
+    /// cross-test races on the shared sink state.
+    static TEST_LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn log_level_threshold_filters_file_sink() {
+        let _guard = TEST_LOG_LOCK.lock().unwrap();
+        let mk = |suffix: &str| {
+            std::env::temp_dir().join(format!(
+                "mex-loglevel-{}-{}.log",
+                suffix,
+                std::process::id()
+            ))
+        };
+
+        // warn: error+warn recorded, info dropped.
+        let path = mk("warn");
+        let _ = std::fs::remove_file(&path);
+        super::init_logging(
+            Some(path.to_str().unwrap()),
+            false,
+            Some(log::LevelFilter::Warn),
+        )
+        .unwrap();
+        log::error!("probe-warn-error");
+        log::warn!("probe-warn-warn");
+        log::info!("probe-warn-info");
+        let logged = std::fs::read_to_string(&path).unwrap();
+        assert!(logged.contains("probe-warn-error"));
+        assert!(logged.contains("probe-warn-warn"));
+        assert!(!logged.contains("probe-warn-info"));
+
+        // debug: debug recorded, trace not (max level stops it).
+        let path = mk("debug");
+        let _ = std::fs::remove_file(&path);
+        super::init_logging(
+            Some(path.to_str().unwrap()),
+            false,
+            Some(log::LevelFilter::Debug),
+        )
+        .unwrap();
+        log::debug!("probe-debug-debug");
+        log::trace!("probe-debug-trace");
+        let logged = std::fs::read_to_string(&path).unwrap();
+        assert!(logged.contains("probe-debug-debug"));
+        assert!(!logged.contains("probe-debug-trace"));
+
+        // trace: trace recorded.
+        let path = mk("trace");
+        let _ = std::fs::remove_file(&path);
+        super::init_logging(
+            Some(path.to_str().unwrap()),
+            false,
+            Some(log::LevelFilter::Trace),
+        )
+        .unwrap();
+        log::trace!("probe-trace-trace");
+        let logged = std::fs::read_to_string(&path).unwrap();
+        assert!(logged.contains("probe-trace-trace"));
+
+        for suffix in ["warn", "debug", "trace"] {
+            let _ = std::fs::remove_file(mk(suffix));
+        }
+    }
+
+    #[test]
+    fn default_log_dir_respects_xdg_state_home() {
+        // Scoped env override: no other test reads these vars.
+        let tmp = std::env::temp_dir().join(format!("mex-logdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let old = std::env::var_os("XDG_STATE_HOME");
+        std::env::set_var("XDG_STATE_HOME", &tmp);
+        let dir = super::default_log_dir();
+        match old {
+            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+        assert_eq!(dir, tmp.join("mex"));
+        assert!(dir.ends_with("mex"));
+    }
+
+    #[test]
+    fn rotating_log_caps_size_and_generations() {
+        let dir = std::env::temp_dir().join(format!("mex-logrot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("mex.log");
+        let mut log = super::RotatingLog::open(&path, 200, 2).unwrap();
+        for i in 0..50 {
+            log.write_line(&format!(
+                "line {i:02} with padding to grow fast 0123456789\n"
+            ))
+            .unwrap();
+        }
+        drop(log);
+        // Current file stays under the cap; at most 2 backups exist.
+        assert!(std::fs::metadata(&path).unwrap().len() <= 200,);
+        assert!(dir.join("mex.log.1").exists());
+        assert!(!dir.join("mex.log.3").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotating_log_rotates_oversized_file_at_open() {
+        // Pre-existing file over the cap: rotated away before writing,
+        // exercising the close-before-rename path Windows requires.
+        let dir = std::env::temp_dir().join(format!("mex-logopen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("mex.log");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, vec![b'x'; 300]).unwrap();
+        let mut log = super::RotatingLog::open(&path, 200, 2).unwrap();
+        assert!(dir.join("mex.log.1").exists());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        log.write_line("hello\n").unwrap();
+        drop(log);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_sink_records_warnings() {
+        let _guard = TEST_LOG_LOCK.lock().unwrap();
+        let path = std::env::temp_dir().join(format!("mex-log-test-{}.log", std::process::id()));
+        // Unique path per process: parallel `cargo test` runs never share it.
+        let _ = std::fs::remove_file(&path);
+        super::init_logging(Some(path.to_str().unwrap()), false, None).unwrap();
+        log::warn!("sink-probe-xyz");
+        log::info!("sink-probe-info-xyz");
+        let logged = std::fs::read_to_string(&path).unwrap();
+        assert!(logged.contains("[WARN]"), "got: {logged}");
+        assert!(logged.contains("sink-probe-xyz"), "got: {logged}");
+        assert!(logged.contains("sink-probe-info-xyz"), "got: {logged}");
+        std::fs::remove_file(&path).unwrap();
+    }
+}
