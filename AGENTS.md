@@ -58,8 +58,10 @@ Headless run (no TTY) logs to stderr.
   NSEC address denials (`address_denials`): a hostname NSEC arriving with
   a service's SRV (RFC form) or an instance NSEC listing only A/AAAA
   (legacy zeroconf form) keeps that address type off that one service
-  (`push_record` gate, retroactive removal); the host header keeps it via
-  `withheld_addrs`, and the service drives no query interest for it.
+  (`push_record` gate, retroactive removal); the host header keeps it as a
+  withheld address, and the service drives no query interest for it.
+  `app::denials::AddressDenials` owns the denials and withheld addresses;
+  `App` only takes newly denied rows off their service.
   `App` methods live in child modules by job: `schedule` (continuous
   browsing, cache refresh, known answers, §7.3 suppression), `ingest`
   (record handlers, `push_record`, goodbyes), `denials`, `sightings`,

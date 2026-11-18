@@ -511,11 +511,7 @@ impl App {
                 let key = service_key(&svc.instance, &svc.service_type);
                 let host_key = host.to_lowercase();
                 for rtype in [1, 28] {
-                    if !self
-                        .address_denials
-                        .iter()
-                        .any(|d| d.covers(&key, rtype, &host_key))
-                    {
+                    if !self.address_denials.covers(&key, rtype, &host_key) {
                         want(host.clone(), rtype);
                     }
                 }

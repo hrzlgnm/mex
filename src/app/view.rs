@@ -88,7 +88,7 @@ impl App {
                     .flat_map(|s| s.answers.iter())
                     .filter(|r| matches!(r.rtype, 1 | 28) && anomalies::host_id(&r.name) == host)
                     .chain(self.pending_addrs.get(&host).into_iter().flatten())
-                    .chain(self.withheld_addrs.get(&host).into_iter().flatten())
+                    .chain(self.address_denials.withheld(&host))
                     // Live copies only, before the dedup and from every
                     // source: a stale copy (an earlier service's, or a
                     // pending one) must not shadow a live one.
@@ -128,7 +128,7 @@ impl App {
             .chain(self.pending_addrs.values().flatten())
             // Denied on every service (#245) but still the host's live
             // addresses: the host header shows them, so naming does too.
-            .chain(self.withheld_addrs.values().flatten());
+            .chain(self.address_denials.all_withheld());
         for rec in records {
             book.add(rec);
         }
@@ -252,8 +252,7 @@ impl App {
         // denial (#245) are still the host's own addresses.
         let withheld = all_targets
             .iter()
-            .filter_map(|target| self.withheld_addrs.get(target))
-            .flatten();
+            .flat_map(|target| self.address_denials.withheld(target));
         for rec in withheld {
             if rec.ttl <= rec.received_at.elapsed().as_secs() as u32 {
                 continue;

@@ -459,10 +459,8 @@ impl App {
             // Addresses withheld from every other service (all deny them)
             // are still live addresses of this host.
             let withheld: Vec<browse::RawRecord> = self
-                .withheld_addrs
-                .get(&host_key)
-                .into_iter()
-                .flatten()
+                .address_denials
+                .withheld(&host_key)
                 .filter(|r| r.ttl > r.received_at.elapsed().as_secs() as u32)
                 .cloned()
                 .collect();
@@ -473,7 +471,7 @@ impl App {
             // host keeps its own copy (the sibling may go away while the
             // others still deny the family).
             for r in &withheld {
-                self.withhold_address(r);
+                self.address_denials.withhold(r);
             }
         }
 
@@ -694,15 +692,15 @@ impl App {
             &self.services[svc_idx].instance,
             &self.services[svc_idx].service_type,
         );
-        if self.address_denied(&key, rec) {
-            self.withhold_address(rec);
+        if self.address_denials.denies(&key, rec) {
+            self.address_denials.withhold(rec);
             return;
         }
         // Filed normally: the service row is now the record's truth, so a
         // withheld copy (from before a denial lifted) must not outlive a
         // later goodbye or rdata change.
         if matches!(rec.rtype, 1 | 28) {
-            self.forget_withheld(rec);
+            self.address_denials.forget_withheld(rec);
         }
         let s = &mut self.services[svc_idx];
         // Host addresses are not signs of service life: filing one on an

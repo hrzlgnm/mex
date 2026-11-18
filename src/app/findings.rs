@@ -48,7 +48,9 @@ impl App {
                 service_type: &s.service_type,
                 answers: &s.answers,
                 subtypes: &s.subtypes,
-                denied_address_types: self.denied_types(&service_key(&s.instance, &s.service_type)),
+                denied_address_types: self
+                    .address_denials
+                    .denied_types(&service_key(&s.instance, &s.service_type)),
             })
             .collect();
         // Pending instances hold PTR/TXT rows that arrived before their
@@ -61,7 +63,9 @@ impl App {
                 service_type: &p.service_type,
                 answers: &p.answers,
                 subtypes: &p.subtypes,
-                denied_address_types: self.denied_types(&service_key(&p.instance, &p.service_type)),
+                denied_address_types: self
+                    .address_denials
+                    .denied_types(&service_key(&p.instance, &p.service_type)),
             });
         }
         let enum_answers: Vec<&browse::RawRecord> = self
