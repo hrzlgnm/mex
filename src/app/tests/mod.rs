@@ -395,11 +395,13 @@ fn knulp_app() -> App {
 /// label resolve to the right service.
 fn service_of<'a>(app: &'a App, instance: &str) -> &'a ServiceEntry {
     let full = instance.trim_end_matches('.');
+    // The full key wins over a bare instance label: a dotted instance
+    // can spell another service's full name.
+    let key = full.to_lowercase();
     app.services
         .iter()
-        .find(|s| {
-            s.instance == full || service_key(&s.instance, &s.service_type) == full.to_lowercase()
-        })
+        .find(|s| service_key(&s.instance, &s.service_type) == key)
+        .or_else(|| app.services.iter().find(|s| s.instance == full))
         .unwrap_or_else(|| panic!("no service {instance}"))
 }
 
