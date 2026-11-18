@@ -86,10 +86,12 @@ impl App {
         at: Instant,
         bytes: Vec<u8>,
     ) -> bool {
-        match rows
-            .iter()
-            .position(|(n, t, src, _, _)| n == &name && t == &rtype_str && src == &source)
-        {
+        // DNS names compare case-insensitively (RFC 4343); the row keeps
+        // the latest asking's case for display.
+        let key = name.to_lowercase();
+        match rows.iter().position(|(n, t, src, _, _)| {
+            n.to_lowercase() == key && t == &rtype_str && src == &source
+        }) {
             Some(pos) => {
                 rows[pos] = (name, rtype_str, source, at, bytes);
                 false
