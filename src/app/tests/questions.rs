@@ -342,3 +342,27 @@ fn questions_pane_text(app: &App) -> String {
     }
     out
 }
+
+#[test]
+fn question_rows_dedup_names_case_insensitively() {
+    // DNS names compare case-insensitively (RFC 4343): the same querier
+    // re-asking in another case refreshes its row instead of taking a
+    // second slot of the capped list.
+    let src: SocketAddr = "192.168.1.9:5353".parse().unwrap();
+    let mut rows = Vec::new();
+    for name in ["_HTTP._tcp.local", "_http._tcp.local"] {
+        App::file_question_row(
+            &mut rows,
+            name.to_string(),
+            "PTR".to_string(),
+            src,
+            Instant::now(),
+            Vec::new(),
+        );
+    }
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].0, "_http._tcp.local",
+        "the latest asking's case is shown"
+    );
+}
