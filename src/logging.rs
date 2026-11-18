@@ -23,11 +23,14 @@ pub(super) static LOGGER_STATE: std::sync::Mutex<LoggerState> =
         stderr_level: log::LevelFilter::Warn,
     });
 
-/// Minimal log sink with no new dependencies. The file sink (if
-/// `--log-file` is given) records Info and above; headless stderr gets
-/// Warn and above so routine traffic stays quiet. TUI mode without a
-/// file installs no logger at all — writing to the terminal would
-/// corrupt the interface.
+/// Minimal log sink with no new dependencies. Records go to a
+/// size-rotated file, `--log-file` or `mex.log` in the default log
+/// directory, at Info and above. Headless runs without `--log-file` also
+/// log Warn and above to stderr, so routine traffic stays quiet there;
+/// an explicit `--log-file` replaces stderr. `--log-level` sets both
+/// thresholds. The TUI never logs to the terminal (it would corrupt the
+/// interface): when its default file cannot be opened, no logger is
+/// installed.
 pub(super) struct MexLogger;
 
 pub(super) static LOGGER: MexLogger = MexLogger;
