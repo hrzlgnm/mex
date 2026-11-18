@@ -67,6 +67,7 @@ jobs:
       aur: ${{ steps.filter.outputs.aur }}
       branch: ${{ steps.branch.outputs.branch }}
       code: ${{ steps.filter.outputs.code }}
+      deps: ${{ steps.filter.outputs.deps }}
     steps:
       - name: 🔄 Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -82,6 +83,10 @@ jobs:
               - '.github/workflows/aur-reusable.yml'
               - '.github/actions/latest-release-info/action.yml'
               - 'packaging/**'
+            deps:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/actions/sbom/**'
             code:
               - '.github/actions/setup-*/**'
               - '.github/actions/sbom/**'
@@ -176,6 +181,8 @@ jobs:
       profile: debug
       upload_artifacts: ${{ github.event_name != 'pull_request' }}
       full_matrix: ${{ github.event_name != 'pull_request' }}
+      # PRs scan the SBOM only when dependencies change; main always does.
+      sbom: ${{ github.event_name != 'pull_request' || needs.changes.outputs.deps == 'true' }}
 
   aur:
     name: AUR
