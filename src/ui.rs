@@ -168,7 +168,7 @@ fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
 }
 
 fn draw_body(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, found: &[Anomaly]) {
-    app.body_rect.set(area);
+    app.layout().body_rect.set(area);
     // No gutter: the abutting pane borders are the drag handles, so no
     // space is lost to divider widgets.
     let left = app.left_pct.clamp(15, 80);
@@ -177,8 +177,8 @@ fn draw_body(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, found: &
         .constraints([Constraint::Percentage(left), Constraint::Min(0)])
         .split(area);
 
-    app.left_rect.set(chunks[0]);
-    app.right_rect.set(chunks[1]);
+    app.layout().left_rect.set(chunks[0]);
+    app.layout().right_rect.set(chunks[1]);
     draw_service_list(frame, chunks[0], app, found);
     draw_detail_panel(frame, chunks[1], app, found);
 }
@@ -409,9 +409,9 @@ fn draw_detail_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, 
         ])
         .split(area);
 
-    app.answers_rect.set(panes[0]);
-    app.questions_rect.set(panes[1]);
-    app.hex_rect.set(panes[2]);
+    app.layout().answers_rect.set(panes[0]);
+    app.layout().questions_rect.set(panes[1]);
+    app.layout().hex_rect.set(panes[2]);
     draw_records_tab(frame, panes[0], app, found);
     draw_questions_tab(frame, panes[1], app, found);
     draw_hex_tab(frame, panes[2], app);

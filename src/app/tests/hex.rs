@@ -264,7 +264,7 @@ fn clicking_record_field_highlights_its_wire_bytes() {
 
     app.scroll_hex_edge(false);
     let scrolled = render_to_buffer(&app, 160, 60);
-    let hex_area = app.hex_rect.get();
+    let hex_area = app.layout.hex_rect.get();
     let title_area = Rect::new(hex_area.x, hex_area.y, hex_area.width, 1);
     let (title_x, title_y) = find_buffer_text_in_rect(&scrolled, title_area, "Owner name")
         .expect("selected field remains in the pane title while scrolling");
@@ -440,7 +440,7 @@ fn clicking_question_name_highlights_the_selected_question_in_packet() {
 
     app.scroll_hex_edge(false);
     let scrolled = render_to_buffer(&app, 160, 60);
-    let hex_area = app.hex_rect.get();
+    let hex_area = app.layout.hex_rect.get();
     let title_area = Rect::new(hex_area.x, hex_area.y, hex_area.width, 1);
     let (title_x, title_y) = find_buffer_text_in_rect(&scrolled, title_area, "QCLASS / QU")
         .expect("selected question field stays visible while scrolling");
@@ -747,7 +747,7 @@ fn unknown_record_data_stays_opaque() {
         .expect("unknown record position");
 
     let buffer = render_to_buffer(&app, 160, 60);
-    let hex_area = app.hex_rect.get();
+    let hex_area = app.layout.hex_rect.get();
     assert!(
         find_buffer_text_in_rect(&buffer, hex_area, "RDATA").is_some(),
         "unknown record data should remain identifiable as RDATA"
@@ -856,7 +856,7 @@ fn hex_pane_shows_focus_cue() {
             .expect("last event")
             .raw_bytes = vec![0xAB; 256];
     }
-    app.hex_offset.set(5);
+    app.layout.hex_offset.set(5);
     app.focus = Focus::Hex;
     // Tall enough that the scrolled dump keeps a viewport in the
     // four-pane stack.
@@ -922,37 +922,37 @@ fn hex_pane_scrolls_and_resets() {
     app.handle_key(&plain(KeyCode::Tab));
     assert_eq!(app.focus, Focus::Hex);
     // Viewport is recorded at draw; fake 10 rows for the scroll math.
-    app.hex_viewport.set(10);
+    app.layout.hex_viewport.set(10);
     app.handle_key(&plain(KeyCode::Char('j')));
-    assert_eq!(app.hex_offset.get(), 1);
+    assert_eq!(app.layout.hex_offset.get(), 1);
     app.handle_key(&plain(KeyCode::Char(' ')));
-    assert_eq!(app.hex_offset.get(), 11);
+    assert_eq!(app.layout.hex_offset.get(), 11);
     app.handle_key(&plain(KeyCode::Home));
-    assert_eq!(app.hex_offset.get(), 0);
+    assert_eq!(app.layout.hex_offset.get(), 0);
     app.handle_key(&plain(KeyCode::End));
-    assert!(app.hex_offset.get() > 1000);
+    assert!(app.layout.hex_offset.get() > 1000);
     // Moving the record cursor restarts the dump at the top.
     app.handle_key(&plain(KeyCode::BackTab));
     app.handle_key(&plain(KeyCode::BackTab));
     assert_eq!(app.focus, Focus::Answers);
     app.handle_key(&plain(KeyCode::Char('k')));
-    assert_eq!(app.hex_offset.get(), 0);
+    assert_eq!(app.layout.hex_offset.get(), 0);
     // Clicking another row restarts the dump; re-clicking keeps scroll.
-    app.answers_rect.set(Rect::new(33, 3, 67, 30));
-    app.right_rect.set(Rect::new(33, 3, 67, 30));
-    app.detail_offset.set(0);
-    app.hex_offset.set(5);
+    app.layout.answers_rect.set(Rect::new(33, 3, 67, 30));
+    app.layout.right_rect.set(Rect::new(33, 3, 67, 30));
+    app.layout.detail_offset.set(0);
+    app.layout.hex_offset.set(5);
     app.click_answers(3 + 2 + 1);
     assert_eq!(app.detail_selected, 0);
-    assert_eq!(app.hex_offset.get(), 0);
-    app.hex_offset.set(5);
+    assert_eq!(app.layout.hex_offset.get(), 0);
+    app.layout.hex_offset.set(5);
     app.click_answers(3 + 2 + 1);
-    assert_eq!(app.hex_offset.get(), 5);
+    assert_eq!(app.layout.hex_offset.get(), 5);
     // Clicking the hex pane focuses it for scrolling.
-    app.left_rect.set(Rect::new(0, 3, 33, 30));
-    app.answers_rect.set(Rect::new(33, 3, 67, 8));
-    app.questions_rect.set(Rect::new(33, 11, 67, 13));
-    app.hex_rect.set(Rect::new(33, 24, 67, 9));
+    app.layout.left_rect.set(Rect::new(0, 3, 33, 30));
+    app.layout.answers_rect.set(Rect::new(33, 3, 67, 8));
+    app.layout.questions_rect.set(Rect::new(33, 11, 67, 13));
+    app.layout.hex_rect.set(Rect::new(33, 24, 67, 9));
     app.focus = Focus::Services;
     app.mouse_down(40, 25);
     assert_eq!(app.focus, Focus::Hex);
@@ -961,9 +961,9 @@ fn hex_pane_scrolls_and_resets() {
 #[test]
 fn hex_offset_resets_on_target_change() {
     let mut app = two_group_app();
-    app.hex_offset.set(7);
+    app.layout.hex_offset.set(7);
     select_instance(&mut app, "Test");
-    assert_eq!(app.hex_offset.get(), 0);
+    assert_eq!(app.layout.hex_offset.get(), 0);
 }
 
 #[test]
@@ -997,11 +997,11 @@ fn snap_to_focused_table_resets_hex_scroll() {
     app.handle_key(&plain(KeyCode::Tab));
     assert_eq!(app.focus, Focus::Answers);
     assert!(app.detail_selected < raw_count);
-    app.hex_offset.set(9);
+    app.layout.hex_offset.set(9);
     app.handle_key(&plain(KeyCode::Tab));
     assert_eq!(app.focus, Focus::Questions);
     assert_eq!(app.detail_selected, raw_count);
-    assert_eq!(app.hex_offset.get(), 0);
+    assert_eq!(app.layout.hex_offset.get(), 0);
 }
 
 /// REVERSED-carrying cell styles inside the Questions pane body
@@ -1010,7 +1010,7 @@ fn snap_to_focused_table_resets_hex_scroll() {
 fn questions_reversed_modifiers(app: &App) -> Vec<ratatui::style::Modifier> {
     // Rects are recorded during draw, so render first.
     let buf = render_to_buffer(app, 100, 30);
-    let area = app.questions_rect.get();
+    let area = app.layout.questions_rect.get();
     let mut out = Vec::new();
     for y in (area.y + 2)..(area.y + area.height.saturating_sub(1)) {
         for x in (area.x + 1)..(area.x + area.width.saturating_sub(1)) {
@@ -1027,7 +1027,7 @@ fn questions_reversed_modifiers(app: &App) -> Vec<ratatui::style::Modifier> {
 /// Top border line text of the hex pane (carries the pane title).
 fn hex_title_line(app: &App) -> String {
     let buf = render_to_buffer(app, 100, 30);
-    let area = app.hex_rect.get();
+    let area = app.layout.hex_rect.get();
     let mut s = String::new();
     for x in area.x..(area.x + area.width) {
         if let Some(cell) = buf.cell((x, area.y)) {
@@ -1041,9 +1041,9 @@ fn hex_title_line(app: &App) -> String {
 /// plus the hex pane title line, rendered at the given terminal size.
 fn hex_body_marks(app: &App, width: u16, height: u16) -> (Vec<ratatui::style::Modifier>, String) {
     let buf = render_to_buffer(app, width, height);
-    let area = app.hex_rect.get();
+    let area = app.layout.hex_rect.get();
     let empty = app.selected_detail_bytes().is_none() && app.latest_event_for_selected().is_none();
-    let offset = app.hex_offset.get();
+    let offset = app.layout.hex_offset.get();
     let mut mods = Vec::new();
     for (i, y) in ((area.y + 1)..(area.y + area.height.saturating_sub(1))).enumerate() {
         // Skip the "Hex dump" header + blank line; the empty message
@@ -1114,7 +1114,7 @@ fn srv_wire() -> Vec<u8> {
 /// cursor marker.
 fn answers_reversed_modifiers(app: &App) -> Vec<ratatui::style::Modifier> {
     let buf = render_to_buffer(app, 100, 30);
-    let area = app.answers_rect.get();
+    let area = app.layout.answers_rect.get();
     let mut out = Vec::new();
     for y in (area.y + 2)..(area.y + area.height.saturating_sub(1)) {
         for x in (area.x + 1)..(area.x + area.width.saturating_sub(1)) {

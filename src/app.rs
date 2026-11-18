@@ -1,7 +1,8 @@
 // Copyright 2026 hrzlgnm
 // SPDX-License-Identifier: MIT
 
-use std::cell::{Cell, RefCell};
+pub use layout::Layout;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -657,31 +658,15 @@ fn fmt_bytes(bytes: u64) -> String {
 pub struct App {
     pub services: Vec<ServiceEntry>,
     pub selected_display: usize,
-    pub list_offset: Cell<usize>,
-    /// Visible rows of the service list pane (minus borders), recorded
-    /// during draw so PageUp/PageDown paging matches the viewport.
-    pub list_viewport: Cell<usize>,
-    /// Visible rows of the Answers table (minus header/borders), recorded
-    /// during draw so paging the record cursor matches the viewport.
-    pub record_viewport: Cell<usize>,
     /// Which pane the cursor keys act on. Tab switches panes; arrows and
     /// j/k navigate inside the focused pane.
     pub focus: Focus,
     pub detail_selected: usize,
-    pub detail_offset: Cell<usize>,
     /// Manual scroll of the Answers table (`Ctrl-j/k`): while set, the
     /// viewport stays where the user put it instead of following the
     /// `j/k` cursor, so arbitrarily tall TXT expansions can be paged
     /// through. Any cursor or fold action clears it.
     pub detail_free_scroll: bool,
-    pub questions_offset: Cell<usize>,
-    /// Manual scroll of the Hex pane, which follows the record cursor and
-    /// has no cursor of its own. Reset when the cursor or target changes;
-    /// upper clamping happens at render time, where the line count is known.
-    pub hex_offset: Cell<usize>,
-    /// Visible rows of the Hex pane (minus borders), recorded during draw
-    /// so paging matches the viewport.
-    pub hex_viewport: Cell<usize>,
     /// Currently selected field in the displayed resource record.
     pub hex_selected_field: Cell<Option<usize>>,
     /// Horizontal split: percent of the body width given to the Hosts pane.
@@ -697,14 +682,6 @@ pub struct App {
     /// Pane border under the mouse cursor, for highlight. Updated on
     /// `Moved`/`Drag` events; render-only.
     pub hover: Cell<DragMode>,
-    /// Last-frame geometry for mouse hit-testing (recorded during draw).
-    pub body_rect: Cell<Rect>,
-    pub left_rect: Cell<Rect>,
-    pub right_rect: Cell<Rect>,
-    pub answers_rect: Cell<Rect>,
-    pub questions_rect: Cell<Rect>,
-    pub hex_rect: Cell<Rect>,
-    pub(crate) hex_field_hits: RefCell<Vec<(Rect, usize)>>,
     pub packet_count: u64,
     pub start_time: Instant,
     pub running: bool,
@@ -716,12 +693,6 @@ pub struct App {
     pub interfaces: Option<HashSet<String>>,
     /// Metrics overlay popup (`m` toggles, `m`/`Esc` closes).
     pub show_metrics: bool,
-    /// Scroll offset inside the metrics popup (viewport recorded at draw).
-    pub metrics_scroll: Cell<usize>,
-    pub metrics_viewport: Cell<usize>,
-    /// Horizontal scroll offset inside the metrics popup, in chars: the
-    /// key column stays frozen while long values pan left.
-    pub metrics_hscroll: Cell<usize>,
     /// Cumulative v2 counters (traffic, queries, suppressions).
     pub metrics: MetricsCounters,
     /// Bumped by anything that can change the list or detail selection
@@ -798,12 +769,6 @@ pub struct App {
     /// `(unattributed)` was the last selected target (sticky like the
     /// service and enumeration keys).
     sticky_unattributed: bool,
-    /// Row -> record index of the Answers table as last drawn (`None` per
-    /// info, block or unowned row), so a click hits what was on screen
-    /// even if findings changed since. `None` before the first draw.
-    pub answers_rows: RefCell<Option<Vec<Option<usize>>>>,
-    /// Row -> question index of the Questions table as last drawn.
-    pub questions_rows: RefCell<Option<Vec<Option<usize>>>>,
     /// Selectable enumeration row. Always present so our own enumeration
     /// demand has a home; answers and questions file here instead of
     /// being skipped as noise.
@@ -826,6 +791,8 @@ pub struct App {
     /// Transient confirmation popup (e.g. state-dump result), shown for
     /// a few seconds and dismissed by any key.
     status_msg: Option<(String, Instant)>,
+    /// Last-frame geometry and scroll offsets; see [`Layout`].
+    layout: Layout,
 }
 
 pub struct ServiceEntry {
@@ -1106,6 +1073,11 @@ fn finding_matches_question(
 }
 
 impl App {
+    /// Last-frame geometry and scroll offsets; see [`Layout`].
+    pub fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
     pub fn new() -> Result<Self> {
         Self::new_with(false, None)
     }
@@ -1129,13 +1101,11 @@ impl App {
             interfaces
         );
         Ok(Self {
+            layout: Layout::default(),
             passive,
             interfaces,
             services: Vec::new(),
             selected_display: 0,
-            list_offset: Cell::new(0),
-            list_viewport: Cell::new(0),
-            record_viewport: Cell::new(0),
             focus: Focus::default(),
             packet_count: 0,
             start_time: Instant::now(),
@@ -1156,11 +1126,7 @@ impl App {
             local_ips: browse::local_ips(),
             overheard: HashMap::new(),
             detail_selected: 0,
-            detail_offset: Cell::new(0),
             detail_free_scroll: false,
-            questions_offset: Cell::new(0),
-            hex_offset: Cell::new(0),
-            hex_viewport: Cell::new(0),
             hex_selected_field: Cell::new(None),
             left_pct: 33,
             // The Answers pane holds finding child rows (#248): it gets
@@ -1169,18 +1135,9 @@ impl App {
             questions_pct: 25,
             drag: DragMode::None,
             hover: Cell::new(DragMode::None),
-            body_rect: Cell::new(Rect::default()),
-            left_rect: Cell::new(Rect::default()),
-            right_rect: Cell::new(Rect::default()),
-            answers_rect: Cell::new(Rect::default()),
-            questions_rect: Cell::new(Rect::default()),
-            hex_rect: Cell::new(Rect::default()),
-            hex_field_hits: RefCell::new(Vec::new()),
             detail_svc_key: None,
             detail_enum_key: None,
             detail_unattributed: false,
-            answers_rows: RefCell::new(None),
-            questions_rows: RefCell::new(None),
             detail_anchor: None,
             sticky_key: None,
             sticky_enum_key: None,
@@ -1202,9 +1159,6 @@ impl App {
             withheld_addrs: HashMap::new(),
             status_msg: None,
             show_metrics: false,
-            metrics_scroll: Cell::new(0),
-            metrics_viewport: Cell::new(0),
-            metrics_hscroll: Cell::new(0),
             metrics: MetricsCounters::default(),
             state_gen: 0,
             clamped_gen: None,
@@ -1611,6 +1565,7 @@ mod denials;
 mod findings;
 mod ingest;
 mod input;
+mod layout;
 mod metrics;
 mod questions;
 mod schedule;

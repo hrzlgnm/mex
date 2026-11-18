@@ -243,7 +243,7 @@ fn question_finding_row_drops_the_querier_and_starts_in_last() {
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| crate::ui::draw_with_findings(f, &app, &found))
         .unwrap();
-    let text = rect_text(term.backend().buffer(), app.questions_rect.get());
+    let text = rect_text(term.backend().buffer(), app.layout.questions_rect.get());
     let lines: Vec<&str> = text.lines().collect();
     let row = lines
         .iter()

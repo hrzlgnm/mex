@@ -96,8 +96,8 @@ impl App {
         if no_ctrl_alt && matches!(key.code, KeyCode::Char('m') | KeyCode::Char('M')) {
             self.show_metrics = !self.show_metrics;
             if self.show_metrics {
-                self.metrics_scroll.set(0);
-                self.metrics_hscroll.set(0);
+                self.layout.metrics_scroll.set(0);
+                self.layout.metrics_hscroll.set(0);
                 // The overlay owns all input while open: drop any active
                 // resize so borders behind it never glow.
                 self.drag = DragMode::None;
@@ -134,7 +134,7 @@ impl App {
                         1
                     })
                 }
-                KeyCode::Char('0') => self.metrics_hscroll.set(0),
+                KeyCode::Char('0') => self.layout.metrics_hscroll.set(0),
                 _ => {}
             }
             return;
@@ -248,8 +248,8 @@ impl App {
     /// / Questions top, then Questions bottom / Hex top horizontally.
     /// Seams win over panes so the border stays grabbable.
     pub(super) fn divider_at(&self, col: u16, row: u16) -> DragMode {
-        let left = self.left_rect.get();
-        let right = self.right_rect.get();
+        let left = self.layout.left_rect.get();
+        let right = self.layout.right_rect.get();
         if left.width > 0 && right.width > 0 {
             let left_edge = left.x.saturating_add(left.width.saturating_sub(1));
             if (col == left_edge || col == right.x)
@@ -259,8 +259,8 @@ impl App {
                 return DragMode::Vertical;
             }
         }
-        let answers = self.answers_rect.get();
-        let questions = self.questions_rect.get();
+        let answers = self.layout.answers_rect.get();
+        let questions = self.layout.questions_rect.get();
         if answers.height > 0 && questions.height > 0 {
             let bottom = answers.y.saturating_add(answers.height.saturating_sub(1));
             if (row == bottom || row == questions.y)
@@ -270,7 +270,7 @@ impl App {
                 return DragMode::HorizUpper;
             }
         }
-        let hex = self.hex_rect.get();
+        let hex = self.layout.hex_rect.get();
         if questions.height > 0 && hex.height > 0 {
             let bottom = questions
                 .y
@@ -286,17 +286,17 @@ impl App {
     }
 
     pub(super) fn set_left_from_x(&mut self, col: u16) {
-        let pct = Self::pct_from_x(col, self.body_rect.get());
+        let pct = Self::pct_from_x(col, self.layout.body_rect.get());
         self.left_pct = Self::clamp_left_pct(pct);
     }
 
     pub(super) fn set_answers_from_y(&mut self, row: u16) {
-        let pct = Self::pct_from_y(row, self.right_rect.get());
+        let pct = Self::pct_from_y(row, self.layout.right_rect.get());
         self.answers_pct = Self::clamp_pane_pct(pct, self.questions_pct);
     }
 
     pub(super) fn set_questions_from_y(&mut self, row: u16) {
-        let combined = Self::pct_from_y(row, self.right_rect.get());
+        let combined = Self::pct_from_y(row, self.layout.right_rect.get());
         let want = combined.saturating_sub(self.answers_pct);
         self.questions_pct = Self::clamp_pane_pct(want, self.answers_pct);
     }
@@ -360,13 +360,13 @@ impl App {
                 return;
             }
         }
-        if Self::point_in(self.left_rect.get(), col, row) {
+        if Self::point_in(self.layout.left_rect.get(), col, row) {
             self.click_service_list(row);
-        } else if Self::point_in(self.answers_rect.get(), col, row) {
+        } else if Self::point_in(self.layout.answers_rect.get(), col, row) {
             self.click_answers(row);
-        } else if Self::point_in(self.questions_rect.get(), col, row) {
+        } else if Self::point_in(self.layout.questions_rect.get(), col, row) {
             self.click_questions(row);
-        } else if Self::point_in(self.hex_rect.get(), col, row) {
+        } else if Self::point_in(self.layout.hex_rect.get(), col, row) {
             // The hex pane follows the cursor; clicking focuses it so its
             // keys scroll the dump.
             self.focus = Focus::Hex;
@@ -376,6 +376,7 @@ impl App {
 
     pub(super) fn click_hex_field(&self, col: u16, row: u16) {
         if let Some((_, index)) = self
+            .layout
             .hex_field_hits
             .borrow()
             .iter()
@@ -427,7 +428,7 @@ impl App {
     /// keyboard rule that expanded headers are not selectable stops.
     pub(super) fn click_service_list(&mut self, row: u16) {
         self.focus = Focus::Services;
-        let area = self.left_rect.get();
+        let area = self.layout.left_rect.get();
         if area.height < 3
             || row <= area.y
             || row >= area.y.saturating_add(area.height).saturating_sub(1)
@@ -435,7 +436,7 @@ impl App {
             return;
         }
         let rel = row.saturating_sub(area.y.saturating_add(1)) as usize;
-        let idx = self.list_offset.get().saturating_add(rel);
+        let idx = self.layout.list_offset.get().saturating_add(rel);
         let items = self.display_items();
         let Some(item) = items.get(idx) else {
             return;
@@ -485,7 +486,7 @@ impl App {
         // Finding and TXT child rows select their parent record, info and
         // block rows nothing. Hit-test the frame as drawn: findings can
         // change between drawing and the click.
-        if let Some(rows) = self.answers_rows.borrow().as_ref() {
+        if let Some(rows) = self.layout.answers_rows.borrow().as_ref() {
             return rows.get(table_row).copied().flatten();
         }
         // Nothing drawn for this target yet: the current layout.
@@ -498,7 +499,7 @@ impl App {
 
     pub(super) fn click_answers(&mut self, row: u16) {
         self.focus = Focus::Answers;
-        let area = self.answers_rect.get();
+        let area = self.layout.answers_rect.get();
         if area.height < 3 || row < area.y.saturating_add(2) {
             return;
         }
@@ -506,7 +507,7 @@ impl App {
             return;
         }
         let rel = row.saturating_sub(area.y.saturating_add(2)) as usize;
-        let table_row = self.detail_offset.get().saturating_add(rel);
+        let table_row = self.layout.detail_offset.get().saturating_add(rel);
         if let Some(idx) = self.answers_table_row_to_detail(table_row) {
             // Stay on the clicked target: the cursor follows the click
             // instead of the manual-scroll viewport. A new row also
@@ -524,7 +525,7 @@ impl App {
 
     pub(super) fn click_questions(&mut self, row: u16) {
         self.focus = Focus::Questions;
-        let area = self.questions_rect.get();
+        let area = self.layout.questions_rect.get();
         if area.height < 3 || row < area.y.saturating_add(2) {
             return;
         }
@@ -536,10 +537,11 @@ impl App {
             return;
         };
         let raws = target.ordered_answers().len();
-        let table_row = self.questions_offset.get().saturating_add(rel);
+        let table_row = self.layout.questions_offset.get().saturating_add(rel);
         // Each question row is followed by its finding rows (#248); hit
         // the frame as drawn, else the current layout.
         let drawn = self
+            .layout
             .questions_rows
             .borrow()
             .as_ref()
@@ -668,7 +670,7 @@ impl App {
     /// (PageUp/PageDown/b/f/Space). Falls back to 10 stops before the
     /// first draw answers the real height.
     pub(super) fn page_selection(&mut self, pages: isize) {
-        let per_page = self.list_viewport.get().max(1) as isize;
+        let per_page = self.layout.list_viewport.get().max(1) as isize;
         let steps = pages * per_page;
         let n = steps.unsigned_abs().min(1000);
         for _ in 0..n {
@@ -886,7 +888,7 @@ impl App {
     /// Page the record cursor by one Answers-table viewport. Falls back
     /// to 10 rows before the first draw answers the real height.
     pub(super) fn page_detail(&mut self, pages: isize) {
-        let per_page = self.record_viewport.get().max(1) as isize;
+        let per_page = self.layout.record_viewport.get().max(1) as isize;
         let steps = pages * per_page;
         let n = steps.unsigned_abs().min(1000);
         for _ in 0..n {
@@ -902,13 +904,13 @@ impl App {
     /// it there until the cursor, selection, or expansion changes. Upper
     /// clamping happens at render time, where the row count is known.
     pub(super) fn scroll_detail(&mut self, delta: isize) {
-        let cur = self.detail_offset.get();
+        let cur = self.layout.detail_offset.get();
         let next = if delta < 0 {
             cur.saturating_sub(delta.unsigned_abs())
         } else {
             cur.saturating_add(delta.unsigned_abs())
         };
-        self.detail_offset.set(next);
+        self.layout.detail_offset.set(next);
         self.detail_free_scroll = true;
     }
 
@@ -944,51 +946,51 @@ impl App {
     /// Nudge the Hex viewport; the dump follows the record cursor, so
     /// there is no cursor to resume and no pin flag.
     pub(super) fn scroll_hex(&mut self, delta: isize) {
-        Self::bump_offset(&self.hex_offset, delta);
+        Self::bump_offset(&self.layout.hex_offset, delta);
     }
 
     pub(super) fn scroll_hex_edge(&mut self, first: bool) {
         if first {
-            self.hex_offset.set(0);
+            self.layout.hex_offset.set(0);
         } else {
-            self.hex_offset.set(usize::MAX / 2);
+            self.layout.hex_offset.set(usize::MAX / 2);
         }
     }
 
     pub(super) fn page_hex(&mut self, pages: isize) {
-        let steps = Self::page_offset(&self.hex_viewport, pages);
+        let steps = Self::page_offset(&self.layout.hex_viewport, pages);
         self.scroll_hex(steps);
     }
 
     /// New detail row: restart the hex dump at the top.
     pub(super) fn restart_for_new_row(&mut self) {
-        self.hex_offset.set(0);
+        self.layout.hex_offset.set(0);
         self.hex_selected_field.set(None);
-        self.hex_field_hits.borrow_mut().clear();
+        self.layout.hex_field_hits.borrow_mut().clear();
     }
 
     /// Scroll the metrics overlay; upper clamping happens at render time.
     pub(super) fn scroll_metrics(&mut self, delta: isize) {
-        Self::bump_offset(&self.metrics_scroll, delta);
+        Self::bump_offset(&self.layout.metrics_scroll, delta);
     }
 
     pub(super) fn scroll_metrics_edge(&mut self, first: bool) {
         if first {
-            self.metrics_scroll.set(0);
+            self.layout.metrics_scroll.set(0);
         } else {
-            self.metrics_scroll.set(usize::MAX / 2);
+            self.layout.metrics_scroll.set(usize::MAX / 2);
         }
     }
 
     pub(super) fn page_metrics(&mut self, pages: isize) {
-        let steps = Self::page_offset(&self.metrics_viewport, pages);
+        let steps = Self::page_offset(&self.layout.metrics_viewport, pages);
         self.scroll_metrics(steps);
     }
 
     /// Pan the metrics overlay horizontally (chars); upper clamping
     /// happens at render time against the longest value.
     pub(super) fn scroll_metrics_h(&mut self, delta: isize) {
-        Self::bump_offset(&self.metrics_hscroll, delta);
+        Self::bump_offset(&self.layout.metrics_hscroll, delta);
     }
 
     /// Identity of the table row at an index (raw answers first, then
@@ -1064,7 +1066,7 @@ impl App {
         if svc_key.is_none() && enum_key.is_none() && !unattributed {
             // Headers select no row: no field stays highlighted.
             self.hex_selected_field.set(None);
-            self.hex_field_hits.borrow_mut().clear();
+            self.layout.hex_field_hits.borrow_mut().clear();
             return;
         }
         if self.detail_svc_key != svc_key
@@ -1075,12 +1077,12 @@ impl App {
             self.detail_enum_key = enum_key;
             self.detail_unattributed = unattributed;
             // The drawn row maps belong to the old target.
-            self.answers_rows.replace(None);
-            self.questions_rows.replace(None);
+            self.layout.answers_rows.replace(None);
+            self.layout.questions_rows.replace(None);
             self.detail_selected = 0;
-            self.detail_offset.set(0);
+            self.layout.detail_offset.set(0);
             self.detail_free_scroll = false;
-            self.questions_offset.set(0);
+            self.layout.questions_offset.set(0);
             self.restart_for_new_row();
             self.detail_anchor = self
                 .display_detail()
@@ -1101,7 +1103,7 @@ impl App {
                 // Tracked row expired away (capped question list): park on
                 // the last raw record instead of pointing at shifted churn.
                 self.hex_selected_field.set(None);
-                self.hex_field_hits.borrow_mut().clear();
+                self.layout.hex_field_hits.borrow_mut().clear();
                 let parked = self
                     .display_detail()
                     .map(|d| d.ordered_answers().len().saturating_sub(1))
@@ -1144,11 +1146,11 @@ impl App {
         ) {
             self.move_selection(-1);
         }
-        if self.selected_display < self.list_offset.get() {
-            self.list_offset.set(self.selected_display);
+        if self.selected_display < self.layout.list_offset.get() {
+            self.layout.list_offset.set(self.selected_display);
         }
-        if self.list_offset.get() > max {
-            self.list_offset.set(max.saturating_sub(1));
+        if self.layout.list_offset.get() > max {
+            self.layout.list_offset.set(max.saturating_sub(1));
         }
         // The first header is not a selectable stop, so plain
         // follow-the-cursor scrolling would strand the viewport at
@@ -1157,8 +1159,8 @@ impl App {
         if let Some(first) = items.iter().position(|it| self.is_selectable(it)) {
             if self.selected_display == first {
                 let top = first.saturating_sub(1);
-                if self.list_offset.get() > top {
-                    self.list_offset.set(top);
+                if self.layout.list_offset.get() > top {
+                    self.layout.list_offset.set(top);
                 }
             }
         }

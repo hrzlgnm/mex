@@ -406,7 +406,7 @@ fn legacy_aaaa_denial() -> browse::RawRecord {
 /// Answers pane text, one line per table row (borders included).
 fn answers_text(app: &App) -> Vec<String> {
     let buf = render_to_buffer(app, 160, 40);
-    rect_text(&buf, app.answers_rect.get())
+    rect_text(&buf, app.layout.answers_rect.get())
         .lines()
         .map(str::to_string)
         .collect()

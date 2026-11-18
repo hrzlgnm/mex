@@ -175,7 +175,7 @@ fn finding_row_under_its_record_drops_source_icon_and_severity_word() {
     app.evict_expired();
     select_instance(&mut app, "Test");
     let buf = render_to_buffer(&app, 160, 40);
-    let area = app.answers_rect.get();
+    let area = app.layout.answers_rect.get();
     let text = rect_text(&buf, area);
     let line = text
         .lines()
@@ -235,7 +235,7 @@ fn shared_identity_findings_name_their_rdata() {
     assert_eq!(row_kinds(&app, 1, "192.168.1.10"), ["ttl-low"]);
     assert_eq!(row_kinds(&app, 1, "192.168.1.11"), ["ttl-low"]);
     let buf = render_to_buffer(&app, 200, 40);
-    let text = rect_text(&buf, app.answers_rect.get());
+    let text = rect_text(&buf, app.layout.answers_rect.get());
     for rdata in ["192.168.1.10", "192.168.1.11"] {
         assert!(
             text.contains(&format!("A test.local. = {rdata}")),

@@ -97,7 +97,7 @@ fn worst_finding_picks_the_row_marker() {
             .unwrap();
         term.backend().buffer().clone()
     };
-    let text = rect_text(&buf, app.answers_rect.get());
+    let text = rect_text(&buf, app.layout.answers_rect.get());
     let warn = icon(anomalies::Severity::Warning);
     assert!(
         text.lines().any(|l| l.contains(&format!("TXT {warn}"))),
@@ -165,7 +165,7 @@ fn cursor_skips_finding_rows() {
     }
     // The highlighted (REVERSED) row is the SRV row, not a child.
     let buf = render_to_buffer(&app, 160, 40);
-    let area = app.answers_rect.get();
+    let area = app.layout.answers_rect.get();
     let reversed: String = (area.y..area.y + area.height)
         .filter(|&y| {
             buf.cell((area.x + 2, y))
@@ -313,7 +313,7 @@ fn badges_count_info_and_enumeration_findings() {
         .filter(|a| a.service == "Test._http._tcp.local")
         .count();
     let buf = render_to_buffer(&app, 160, 40);
-    let hosts = rect_text(&buf, app.left_rect.get());
+    let hosts = rect_text(&buf, app.layout.left_rect.get());
     let warn = icon(anomalies::Severity::Warning);
     let info = icon(anomalies::Severity::Info);
     let test_row = hosts.lines().find(|l| l.contains("Test [")).unwrap();
@@ -381,7 +381,7 @@ fn unattributed_entry_lists_ownerless_findings_until_an_owner_appears() {
         .filter(|a| a.service == anomalies::UNATTRIBUTED_SERVICE)
         .count();
     let buf = render_to_buffer(&app, 160, 40);
-    let hosts = rect_text(&buf, app.left_rect.get());
+    let hosts = rect_text(&buf, app.layout.left_rect.get());
     let header = hosts
         .lines()
         .find(|l| l.contains("(unattributed)"))
@@ -486,11 +486,11 @@ fn folding_unattributed_keeps_it_as_the_detail_target() {
 #[test]
 fn entering_unattributed_resets_the_answers_viewport() {
     let (mut app, pos) = app_with_unattributed();
-    app.detail_offset.set(5);
+    app.layout.detail_offset.set(5);
     app.detail_free_scroll = true;
     app.selected_display = pos;
     app.clamp_selection();
-    assert_eq!(app.detail_offset.get(), 0);
+    assert_eq!(app.layout.detail_offset.get(), 0);
     assert!(!app.detail_free_scroll);
 }
 
@@ -498,7 +498,7 @@ fn entering_unattributed_resets_the_answers_viewport() {
 fn answers_click_hits_the_row_as_drawn() {
     let mut app = App::new().unwrap();
     service_with_txt(&mut app, "a=1; b=2");
-    app.detail_offset.set(0);
+    app.layout.detail_offset.set(0);
     // Draw a frame without the PTR's ttl-mismatch child: SRV sits on
     // table row 2 (srvc, PTR, SRV).
     let drawn: Vec<anomalies::Anomaly> = app
@@ -510,7 +510,7 @@ fn answers_click_hits_the_row_as_drawn() {
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| crate::ui::draw_with_findings(f, &app, &drawn))
         .unwrap();
-    let area = app.answers_rect.get();
+    let area = app.layout.answers_rect.get();
     // The live analyzer still has the PTR finding, which would put a
     // child row at table row 2; the click must follow the frame.
     app.click_answers(area.y + 2 + 2);
