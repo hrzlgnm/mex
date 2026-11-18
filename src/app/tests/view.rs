@@ -184,9 +184,9 @@ fn tiny_terminal_renders_every_right_pane() {
         // own title inside its own rect — not just somewhere in the
         // buffer.
         for (rect, title) in [
-            (&app.answers_rect, "Answers"),
-            (&app.questions_rect, "Questions"),
-            (&app.hex_rect, "Raw Packet"),
+            (&app.layout.answers_rect, "Answers"),
+            (&app.layout.questions_rect, "Questions"),
+            (&app.layout.hex_rect, "Raw Packet"),
         ] {
             let area = rect.get();
             assert!(area.height >= 1, "{width}x{height}: every pane keeps a row");
@@ -205,7 +205,7 @@ fn synthetic_rows_and_hostnames_render_italic() {
     let buf = render_to_buffer(&app, 100, 30);
     // Host group header: the display name after the glyph is italic,
     // the count and addresses are not.
-    let area = app.left_rect.get();
+    let area = app.layout.left_rect.get();
     let mut header = None;
     for y in (area.y + 1)..(area.y + area.height.saturating_sub(1)) {
         let mut row = String::new();
@@ -232,7 +232,7 @@ fn synthetic_rows_and_hostnames_render_italic() {
         "only the hostname is italic"
     );
     // Detail table synthetic rows (`srvc`, …) are italic throughout.
-    let area = app.answers_rect.get();
+    let area = app.layout.answers_rect.get();
     let label_cell = buf.cell((area.x + 1, area.y + 2)).expect("srvc cell");
     assert_eq!(label_cell.symbol(), "s");
     assert!(
@@ -256,7 +256,7 @@ fn txt_children_render_upright() {
     app.handle_key(&key(KeyCode::Tab));
     app.handle_key(&key(KeyCode::Enter));
     let buf = render_to_buffer(&app, 100, 30);
-    let area = app.answers_rect.get();
+    let area = app.layout.answers_rect.get();
     // Expanded TXT pair rows show verbatim wire content: green like
     // the header rows, but never italic.
     let mut pair = None;

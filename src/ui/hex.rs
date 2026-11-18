@@ -17,7 +17,9 @@ pub(super) fn draw_hex_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: 
     // record, the query packet of the selected question row, otherwise the
     // whole latest packet for the service. Tab focuses it; j/k and paging
     // keys then scroll, and the offset resets when the cursor moves.
-    app.hex_viewport.set(area.height.saturating_sub(2) as usize);
+    app.layout()
+        .hex_viewport
+        .set(area.height.saturating_sub(2) as usize);
     let (dump, title, selected_field_label) =
         if let Some((bytes, title)) = app.selected_detail_bytes() {
             let fields = app.selected_detail_fields().unwrap_or_default();
@@ -63,14 +65,18 @@ pub(super) fn draw_hex_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: 
             };
             let empty = Paragraph::new("No raw packet data available").style(empty_style);
             frame.render_widget(empty, area);
-            app.hex_field_hits.borrow_mut().clear();
+            app.layout().hex_field_hits.borrow_mut().clear();
             return;
         };
 
     let total = dump.lines.len();
-    let offset = clamp_scroll(app.hex_offset.get(), total, app.hex_viewport.get());
-    app.hex_offset.set(offset);
-    *app.hex_field_hits.borrow_mut() = dump
+    let offset = clamp_scroll(
+        app.layout().hex_offset.get(),
+        total,
+        app.layout().hex_viewport.get(),
+    );
+    app.layout().hex_offset.set(offset);
+    *app.layout().hex_field_hits.borrow_mut() = dump
         .field_positions
         .iter()
         .filter_map(|position| {

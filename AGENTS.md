@@ -81,7 +81,9 @@ Headless run (no TTY) logs to stderr.
   (unresolved targets, address-query evidence), `naming` (service type,
   label and subtype checks), `questions` (question verdicts), `scope`
   (finding display scopes).
-* `src/ui.rs` — ratatui rendering only, no state mutations.
+* `src/ui.rs` — ratatui rendering only. The only state draw writes is
+  `app::Layout` (via `App::layout()`): pane geometry, viewport heights,
+  row maps, hex hit boxes and the scroll offsets it clamps.
   Child modules per pane: `services`, `records`, `questions`, `hex`,
   `metrics` (overlay); `ui.rs` keeps terminal init/restore/suspend, the
   frame layout and shared cell/finding helpers.

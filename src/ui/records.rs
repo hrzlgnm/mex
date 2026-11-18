@@ -33,7 +33,8 @@ pub(super) fn draw_records_tab(
     let book = app.address_book();
     let own = own_hosts(&target);
     let (rows, raw_positions) = detail_table_rows(app, &target, &layout, &book, &own);
-    app.answers_rows
+    app.layout()
+        .answers_rows
         .replace(Some(layout.iter().map(|l| l.owning_record()).collect()));
     let total_rows = rows.len();
 
@@ -79,7 +80,8 @@ pub(super) fn draw_records_tab(
     let mut title_spans = vec![Span::raw(format!(" {block_title} "))];
     title_spans.extend(title_count_spans(shown));
     // Visible data rows: borders plus the header row are chrome.
-    app.record_viewport
+    app.layout()
+        .record_viewport
         .set(area.height.saturating_sub(3) as usize);
 
     let table = Table::new(rows, widths)
@@ -128,7 +130,7 @@ pub(super) fn draw_records_tab(
     // keep the parent visible: oversized expansions pin the parent to
     // the top and show the first viewport-full of children (page the
     // rest with Ctrl-j/k).
-    let mut offset = app.detail_offset.get();
+    let mut offset = app.layout().detail_offset.get();
     if !app.detail_free_scroll {
         if let Some(selected) = selected_table_row {
             let extent_end = raw_positions
@@ -155,7 +157,7 @@ pub(super) fn draw_records_tab(
     });
     *tstate.offset_mut() = offset;
     frame.render_stateful_widget(table, area, &mut tstate);
-    app.detail_offset.set(tstate.offset());
+    app.layout().detail_offset.set(tstate.offset());
 }
 
 /// Viewport offset that keeps `selected` visible and pulls the child

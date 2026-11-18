@@ -147,29 +147,29 @@ fn metrics_toggle_and_scroll_keys() {
     assert!(!app.show_metrics);
     app.handle_key(&key(KeyCode::Char('m')));
     assert!(app.show_metrics);
-    assert_eq!(app.metrics_scroll.get(), 0);
-    assert_eq!(app.metrics_hscroll.get(), 0);
+    assert_eq!(app.layout.metrics_scroll.get(), 0);
+    assert_eq!(app.layout.metrics_hscroll.get(), 0);
     app.handle_key(&key(KeyCode::Char('j')));
-    assert_eq!(app.metrics_scroll.get(), 1);
+    assert_eq!(app.layout.metrics_scroll.get(), 1);
     app.handle_key(&key(KeyCode::Char('k')));
-    assert_eq!(app.metrics_scroll.get(), 0);
+    assert_eq!(app.layout.metrics_scroll.get(), 0);
     // Uppercase reports the same intent.
     app.handle_key(&key(KeyCode::Char('J')));
-    assert_eq!(app.metrics_scroll.get(), 1);
+    assert_eq!(app.layout.metrics_scroll.get(), 1);
     app.handle_key(&key(KeyCode::Char('K')));
-    assert_eq!(app.metrics_scroll.get(), 0);
+    assert_eq!(app.layout.metrics_scroll.get(), 0);
     // Horizontal pan: h/l and arrows move one char, Ctrl jumps ten,
     // `0` jumps back. The key column stays frozen (no vertical move).
     app.handle_key(&key(KeyCode::Char('l')));
-    assert_eq!(app.metrics_hscroll.get(), 1);
+    assert_eq!(app.layout.metrics_hscroll.get(), 1);
     app.handle_key(&key(KeyCode::Right));
-    assert_eq!(app.metrics_hscroll.get(), 2);
+    assert_eq!(app.layout.metrics_hscroll.get(), 2);
     app.handle_key(&key(KeyCode::Char('h')));
-    assert_eq!(app.metrics_hscroll.get(), 1);
+    assert_eq!(app.layout.metrics_hscroll.get(), 1);
     app.handle_key(&key(KeyCode::Left));
-    assert_eq!(app.metrics_hscroll.get(), 0);
+    assert_eq!(app.layout.metrics_hscroll.get(), 0);
     app.handle_key(&key(KeyCode::Char('h')));
-    assert_eq!(app.metrics_hscroll.get(), 0);
+    assert_eq!(app.layout.metrics_hscroll.get(), 0);
     let ctrl = |code| KeyEvent {
         code,
         modifiers: KeyModifiers::CONTROL,
@@ -177,14 +177,14 @@ fn metrics_toggle_and_scroll_keys() {
         state: KeyEventState::empty(),
     };
     app.handle_key(&ctrl(KeyCode::Char('l')));
-    assert_eq!(app.metrics_hscroll.get(), 10);
+    assert_eq!(app.layout.metrics_hscroll.get(), 10);
     app.handle_key(&ctrl(KeyCode::Right));
-    assert_eq!(app.metrics_hscroll.get(), 20);
+    assert_eq!(app.layout.metrics_hscroll.get(), 20);
     app.handle_key(&key(KeyCode::Char('0')));
-    assert_eq!(app.metrics_hscroll.get(), 0);
-    assert_eq!(app.metrics_scroll.get(), 0);
+    assert_eq!(app.layout.metrics_hscroll.get(), 0);
+    assert_eq!(app.layout.metrics_scroll.get(), 0);
     app.handle_key(&key(KeyCode::Char('k')));
-    assert_eq!(app.metrics_scroll.get(), 0);
+    assert_eq!(app.layout.metrics_scroll.get(), 0);
     // Tab must not escape the overlay.
     app.handle_key(&key(KeyCode::Tab));
     assert!(app.show_metrics);
@@ -346,11 +346,11 @@ fn metrics_overlay_suppresses_resize_hover() {
     };
     use ratatui::layout::Rect;
     let mut app = App::new().unwrap();
-    app.left_rect.set(Rect::new(0, 3, 33, 30));
-    app.right_rect.set(Rect::new(33, 3, 67, 30));
-    app.answers_rect.set(Rect::new(33, 3, 67, 10));
-    app.questions_rect.set(Rect::new(33, 13, 67, 8));
-    app.hex_rect.set(Rect::new(33, 21, 67, 12));
+    app.layout.left_rect.set(Rect::new(0, 3, 33, 30));
+    app.layout.right_rect.set(Rect::new(33, 3, 67, 30));
+    app.layout.answers_rect.set(Rect::new(33, 3, 67, 10));
+    app.layout.questions_rect.set(Rect::new(33, 13, 67, 8));
+    app.layout.hex_rect.set(Rect::new(33, 21, 67, 12));
     let moved = MouseEvent {
         kind: MouseEventKind::Moved,
         column: 32,

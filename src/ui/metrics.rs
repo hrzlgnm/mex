@@ -7,9 +7,9 @@ pub(super) fn draw_metrics_overlay(frame: &mut Frame, app: &App, found: &[Anomal
     let rows = app.metrics_rows_in(found);
     let total = rows.len();
     let viewport = (area.height as usize).saturating_sub(4);
-    app.metrics_viewport.set(viewport);
-    let offset = clamp_scroll(app.metrics_scroll.get(), total, viewport);
-    app.metrics_scroll.set(offset);
+    app.layout().metrics_viewport.set(viewport);
+    let offset = clamp_scroll(app.layout().metrics_scroll.get(), total, viewport);
+    app.layout().metrics_scroll.set(offset);
 
     // Compact key column: size to the longest key (single-space indent
     // plus one cell of padding) instead of a fixed 38% split, so values
@@ -35,10 +35,11 @@ pub(super) fn draw_metrics_overlay(frame: &mut Frame, app: &App, found: &[Anomal
         .max()
         .unwrap_or(0);
     let hscroll = app
+        .layout()
         .metrics_hscroll
         .get()
         .min(longest.saturating_sub(value_w.max(1)));
-    app.metrics_hscroll.set(hscroll);
+    app.layout().metrics_hscroll.set(hscroll);
 
     let section_style = Style::default()
         .add_modifier(Modifier::BOLD)
@@ -79,7 +80,7 @@ pub(super) fn draw_metrics_overlay(frame: &mut Frame, app: &App, found: &[Anomal
     let mut state = TableState::default();
     *state.offset_mut() = offset;
     frame.render_stateful_widget(table, area, &mut state);
-    app.metrics_scroll.set(state.offset());
+    app.layout().metrics_scroll.set(state.offset());
 }
 
 /// Skip `skip` chars of `s` for horizontal panning. Char-boundary safe;

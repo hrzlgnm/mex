@@ -131,7 +131,7 @@ fn questions_pane_names_queriers_and_keeps_one_shot() {
         ));
     }
     let buf = render_to_buffer(&app, 200, 40);
-    let text = rect_text(&buf, app.questions_rect.get());
+    let text = rect_text(&buf, app.layout.questions_rect.get());
     assert!(
         text.contains(&format!("{REPEATER} (FritzBoxRepeater)")),
         "{text}"

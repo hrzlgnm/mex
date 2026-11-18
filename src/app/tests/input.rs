@@ -80,9 +80,9 @@ fn scroll_pins_viewport_and_cursor_resumes_follow() {
     // uses J instead.
     app.handle_key(&plain(KeyCode::Char('J')));
     assert!(app.detail_free_scroll);
-    assert_eq!(app.detail_offset.get(), 1);
+    assert_eq!(app.layout.detail_offset.get(), 1);
     app.handle_key(&ctrl(KeyCode::Char('k')));
-    assert_eq!(app.detail_offset.get(), 0);
+    assert_eq!(app.layout.detail_offset.get(), 0);
     // Tab focuses Answers; moving the record cursor resumes follow.
     app.handle_key(&plain(KeyCode::Tab));
     assert_eq!(app.focus, Focus::Answers);
@@ -231,7 +231,7 @@ fn records_home_end_and_paging() {
         kind: KeyEventKind::Press,
         state: KeyEventState::empty(),
     };
-    app.record_viewport.set(2);
+    app.layout.record_viewport.set(2);
     app.handle_key(&key(KeyCode::Tab));
     app.handle_key(&key(KeyCode::End));
     assert_eq!(app.detail_selected, 2);
@@ -326,7 +326,7 @@ fn arrows_jump_between_groups_like_hl() {
 #[test]
 fn home_end_and_space_paging() {
     let mut app = two_group_app();
-    app.list_viewport.set(2);
+    app.layout.list_viewport.set(2);
     let stops = selectable_positions(&app);
     let (first, last) = (stops[0], *stops.last().unwrap());
     app.handle_key(&plain_key(KeyCode::End));
@@ -354,13 +354,13 @@ fn shift_arrows_and_jk_scroll_detail() {
     };
     app.handle_key(&shift(KeyCode::Down));
     assert!(app.detail_free_scroll);
-    assert_eq!(app.detail_offset.get(), 1);
+    assert_eq!(app.layout.detail_offset.get(), 1);
     app.handle_key(&plain_key(KeyCode::Char('J')));
-    assert_eq!(app.detail_offset.get(), 2);
+    assert_eq!(app.layout.detail_offset.get(), 2);
     app.handle_key(&plain_key(KeyCode::Char('K')));
-    assert_eq!(app.detail_offset.get(), 1);
+    assert_eq!(app.layout.detail_offset.get(), 1);
     app.handle_key(&shift(KeyCode::Up));
-    assert_eq!(app.detail_offset.get(), 0);
+    assert_eq!(app.layout.detail_offset.get(), 0);
 }
 
 #[test]
@@ -387,19 +387,19 @@ fn shifted_jk_scroll_in_all_reported_shapes() {
     // Uppercase, with and without SHIFT flagged (terminal-dependent).
     app.handle_key(&plain(KeyCode::Char('J')));
     app.handle_key(&shift(KeyCode::Char('J')));
-    assert_eq!(app.detail_offset.get(), 2);
+    assert_eq!(app.layout.detail_offset.get(), 2);
     assert_eq!(app.detail_selected, cursor);
     app.handle_key(&plain(KeyCode::Char('K')));
     app.handle_key(&shift(KeyCode::Char('K')));
-    assert_eq!(app.detail_offset.get(), 0);
+    assert_eq!(app.layout.detail_offset.get(), 0);
     assert_eq!(app.detail_selected, cursor);
     // Lowercase + SHIFT (other keyboard protocols) scrolls too and
     // never moves the cursor.
     app.handle_key(&shift(KeyCode::Char('j')));
-    assert_eq!(app.detail_offset.get(), 1);
+    assert_eq!(app.layout.detail_offset.get(), 1);
     assert_eq!(app.detail_selected, cursor);
     app.handle_key(&shift(KeyCode::Char('k')));
-    assert_eq!(app.detail_offset.get(), 0);
+    assert_eq!(app.layout.detail_offset.get(), 0);
     assert_eq!(app.detail_selected, cursor);
     assert!(app.detail_free_scroll);
     // Plain lowercase still moves the cursor instead of scrolling.
@@ -460,8 +460,8 @@ fn mouse_pane_splits_clamp_and_convert() {
 fn mouse_drag_moves_splits_with_clamp() {
     use ratatui::layout::Rect;
     let mut app = App::new().unwrap();
-    app.body_rect.set(Rect::new(0, 3, 100, 40));
-    app.right_rect.set(Rect::new(33, 3, 67, 30));
+    app.layout.body_rect.set(Rect::new(0, 3, 100, 40));
+    app.layout.right_rect.set(Rect::new(33, 3, 67, 30));
     app.set_left_from_x(5);
     assert_eq!(app.left_pct, 15);
     app.set_left_from_x(50);
@@ -520,7 +520,7 @@ fn mouse_down_drag_sequence_moves_seams() {
     app.answers_pct = 30;
     app.questions_pct = 25;
     render_to_buffer(&app, 100, 40);
-    let right = app.right_rect.get();
+    let right = app.layout.right_rect.get();
     let bottom = right.y + right.height - 1;
     // Lower seam slammed to the bottom: questions pins at its max,
     // leaving hex its 10%.
@@ -544,8 +544,8 @@ fn mouse_down_drag_sequence_moves_seams() {
 fn pane_shares_keep_minimums_at_extremes() {
     use ratatui::layout::Rect;
     let mut app = App::new().unwrap();
-    app.body_rect.set(Rect::new(0, 3, 100, 40));
-    app.right_rect.set(Rect::new(33, 3, 67, 30));
+    app.layout.body_rect.set(Rect::new(0, 3, 100, 40));
+    app.layout.right_rect.set(Rect::new(33, 3, 67, 30));
     // Slam every divider against the bottom, then the top.
     app.questions_pct = 25;
     app.set_answers_from_y(3 + 30);
@@ -560,7 +560,11 @@ fn pane_shares_keep_minimums_at_extremes() {
     // small sizes: no share collapses to zero rows.
     for (width, height) in [(100, 30), (60, 12)] {
         render_to_buffer(&app, width, height);
-        for pane in [&app.answers_rect, &app.questions_rect, &app.hex_rect] {
+        for pane in [
+            &app.layout.answers_rect,
+            &app.layout.questions_rect,
+            &app.layout.hex_rect,
+        ] {
             assert!(
                 pane.get().height >= 1,
                 "{width}x{height}: slammed shares must still render every pane"
@@ -574,11 +578,11 @@ fn mouse_border_hit_test_prefers_seams() {
     use ratatui::layout::Rect;
     let app = App::new().unwrap();
     // Abutting panes: the two border cells form the grab zone.
-    app.left_rect.set(Rect::new(0, 3, 33, 30));
-    app.right_rect.set(Rect::new(33, 3, 67, 30));
-    app.answers_rect.set(Rect::new(33, 3, 67, 10));
-    app.questions_rect.set(Rect::new(33, 13, 67, 14));
-    app.hex_rect.set(Rect::new(33, 27, 67, 6));
+    app.layout.left_rect.set(Rect::new(0, 3, 33, 30));
+    app.layout.right_rect.set(Rect::new(33, 3, 67, 30));
+    app.layout.answers_rect.set(Rect::new(33, 3, 67, 10));
+    app.layout.questions_rect.set(Rect::new(33, 13, 67, 14));
+    app.layout.hex_rect.set(Rect::new(33, 27, 67, 6));
     // Either border cell grabs vertically.
     assert_eq!(app.divider_at(32, 5), DragMode::Vertical);
     assert_eq!(app.divider_at(33, 5), DragMode::Vertical);
@@ -598,12 +602,12 @@ fn mouse_down_on_border_starts_drag() {
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::layout::Rect;
     let mut app = App::new().unwrap();
-    app.body_rect.set(Rect::new(0, 3, 100, 40));
-    app.left_rect.set(Rect::new(0, 3, 33, 37));
-    app.right_rect.set(Rect::new(33, 3, 67, 37));
-    app.answers_rect.set(Rect::new(33, 3, 67, 12));
-    app.questions_rect.set(Rect::new(33, 15, 67, 12));
-    app.hex_rect.set(Rect::new(33, 27, 67, 13));
+    app.layout.body_rect.set(Rect::new(0, 3, 100, 40));
+    app.layout.left_rect.set(Rect::new(0, 3, 33, 37));
+    app.layout.right_rect.set(Rect::new(33, 3, 67, 37));
+    app.layout.answers_rect.set(Rect::new(33, 3, 67, 12));
+    app.layout.questions_rect.set(Rect::new(33, 15, 67, 12));
+    app.layout.hex_rect.set(Rect::new(33, 27, 67, 13));
     // Right border cell of the Hosts pane starts a vertical drag.
     let down = MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
@@ -623,8 +627,8 @@ fn mouse_click_unfold_above_keeps_selection() {
     // Collapse the host above the selection, then click its header to
     // unfold: the inserted rows must not steal the cursor.
     app.collapsed_hosts.insert("shell.local".to_string());
-    app.left_rect.set(Rect::new(0, 3, 33, 30));
-    app.right_rect.set(Rect::new(33, 3, 67, 30));
+    app.layout.left_rect.set(Rect::new(0, 3, 33, 30));
+    app.layout.right_rect.set(Rect::new(33, 3, 67, 30));
     let header = app
         .display_items()
         .iter()
@@ -678,19 +682,19 @@ fn mouse_wheel_moves_focused_pane_like_jk() {
     // Hex: one notch scrolls the dump one line.
     app.focus = Focus::Hex;
     app.handle_mouse(&wheel(MouseEventKind::ScrollDown));
-    assert_eq!(app.hex_offset.get(), 1);
+    assert_eq!(app.layout.hex_offset.get(), 1);
     app.handle_mouse(&wheel(MouseEventKind::ScrollUp));
-    assert_eq!(app.hex_offset.get(), 0);
+    assert_eq!(app.layout.hex_offset.get(), 0);
     // Metrics overlay owns the wheel while open.
     app.show_metrics = true;
     app.handle_mouse(&wheel(MouseEventKind::ScrollDown));
-    assert_eq!(app.metrics_scroll.get(), 1);
+    assert_eq!(app.layout.metrics_scroll.get(), 1);
     assert_eq!(app.detail_selected, cursor);
     // Horizontal wheel is ignored everywhere.
     app.show_metrics = false;
     app.handle_mouse(&wheel(MouseEventKind::ScrollLeft));
     app.handle_mouse(&wheel(MouseEventKind::ScrollRight));
-    assert_eq!(app.hex_offset.get(), 0);
+    assert_eq!(app.layout.hex_offset.get(), 0);
     assert_eq!(app.detail_selected, cursor);
 }
 
@@ -748,12 +752,12 @@ fn mouse_click_selects_service_and_focuses() {
         .iter()
         .position(|it| matches!(it, DisplayItem::Instance { .. }))
         .expect("instance row");
-    app.list_offset.set(0);
-    app.left_rect.set(Rect::new(0, 3, 33, 30));
-    app.right_rect.set(Rect::new(33, 3, 67, 30));
-    app.answers_rect.set(Rect::new(33, 3, 67, 10));
-    app.questions_rect.set(Rect::new(33, 13, 67, 10));
-    app.hex_rect.set(Rect::new(33, 23, 67, 10));
+    app.layout.list_offset.set(0);
+    app.layout.left_rect.set(Rect::new(0, 3, 33, 30));
+    app.layout.right_rect.set(Rect::new(33, 3, 67, 30));
+    app.layout.answers_rect.set(Rect::new(33, 3, 67, 10));
+    app.layout.questions_rect.set(Rect::new(33, 13, 67, 10));
+    app.layout.hex_rect.set(Rect::new(33, 23, 67, 10));
     let row = 3 + 1 + first_instance as u16;
     app.click_service_list(row);
     assert_eq!(app.focus, Focus::Services);
@@ -769,12 +773,12 @@ fn mouse_click_header_folds_host() {
         .iter()
         .position(|it| matches!(it, DisplayItem::Host { .. }))
         .expect("host header");
-    app.list_offset.set(0);
-    app.left_rect.set(Rect::new(0, 3, 33, 30));
-    app.right_rect.set(Rect::new(33, 3, 67, 30));
-    app.answers_rect.set(Rect::default());
-    app.questions_rect.set(Rect::default());
-    app.hex_rect.set(Rect::default());
+    app.layout.list_offset.set(0);
+    app.layout.left_rect.set(Rect::new(0, 3, 33, 30));
+    app.layout.right_rect.set(Rect::new(33, 3, 67, 30));
+    app.layout.answers_rect.set(Rect::default());
+    app.layout.questions_rect.set(Rect::default());
+    app.layout.hex_rect.set(Rect::default());
     let row = 3 + 1 + header as u16;
     app.click_service_list(row);
     assert!(!app.collapsed_hosts.is_empty());
@@ -786,11 +790,11 @@ fn mouse_click_answers_selects_record() {
     let mut app = App::new().unwrap();
     service_with_txt(&mut app, "a=1; b=2");
     app.focus = Focus::Services;
-    app.right_rect.set(Rect::new(33, 3, 67, 30));
-    app.answers_rect.set(Rect::new(33, 3, 67, 20));
-    app.questions_rect.set(Rect::new(33, 24, 67, 8));
-    app.hex_rect.set(Rect::default());
-    app.detail_offset.set(0);
+    app.layout.right_rect.set(Rect::new(33, 3, 67, 30));
+    app.layout.answers_rect.set(Rect::new(33, 3, 67, 20));
+    app.layout.questions_rect.set(Rect::new(33, 24, 67, 8));
+    app.layout.hex_rect.set(Rect::default());
+    app.layout.detail_offset.set(0);
     // Table rows: 1 info row, then PTR/SRV/TXT in type order; the PTR
     // carries one finding child row (info ttl-mismatch).
     let info = 1;
@@ -815,11 +819,11 @@ fn mouse_click_answers_child_selects_parent() {
     let mut app = App::new().unwrap();
     service_with_txt(&mut app, "a=1; b=2");
     assert!(app.toggle_txt_expanded());
-    app.right_rect.set(Rect::new(33, 3, 67, 30));
-    app.answers_rect.set(Rect::new(33, 3, 67, 20));
-    app.questions_rect.set(Rect::new(33, 24, 67, 8));
-    app.hex_rect.set(Rect::default());
-    app.detail_offset.set(0);
+    app.layout.right_rect.set(Rect::new(33, 3, 67, 30));
+    app.layout.answers_rect.set(Rect::new(33, 3, 67, 20));
+    app.layout.questions_rect.set(Rect::new(33, 24, 67, 8));
+    app.layout.hex_rect.set(Rect::default());
+    app.layout.detail_offset.set(0);
     // Info(1) + PTR(1) + SRV(1) + TXT parent(1), then 2 child rows.
     // Clicking the first child must land on the TXT parent (index 2).
     let row = 3 + 2 + 4u16;
@@ -864,7 +868,7 @@ fn assert_shares(app: &App) {
 /// mode: one dispatch shared by seam lookup and share reads.
 fn seam_target(app: &App, mode: DragMode) -> (ratatui::layout::Rect, u16) {
     match mode {
-        DragMode::HorizUpper => (app.questions_rect.get(), app.answers_pct),
-        _ => (app.hex_rect.get(), app.questions_pct),
+        DragMode::HorizUpper => (app.layout.questions_rect.get(), app.answers_pct),
+        _ => (app.layout.hex_rect.get(), app.questions_pct),
     }
 }

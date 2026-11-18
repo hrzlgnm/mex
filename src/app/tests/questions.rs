@@ -326,7 +326,7 @@ fn ordered_questions_sort_by_type_then_newest_first() {
 /// assertions on columns and cell labels.
 fn questions_pane_text(app: &App) -> String {
     let buf = render_to_buffer(app, 120, 40);
-    let area = app.questions_rect.get();
+    let area = app.layout.questions_rect.get();
     let mut out = String::new();
     for y in area.y..(area.y + area.height) {
         for x in area.x..(area.x + area.width) {

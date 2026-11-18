@@ -139,7 +139,7 @@ pub(super) fn draw_questions_tab(
             rows.push(finding_row(a, &identity_count, &book, 3, 4, true));
         }
     }
-    app.questions_rows.replace(Some(row_map));
+    app.layout().questions_rows.replace(Some(row_map));
 
     let widths = [
         Constraint::Length(8),
@@ -212,9 +212,9 @@ pub(super) fn draw_questions_tab(
     } else {
         None
     });
-    *tstate.offset_mut() = app.questions_offset.get();
+    *tstate.offset_mut() = app.layout().questions_offset.get();
     frame.render_stateful_widget(table, area, &mut tstate);
-    app.questions_offset.set(tstate.offset());
+    app.layout().questions_offset.set(tstate.offset());
 }
 
 /// Source cell for the Questions table: our own inferred sends render

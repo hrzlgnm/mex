@@ -23,7 +23,8 @@ pub(super) fn draw_service_list(
     app: &App,
     found: &[Anomaly],
 ) {
-    app.list_viewport
+    app.layout()
+        .list_viewport
         .set(area.height.saturating_sub(2) as usize);
     let items = app.display_items();
     let anomaly_counts = App::anomaly_counts_in(found);
@@ -164,7 +165,7 @@ pub(super) fn draw_service_list(
         .highlight_spacing(HighlightSpacing::Always);
 
     let mut state = ListState::default()
-        .with_offset(app.list_offset.get())
+        .with_offset(app.layout().list_offset.get())
         // The highlight lives in the focused pane; Tab moves it along.
         .with_selected(if app.focus == Focus::Services {
             Some(app.selected_display)
@@ -172,5 +173,5 @@ pub(super) fn draw_service_list(
             None
         });
     frame.render_stateful_widget(list, area, &mut state);
-    app.list_offset.set(state.offset());
+    app.layout().list_offset.set(state.offset());
 }
