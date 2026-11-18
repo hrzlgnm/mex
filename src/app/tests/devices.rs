@@ -268,7 +268,10 @@ fn withheld_host_address_still_names_its_device() {
     let mut aaaa = aaaa_knulp();
     aaaa.source = "[fd00::1]:5353".parse().unwrap();
     ingest(&mut app, &aaaa);
-    assert!(!rows_of(&app, DACP).contains(&28), "denied on the service");
+    assert!(
+        !live_rows(&app, DACP).contains(&28),
+        "denied on the service"
+    );
     app.ingest_event(&query_event(
         DACP,
         16,

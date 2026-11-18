@@ -15,7 +15,6 @@ mod per_link_copies;
 mod per_nic_answers;
 mod question_window;
 mod questions;
-mod review_followups;
 mod schedule;
 mod scheduler;
 mod srv_target;
@@ -387,15 +386,31 @@ fn knulp_app() -> App {
     app
 }
 
-fn rows_of(app: &App, instance: &str) -> Vec<u16> {
+/// The service of `instance`, given bare (`Test`) or with its type
+/// (`Test._http._tcp.local`): the first label names it.
+fn service_of<'a>(app: &'a App, instance: &str) -> &'a ServiceEntry {
     let inst = instance.split('.').next().unwrap();
     app.services
         .iter()
         .find(|s| s.instance == inst)
         .expect("service")
+}
+
+/// Row types of a service's live rows (TTL > 0).
+fn live_rows(app: &App, instance: &str) -> Vec<u16> {
+    service_of(app, instance)
         .answers
         .iter()
         .filter(|r| r.ttl > 0)
+        .map(|r| r.rtype)
+        .collect()
+}
+
+/// Row types of every row of a service, goodbye (TTL 0) rows included.
+fn all_rows(app: &App, instance: &str) -> Vec<u16> {
+    service_of(app, instance)
+        .answers
+        .iter()
         .map(|r| r.rtype)
         .collect()
 }
