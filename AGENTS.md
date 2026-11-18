@@ -51,6 +51,8 @@ Headless run (no TTY) logs to stderr.
   (legacy zeroconf form) keeps that address type off that one service
   (`push_record` gate, retroactive removal); the host header keeps it via
   `withheld_addrs`, and the service drives no query interest for it.
+  Its tests live in `src/app/tests/`: shared fixtures in `mod.rs`, one
+  file per topic (scheduling, ingest, input, …, or the issue they cover).
 * `src/devices.rs` — device names behind source addresses (#246): an
   `AddressBook` built on demand from live A/AAAA records
   (`App::address_book`), exact match first (own announcement beats a

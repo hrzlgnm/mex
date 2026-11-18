@@ -1,0 +1,942 @@
+use super::*;
+
+#[test]
+fn record_carries_ingress_interface() {
+    let mut app = App::new().unwrap();
+    let mut rec = ptr_record(120);
+    rec.iface = "br0".to_string();
+    ingest(&mut app, &rec);
+    ingest(&mut app, &srv_record(120));
+    let ptrs = live_ptr_rows(&app);
+    assert_eq!(ptrs.len(), 1);
+    assert_eq!(ptrs[0].iface, "br0");
+}
+
+#[test]
+fn goodbye_then_comeback_reactivates() {
+    let mut app = App::new().unwrap();
+    ingest(&mut app, &ptr_record(120));
+    ingest(&mut app, &srv_record(120));
+    assert_eq!(app.services.len(), 1);
+    assert!(app.services[0].is_active);
+
+    // Goodbye takes the service offline but keeps it during grace.
+    ingest(&mut app, &ptr_record(0));
+    assert_eq!(app.services.len(), 1);
+    assert!(!app.services[0].is_active);
+
+    // Comeback with valid TTL must show the service as online again.
+    ingest(&mut app, &ptr_record(120));
+    assert!(app.services[0].is_active);
+    let ptrs = live_ptr_rows(&app);
+    assert_eq!(ptrs.len(), 1);
+    assert_eq!(ptrs[0].ttl, 120);
+
+    // A fresh SRV burst merges pending state without duplicating the
+    // PTR row or dropping back offline.
+    ingest(&mut app, &srv_record(120));
+    assert!(app.services[0].is_active);
+    let ptrs = live_ptr_rows(&app);
+    assert_eq!(ptrs.len(), 1);
+    assert_eq!(ptrs[0].ttl, 120);
+}
+
+#[test]
+fn txt_after_srv_lands_on_live_service() {
+    // Passive-mode order: PTR, SRV (service confirmed), then TXT.
+    // The late TXT must not strand in pending.
+    let mut app = App::new().unwrap();
+    ingest(&mut app, &ptr_record(120));
+    ingest(&mut app, &srv_record(120));
+    assert!(app.services[0]
+        .ordered_answers()
+        .iter()
+        .all(|r| r.rtype != 16));
+    ingest(&mut app, &txt_record("a=1; b=2"));
+    assert!(app.services[0]
+        .ordered_answers()
+        .iter()
+        .any(|r| r.rtype == 16));
+}
+
+#[test]
+fn subtype_after_srv_merges_into_live_service() {
+    // Same passive-mode order for DNS-SD subtypes (e.g. Google Cast
+    // group IDs under `..._sub._googlecast._tcp.local`).
+    let mut app = App::new().unwrap();
+    ingest(&mut app, &ptr_record(120));
+    ingest(&mut app, &srv_record(120));
+    assert!(app.services[0].subtypes.is_empty());
+    ingest(
+        &mut app,
+        &raw_record(
+            "_printer._sub._http._tcp.local.",
+            12,
+            "PTR",
+            "Test._http._tcp.local.",
+            120,
+        ),
+    );
+    assert_eq!(app.services[0].subtypes, vec![b"_printer".to_vec()]);
+    assert!(app.services[0]
+        .ordered_answers()
+        .iter()
+        .any(|r| r.rtype == 12 && r.name == "_printer._sub._http._tcp.local."));
+    // No stranded pending entry for the confirmed instance.
+    assert!(app.pending_instances.is_empty());
+}
+
+#[test]
+fn subtype_without_underscore_and_restricted_characters_is_valid() {
+    let mut app = App::new().unwrap();
+    ingest(
+        &mut app,
+        &raw_record(
+            "%%0B3BFD96-5017-44DB-96E1-BEC3451F7DE2._sub._googlecast._tcp.local.",
+            12,
+            "PTR",
+            "Google-Home._googlecast._tcp.local.",
+            4500,
+        ),
+    );
+
+    assert_eq!(
+        app.pending_instances[0].subtypes,
+        vec![b"%%0B3BFD96-5017-44DB-96E1-BEC3451F7DE2".to_vec()]
+    );
+    assert!(!app
+        .anomalies()
+        .iter()
+        .any(|a| a.kind == anomalies::AnomalyKind::TypeFormat));
+}
+
+#[test]
+fn service_types_match_case_insensitively() {
+    // `_HTTP` and `_http` are one service (RFC 6763 §7); same for the
+    // `._sub.` marker and instance matching.
+    let mut app = App::new().unwrap();
+    ingest(
+        &mut app,
+        &raw_record(
+            "_HTTP._TCP.LOCAL.",
+            12,
+            "PTR",
+            "Test._HTTP._TCP.LOCAL.",
+            120,
+        ),
+    );
+    ingest(
+        &mut app,
+        &raw_record(
+            "Test._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 80 test.local.",
+            120,
+        ),
+    );
+    assert_eq!(app.services.len(), 1);
+    ingest(
+        &mut app,
+        &raw_record(
+            "_PRINTER._SUB._http._tcp.local.",
+            12,
+            "PTR",
+            "Test._http._tcp.local.",
+            120,
+        ),
+    );
+    assert_eq!(app.services.len(), 1);
+    assert_eq!(app.services[0].subtypes.len(), 1);
+    // One continuous interest, not one per case variant.
+    let desired = app.desired_continuous();
+    let ptr_keys: Vec<_> = desired.keys().filter(|(_, t)| *t == 12).collect();
+    assert!(ptr_keys.iter().any(|(n, _)| n == "_http._tcp.local"));
+    assert_eq!(
+        ptr_keys
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case("_http._tcp.local"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn non_ascii_instance_names_do_not_panic_split() {
+    // `é` is two bytes in UTF-8: byte-slicing at `len - known.len()`
+    // can land inside the character. Splitting must skip such
+    // candidates instead of panicking in `split_at`.
+    let mut app = App::new().unwrap();
+    app.known_types.insert("_https._tcp.local".to_string());
+    assert!(app.split_instance_type("é._ssh._tcp.local").is_none());
+    assert_eq!(
+        App::strip_suffix_ci("é._ssh._tcp.local", "_https._tcp.local"),
+        None
+    );
+    // Sanity: ASCII suffix matching still works.
+    assert_eq!(
+        App::strip_suffix_ci("Test._http._tcp.local", "_HTTP._TCP.LOCAL"),
+        Some("Test")
+    );
+}
+
+#[test]
+fn enum_query_kas_never_become_answers() {
+    // Sibling-style enumeration query: one question plus known answers
+    // (RFC 6762 §7.1). KAs are beliefs, not sightings: in passive mode
+    // (or any mode) they must never land in the Answers pane nor in the
+    // known-answer bookkeeping. A genuine response still files normally.
+    let mut app = App::new().unwrap();
+    app.passive = true;
+    let kas = [
+        "_dacp._tcp.local.",
+        "_mass._tcp.local.",
+        "_http._tcp.local.",
+    ]
+    .iter()
+    .map(|t| ka_record("_services._dns-sd._udp.local.", t))
+    .collect();
+    let ev = query_event(
+        "_services._dns-sd._udp.local.",
+        12,
+        "PTR",
+        false,
+        kas,
+        remote_source(),
+    );
+    app.ingest_event(&ev);
+    assert_eq!(app.enum_entries[0].questions.len(), 1);
+    assert!(
+        app.enum_entries[0].answers.is_empty(),
+        "query KAs must not become enumeration answers"
+    );
+    assert!(
+        app.enum_known.is_empty(),
+        "query KAs must not seed known-answer bookkeeping"
+    );
+    assert!(app.known_types.is_empty());
+
+    let ans = raw_record(
+        "_services._dns-sd._udp.local.",
+        12,
+        "PTR",
+        "_dacp._tcp.local.",
+        4500,
+    );
+    let ev = event_for(&ans);
+    app.ingest_event(&ev);
+    assert_eq!(app.enum_entries[0].answers.len(), 1);
+    assert!(app.enum_known.contains_key("_dacp._tcp.local"));
+    assert!(app.known_types.contains("_dacp._tcp.local"));
+}
+
+#[test]
+fn enum_answers_coalesce_wire_case_variants() {
+    let mut app = App::new().unwrap();
+    ingest(
+        &mut app,
+        &raw_record(
+            "_services._dns-sd._udp.local.",
+            12,
+            "PTR",
+            "_http._tcp.local.",
+            120,
+        ),
+    );
+    // Same answer in different wire case: DNS names compare
+    // case-insensitively, so this refreshes the row instead of
+    // growing the list.
+    ingest(
+        &mut app,
+        &raw_record(
+            "_SERVICES._DNS-SD._UDP.LOCAL.",
+            12,
+            "PTR",
+            "_HTTP._TCP.LOCAL.",
+            120,
+        ),
+    );
+    assert_eq!(app.enum_entries[0].answers.len(), 1);
+}
+
+#[test]
+fn enum_subtype_targets_with_lossy_collisions_remain_distinct() {
+    let target = |byte: u8| {
+        let subtype: &'static [u8] = Box::leak(vec![byte].into_boxed_slice());
+        let labels: &'static [simple_dns::Label<'static>] = Box::leak(
+            vec![
+                simple_dns::Label::new_unchecked(subtype),
+                simple_dns::Label::new_unchecked(&b"_sub"[..]),
+                simple_dns::Label::new_unchecked(&b"_http"[..]),
+                simple_dns::Label::new_unchecked(&b"_tcp"[..]),
+                simple_dns::Label::new_unchecked(&b"local"[..]),
+            ]
+            .into_boxed_slice(),
+        );
+        simple_dns::Name::new_with_labels(labels)
+    };
+    let mut packet = simple_dns::Packet::new_reply(0);
+    for byte in [0xfe, 0xff] {
+        packet.answers.push(simple_dns::ResourceRecord::new(
+            simple_dns::Name::new_unchecked("_services._dns-sd._udp.local."),
+            simple_dns::CLASS::IN,
+            4500,
+            simple_dns::rdata::RData::PTR(target(byte).into()),
+        ));
+    }
+    let bytes = packet.build_bytes_vec().unwrap();
+    let event = browse::parse_packet(
+        &bytes,
+        test_source(),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(224, 0, 0, 251)),
+        "br0",
+        3,
+    )
+    .unwrap();
+    let mut app = App::new().unwrap();
+    app.ingest_event(&event);
+
+    assert_eq!(app.enum_entries[0].answers.len(), 2);
+    assert_eq!(app.enum_entries[0].ordered_answers().len(), 2);
+    let messages: Vec<_> = app
+        .anomalies()
+        .into_iter()
+        .filter(|anomaly| anomaly.kind == anomalies::AnomalyKind::EnumSubtype)
+        .map(|anomaly| anomaly.message)
+        .collect();
+    assert_eq!(messages.len(), 2);
+    assert!(messages.iter().any(|message| message.contains(r"\xFE")));
+    assert!(messages.iter().any(|message| message.contains(r"\xFF")));
+}
+
+#[test]
+fn reverse_ptr_creates_no_pending_service() {
+    // Reverse-mapping PTRs map addresses to hostnames; they are not
+    // service enumeration and must not seed (phantom) services.
+    let mut app = App::new().unwrap();
+    let rec = raw_record(
+        "Android.local.37.178.168.192.in-addr.arpa.",
+        12,
+        "PTR",
+        "Android.local.",
+        120,
+    );
+    let ev = browse::Event {
+        answers: vec![rec],
+        questions: vec![],
+        query_kas: vec![],
+        rcode: Some(0),
+        received_at: Instant::now(),
+        raw_bytes: vec![],
+        source: test_source(),
+    };
+    app.ingest_event(&ev);
+    assert!(app.services.is_empty());
+    assert!(app.pending_instances.is_empty());
+    assert!(
+        app.anomalies()
+            .iter()
+            .all(|a| a.kind != anomalies::AnomalyKind::TypeFormat),
+        "reverse name must not flag"
+    );
+}
+
+#[test]
+fn shared_hostname_a_record_reaches_every_service() {
+    let mut app = two_on_shared_host_app();
+    ingest(
+        &mut app,
+        &raw_record("shared.local.", 1, "A", "192.168.1.10", 120),
+    );
+    assert!(has_live_a(&app, "One"), "A missing on One");
+    assert!(has_live_a(&app, "Two"), "A missing on Two");
+}
+
+#[test]
+fn late_joiner_backfills_shared_hostname_a_record() {
+    let mut app = App::new().unwrap();
+    ingest(
+        &mut app,
+        &raw_record("_http._tcp.local.", 12, "PTR", "One._http._tcp.local.", 120),
+    );
+    ingest(
+        &mut app,
+        &raw_record("_http._tcp.local.", 12, "PTR", "Two._http._tcp.local.", 120),
+    );
+    ingest(
+        &mut app,
+        &raw_record(
+            "One._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 80 shared.local.",
+            120,
+        ),
+    );
+    // Address lands while only One is confirmed: it must still reach
+    // Two once its SRV promotes it.
+    ingest(
+        &mut app,
+        &raw_record("shared.local.", 1, "A", "192.168.1.10", 120),
+    );
+    ingest(
+        &mut app,
+        &raw_record(
+            "Two._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 8080 shared.local.",
+            120,
+        ),
+    );
+    assert_eq!(app.services.len(), 2);
+    assert!(has_live_a(&app, "One"), "A missing on One");
+    assert!(has_live_a(&app, "Two"), "A missing on late joiner Two");
+}
+
+#[test]
+fn shared_hostname_a_goodbye_reaches_every_service() {
+    let mut app = two_on_shared_host_app();
+    ingest(
+        &mut app,
+        &raw_record("shared.local.", 1, "A", "192.168.1.10", 120),
+    );
+    assert!(has_live_a(&app, "One") && has_live_a(&app, "Two"));
+    ingest(
+        &mut app,
+        &raw_record("shared.local.", 1, "A", "192.168.1.10", 0),
+    );
+    // Both services keep the row as an expired goodbye; neither keeps
+    // a live address, and both stay browsable (A never deactivates).
+    for instance in ["One", "Two"] {
+        let svc = app
+            .services
+            .iter()
+            .find(|s| s.instance == instance)
+            .expect("service present");
+        assert!(
+            svc.answers
+                .iter()
+                .any(|r| r.rtype == 1 && r.rdata == "192.168.1.10" && r.ttl == 0),
+            "goodbye row missing on {instance}"
+        );
+        assert!(!has_live_a(&app, instance), "live A stranded on {instance}");
+        assert!(svc.is_active, "{instance} deactivated by an A goodbye");
+    }
+}
+
+#[test]
+fn pending_address_flush_reaches_every_service() {
+    let mut app = App::new().unwrap();
+    // Address arrives before either SRV: no hostname matches, so it
+    // parks in pending_addrs. The ingest helper never flushes, which
+    // is exactly what this exercises.
+    ingest(
+        &mut app,
+        &raw_record("shared.local.", 1, "A", "192.168.1.10", 120),
+    );
+    ingest(
+        &mut app,
+        &raw_record("shared.local.", 1, "A", "192.168.1.11", 120),
+    );
+    assert!(app.services.is_empty());
+    assert_eq!(app.pending_addrs_count(), 2);
+    ingest(
+        &mut app,
+        &raw_record("_http._tcp.local.", 12, "PTR", "One._http._tcp.local.", 120),
+    );
+    ingest(
+        &mut app,
+        &raw_record("_http._tcp.local.", 12, "PTR", "Two._http._tcp.local.", 120),
+    );
+    ingest(
+        &mut app,
+        &raw_record(
+            "One._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 80 shared.local.",
+            120,
+        ),
+    );
+    ingest(
+        &mut app,
+        &raw_record(
+            "Two._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 8080 shared.local.",
+            120,
+        ),
+    );
+    // Backfill finds no sibling rows (nothing flushed yet), so the
+    // parked address is still pending until the drain-time flush.
+    app.flush_pending_addrs();
+    assert!(app.pending_addrs.is_empty());
+    for instance in ["One", "Two"] {
+        let service = app
+            .services
+            .iter()
+            .find(|service| service.instance == instance)
+            .unwrap();
+        assert_eq!(
+            service.answers.iter().filter(|r| r.rtype == 1).count(),
+            2,
+            "pending A records missing on {instance}"
+        );
+    }
+}
+
+#[test]
+fn unrelated_packet_batch_does_not_flush_pending_addresses() {
+    let mut app = App::new_with(true, None).unwrap();
+    let (tx, rx) = mpsc::channel();
+    app.rx = rx;
+
+    tx.send(event_for(&raw_record(
+        "test.local.",
+        1,
+        "A",
+        "192.168.1.10",
+        120,
+    )))
+    .unwrap();
+    app.drain_events();
+    assert_eq!(app.pending_addrs_count(), 1);
+
+    ingest(&mut app, &ptr_record(120));
+    ingest(&mut app, &srv_record(120));
+
+    tx.send(event_for(&raw_record(
+        "unrelated.local.",
+        1,
+        "A",
+        "192.168.1.11",
+        120,
+    )))
+    .unwrap();
+    app.drain_events();
+
+    assert!(app.pending_addrs.contains_key("test.local"));
+
+    tx.send(event_for(&srv_record(120))).unwrap();
+    app.drain_events();
+
+    assert!(!app.pending_addrs.contains_key("test.local"));
+    assert!(has_live_a(&app, "Test"));
+}
+
+#[test]
+fn pending_address_flush_includes_live_alternate_srv_targets() {
+    let mut app = App::new_with(true, None).unwrap();
+    ingest(
+        &mut app,
+        &raw_record("_http._tcp.local.", 12, "PTR", "Svc._http._tcp.local.", 120),
+    );
+    ingest(
+        &mut app,
+        &raw_record(
+            "Svc._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 80 host-a.local.",
+            120,
+        ),
+    );
+    ingest(
+        &mut app,
+        &raw_record(
+            "Svc._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 8080 host-b.local.",
+            120,
+        ),
+    );
+    app.pending_addrs.insert(
+        "host-a.local".to_string(),
+        vec![raw_record("host-a.local.", 1, "A", "192.168.1.10", 120)],
+    );
+    app.flush_pending_addrs();
+
+    assert!(app.pending_addrs.is_empty());
+    assert_eq!(app.services[0].hostname, "host-b.local.");
+    assert!(app.services[0]
+        .answers
+        .iter()
+        .any(|r| r.rtype == 1 && r.rdata == "192.168.1.10"));
+}
+
+#[test]
+fn backfill_ignores_sibling_rows_from_old_hostname() {
+    let mut app = App::new().unwrap();
+    ingest(
+        &mut app,
+        &raw_record("_http._tcp.local.", 12, "PTR", "One._http._tcp.local.", 120),
+    );
+    ingest(
+        &mut app,
+        &raw_record("_http._tcp.local.", 12, "PTR", "Two._http._tcp.local.", 120),
+    );
+    ingest(
+        &mut app,
+        &raw_record("One._http._tcp.local.", 33, "SRV", "0 0 80 old.local.", 120),
+    );
+    ingest(
+        &mut app,
+        &raw_record("old.local.", 1, "A", "192.168.0.5", 120),
+    );
+    // One moves to the shared host; its old-host rows stay put.
+    ingest(
+        &mut app,
+        &raw_record(
+            "One._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 80 shared.local.",
+            120,
+        ),
+    );
+    // Promoting Two must not inherit One's old-host address.
+    ingest(
+        &mut app,
+        &raw_record(
+            "Two._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 8080 shared.local.",
+            120,
+        ),
+    );
+    let two = app
+        .services
+        .iter()
+        .find(|s| s.instance == "Two")
+        .expect("Two present");
+    assert!(
+        two.answers.iter().all(|r| r.rtype != 1 && r.rtype != 28),
+        "old-host address leaked onto Two"
+    );
+    let one = app
+        .services
+        .iter()
+        .find(|s| s.instance == "One")
+        .expect("One present");
+    assert!(one
+        .answers
+        .iter()
+        .any(|r| r.rtype == 1 && r.rdata == "192.168.0.5"));
+}
+
+#[test]
+fn host_name_does_not_flap_on_alternating_srv_targets() {
+    let mut app = App::new().unwrap();
+    ingest(
+        &mut app,
+        &raw_record("_http._tcp.local.", 12, "PTR", "Svc._http._tcp.local.", 120),
+    );
+    ingest(
+        &mut app,
+        &raw_record(
+            "Svc._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 80 host-a.local.",
+            120,
+        ),
+    );
+    assert_eq!(app.services[0].hostname, "host-a.local.");
+    assert_eq!(app.services[0].port, 80);
+    // A genuinely new target moves the service.
+    ingest(
+        &mut app,
+        &raw_record(
+            "Svc._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 8080 host-b.local.",
+            120,
+        ),
+    );
+    assert_eq!(app.services[0].hostname, "host-b.local.");
+    assert_eq!(app.services[0].port, 8080);
+    // Refreshing the now-known alternate target must not flip back or
+    // change the selected target's port.
+    ingest(
+        &mut app,
+        &raw_record(
+            "Svc._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 80 host-a.local.",
+            120,
+        ),
+    );
+    assert_eq!(app.services[0].hostname, "host-b.local.");
+    assert_eq!(app.services[0].port, 8080);
+    ingest(
+        &mut app,
+        &raw_record(
+            "Svc._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 8080 host-b.local.",
+            120,
+        ),
+    );
+    assert_eq!(app.services[0].hostname, "host-b.local.");
+    assert_eq!(app.services[0].port, 8080);
+    // Addresses published only under the alternate target are still
+    // filed on the service and surfaced on the selected host.
+    ingest(
+        &mut app,
+        &raw_record("host-a.local.", 1, "A", "192.168.1.10", 120),
+    );
+    assert!(app.services[0]
+        .answers
+        .iter()
+        .any(|r| r.rtype == 1 && r.rdata == "192.168.1.10"));
+    assert!(app
+        .host_addresses("host-b.local")
+        .contains(&"192.168.1.10".to_string()));
+    // A refresh after expiry of the alternate-target address is still
+    // routed and displayed.
+    ingest(
+        &mut app,
+        &raw_record("host-a.local.", 1, "A", "192.168.1.10", 0),
+    );
+    assert!(!app
+        .host_addresses("host-b.local")
+        .contains(&"192.168.1.10".to_string()));
+    ingest(
+        &mut app,
+        &raw_record("host-a.local.", 1, "A", "192.168.1.10", 120),
+    );
+    assert!(app
+        .host_addresses("host-b.local")
+        .contains(&"192.168.1.10".to_string()));
+    for rec in &mut app.services[0].answers {
+        if rec.rtype == 1 && rec.rdata == "192.168.1.10" {
+            rec.received_at = Instant::now() - Duration::from_secs(121);
+        }
+    }
+    assert!(!app
+        .host_addresses("host-b.local")
+        .contains(&"192.168.1.10".to_string()));
+    ingest(
+        &mut app,
+        &raw_record("host-a.local.", 1, "A", "192.168.1.10", 120),
+    );
+    assert!(app
+        .host_addresses("host-b.local")
+        .contains(&"192.168.1.10".to_string()));
+}
+
+#[test]
+fn stale_alternate_target_does_not_route_addr_goodbye() {
+    let mut app = App::new().unwrap();
+    ingest(
+        &mut app,
+        &raw_record("_http._tcp.local.", 12, "PTR", "Svc._http._tcp.local.", 120),
+    );
+    ingest(
+        &mut app,
+        &raw_record(
+            "Svc._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 80 host-b.local.",
+            120,
+        ),
+    );
+    app.services[0].answers.push(raw_record(
+        "Svc._http._tcp.local.",
+        33,
+        "SRV",
+        "0 0 80 host-a.local.",
+        0,
+    ));
+    ingest(
+        &mut app,
+        &raw_record("host-a.local.", 1, "A", "192.168.1.10", 0),
+    );
+    assert!(!app.services[0]
+        .answers
+        .iter()
+        .any(|r| r.rtype == 1 && r.rdata == "192.168.1.10"));
+    assert!(!app
+        .host_addresses("host-b.local")
+        .contains(&"192.168.1.10".to_string()));
+}
+
+#[test]
+fn addr_on_withdrawn_service_keeps_grace_deadline() {
+    let mut app = two_on_shared_host_app();
+    ingest(
+        &mut app,
+        &raw_record("shared.local.", 1, "A", "192.168.1.10", 120),
+    );
+    // Withdraw One; it lingers inactive through the grace period.
+    ingest(
+        &mut app,
+        &raw_record("_http._tcp.local.", 12, "PTR", "One._http._tcp.local.", 0),
+    );
+    let deadline = app
+        .services
+        .iter()
+        .find(|s| s.instance == "One")
+        .expect("One present")
+        .last_seen;
+    assert!(
+        !app.services
+            .iter()
+            .find(|s| s.instance == "One")
+            .expect("One present")
+            .is_active
+    );
+    // A subsequent shared-host announcement still files its row...
+    ingest(
+        &mut app,
+        &raw_record("shared.local.", 1, "A", "192.168.1.11", 120),
+    );
+    let one = app
+        .services
+        .iter()
+        .find(|s| s.instance == "One")
+        .expect("One present");
+    assert!(one
+        .answers
+        .iter()
+        .any(|r| r.rtype == 1 && r.rdata == "192.168.1.11"));
+    // ...without extending the grace deadline; the sibling is unaffected.
+    assert_eq!(one.last_seen, deadline);
+    assert!(has_live_a(&app, "Two"));
+}
+
+#[test]
+fn pending_addrs_count_as_live_answers() {
+    let mut app = App::new().unwrap();
+    // An A record arrives before any SRV names the host: parked in
+    // pending_addrs, still a live answer for the interest.
+    let mut rec = raw_record("lonely.local.", 1, "A", "192.168.1.9", 120);
+    rec.source = remote_source();
+    ingest(&mut app, &rec);
+    assert_eq!(app.pending_addrs_count(), 1);
+    let view = app.interest_view(&("lonely.local".to_string(), 1));
+    assert_eq!(view.status, InterestStatus::Answered);
+}
+
+#[test]
+fn repeated_unmatched_addresses_do_not_accumulate() {
+    let mut app = App::new().unwrap();
+    for _ in 0..8 {
+        ingest(
+            &mut app,
+            &raw_record("lonely.local.", 1, "A", "192.168.1.9", 120),
+        );
+    }
+    assert_eq!(app.pending_addrs_count(), 1);
+}
+
+#[test]
+fn expired_unmatched_addresses_are_evicted() {
+    let mut app = App::new().unwrap();
+    let mut rec = raw_record("lonely.local.", 1, "A", "192.168.1.9", 1);
+    rec.received_at = Instant::now() - Duration::from_secs(2);
+    ingest(&mut app, &rec);
+    assert_eq!(app.pending_addrs_count(), 1);
+
+    app.next_pending_addr_prune = Instant::now();
+    app.evict_expired();
+
+    assert!(app.pending_addrs.is_empty());
+}
+
+#[test]
+fn nonzero_rcode_response_records_are_not_ingested() {
+    // RFC 6762 §18.11: the whole message is ignored, so an address in
+    // an RCODE 3 reply neither resolves the SRV target nor files a row.
+    let mut app = App::new().unwrap();
+    ingest(&mut app, &ptr_record(4500));
+    ingest(&mut app, &srv_record(120));
+    mark_address_queries(&mut app, "test.local", Duration::from_secs(2));
+    ingest_packet(
+        &mut app,
+        browse::Event {
+            answers: vec![raw_record("test.local.", 1, "A", "192.168.1.10", 120)],
+            questions: Vec::new(),
+            query_kas: Vec::new(),
+            rcode: Some(3),
+            received_at: Instant::now(),
+            raw_bytes: vec![0x01],
+            source: test_source(),
+        },
+    );
+    assert!(app.services[0].answers.iter().all(|r| r.rtype != 1));
+    assert_eq!(app.raw_events.len(), 1, "packet log keeps the raw packet");
+    let finding = app
+        .anomalies()
+        .into_iter()
+        .find(|a| a.kind.as_str() == "unresolved-srv-target")
+        .expect("target stays unresolved");
+    assert!(finding.message.contains("A: no response"));
+}
+
+fn live_ptr_rows(app: &App) -> Vec<browse::RawRecord> {
+    app.services
+        .iter()
+        .flat_map(|s| s.ordered_answers())
+        .filter(|r| r.rtype == 12)
+        .cloned()
+        .collect()
+}
+
+/// Two instances of one type sharing a single hostname: the shape
+/// behind the fan-out bug (many SRVs, one host).
+fn two_on_shared_host_app() -> App {
+    let mut app = App::new().unwrap();
+    ingest(
+        &mut app,
+        &raw_record("_http._tcp.local.", 12, "PTR", "One._http._tcp.local.", 120),
+    );
+    ingest(
+        &mut app,
+        &raw_record("_http._tcp.local.", 12, "PTR", "Two._http._tcp.local.", 120),
+    );
+    ingest(
+        &mut app,
+        &raw_record(
+            "One._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 80 shared.local.",
+            120,
+        ),
+    );
+    ingest(
+        &mut app,
+        &raw_record(
+            "Two._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 8080 shared.local.",
+            120,
+        ),
+    );
+    assert_eq!(app.services.len(), 2);
+    app
+}
+
+fn has_live_a(app: &App, instance: &str) -> bool {
+    app.services
+        .iter()
+        .find(|s| s.instance == instance)
+        .expect("service present")
+        .answers
+        .iter()
+        .any(|r| {
+            r.rtype == 1
+                && r.rdata == "192.168.1.10"
+                && r.ttl > r.received_at.elapsed().as_secs() as u32
+        })
+}
