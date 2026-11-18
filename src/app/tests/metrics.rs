@@ -237,7 +237,7 @@ fn metrics_suppression_counter() {
     ingest(&mut app, &ptr_record(120));
     ingest(&mut app, &srv_record(120));
     let ckey = ("_http._tcp.local".to_string(), 12);
-    app.continuous.insert(
+    app.scheduler.continuous_mut().insert(
         ckey.clone(),
         ContinuousQuery {
             next_due: Instant::now() - Duration::from_millis(1),
@@ -326,7 +326,7 @@ fn metrics_has_no_flickering_overheard_rows() {
         remote_source(),
     );
     app.ingest_event(&ev);
-    assert_eq!(app.overheard.len(), 1);
+    assert_eq!(app.scheduler.overheard().len(), 1);
     let rows = app.metrics_rows();
     assert!(
         rows.iter()

@@ -131,7 +131,7 @@ impl App {
     /// Snapshot of mex's own browse state.
     pub(super) fn state_dump(&self) -> dump::StateDump {
         let book = self.address_book();
-        let mut service_types: Vec<String> = self.known_types.iter().cloned().collect();
+        let mut service_types: Vec<String> = self.scheduler.known_types().iter().cloned().collect();
         service_types.sort();
         let mut metrics = std::collections::BTreeMap::new();
         let m = &self.metrics;
@@ -183,23 +183,29 @@ impl App {
             m.services_expired_total,
         );
         metrics.insert("service_types".to_string(), service_types.len() as u64);
-        metrics.insert("enum_known".to_string(), self.enum_known.len() as u64);
+        metrics.insert(
+            "enum_known".to_string(),
+            self.scheduler.enum_known().len() as u64,
+        );
         metrics.insert(
             "continuous_interests".to_string(),
-            self.continuous.len() as u64,
+            self.scheduler.continuous().len() as u64,
         );
-        metrics.insert("requery_pending".to_string(), self.requeries.len() as u64);
+        metrics.insert(
+            "requery_pending".to_string(),
+            self.scheduler.requeries().len() as u64,
+        );
         metrics.insert(
             "uptime_secs".to_string(),
             self.start_time.elapsed().as_secs(),
         );
         let now = Instant::now();
         let mut interest_keys: HashSet<(String, u16)> =
-            self.query_history.keys().cloned().collect();
-        for key in self.requeries.keys() {
+            self.scheduler.query_history().keys().cloned().collect();
+        for key in self.scheduler.requeries().keys() {
             interest_keys.insert(Self::provenance_key(&key.0, key.1));
         }
-        for key in self.continuous.keys() {
+        for key in self.scheduler.continuous().keys() {
             interest_keys.insert(Self::provenance_key(&key.0, key.1));
         }
         // Answer-only interests (e.g. passive captures, answers without

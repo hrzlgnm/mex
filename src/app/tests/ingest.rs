@@ -167,7 +167,9 @@ fn non_ascii_instance_names_do_not_panic_split() {
     // can land inside the character. Splitting must skip such
     // candidates instead of panicking in `split_at`.
     let mut app = App::new().unwrap();
-    app.known_types.insert("_https._tcp.local".to_string());
+    app.scheduler
+        .known_types_mut()
+        .insert("_https._tcp.local".to_string());
     assert!(app.split_instance_type("é._ssh._tcp.local").is_none());
     assert_eq!(
         App::strip_suffix_ci("é._ssh._tcp.local", "_https._tcp.local"),
@@ -211,10 +213,10 @@ fn enum_query_kas_never_become_answers() {
         "query KAs must not become enumeration answers"
     );
     assert!(
-        app.enum_known.is_empty(),
+        app.scheduler.enum_known().is_empty(),
         "query KAs must not seed known-answer bookkeeping"
     );
-    assert!(app.known_types.is_empty());
+    assert!(app.scheduler.known_types().is_empty());
 
     let ans = raw_record(
         "_services._dns-sd._udp.local.",
@@ -226,8 +228,8 @@ fn enum_query_kas_never_become_answers() {
     let ev = event_for(&ans);
     app.ingest_event(&ev);
     assert_eq!(app.enum_entries[0].answers.len(), 1);
-    assert!(app.enum_known.contains_key("_dacp._tcp.local"));
-    assert!(app.known_types.contains("_dacp._tcp.local"));
+    assert!(app.scheduler.enum_known().contains_key("_dacp._tcp.local"));
+    assert!(app.scheduler.known_types().contains("_dacp._tcp.local"));
 }
 
 #[test]

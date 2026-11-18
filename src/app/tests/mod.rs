@@ -98,7 +98,7 @@ fn event_for(rec: &browse::RawRecord) -> browse::Event {
 /// Backdate the refresh schedule of every tracked row of a question
 /// so the next `requery_expiring` pass treats its attempt as due.
 fn make_refresh_due(app: &mut App, name: &str, rtype: u16) {
-    for (row, state) in app.refresh_rows.iter_mut() {
+    for (row, state) in app.scheduler.refresh_rows_mut().iter_mut() {
         if row.0 == name && row.1 == rtype {
             state.next_due = Instant::now() - Duration::from_millis(1);
         }
@@ -120,7 +120,7 @@ fn ingest_packet(app: &mut App, event: browse::Event) {
 fn mark_address_queries(app: &mut App, hostname: &str, age: Duration) {
     let sent_at = Instant::now() - age;
     for rtype in [1, 28] {
-        app.query_history.insert(
+        app.scheduler.query_history_mut().insert(
             App::provenance_key(hostname, rtype),
             InterestQueryState {
                 transmitted: Some(sent_at),
@@ -305,7 +305,7 @@ fn due_query_setup() -> App {
             }
         }
     }
-    app.continuous.insert(
+    app.scheduler.continuous_mut().insert(
         ("_http._tcp.local".to_string(), 12),
         ContinuousQuery {
             next_due: Instant::now() - Duration::from_millis(1),

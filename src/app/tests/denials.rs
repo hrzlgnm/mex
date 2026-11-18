@@ -247,7 +247,7 @@ fn same_packet_additional_is_never_filed_on_a_denying_service() {
     ingest(&mut app, &srv_on_knulp(DACP));
     let key = ("knulp.local".to_string(), 28);
     let undamped = Duration::from_secs(4);
-    app.continuous.insert(
+    app.scheduler.continuous_mut().insert(
         key.clone(),
         ContinuousQuery {
             next_due: Instant::now() + undamped,
@@ -265,7 +265,10 @@ fn same_packet_additional_is_never_filed_on_a_denying_service() {
     ]));
     assert!(!rows_of(&app, DACP).contains(&28));
     // Never filed, so its cache-flush bit didn't damp the stream.
-    assert_eq!(app.continuous.get(&key).unwrap().interval, undamped);
+    assert_eq!(
+        app.scheduler.continuous().get(&key).unwrap().interval,
+        undamped
+    );
 }
 
 #[test]

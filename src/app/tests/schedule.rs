@@ -54,7 +54,8 @@ fn cached_unique_address_skips_initial_query() {
     app.poll_continuous();
     for rtype in [1, 28] {
         let entry = app
-            .continuous
+            .scheduler
+            .continuous()
             .get(&("test.local".to_string(), rtype))
             .expect("address interest");
         assert_eq!(entry.interval, MAX_CONTINUOUS_INTERVAL);
@@ -97,7 +98,8 @@ fn missing_address_still_queried_promptly() {
     app.poll_continuous();
     for rtype in [1, 28] {
         let entry = app
-            .continuous
+            .scheduler
+            .continuous()
             .get(&("test.local".to_string(), rtype))
             .expect("address interest");
         assert_eq!(entry.interval, Duration::from_secs(1));
@@ -111,7 +113,8 @@ fn shared_cached_answer_does_not_dampen() {
     ingest_srv_with_addresses(&mut app, false);
     app.poll_continuous();
     let entry = app
-        .continuous
+        .scheduler
+        .continuous()
         .get(&("test.local".to_string(), 1))
         .expect("address interest");
     assert_eq!(entry.interval, Duration::from_secs(1));
@@ -138,7 +141,8 @@ fn enum_gets_qu_on_first_send() {
     let mut app = App::new().unwrap();
     app.poll_continuous(); // seeds the enumeration interest
     let past = Instant::now() - Duration::from_millis(1);
-    app.continuous
+    app.scheduler
+        .continuous_mut()
         .get_mut(&(ENUM_SERVICE.to_string().to_lowercase(), 12))
         .expect("enum interest seeded")
         .next_due = past;
@@ -150,9 +154,11 @@ fn enum_gets_qu_on_first_send() {
 #[test]
 fn continuous_backoff_is_1s_then_doubling() {
     let mut app = App::new().unwrap();
-    app.known_types.insert("_http._tcp.local".to_string());
+    app.scheduler
+        .known_types_mut()
+        .insert("_http._tcp.local".to_string());
     let key = ("_http._tcp.local".to_string(), 12);
-    app.continuous.insert(
+    app.scheduler.continuous_mut().insert(
         key.clone(),
         ContinuousQuery {
             next_due: Instant::now() - Duration::from_millis(1),
@@ -161,16 +167,28 @@ fn continuous_backoff_is_1s_then_doubling() {
         },
     );
     app.poll_continuous();
-    let entry = app.continuous.get(&key).expect("still scheduled");
+    let entry = app
+        .scheduler
+        .continuous()
+        .get(&key)
+        .expect("still scheduled");
     assert_eq!(entry.interval, Duration::from_secs(2));
     // First gap uses the 1s interval, not the doubled 2s.
     assert!(entry.next_due > Instant::now() + Duration::from_millis(500));
     assert!(entry.next_due <= Instant::now() + Duration::from_secs(1));
 
     // Second gap uses the 2s interval, then doubles to 4s.
-    app.continuous.get_mut(&key).unwrap().next_due = Instant::now() - Duration::from_millis(1);
+    app.scheduler
+        .continuous_mut()
+        .get_mut(&key)
+        .unwrap()
+        .next_due = Instant::now() - Duration::from_millis(1);
     app.poll_continuous();
-    let entry = app.continuous.get(&key).expect("still scheduled");
+    let entry = app
+        .scheduler
+        .continuous()
+        .get(&key)
+        .expect("still scheduled");
     assert_eq!(entry.interval, Duration::from_secs(4));
     assert!(entry.next_due > Instant::now() + Duration::from_secs(1));
     assert!(entry.next_due <= Instant::now() + Duration::from_secs(2));
@@ -217,7 +235,7 @@ fn requery_ignores_expired_rows() {
     app.requery_expiring();
     let key = ("_http._tcp.local".to_string(), 12);
     assert!(
-        !app.requeries.contains_key(&key),
+        !app.scheduler.requeries().contains_key(&key),
         "expired rows must not schedule refresh queries"
     );
 }
@@ -240,7 +258,7 @@ fn refresh_step_follows_the_triggering_row_ttl() {
     let mut app = app_with_stale_enum_row();
     app.requery_expiring();
     let key = ("_services._dns-sd._udp.local".to_string(), 12);
-    let (due, count) = app.requeries[&key];
+    let (due, count) = app.scheduler.requeries_mut()[&key];
     assert_eq!(count, 1);
     // 5% of the stale row's 4500s TTL, not of the sibling's 60s.
     assert!(
@@ -365,7 +383,7 @@ fn spent_rows_are_not_projected_as_due() {
     }
     assert_eq!(app.metrics.q_sent_refresh, 4);
     let key = ("_services._dns-sd._udp.local".to_string(), 12);
-    assert!(!app.requeries.contains_key(&key));
+    assert!(!app.scheduler.requeries().contains_key(&key));
     // Only the fresh TTL 60 row is left to refresh, at 80% (48s).
     let due = app.next_refresh_due(&key).expect("fresh row projected");
     assert!(due >= Instant::now() + Duration::from_secs(40));
@@ -388,7 +406,8 @@ fn query_provenance_records_transmit_suppress_observe() {
     // No overheard query: the SRV refresh is transmitted.
     let srv_key = ("test._http._tcp.local".to_string(), 33);
     let prov = app
-        .query_history
+        .scheduler
+        .query_history()
         .get(&srv_key)
         .expect("provenance recorded");
     assert!(prov.transmitted.is_some());
@@ -408,13 +427,21 @@ fn query_provenance_records_transmit_suppress_observe() {
         remote_source(),
     );
     app.ingest_event(&ev);
-    let prov = app.query_history.get(&srv_key).expect("observed recorded");
+    let prov = app
+        .scheduler
+        .query_history()
+        .get(&srv_key)
+        .expect("observed recorded");
     assert!(prov.observed.is_some());
     // Make the refresh due again: the schedule spaces attempts ~5%
     // of TTL apart, so without backdating the second run skips it.
     make_refresh_due(&mut app, "Test._http._tcp.local", 33);
     app.requery_expiring();
-    let prov = app.query_history.get(&srv_key).expect("still there");
+    let prov = app
+        .scheduler
+        .query_history()
+        .get(&srv_key)
+        .expect("still there");
     assert!(prov.suppressed.is_some());
     assert!(matches!(
         prov.last().map(|(o, _)| o),
@@ -432,7 +459,8 @@ fn query_provenance_records_transmit_suppress_observe() {
     );
     app.ingest_event(&ev);
     let prov = app
-        .query_history
+        .scheduler
+        .query_history()
         .get(&("_printer._tcp.local".to_string(), 12))
         .expect("observed recorded");
     assert!(prov.observed.is_some());
@@ -452,7 +480,7 @@ fn query_provenance_prunes_dead_interests() {
         Instant::now(),
     );
     // Stale provenance with no live schedule is dropped.
-    app.query_history.insert(
+    app.scheduler.query_history_mut().insert(
         ("gone._tcp.local".to_string(), 12),
         InterestQueryState {
             transmitted: Some(Instant::now() - Duration::from_secs(3600)),
@@ -461,10 +489,12 @@ fn query_provenance_prunes_dead_interests() {
     );
     app.evict_expired();
     assert!(app
-        .query_history
+        .scheduler
+        .query_history()
         .contains_key(&("_http._tcp.local".to_string(), 12)));
     assert!(!app
-        .query_history
+        .scheduler
+        .query_history()
         .contains_key(&("gone._tcp.local".to_string(), 12)));
 }
 
@@ -536,7 +566,8 @@ fn pihole_cycle_expires_after_four_misses_then_rescues() {
         }
     }
     assert!(!app
-        .requeries
+        .scheduler
+        .requeries()
         .keys()
         .any(|(n, t)| n == "Test._http._tcp.local" && *t == 33));
     assert_eq!(app.metrics.q_sent_refresh, 4);
@@ -574,7 +605,7 @@ fn provenance_lookup_folds_non_ascii_case() {
     // not normalize away.
     let wire_case = "\u{00C9}tag\u{00E9}._http._tcp.local";
     let lower_case = "\u{00E9}tag\u{00E9}._http._tcp.local";
-    app.requeries.insert(
+    app.scheduler.requeries_mut().insert(
         (wire_case.to_string(), 12),
         (Instant::now() + Duration::from_secs(60), 2),
     );
@@ -592,7 +623,11 @@ fn projected_refresh_beats_backed_off_browse() {
     // Back the continuous stream off to hourly: the projected
     // refresh at receipt + 80% TTL must own DUE instead.
     let key = ("test._http._tcp.local".to_string(), 33);
-    app.continuous.get_mut(&key).unwrap().next_due = Instant::now() + Duration::from_secs(3600);
+    app.scheduler
+        .continuous_mut()
+        .get_mut(&key)
+        .unwrap()
+        .next_due = Instant::now() + Duration::from_secs(3600);
     let view = app.interest_view(&key);
     assert_eq!(view.timer, TimerKind::Refresh);
     let secs = view
@@ -631,7 +666,7 @@ fn requery_postpones_continuous_for_same_key() {
     }
     // Continuous stream is due right now.
     let ckey = ("_http._tcp.local".to_string(), 12);
-    app.continuous.insert(
+    app.scheduler.continuous_mut().insert(
         ckey.clone(),
         ContinuousQuery {
             next_due: Instant::now() - Duration::from_millis(1),
@@ -640,7 +675,11 @@ fn requery_postpones_continuous_for_same_key() {
         },
     );
     app.requery_expiring();
-    let entry = app.continuous.get(&ckey).expect("still scheduled");
+    let entry = app
+        .scheduler
+        .continuous()
+        .get(&ckey)
+        .expect("still scheduled");
     // Refresh sent now, so the exponential stream must wait at
     // least its interval instead of firing on the same tick.
     assert!(entry.next_due > Instant::now() + Duration::from_millis(500));
@@ -652,7 +691,7 @@ fn duplicate_qm_with_subset_ka_suppresses_continuous() {
     ingest(&mut app, &ptr_record(120));
     ingest(&mut app, &srv_record(120));
     let ckey = ("_http._tcp.local".to_string(), 12);
-    app.continuous.insert(
+    app.scheduler.continuous_mut().insert(
         ckey.clone(),
         ContinuousQuery {
             next_due: Instant::now() - Duration::from_millis(1),
@@ -671,13 +710,18 @@ fn duplicate_qm_with_subset_ka_suppresses_continuous() {
     );
     app.ingest_event(&ev);
     app.poll_continuous();
-    let entry = app.continuous.get(&ckey).expect("still scheduled");
+    let entry = app
+        .scheduler
+        .continuous()
+        .get(&ckey)
+        .expect("still scheduled");
     // Treated as sent: backed off instead of transmitting.
     assert_eq!(entry.interval, Duration::from_secs(4));
     assert!(entry.next_due > Instant::now() + Duration::from_secs(1));
     // Single-use: entry consumed.
     assert!(!app
-        .overheard
+        .scheduler
+        .overheard()
         .contains_key(&("_http._tcp.local".to_string(), 12)));
 }
 
@@ -687,7 +731,7 @@ fn duplicate_qm_with_extra_ka_does_not_suppress() {
     ingest(&mut app, &ptr_record(120));
     ingest(&mut app, &srv_record(120));
     let ckey = ("_http._tcp.local".to_string(), 12);
-    app.continuous.insert(
+    app.scheduler.continuous_mut().insert(
         ckey.clone(),
         ContinuousQuery {
             next_due: Instant::now() - Duration::from_millis(1),
@@ -706,12 +750,17 @@ fn duplicate_qm_with_extra_ka_does_not_suppress() {
     );
     app.ingest_event(&ev);
     app.poll_continuous();
-    let entry = app.continuous.get(&ckey).expect("still scheduled");
+    let entry = app
+        .scheduler
+        .continuous()
+        .get(&ckey)
+        .expect("still scheduled");
     assert_eq!(entry.interval, Duration::from_secs(4));
     // Not suppressed: next_due is now+2s from the real send, but the
     // overheard entry remains since it wasn't consumed.
     assert!(app
-        .overheard
+        .scheduler
+        .overheard()
         .contains_key(&("_http._tcp.local".to_string(), 12)));
 }
 
@@ -721,7 +770,7 @@ fn qu_and_local_source_never_suppress() {
     ingest(&mut app, &ptr_record(120));
     ingest(&mut app, &srv_record(120));
     let ckey = ("_http._tcp.local".to_string(), 12);
-    app.continuous.insert(
+    app.scheduler.continuous_mut().insert(
         ckey.clone(),
         ContinuousQuery {
             next_due: Instant::now() - Duration::from_millis(1),
@@ -739,13 +788,13 @@ fn qu_and_local_source_never_suppress() {
         remote_source(),
     );
     app.ingest_event(&ev);
-    assert!(app.overheard.is_empty());
+    assert!(app.scheduler.overheard().is_empty());
     // Loopback from ourselves: ignored even with subset KA.
     let local: std::net::SocketAddr = test_source();
     app.local_ips.insert(local.ip());
     let ev = query_event("_http._tcp.local.", 12, "PTR", false, Vec::new(), local);
     app.ingest_event(&ev);
-    assert!(app.overheard.is_empty());
+    assert!(app.scheduler.overheard().is_empty());
 }
 
 #[test]
@@ -757,7 +806,8 @@ fn active_mode_sends_due_queries() {
     // instead of emitting back-to-back duplicates.
     assert_eq!(app.metrics.q_sent_continuous, 0);
     let entry = app
-        .continuous
+        .scheduler
+        .continuous()
         .get(&("_http._tcp.local".to_string(), 12))
         .expect("still scheduled");
     assert!(entry.next_due > Instant::now());
@@ -767,7 +817,8 @@ fn active_mode_sends_due_queries() {
 fn passive_mode_sends_nothing() {
     let setup = due_query_setup();
     let due = setup
-        .continuous
+        .scheduler
+        .continuous()
         .get(&("_http._tcp.local".to_string(), 12))
         .expect("seeded entry")
         .next_due;
@@ -775,15 +826,16 @@ fn passive_mode_sends_nothing() {
     app.passive = true;
     app.send_queries();
     let entry = app
-        .continuous
+        .scheduler
+        .continuous()
         .get(&("_http._tcp.local".to_string(), 12))
         .expect("still scheduled");
     assert_eq!(entry.next_due, due);
     assert_eq!(entry.interval, Duration::from_secs(2));
     assert_eq!(app.metrics.q_sent_continuous, 0);
     assert_eq!(app.metrics.q_sent_refresh, 0);
-    assert!(app.requeries.is_empty());
-    assert!(!app.startup_qu_sent);
+    assert!(app.scheduler.requeries().is_empty());
+    assert!(!*app.scheduler.startup_qu_sent_mut());
 }
 
 #[test]
@@ -806,7 +858,8 @@ fn query_interfaces_survive_link_changes_and_exclude_inactive_selection() {
     app.link_stats.v4.clear();
     app.interfaces = None;
     assert_eq!(
-        app.query_history[&App::provenance_key("test.local", 1)].transmitted_interfaces,
+        app.scheduler.query_history_mut()[&App::provenance_key("test.local", 1)]
+            .transmitted_interfaces,
         "br0"
     );
 }

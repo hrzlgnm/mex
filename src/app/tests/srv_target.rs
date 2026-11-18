@@ -642,7 +642,7 @@ fn negative_families_on_different_interfaces_do_not_combine() {
     ingest(&mut app, &ptr_record(4500));
     ingest(&mut app, &srv_record(120));
     mark_address_queries(&mut app, "test.local", Duration::from_secs(2));
-    for state in app.query_history.values_mut() {
+    for state in app.scheduler.query_history_mut().values_mut() {
         state.transmitted_interfaces = "br0, eth0".into();
     }
     for (iface, bitmap) in [("br0", "AAAA"), ("eth0", "A")] {

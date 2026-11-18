@@ -258,9 +258,9 @@ fn out_of_scope_records_never_drive_queries() {
         &mut app,
         &raw_record("test.local.", 6, "TYPE6", "rdlength=22", 4500),
     );
-    assert!(!app.requeries.keys().any(|k| k.1 == 6));
-    assert!(!app.continuous.keys().any(|k| k.1 == 6));
-    assert!(!app.refresh_rows.keys().any(|r| r.1 == 6));
+    assert!(!app.scheduler.requeries().keys().any(|k| k.1 == 6));
+    assert!(!app.scheduler.continuous().keys().any(|k| k.1 == 6));
+    assert!(!app.scheduler.refresh_rows().keys().any(|r| r.1 == 6));
 }
 
 #[test]

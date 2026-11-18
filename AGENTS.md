@@ -63,7 +63,8 @@ Headless run (no TTY) logs to stderr.
   `app::denials::AddressDenials` owns the denials and withheld addresses;
   `App` only takes newly denied rows off their service.
   `App` methods live in child modules by job: `schedule` (continuous
-  browsing, cache refresh, known answers, §7.3 suppression), `ingest`
+  browsing, cache refresh, known answers, §7.3 suppression; its state is
+  `Scheduler`, changed elsewhere only through its methods), `ingest`
   (record handlers, `push_record`, goodbyes), `denials`, `sightings`,
   `questions` (question routing), `input` (keys, mouse, selection),
   `view` (read-only accessors for `ui`; `App` has no public fields), `metrics`, `findings`

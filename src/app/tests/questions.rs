@@ -204,7 +204,8 @@ fn questions_pane_shows_last_and_due() {
     // Backdate the last transmit past the old fixed column width:
     // the full kind word must survive, not clip.
     if let Some(s) = app
-        .query_history
+        .scheduler
+        .query_history_mut()
         .get_mut(&("test._http._tcp.local".to_string(), 33))
     {
         s.transmitted = Some(Instant::now() - Duration::from_secs(4000));

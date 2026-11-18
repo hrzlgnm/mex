@@ -150,7 +150,11 @@ impl App {
         kv(
             &mut rows,
             "types / enum",
-            format!("{} / {}", self.known_types.len(), self.enum_known.len()),
+            format!(
+                "{} / {}",
+                self.scheduler.known_types().len(),
+                self.scheduler.enum_known().len()
+            ),
         );
         for entry in &self.enum_entries {
             let live_answers = entry
@@ -311,7 +315,7 @@ impl App {
             "continuous interests",
             format!(
                 "{} · next in {} · {}",
-                self.continuous.len(),
+                self.scheduler.continuous().len(),
                 self.next_continuous_in(),
                 self.interval_histogram()
             ),
@@ -321,7 +325,7 @@ impl App {
             "requeries",
             format!(
                 "{} pending · {} overdue · {}",
-                self.requeries.len(),
+                self.scheduler.requeries().len(),
                 self.requery_overdue(),
                 self.unanswered_histogram()
             ),
@@ -464,7 +468,8 @@ impl App {
 
     pub(super) fn next_continuous_in(&self) -> String {
         let now = Instant::now();
-        self.continuous
+        self.scheduler
+            .continuous()
             .values()
             .map(|e| e.next_due.saturating_duration_since(now))
             .min()
@@ -479,11 +484,11 @@ impl App {
     }
 
     pub(super) fn interval_histogram(&self) -> String {
-        if self.continuous.is_empty() {
+        if self.scheduler.continuous().is_empty() {
             return "no interests".to_string();
         }
         let mut buckets: HashMap<String, usize> = HashMap::new();
-        for e in self.continuous.values() {
+        for e in self.scheduler.continuous().values() {
             let secs = e.interval.as_secs();
             let label = if secs >= 3600 {
                 "1h".to_string()
@@ -521,7 +526,8 @@ impl App {
 
     pub(super) fn requery_overdue(&self) -> usize {
         let now = Instant::now();
-        self.requeries
+        self.scheduler
+            .requeries()
             .values()
             .filter(|(due, _)| now >= *due)
             .count()
@@ -562,11 +568,11 @@ impl App {
     }
 
     pub(super) fn unanswered_histogram(&self) -> String {
-        if self.requeries.is_empty() {
+        if self.scheduler.requeries().is_empty() {
             return "none unanswered".to_string();
         }
         let mut counts = [0usize; 4];
-        for (_, c) in self.requeries.values() {
+        for (_, c) in self.scheduler.requeries().values() {
             let idx = usize::from((*c).min(4).saturating_sub(1).min(3));
             counts[idx] += 1;
         }

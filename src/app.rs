@@ -3,6 +3,7 @@
 
 use denials::AddressDenials;
 pub use layout::Layout;
+use schedule::Scheduler;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -630,44 +631,9 @@ pub struct App {
 
     rx: mpsc::Receiver<browse::Event>,
     query_tx: browse::QueryTx,
-    /// Continuous browse schedule per (name, rtype): RFC 6762 §5.2
-    /// exponential backoff (1s, 2s, 4s, … capped at 1h). Replaces the old
-    /// fixed 60s re-poll. TTL-driven cache refresh lives in `requeries`.
-    continuous: HashMap<(String, u16), ContinuousQuery>,
-    /// Every service type ever learned (enumeration answers, PTR owners,
-    /// confirmed services). Persistent: used for instance/type splitting
-    /// and as the desired continuous-query set. Never cleared on a timer.
-    known_types: HashSet<String>,
-    /// Per-interest summary of `refresh_rows` for the UI and dumps:
-    /// (earliest next refresh due, highest unanswered count) over the
-    /// rows of a (name, type) still being refreshed. Rebuilt by every
-    /// `requery_expiring` pass; answers clear it early via push_record.
-    requeries: HashMap<(String, u16), (Instant, u8)>,
-    /// Refresh schedule per cached row (RFC 6762 §5.2): a querier SHOULD
-    /// re-ask at 80% of the row's TTL, then 85/90/95% if no answer
-    /// arrives, with ~2% random variation; after four misses the row
-    /// expires at 100% (no hourly refresh — hourly is only the cap for
-    /// *unanswered* continuous browsing). Rows sharing a question are
-    /// tracked separately so each gets its own four attempts on its own
-    /// TTL. A re-announcement replaces the row and starts it afresh.
-    /// Pruned to live rows in `requery_expiring`.
-    refresh_rows: HashMap<RefreshRow, RowRefresh>,
-    /// Per-interest query provenance (transmit / suppress / observe),
-    /// keyed like `continuous` by (lowercased name, type) — see
-    /// `provenance_key`. Pruned with dead interests in `evict_expired`.
-    query_history: HashMap<(String, u16), InterestQueryState>,
-    /// Enumeration answers learned from `_services._dns-sd._udp.local`
-    /// PTR answers: service type -> (original TTL, received_at, ingress
-    /// interface). Used as known answers on enumeration requeries
-    /// (RFC 6762 §7.1, shared), scoped to the link they came from.
-    enum_known: HashMap<String, (u32, Instant, String)>,
-    /// Whether the startup QU batch was already sent (RFC 6762 §5.4:
-    /// QU only on wake/interface-activation batch, QM afterwards).
-    startup_qu_sent: bool,
-    /// Queries are on hold because no family can transmit (no usable
-    /// link on either, or `-i` naming only down links): nothing is
-    /// counted as sent and no schedule advances until one resumes.
-    transmit_held: bool,
+    /// Query scheduling state (RFC 6762 §5.2/§5.4/§7.1/§7.3); see
+    /// [`Scheduler`].
+    scheduler: Scheduler,
     last_ip_refresh: Instant,
     collapsed_hosts: HashSet<String>,
     /// Expanded TXT records in the Answers table, keyed by
@@ -676,12 +642,6 @@ pub struct App {
     /// `Enter` expands them into `▾ TXT` plus child rows.
     expanded_txt: HashSet<TxtKey>,
     local_ips: HashSet<std::net::IpAddr>,
-    /// Recently overheard QM questions from other queriers (RFC 6762 §7.3):
-    /// key (lowercased name, type) -> (seen_at, remote KA targets lowercased
-    /// and dot-trimmed, ingress iface). Consumed to suppress our own
-    /// duplicate once; pruned after OVERHEARD_WINDOW. Own loopback and QU
-    /// questions are never stored.
-    overheard: HashMap<(String, u16), (Instant, HashSet<String>, String)>,
     detail_svc_key: Option<(String, String)>,
     detail_enum_key: Option<String>,
     /// Whether the detail cursor last synced onto `(unattributed)`.
@@ -1037,19 +997,10 @@ impl App {
             running: true,
             rx,
             query_tx,
-            continuous: HashMap::new(),
-            known_types: HashSet::new(),
-            requeries: HashMap::new(),
-            refresh_rows: HashMap::new(),
-            query_history: HashMap::new(),
-            enum_known: HashMap::new(),
-            startup_qu_sent: false,
-            transmit_held: false,
             last_ip_refresh: Instant::now(),
             collapsed_hosts: HashSet::new(),
             expanded_txt: HashSet::new(),
             local_ips: browse::local_ips(),
-            overheard: HashMap::new(),
             // The Answers pane holds finding child rows (#248): it gets
             // the larger share.
             detail_svc_key: None,
@@ -1075,6 +1026,7 @@ impl App {
             address_denials: AddressDenials::default(),
             status_msg: None,
             metrics: MetricsCounters::default(),
+            scheduler: Scheduler::default(),
             state_gen: 0,
             clamped_gen: None,
             link_stats,
@@ -1398,30 +1350,7 @@ impl App {
             live.insert((full.clone(), 33));
             live.insert((full, 16));
         }
-        for t in self.enum_known.keys() {
-            live.insert((t.clone(), 12));
-        }
-        self.requeries
-            .retain(|k, _| live.contains(&(k.0.to_lowercase(), k.1)));
-        self.continuous.retain(|k, _| live.contains(k));
-        // Provenance outlives short schedule gaps but not dead
-        // interests: keep entries with a live schedule key or a recent
-        // event, so a recently expired interest still reports its
-        // terminal state in dumps.
-        self.query_history.retain(|k, v| {
-            live.contains(k)
-                || [
-                    v.transmitted,
-                    v.suppressed,
-                    v.observed.as_ref().map(|o| o.at),
-                ]
-                .into_iter()
-                .flatten()
-                .any(|t| t.elapsed() < INTEREST_GRACE)
-        });
-        // Overheard QM queries are single-use and short-lived (§7.3).
-        self.overheard
-            .retain(|_, (seen, _, _)| seen.elapsed() < OVERHEARD_WINDOW);
+        self.scheduler.evict(live);
         // Drop TXT expansion state for answers that no longer exist.
         let mut live_txt = HashSet::new();
         for svc in &self.services {
@@ -1452,16 +1381,6 @@ impl App {
         if enum_rows_pruned {
             self.touch();
         }
-        // Expire enumeration known answers at 100% TTL; prune the type
-        // cache to live interests so it cannot grow without bound.
-        self.enum_known
-            .retain(|_, (ttl, received, _)| received.elapsed().as_secs() as u32 <= *ttl);
-        let live_types: HashSet<String> = live
-            .iter()
-            .filter(|(_, t)| *t == 12)
-            .map(|(n, _)| n.clone())
-            .collect();
-        self.known_types.retain(|t| live_types.contains(t));
         // Cursor clamping walks the display list and re-sorts the detail
         // rows; skip it on idle ticks where nothing it reads has changed.
         if self.clamped_gen != Some(self.state_gen) {
