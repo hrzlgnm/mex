@@ -391,7 +391,7 @@ fn unattributed_entry_lists_ownerless_findings_until_an_owner_appears() {
         "{header}"
     );
     // Selecting it lists the findings grouped by name.
-    app.selected_display = pos;
+    app.view_state.selected_display = pos;
     let lines = answers_text(&app);
     let block = lines
         .iter()
@@ -446,15 +446,15 @@ fn sourced_finding_stays_on_its_responders_row() {
 #[test]
 fn vanished_unattributed_row_does_not_panic_navigation() {
     let (mut app, pos) = app_with_unattributed();
-    app.selected_display = pos;
+    app.view_state.selected_display = pos;
     app.clamp_selection();
     // The sighting ages out between frames; no clamp runs before `k`.
     app.sightings.clear();
-    assert!(app.selected_display >= app.display_items().len());
+    assert!(app.view_state.selected_display >= app.display_items().len());
     app.move_selection(-1);
-    assert!(app.selected_display < app.display_items().len());
+    assert!(app.view_state.selected_display < app.display_items().len());
     app.move_selection(1);
-    assert!(app.selected_display < app.display_items().len());
+    assert!(app.view_state.selected_display < app.display_items().len());
 }
 
 #[test]
@@ -464,11 +464,11 @@ fn folding_unattributed_keeps_it_as_the_detail_target() {
         app.display_detail(),
         Some(DetailTarget::Service(_))
     ));
-    app.selected_display = pos;
+    app.view_state.selected_display = pos;
     app.clamp_selection();
     app.toggle_collapse();
     assert!(matches!(
-        app.display_items().get(app.selected_display),
+        app.display_items().get(app.view_state.selected_display),
         Some(DisplayItem::Host { label }) if label == UNATTRIBUTED_HOST
     ));
     assert!(
@@ -487,11 +487,11 @@ fn folding_unattributed_keeps_it_as_the_detail_target() {
 fn entering_unattributed_resets_the_answers_viewport() {
     let (mut app, pos) = app_with_unattributed();
     app.layout.detail_offset.set(5);
-    app.detail_free_scroll = true;
-    app.selected_display = pos;
+    app.view_state.detail_free_scroll = true;
+    app.view_state.selected_display = pos;
     app.clamp_selection();
     assert_eq!(app.layout.detail_offset.get(), 0);
-    assert!(!app.detail_free_scroll);
+    assert!(!app.view_state.detail_free_scroll);
 }
 
 #[test]

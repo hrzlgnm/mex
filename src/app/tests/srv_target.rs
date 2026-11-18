@@ -50,7 +50,7 @@ fn enum_question_finding_keeps_qry_scope() {
         .iter()
         .position(|it| matches!(it, DisplayItem::Enum { .. }))
         .expect("enum row");
-    app.selected_display = pos;
+    app.view_state.selected_display = pos;
     app.clamp_selection();
     let lines = answers_text(&app);
     assert!(

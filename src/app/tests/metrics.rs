@@ -144,9 +144,9 @@ fn metrics_toggle_and_scroll_keys() {
         kind: KeyEventKind::Press,
         state: KeyEventState::empty(),
     };
-    assert!(!app.show_metrics);
+    assert!(!app.view_state.show_metrics);
     app.handle_key(&key(KeyCode::Char('m')));
-    assert!(app.show_metrics);
+    assert!(app.view_state.show_metrics);
     assert_eq!(app.layout.metrics_scroll.get(), 0);
     assert_eq!(app.layout.metrics_hscroll.get(), 0);
     app.handle_key(&key(KeyCode::Char('j')));
@@ -187,10 +187,10 @@ fn metrics_toggle_and_scroll_keys() {
     assert_eq!(app.layout.metrics_scroll.get(), 0);
     // Tab must not escape the overlay.
     app.handle_key(&key(KeyCode::Tab));
-    assert!(app.show_metrics);
-    assert_eq!(app.focus, Focus::Services);
+    assert!(app.view_state.show_metrics);
+    assert_eq!(app.view_state.focus, Focus::Services);
     app.handle_key(&key(KeyCode::Esc));
-    assert!(!app.show_metrics);
+    assert!(!app.view_state.show_metrics);
 }
 
 #[test]
@@ -358,7 +358,7 @@ fn metrics_overlay_suppresses_resize_hover() {
         modifiers: KeyModifiers::empty(),
     };
     app.handle_mouse(&moved);
-    assert_eq!(app.hover.get(), DragMode::Vertical);
+    assert_eq!(app.view_state.hover.get(), DragMode::Vertical);
     // Opening the overlay clears resize state...
     let m = KeyEvent {
         code: KeyCode::Char('m'),
@@ -367,12 +367,12 @@ fn metrics_overlay_suppresses_resize_hover() {
         state: KeyEventState::empty(),
     };
     app.handle_key(&m);
-    assert!(app.show_metrics);
-    assert_eq!(app.drag, DragMode::None);
-    assert_eq!(app.hover.get(), DragMode::None);
+    assert!(app.view_state.show_metrics);
+    assert_eq!(app.view_state.drag, DragMode::None);
+    assert_eq!(app.view_state.hover.get(), DragMode::None);
     // ...and motion over a seam while open stays inert.
     app.handle_mouse(&moved);
-    assert_eq!(app.hover.get(), DragMode::None);
+    assert_eq!(app.view_state.hover.get(), DragMode::None);
     let down = MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: 32,
@@ -380,10 +380,10 @@ fn metrics_overlay_suppresses_resize_hover() {
         modifiers: KeyModifiers::empty(),
     };
     app.handle_mouse(&down);
-    assert_eq!(app.drag, DragMode::None);
+    assert_eq!(app.view_state.drag, DragMode::None);
     // Closing restores hover tracking.
     app.handle_key(&m);
-    assert!(!app.show_metrics);
+    assert!(!app.view_state.show_metrics);
     app.handle_mouse(&moved);
-    assert_eq!(app.hover.get(), DragMode::Vertical);
+    assert_eq!(app.view_state.hover.get(), DragMode::Vertical);
 }

@@ -72,7 +72,7 @@ fn header_falls_back_to_last_selected_kind() {
         .iter()
         .position(|it| matches!(it, DisplayItem::Enum { .. }))
         .expect("enum row");
-    app.selected_display = enum_pos;
+    app.view_state.selected_display = enum_pos;
     app.clamp_selection();
     assert!(app.selected_enum().is_some());
     app.collapsed_hosts.insert(ENUM_HOST.to_string());
@@ -81,7 +81,7 @@ fn header_falls_back_to_last_selected_kind() {
         .iter()
         .position(|it| matches!(it, DisplayItem::Host { label } if label == ENUM_HOST))
         .expect("enum header");
-    app.selected_display = header_pos;
+    app.view_state.selected_display = header_pos;
     app.clamp_selection();
     assert!(app.selected_service().is_none());
     assert!(app.selected_enum().is_none());

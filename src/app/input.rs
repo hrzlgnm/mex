@@ -3,7 +3,7 @@ use super::*;
 impl App {
     pub(super) fn toggle_collapse(&mut self) {
         let items = self.display_items();
-        match items.get(self.selected_display) {
+        match items.get(self.view_state.selected_display) {
             Some(DisplayItem::Host { label }) => {
                 let label = label.clone();
                 if !self.collapsed_hosts.remove(&label) {
@@ -94,23 +94,23 @@ impl App {
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         // `m` toggles the metrics overlay from anywhere.
         if no_ctrl_alt && matches!(key.code, KeyCode::Char('m') | KeyCode::Char('M')) {
-            self.show_metrics = !self.show_metrics;
-            if self.show_metrics {
+            self.view_state.show_metrics = !self.view_state.show_metrics;
+            if self.view_state.show_metrics {
                 self.layout.metrics_scroll.set(0);
                 self.layout.metrics_hscroll.set(0);
                 // The overlay owns all input while open: drop any active
                 // resize so borders behind it never glow.
-                self.drag = DragMode::None;
-                self.hover.set(DragMode::None);
+                self.view_state.drag = DragMode::None;
+                self.view_state.hover.set(DragMode::None);
             }
             return;
         }
         // While the overlay is open it owns every key except Ctrl+C:
         // `m`/`Esc` closes, `q` quits, the rest scrolls. Uppercase and
         // lowercase + SHIFT report the same intent on all protocols.
-        if self.show_metrics {
+        if self.view_state.show_metrics {
             match key.code {
-                KeyCode::Esc => self.show_metrics = false,
+                KeyCode::Esc => self.view_state.show_metrics = false,
                 KeyCode::Char('q') => self.running = false,
                 KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => self.scroll_metrics(-1),
                 KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => self.scroll_metrics(1),
@@ -147,7 +147,7 @@ impl App {
         // Tab cycles pane focus in both directions.
         match key.code {
             KeyCode::Tab => {
-                self.focus = match self.focus {
+                self.view_state.focus = match self.view_state.focus {
                     Focus::Services => Focus::Answers,
                     Focus::Answers => Focus::Questions,
                     Focus::Questions => Focus::Hex,
@@ -157,7 +157,7 @@ impl App {
                 return;
             }
             KeyCode::BackTab => {
-                self.focus = match self.focus {
+                self.view_state.focus = match self.view_state.focus {
                     Focus::Services => Focus::Hex,
                     Focus::Answers => Focus::Services,
                     Focus::Questions => Focus::Answers,
@@ -287,18 +287,18 @@ impl App {
 
     pub(super) fn set_left_from_x(&mut self, col: u16) {
         let pct = Self::pct_from_x(col, self.layout.body_rect.get());
-        self.left_pct = Self::clamp_left_pct(pct);
+        self.view_state.left_pct = Self::clamp_left_pct(pct);
     }
 
     pub(super) fn set_answers_from_y(&mut self, row: u16) {
         let pct = Self::pct_from_y(row, self.layout.right_rect.get());
-        self.answers_pct = Self::clamp_pane_pct(pct, self.questions_pct);
+        self.view_state.answers_pct = Self::clamp_pane_pct(pct, self.view_state.questions_pct);
     }
 
     pub(super) fn set_questions_from_y(&mut self, row: u16) {
         let combined = Self::pct_from_y(row, self.layout.right_rect.get());
-        let want = combined.saturating_sub(self.answers_pct);
-        self.questions_pct = Self::clamp_pane_pct(want, self.answers_pct);
+        let want = combined.saturating_sub(self.view_state.answers_pct);
+        self.view_state.questions_pct = Self::clamp_pane_pct(want, self.view_state.answers_pct);
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: &MouseEvent) {
@@ -314,7 +314,7 @@ impl App {
                 self.mouse_moved(mouse.column, mouse.row);
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                self.drag = DragMode::None;
+                self.view_state.drag = DragMode::None;
             }
             MouseEventKind::ScrollDown => self.mouse_wheel(1),
             MouseEventKind::ScrollUp => self.mouse_wheel(-1),
@@ -328,11 +328,11 @@ impl App {
     /// move the cursor (the hex dump follows); free-scroll panes nudge the
     /// viewport. The metrics overlay owns the wheel while open.
     pub(super) fn mouse_wheel(&mut self, delta: isize) {
-        if self.show_metrics {
+        if self.view_state.show_metrics {
             self.scroll_metrics(delta);
             return;
         }
-        match self.focus {
+        match self.view_state.focus {
             Focus::Services => self.move_selection(delta),
             Focus::Answers | Focus::Questions => self.move_detail_cursor(delta),
             Focus::Hex => self.scroll_hex(delta),
@@ -342,21 +342,21 @@ impl App {
     /// Horizontal wheel notch: pans metrics values while the overlay is
     /// open, ignored everywhere else.
     pub(super) fn mouse_hwheel(&mut self, delta: isize) {
-        if self.show_metrics {
+        if self.view_state.show_metrics {
             self.scroll_metrics_h(delta);
         }
     }
 
     pub(super) fn mouse_down(&mut self, col: u16, row: u16) {
         // The metrics overlay owns all input while open (closed via m/Esc).
-        if self.show_metrics {
+        if self.view_state.show_metrics {
             return;
         }
         match self.divider_at(col, row) {
             DragMode::None => {}
             mode => {
-                self.drag = mode;
-                self.hover.set(mode);
+                self.view_state.drag = mode;
+                self.view_state.hover.set(mode);
                 return;
             }
         }
@@ -369,7 +369,7 @@ impl App {
         } else if Self::point_in(self.layout.hex_rect.get(), col, row) {
             // The hex pane follows the cursor; clicking focuses it so its
             // keys scroll the dump.
-            self.focus = Focus::Hex;
+            self.view_state.focus = Focus::Hex;
             self.click_hex_field(col, row);
         }
     }
@@ -382,52 +382,52 @@ impl App {
             .iter()
             .find(|(rect, _)| col >= rect.x && col < rect.x + rect.width && row == rect.y)
         {
-            self.hex_selected_field.set(Some(*index));
+            self.view_state.hex_selected_field.set(Some(*index));
         }
     }
 
     pub(super) fn mouse_drag(&mut self, col: u16, row: u16) {
         // The metrics overlay owns all input while open (closed via m/Esc).
-        if self.show_metrics {
+        if self.view_state.show_metrics {
             return;
         }
-        match self.drag {
+        match self.view_state.drag {
             DragMode::Vertical => {
                 self.set_left_from_x(col);
-                self.hover.set(DragMode::Vertical);
+                self.view_state.hover.set(DragMode::Vertical);
             }
             DragMode::HorizUpper => {
                 self.set_answers_from_y(row);
-                self.hover.set(DragMode::HorizUpper);
+                self.view_state.hover.set(DragMode::HorizUpper);
             }
             DragMode::HorizLower => {
                 self.set_questions_from_y(row);
-                self.hover.set(DragMode::HorizLower);
+                self.view_state.hover.set(DragMode::HorizLower);
             }
             DragMode::None => {
-                self.hover.set(self.divider_at(col, row));
+                self.view_state.hover.set(self.divider_at(col, row));
             }
         }
     }
 
     pub(super) fn mouse_moved(&mut self, col: u16, row: u16) {
         // The metrics overlay owns all input while open (closed via m/Esc).
-        if self.show_metrics {
+        if self.view_state.show_metrics {
             return;
         }
         // Some terminals report drags as Moved; keep following the active
         // divider in that case.
-        if self.drag != DragMode::None {
+        if self.view_state.drag != DragMode::None {
             self.mouse_drag(col, row);
         } else {
-            self.hover.set(self.divider_at(col, row));
+            self.view_state.hover.set(self.divider_at(col, row));
         }
     }
 
     /// Click in the Hosts pane: instances select, headers fold. Mirrors the
     /// keyboard rule that expanded headers are not selectable stops.
     pub(super) fn click_service_list(&mut self, row: u16) {
-        self.focus = Focus::Services;
+        self.view_state.focus = Focus::Services;
         let area = self.layout.left_rect.get();
         if area.height < 3
             || row <= area.y
@@ -443,7 +443,7 @@ impl App {
         };
         match item {
             DisplayItem::Instance { .. } | DisplayItem::Enum { .. } | DisplayItem::Unattributed => {
-                self.selected_display = idx;
+                self.view_state.selected_display = idx;
                 self.clamp_selection();
             }
             DisplayItem::Host { label } => {
@@ -451,7 +451,7 @@ impl App {
                 // Capture the selected item first: folding below the cursor
                 // removes rows and unfolding above it inserts them, so the
                 // raw index is stale after the toggle either way.
-                let prev = items.get(self.selected_display).cloned();
+                let prev = items.get(self.view_state.selected_display).cloned();
                 if !self.collapsed_hosts.remove(&label) {
                     self.collapsed_hosts.insert(label);
                 }
@@ -461,7 +461,7 @@ impl App {
                     if let Some(pos) = items.iter().position(|it| *it == p) {
                         // Same item, new row: selecting the clicked header
                         // can wait for clamp_selection below.
-                        self.selected_display = pos;
+                        self.view_state.selected_display = pos;
                         restored = true;
                     }
                 }
@@ -472,7 +472,7 @@ impl App {
                     && matches!(items.get(idx), Some(DisplayItem::Host { .. }))
                     && self.is_selectable(&items[idx])
                 {
-                    self.selected_display = idx;
+                    self.view_state.selected_display = idx;
                 }
                 self.clamp_selection();
             }
@@ -498,7 +498,7 @@ impl App {
     }
 
     pub(super) fn click_answers(&mut self, row: u16) {
-        self.focus = Focus::Answers;
+        self.view_state.focus = Focus::Answers;
         let area = self.layout.answers_rect.get();
         if area.height < 3 || row < area.y.saturating_add(2) {
             return;
@@ -512,19 +512,19 @@ impl App {
             // Stay on the clicked target: the cursor follows the click
             // instead of the manual-scroll viewport. A new row also
             // restarts the hex dump at the top.
-            self.detail_free_scroll = false;
-            if self.detail_selected != idx {
-                self.detail_selected = idx;
+            self.view_state.detail_free_scroll = false;
+            if self.view_state.detail_selected != idx {
+                self.view_state.detail_selected = idx;
                 self.restart_for_new_row();
             }
             self.detail_anchor = self
                 .display_detail()
-                .and_then(|d| Self::identity_at_detail(&d, self.detail_selected));
+                .and_then(|d| Self::identity_at_detail(&d, self.view_state.detail_selected));
         }
     }
 
     pub(super) fn click_questions(&mut self, row: u16) {
-        self.focus = Focus::Questions;
+        self.view_state.focus = Focus::Questions;
         let area = self.layout.questions_rect.get();
         if area.height < 3 || row < area.y.saturating_add(2) {
             return;
@@ -558,22 +558,22 @@ impl App {
             None
         });
         if let Some(question) = hit {
-            self.detail_free_scroll = false;
+            self.view_state.detail_free_scroll = false;
             let idx = raws + question;
-            if self.detail_selected != idx {
-                self.detail_selected = idx;
+            if self.view_state.detail_selected != idx {
+                self.view_state.detail_selected = idx;
                 self.restart_for_new_row();
             }
             self.detail_anchor = self
                 .display_detail()
-                .and_then(|d| Self::identity_at_detail(&d, self.detail_selected));
+                .and_then(|d| Self::identity_at_detail(&d, self.view_state.detail_selected));
         }
     }
 
     /// Cursor keys routed to the focused pane. Tab switches panes; arrows
     /// and j/k navigate inside the focused pane.
     pub(super) fn handle_focused_key(&mut self, key: &KeyEvent) {
-        match self.focus {
+        match self.view_state.focus {
             Focus::Services => match key.code {
                 KeyCode::Up => self.move_selection(-1),
                 KeyCode::Down => self.move_selection(1),
@@ -662,7 +662,7 @@ impl App {
             }
         }
         if let Some(i) = target {
-            self.selected_display = i;
+            self.view_state.selected_display = i;
         }
     }
 
@@ -674,9 +674,9 @@ impl App {
         let steps = pages * per_page;
         let n = steps.unsigned_abs().min(1000);
         for _ in 0..n {
-            let before = self.selected_display;
+            let before = self.view_state.selected_display;
             self.move_selection(steps.signum());
-            if self.selected_display == before {
+            if self.view_state.selected_display == before {
                 break;
             }
         }
@@ -697,7 +697,7 @@ impl App {
 
     /// Key of the host group containing the cursor row.
     pub(super) fn cursor_group(&self) -> Option<String> {
-        match self.display_items().get(self.selected_display)? {
+        match self.display_items().get(self.view_state.selected_display)? {
             DisplayItem::Host { label } => Some(label.clone()),
             DisplayItem::Instance { index } => {
                 Some(Self::host_key(&self.services[*index].hostname))
@@ -760,7 +760,7 @@ impl App {
                 DisplayItem::Unattributed => label == UNATTRIBUTED_HOST,
             };
             if belongs && self.is_selectable(it) {
-                self.selected_display = i;
+                self.view_state.selected_display = i;
                 return;
             }
         }
@@ -769,13 +769,13 @@ impl App {
     pub(super) fn move_selection(&mut self, delta: isize) {
         let items = self.display_items();
         if items.is_empty() {
-            self.selected_display = 0;
+            self.view_state.selected_display = 0;
             return;
         }
         let max = items.len().saturating_sub(1);
         // Entries can vanish between frames on time alone (an expiring
         // `(unattributed)` group): never index past the rebuilt list.
-        let mut cur = self.selected_display.min(max);
+        let mut cur = self.view_state.selected_display.min(max);
 
         // Host headers are not stops; Up/Down lands on instances.
         loop {
@@ -793,7 +793,7 @@ impl App {
                 break;
             }
             if self.is_selectable(&items[cur]) {
-                self.selected_display = cur;
+                self.view_state.selected_display = cur;
                 return;
             }
         }
@@ -813,7 +813,7 @@ impl App {
                 )
             })
             .unwrap_or((0, 0));
-        match self.focus {
+        match self.view_state.focus {
             Focus::Answers => (0, raws),
             Focus::Questions => (raws, total),
             Focus::Services => (0, total),
@@ -825,18 +825,20 @@ impl App {
     /// it where it is when already inside.
     pub(super) fn snap_detail_to_focus(&mut self) {
         self.sync_detail_cursor();
-        let before = self.detail_selected;
+        let before = self.view_state.detail_selected;
         let (lo, hi) = self.detail_range();
-        if hi > lo && (self.detail_selected < lo || self.detail_selected >= hi) {
-            self.detail_selected = lo;
+        if hi > lo
+            && (self.view_state.detail_selected < lo || self.view_state.detail_selected >= hi)
+        {
+            self.view_state.detail_selected = lo;
         }
         // New row means new hex bytes: restart the dump at the top.
-        if self.detail_selected != before {
+        if self.view_state.detail_selected != before {
             self.restart_for_new_row();
         }
         self.detail_anchor = self
             .display_detail()
-            .and_then(|d| Self::identity_at_detail(&d, self.detail_selected));
+            .and_then(|d| Self::identity_at_detail(&d, self.view_state.detail_selected));
     }
 
     /// Record cursor over the focused table: raw answers for Answers,
@@ -846,26 +848,26 @@ impl App {
     pub(super) fn move_detail_cursor(&mut self, delta: isize) {
         self.sync_detail_cursor();
         // Resuming cursor-follow: manual scroll ends once the cursor moves.
-        self.detail_free_scroll = false;
-        let before = self.detail_selected;
+        self.view_state.detail_free_scroll = false;
+        let before = self.view_state.detail_selected;
         let (lo, hi) = self.detail_range();
         if hi <= lo {
             return;
         }
-        if self.detail_selected < lo || self.detail_selected >= hi {
-            self.detail_selected = if delta < 0 { hi - 1 } else { lo };
+        if self.view_state.detail_selected < lo || self.view_state.detail_selected >= hi {
+            self.view_state.detail_selected = if delta < 0 { hi - 1 } else { lo };
         } else if delta > 0 {
-            if self.detail_selected + 1 < hi {
-                self.detail_selected += 1;
+            if self.view_state.detail_selected + 1 < hi {
+                self.view_state.detail_selected += 1;
             }
-        } else if delta < 0 && self.detail_selected > lo {
-            self.detail_selected -= 1;
+        } else if delta < 0 && self.view_state.detail_selected > lo {
+            self.view_state.detail_selected -= 1;
         }
         self.detail_anchor = self
             .display_detail()
-            .and_then(|d| Self::identity_at_detail(&d, self.detail_selected));
+            .and_then(|d| Self::identity_at_detail(&d, self.view_state.detail_selected));
         // New row means new hex bytes: restart the dump at the top.
-        if self.detail_selected != before {
+        if self.view_state.detail_selected != before {
             self.restart_for_new_row();
         }
     }
@@ -873,14 +875,14 @@ impl App {
     /// First/last row of the focused table.
     pub(super) fn move_detail_edge(&mut self, first: bool) {
         self.sync_detail_cursor();
-        self.detail_free_scroll = false;
-        let before = self.detail_selected;
+        self.view_state.detail_free_scroll = false;
+        let before = self.view_state.detail_selected;
         let (lo, hi) = self.detail_range();
-        self.detail_selected = if hi <= lo || first { lo } else { hi - 1 };
+        self.view_state.detail_selected = if hi <= lo || first { lo } else { hi - 1 };
         self.detail_anchor = self
             .display_detail()
-            .and_then(|d| Self::identity_at_detail(&d, self.detail_selected));
-        if self.detail_selected != before {
+            .and_then(|d| Self::identity_at_detail(&d, self.view_state.detail_selected));
+        if self.view_state.detail_selected != before {
             self.restart_for_new_row();
         }
     }
@@ -892,9 +894,9 @@ impl App {
         let steps = pages * per_page;
         let n = steps.unsigned_abs().min(1000);
         for _ in 0..n {
-            let before = self.detail_selected;
+            let before = self.view_state.detail_selected;
             self.move_detail_cursor(steps.signum());
-            if self.detail_selected == before {
+            if self.view_state.detail_selected == before {
                 break;
             }
         }
@@ -911,14 +913,14 @@ impl App {
             cur.saturating_add(delta.unsigned_abs())
         };
         self.layout.detail_offset.set(next);
-        self.detail_free_scroll = true;
+        self.view_state.detail_free_scroll = true;
     }
 
     /// Scroll the focused detail viewport: the Hex dump while it holds
     /// focus, otherwise the Answers table (which also scrolls from the
     /// Services and Questions panes).
     pub(super) fn scroll_focused_detail(&mut self, delta: isize) {
-        if self.focus == Focus::Hex {
+        if self.view_state.focus == Focus::Hex {
             self.scroll_hex(delta);
         } else {
             self.scroll_detail(delta);
@@ -965,7 +967,7 @@ impl App {
     /// New detail row: restart the hex dump at the top.
     pub(super) fn restart_for_new_row(&mut self) {
         self.layout.hex_offset.set(0);
-        self.hex_selected_field.set(None);
+        self.view_state.hex_selected_field.set(None);
         self.layout.hex_field_hits.borrow_mut().clear();
     }
 
@@ -1065,7 +1067,7 @@ impl App {
         let unattributed = self.unattributed_selected();
         if svc_key.is_none() && enum_key.is_none() && !unattributed {
             // Headers select no row: no field stays highlighted.
-            self.hex_selected_field.set(None);
+            self.view_state.hex_selected_field.set(None);
             self.layout.hex_field_hits.borrow_mut().clear();
             return;
         }
@@ -1079,14 +1081,14 @@ impl App {
             // The drawn row maps belong to the old target.
             self.layout.answers_rows.replace(None);
             self.layout.questions_rows.replace(None);
-            self.detail_selected = 0;
+            self.view_state.detail_selected = 0;
             self.layout.detail_offset.set(0);
-            self.detail_free_scroll = false;
+            self.view_state.detail_free_scroll = false;
             self.layout.questions_offset.set(0);
             self.restart_for_new_row();
             self.detail_anchor = self
                 .display_detail()
-                .and_then(|d| Self::identity_at_detail(&d, self.detail_selected));
+                .and_then(|d| Self::identity_at_detail(&d, self.view_state.detail_selected));
             return;
         }
         // Re-anchor the index to the tracked identity; rows reshuffle as
@@ -1098,20 +1100,20 @@ impl App {
                 .and_then(|a| Self::position_of_detail(&d, a))
         });
         match (pos, anchor) {
-            (Some(pos), _) => self.detail_selected = pos,
+            (Some(pos), _) => self.view_state.detail_selected = pos,
             (None, Some(_)) => {
                 // Tracked row expired away (capped question list): park on
                 // the last raw record instead of pointing at shifted churn.
-                self.hex_selected_field.set(None);
+                self.view_state.hex_selected_field.set(None);
                 self.layout.hex_field_hits.borrow_mut().clear();
                 let parked = self
                     .display_detail()
                     .map(|d| d.ordered_answers().len().saturating_sub(1))
                     .unwrap_or(0);
-                self.detail_selected = parked;
+                self.view_state.detail_selected = parked;
                 self.detail_anchor = self
                     .display_detail()
-                    .and_then(|d| Self::identity_at_detail(&d, self.detail_selected));
+                    .and_then(|d| Self::identity_at_detail(&d, self.view_state.detail_selected));
             }
             (None, None) => {}
         }
@@ -1120,34 +1122,36 @@ impl App {
             .display_detail()
             .map(|d| (d.ordered_answers().len() + d.questions_len()).saturating_sub(1))
             .unwrap_or(0);
-        if self.detail_selected > max {
-            self.detail_selected = max;
+        if self.view_state.detail_selected > max {
+            self.view_state.detail_selected = max;
         }
     }
 
     pub(super) fn clamp_selection(&mut self) {
         let items = self.display_items();
         let max = items.len().saturating_sub(1);
-        if self.selected_display > max {
-            self.selected_display = max;
+        if self.view_state.selected_display > max {
+            self.view_state.selected_display = max;
         }
         // Expanded headers are not selectable stops (e.g. after a collapse
         // stranded the cursor on one, or at startup); settle on an instance.
         // Collapsed headers stay put so their host can be unfolded again.
         if matches!(
-            self.display_items().get(self.selected_display),
+            self.display_items().get(self.view_state.selected_display),
             Some(DisplayItem::Host { label }) if !self.is_host_collapsed(label)
         ) {
             self.move_selection(1);
         }
         if matches!(
-            self.display_items().get(self.selected_display),
+            self.display_items().get(self.view_state.selected_display),
             Some(DisplayItem::Host { label }) if !self.is_host_collapsed(label)
         ) {
             self.move_selection(-1);
         }
-        if self.selected_display < self.layout.list_offset.get() {
-            self.layout.list_offset.set(self.selected_display);
+        if self.view_state.selected_display < self.layout.list_offset.get() {
+            self.layout
+                .list_offset
+                .set(self.view_state.selected_display);
         }
         if self.layout.list_offset.get() > max {
             self.layout.list_offset.set(max.saturating_sub(1));
@@ -1157,7 +1161,7 @@ impl App {
         // offset 1 with row 0 hidden forever. When the cursor sits on
         // the first selectable row, pull the view back to the top.
         if let Some(first) = items.iter().position(|it| self.is_selectable(it)) {
-            if self.selected_display == first {
+            if self.view_state.selected_display == first {
                 let top = first.saturating_sub(1);
                 if self.layout.list_offset.get() > top {
                     self.layout.list_offset.set(top);
@@ -1205,7 +1209,7 @@ impl App {
             self.expanded_txt.insert(key);
         }
         // Let the next frame auto-fit the newly shown/hidden children.
-        self.detail_free_scroll = false;
+        self.view_state.detail_free_scroll = false;
         true
     }
 }

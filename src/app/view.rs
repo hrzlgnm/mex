@@ -335,7 +335,7 @@ impl App {
 
     pub fn selected_service(&self) -> Option<&ServiceEntry> {
         let items = self.display_items();
-        match items.get(self.selected_display)? {
+        match items.get(self.view_state.selected_display)? {
             DisplayItem::Instance { index } => self.services.get(*index),
             _ => None,
         }
@@ -343,7 +343,7 @@ impl App {
 
     pub fn selected_enum(&self) -> Option<&EnumEntry> {
         let items = self.display_items();
-        match items.get(self.selected_display)? {
+        match items.get(self.view_state.selected_display)? {
             DisplayItem::Enum { index } => self.enum_entries.get(*index),
             _ => None,
         }
@@ -418,7 +418,7 @@ impl App {
     /// Whether the Hosts cursor sits on the `(unattributed)` row.
     pub(super) fn unattributed_selected(&self) -> bool {
         matches!(
-            self.display_items().get(self.selected_display),
+            self.display_items().get(self.view_state.selected_display),
             Some(DisplayItem::Unattributed)
         )
     }
@@ -444,13 +444,13 @@ impl App {
             DetailTarget::Unattributed => return None,
         }
         let raws = target.ordered_answers();
-        if self.detail_selected < raws.len() {
-            return Some(DetailEntry::Record(raws[self.detail_selected]));
+        if self.view_state.detail_selected < raws.len() {
+            return Some(DetailEntry::Record(raws[self.view_state.detail_selected]));
         }
         target
             .ordered_questions()
             .into_iter()
-            .nth(self.detail_selected - raws.len())
+            .nth(self.view_state.detail_selected - raws.len())
             .map(|q| DetailEntry::Question {
                 name: &q.0,
                 rtype_str: &q.1,

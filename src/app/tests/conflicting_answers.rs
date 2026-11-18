@@ -187,7 +187,7 @@ fn conflict_shows_in_every_sibling_host_block_and_badges_once() {
             .iter()
             .position(|it| matches!(it, DisplayItem::Instance { index } if *index == i))
             .unwrap();
-        app.selected_display = pos;
+        app.view_state.selected_display = pos;
         app.clamp_selection();
         let lines = answers_text(&app);
         let block = lines

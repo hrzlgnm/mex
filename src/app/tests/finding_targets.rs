@@ -131,7 +131,7 @@ fn enum_type_format_sits_under_its_ptr_row() {
         .iter()
         .position(|it| matches!(it, DisplayItem::Enum { .. }))
         .expect("enum row");
-    app.selected_display = enum_pos;
+    app.view_state.selected_display = enum_pos;
     app.clamp_selection();
     assert!(row_kinds(&app, 12, "badtype.local.").contains(&"type-format"));
     // The collapsed enumeration header keeps showing it.
@@ -351,7 +351,7 @@ fn select_host_header(app: &mut App, key: &str) {
         .iter()
         .position(|it| matches!(it, DisplayItem::Host { label } if label == key))
         .unwrap_or_else(|| panic!("host header for {key}"));
-    app.selected_display = pos;
+    app.view_state.selected_display = pos;
     app.clamp_selection();
     assert!(app.selected_service().is_none());
 }
@@ -413,7 +413,7 @@ fn assert_enum_subtype_per_copy(copies: &[(&str, &str, u32)]) {
         rec.ifindex = *ifindex;
         ingest(&mut app, &rec);
     }
-    app.selected_display = app
+    app.view_state.selected_display = app
         .display_items()
         .iter()
         .position(|d| matches!(d, DisplayItem::Enum { .. }))

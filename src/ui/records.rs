@@ -72,7 +72,7 @@ pub(super) fn draw_records_tab(
         Constraint::Min(20),
     ];
 
-    let block_title = if app.detail_free_scroll {
+    let block_title = if app.view_state().detail_free_scroll {
         format!("Answers: {} ↕", target.pane_ident())
     } else {
         format!("Answers: {}", target.pane_ident())
@@ -97,7 +97,7 @@ pub(super) fn draw_records_tab(
                 .borders(Borders::ALL)
                 .title(Line::from(title_spans))
                 .border_style(border_color(
-                    app.focus == Focus::Answers,
+                    app.view_state().focus == Focus::Answers,
                     resize_active(app, DragMode::Vertical)
                         || resize_active(app, DragMode::HorizUpper),
                 )),
@@ -105,7 +105,7 @@ pub(super) fn draw_records_tab(
         // The hex pane follows the record cursor whatever holds focus, so
         // the cursor row stays marked even when unfocused — dimmed to stay
         // distinct from the focused cursor.
-        .row_highlight_style(if app.focus == Focus::Answers {
+        .row_highlight_style(if app.view_state().focus == Focus::Answers {
             Style::default().add_modifier(Modifier::REVERSED)
         } else {
             Style::default().add_modifier(Modifier::REVERSED | Modifier::DIM)
@@ -118,12 +118,13 @@ pub(super) fn draw_records_tab(
     // In free-scroll mode the selection is withheld so ratatui (which
     // always snaps the viewport back to the selected row) does not undo
     // the manual offset; the cursor itself is untouched (hex pane follows).
-    let selected_table_row =
-        if app.selected_detail_entry().is_some() && app.detail_selected < raw_positions.len() {
-            Some(raw_positions[app.detail_selected])
-        } else {
-            None
-        };
+    let selected_table_row = if app.selected_detail_entry().is_some()
+        && app.view_state().detail_selected < raw_positions.len()
+    {
+        Some(raw_positions[app.view_state().detail_selected])
+    } else {
+        None
+    };
     // Auto-fit the selected record's child extent into view on
     // cursor-follow frames, so an `Enter` expansion near the bottom of
     // the pane reveals its children instead of clipping them. Capped to
@@ -131,10 +132,10 @@ pub(super) fn draw_records_tab(
     // the top and show the first viewport-full of children (page the
     // rest with Ctrl-j/k).
     let mut offset = app.layout().detail_offset.get();
-    if !app.detail_free_scroll {
+    if !app.view_state().detail_free_scroll {
         if let Some(selected) = selected_table_row {
             let extent_end = raw_positions
-                .get(app.detail_selected + 1)
+                .get(app.view_state().detail_selected + 1)
                 .copied()
                 .unwrap_or(total_rows);
             let viewport = area.height.saturating_sub(3) as usize;
@@ -150,7 +151,7 @@ pub(super) fn draw_records_tab(
     // always snaps the viewport back to the selected row) does not undo
     // the manual offset; otherwise the marker stays visible whatever
     // holds focus, so the hex source row is always identifiable.
-    tstate.select(if app.detail_free_scroll {
+    tstate.select(if app.view_state().detail_free_scroll {
         None
     } else {
         selected_table_row

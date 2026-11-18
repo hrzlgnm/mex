@@ -44,7 +44,7 @@ pub(super) fn draw_service_list(
         .iter()
         .enumerate()
         .map(|(i, item)| {
-            let is_selected = i == app.selected_display;
+            let is_selected = i == app.view_state().selected_display;
             match item {
                 DisplayItem::Host { label } => {
                     let collapsed = app.is_host_collapsed(label);
@@ -132,7 +132,7 @@ pub(super) fn draw_service_list(
     // Always show the selected row's host in the border title:
     // instance rows carry no host themselves, so the host would otherwise
     // be invisible once its group header scrolls out of view.
-    let title = match app.display_items().get(app.selected_display) {
+    let title = match app.display_items().get(app.view_state().selected_display) {
         Some(DisplayItem::Enum { .. }) => {
             format!(" Hosts: {} ", app.host_display_name(crate::app::ENUM_HOST))
         }
@@ -157,7 +157,7 @@ pub(super) fn draw_service_list(
                 .borders(Borders::ALL)
                 .title(title)
                 .border_style(border_color(
-                    app.focus == Focus::Services,
+                    app.view_state().focus == Focus::Services,
                     resize_active(app, DragMode::Vertical),
                 )),
         )
@@ -167,8 +167,8 @@ pub(super) fn draw_service_list(
     let mut state = ListState::default()
         .with_offset(app.layout().list_offset.get())
         // The highlight lives in the focused pane; Tab moves it along.
-        .with_selected(if app.focus == Focus::Services {
-            Some(app.selected_display)
+        .with_selected(if app.view_state().focus == Focus::Services {
+            Some(app.view_state().selected_display)
         } else {
             None
         });
