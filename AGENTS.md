@@ -85,7 +85,8 @@ Headless run (no TTY) logs to stderr.
   modules: `records` (record claims, SRV targets, TTLs), `resolve`
   (unresolved targets, address-query evidence), `naming` (service type,
   label and subtype checks), `questions` (question verdicts), `scope`
-  (finding display scopes).
+  (finding display scopes). Tests live in `src/anomalies/tests/`, one file
+  per topic.
 * `src/ui.rs` — ratatui rendering only. It reads focus, selection and
   pane splits through `App::view_state()` (`app::ViewState`, changed only
   by input). The only state draw writes is
