@@ -25,10 +25,11 @@ pub(super) static LOGGER_STATE: std::sync::Mutex<LoggerState> =
 
 /// Minimal log sink with no new dependencies. Records go to a
 /// size-rotated file, `--log-file` or `mex.log` in the default log
-/// directory, at Info and above; headless runs also log Warn and above
-/// to stderr so routine traffic stays quiet there. `--log-level` sets
-/// both thresholds. The TUI never logs to the terminal (it would corrupt
-/// the interface): when its default file cannot be opened, no logger is
+/// directory, at Info and above. Headless runs without `--log-file` also
+/// log Warn and above to stderr, so routine traffic stays quiet there;
+/// an explicit `--log-file` replaces stderr. `--log-level` sets both
+/// thresholds. The TUI never logs to the terminal (it would corrupt the
+/// interface): when its default file cannot be opened, no logger is
 /// installed.
 pub(super) struct MexLogger;
 
