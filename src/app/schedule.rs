@@ -1045,7 +1045,7 @@ impl App {
     pub(super) fn has_fresh_unique_answer(&self, key: &(String, u16)) -> bool {
         // Pending instances count too: they already drive SRV/TXT
         // interest (`desired_continuous`) before their SRV arrives.
-        let rows = self
+        let mut rows = self
             .services
             .iter()
             .flat_map(|s| &s.answers)
