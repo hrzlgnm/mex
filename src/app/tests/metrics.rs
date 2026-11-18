@@ -390,3 +390,20 @@ fn metrics_overlay_suppresses_resize_hover() {
     app.handle_mouse(&moved);
     assert_eq!(app.view_state.hover.get(), DragMode::Vertical);
 }
+
+#[test]
+fn per_source_counters_stay_bounded_and_keep_the_top_talker() {
+    // Spoofed or churning source addresses must not grow the per-source
+    // map without bound; the overlay shows only the top talkers.
+    let mut m = MetricsCounters::default();
+    let busy: SocketAddr = "192.168.1.2:5353".parse().unwrap();
+    for _ in 0..50 {
+        m.count_source(busy);
+    }
+    for i in 0..10_000u32 {
+        let src = SocketAddr::from(([10, (i >> 16) as u8, (i >> 8) as u8, i as u8], 5353));
+        m.count_source(src);
+    }
+    assert!(m.source_rx.len() <= SOURCE_RX_CAP);
+    assert_eq!(m.source_rx.get(&busy), Some(&50));
+}
