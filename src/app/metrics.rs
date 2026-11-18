@@ -44,7 +44,7 @@ impl App {
         *m.iface_rx
             .entry(Self::link_key(iface, ifindex))
             .or_insert(0) += 1;
-        *m.source_rx.entry(ev.source).or_insert(0) += 1;
+        m.count_source(ev.source);
     }
 
     /// Rows for the metrics overlay: `(key, value)` with an empty value

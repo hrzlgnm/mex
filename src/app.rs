@@ -474,6 +474,11 @@ const METRICS_WINDOW: Duration = Duration::from_secs(300);
 /// evicted first and counted in `MetricsCounters::sightings_dropped`.
 const SIGHTINGS_CAP: usize = 256;
 
+/// Most distinct packet sources counted in `MetricsCounters::source_rx`.
+/// The overlay shows only the top talkers; the cap keeps spoofed or
+/// churning source addresses from growing the map without bound.
+const SOURCE_RX_CAP: usize = 256;
+
 /// How long a Questions-pane row lives after its querier last asked
 /// (#238). Equal to the long mDNS TTL (4500 s): our own steady demand
 /// (continuous browsing capped hourly, refreshes at 80–95% of a 4500 s
@@ -556,7 +561,8 @@ fn service_key(instance: &str, service_type: &str) -> String {
 
 /// Cumulative v2 traffic/query counters for the metrics overlay. Derived
 /// snapshot rows come from here plus live state; per-packet maps stay
-/// bounded by network size (tens of responders/interfaces).
+/// bounded by network size (tens of responders/interfaces), and the
+/// per-source map is capped at `SOURCE_RX_CAP` against spoofed sources.
 #[derive(Debug, Default)]
 pub struct MetricsCounters {
     pub bytes_total: u64,
@@ -584,6 +590,24 @@ pub struct MetricsCounters {
     pub services_expired_total: u64,
     /// Out-of-scope sightings evicted by `SIGHTINGS_CAP`.
     pub sightings_dropped: u64,
+}
+
+impl MetricsCounters {
+    /// Count one packet from `src`. At `SOURCE_RX_CAP` distinct sources a
+    /// new one evicts the quietest, so the busiest talkers stay exact.
+    pub(super) fn count_source(&mut self, src: std::net::SocketAddr) {
+        if !self.source_rx.contains_key(&src) && self.source_rx.len() >= SOURCE_RX_CAP {
+            if let Some(quietest) = self
+                .source_rx
+                .iter()
+                .min_by_key(|(_, count)| **count)
+                .map(|(addr, _)| *addr)
+            {
+                self.source_rx.remove(&quietest);
+            }
+        }
+        *self.source_rx.entry(src).or_insert(0) += 1;
+    }
 }
 
 fn fmt_age(secs: u64) -> String {
