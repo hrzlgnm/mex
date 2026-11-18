@@ -48,7 +48,8 @@ Headless run (no TTY) logs to stderr.
   question rows, field extraction, type names). `browse.rs` keeps the
   shared types (`RawRecord`, `Event`, `QueryTx`, `TransmitState`,
   `DropStats`) and `spawn`, and re-exports the public API at its old
-  paths.
+  paths. Tests live in `src/browse/tests/`, one file per child module
+  plus `transmit`.
 * `src/app.rs` — browser state, query scheduling, ingest/expire, selection.
   Out-of-scope records, known answers and questions go to `sightings`
   (never rows, never query drivers; capped, expired by TTL/time), with
