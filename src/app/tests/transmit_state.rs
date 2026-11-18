@@ -13,10 +13,15 @@ fn queries_hold_while_no_family_can_transmit() {
         app.metrics.q_sent_continuous, sent_before,
         "nothing counted"
     );
-    let entry = app.continuous.get(&key).expect("still scheduled");
+    let entry = app
+        .scheduler
+        .continuous()
+        .get(&key)
+        .expect("still scheduled");
     assert_eq!(entry.interval, Duration::from_secs(1), "no backoff");
     assert!(
-        app.query_history
+        app.scheduler
+            .query_history()
             .get(&App::provenance_key(&key.0, key.1))
             .is_none_or(|s| s.transmitted.is_none()),
         "no phantom transmission"
@@ -32,12 +37,17 @@ fn one_family_transmitting_keeps_queries_going() {
     app.send_queries();
     assert!(app.metrics.q_sent_continuous > sent_before);
     assert_eq!(
-        app.continuous.get(&key).expect("scheduled").interval,
+        app.scheduler
+            .continuous()
+            .get(&key)
+            .expect("scheduled")
+            .interval,
         Duration::from_secs(2),
         "backoff advances as usual"
     );
     assert!(app
-        .query_history
+        .scheduler
+        .query_history()
         .get(&App::provenance_key(&key.0, key.1))
         .is_some_and(|s| s.transmitted.is_some()));
 }
@@ -76,7 +86,7 @@ fn resume_restarts_discovery_with_the_startup_schedule() {
     let mut app = App::new().unwrap();
     let key = due_http_stream(&mut app);
     // Backed off far, as after a long outage.
-    if let Some(entry) = app.continuous.get_mut(&key) {
+    if let Some(entry) = app.scheduler.continuous_mut().get_mut(&key) {
         entry.interval = Duration::from_secs(3600);
         entry.next_due = Instant::now() + Duration::from_secs(3600);
     }
@@ -84,7 +94,7 @@ fn resume_restarts_discovery_with_the_startup_schedule() {
     app.send_queries();
     app.query_tx.transmit().pin(true, false);
     app.send_queries();
-    let entry = app.continuous.get(&key).expect("re-created");
+    let entry = app.scheduler.continuous().get(&key).expect("re-created");
     assert_eq!(entry.interval, Duration::from_secs(1), "startup interval");
     assert!(
         entry.next_due <= Instant::now() + Duration::from_millis(120),
@@ -110,8 +120,17 @@ fn hold_drops_expired_refresh_summaries_and_keeps_live_attempts() {
     let mut app = app_with_stale_enum_row();
     let key = ("_services._dns-sd._udp.local".to_string(), 12);
     app.requery_expiring();
-    assert!(app.requeries.contains_key(&key), "refresh scheduled");
-    let attempts = |app: &App| app.refresh_rows.values().map(|s| s.attempts).sum::<u8>();
+    assert!(
+        app.scheduler.requeries().contains_key(&key),
+        "refresh scheduled"
+    );
+    let attempts = |app: &App| {
+        app.scheduler
+            .refresh_rows()
+            .values()
+            .map(|s| s.attempts)
+            .sum::<u8>()
+    };
     assert_eq!(attempts(&app), 1);
     // Held: the live row keeps its attempt; nothing is sent.
     app.query_tx.transmit().pin(false, false);
@@ -122,8 +141,11 @@ fn hold_drops_expired_refresh_summaries_and_keeps_live_attempts() {
     // The record expires during the hold: its summary goes too.
     app.enum_entries[0].answers[1].received_at = Instant::now() - Duration::from_secs(4600);
     app.send_queries();
-    assert!(!app.requeries.contains_key(&key), "no refresh shown for it");
-    assert!(app.refresh_rows.is_empty());
+    assert!(
+        !app.scheduler.requeries().contains_key(&key),
+        "no refresh shown for it"
+    );
+    assert!(app.scheduler.refresh_rows().is_empty());
     assert_eq!(app.requery_overdue(), 0);
 }
 
@@ -146,9 +168,11 @@ fn resume_refreshes_the_link_snapshot_before_queries() {
 }
 
 fn due_http_stream(app: &mut App) -> (String, u16) {
-    app.known_types.insert("_http._tcp.local".to_string());
+    app.scheduler
+        .known_types_mut()
+        .insert("_http._tcp.local".to_string());
     let key = ("_http._tcp.local".to_string(), 12);
-    app.continuous.insert(
+    app.scheduler.continuous_mut().insert(
         key.clone(),
         ContinuousQuery {
             next_due: Instant::now() - Duration::from_millis(1),

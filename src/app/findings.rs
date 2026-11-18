@@ -92,8 +92,8 @@ impl App {
                 targets.into_iter().flat_map(move |hostname| {
                     let service_id = service_id.clone();
                     [1, 28].into_iter().filter_map(move |rtype| {
-                        self.query_history
-                            .get(&Self::provenance_key(&hostname, rtype))
+                        self.scheduler
+                            .history(&Self::provenance_key(&hostname, rtype))
                             .and_then(|state| state.transmitted.map(|at| (state, at)))
                             .map(|(state, transmitted_at)| anomalies::AddressQueryView {
                                 service: service_id.clone(),

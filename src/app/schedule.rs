@@ -1,5 +1,195 @@
 use super::*;
 
+/// Query scheduling state (RFC 6762 §5.2, §5.4, §7.1, §7.3).
+///
+/// Owns the continuous-browsing backoff, the per-row cache refresh, the
+/// learned service types and enumeration known answers, query provenance,
+/// overheard questions for duplicate suppression, and the transmit hold.
+/// Outside `app::schedule` it changes only through these methods; the
+/// timing rules themselves still run on `App` here.
+#[derive(Default)]
+pub(super) struct Scheduler {
+    /// Continuous browse schedule per (name, rtype): RFC 6762 §5.2
+    /// exponential backoff (1s, 2s, 4s, … capped at 1h). Replaces the old
+    /// fixed 60s re-poll. TTL-driven cache refresh lives in `requeries`.
+    continuous: HashMap<(String, u16), ContinuousQuery>,
+    /// Every service type ever learned (enumeration answers, PTR owners,
+    /// confirmed services). Persistent: used for instance/type splitting
+    /// and as the desired continuous-query set. Never cleared on a timer.
+    known_types: HashSet<String>,
+    /// Per-interest summary of `refresh_rows` for the UI and dumps:
+    /// (earliest next refresh due, highest unanswered count) over the
+    /// rows of a (name, type) still being refreshed. Rebuilt by every
+    /// `requery_expiring` pass; answers clear it early via push_record.
+    requeries: HashMap<(String, u16), (Instant, u8)>,
+    /// Refresh schedule per cached row (RFC 6762 §5.2): a querier SHOULD
+    /// re-ask at 80% of the row's TTL, then 85/90/95% if no answer
+    /// arrives, with ~2% random variation; after four misses the row
+    /// expires at 100% (no hourly refresh — hourly is only the cap for
+    /// *unanswered* continuous browsing). Rows sharing a question are
+    /// tracked separately so each gets its own four attempts on its own
+    /// TTL. A re-announcement replaces the row and starts it afresh.
+    /// Pruned to live rows in `requery_expiring`.
+    refresh_rows: HashMap<RefreshRow, RowRefresh>,
+    /// Per-interest query provenance (transmit / suppress / observe),
+    /// keyed like `continuous` by (lowercased name, type) — see
+    /// `provenance_key`. Pruned with dead interests in `evict_expired`.
+    query_history: HashMap<(String, u16), InterestQueryState>,
+    /// Enumeration answers learned from `_services._dns-sd._udp.local`
+    /// PTR answers: service type -> (original TTL, received_at, ingress
+    /// interface). Used as known answers on enumeration requeries
+    /// (RFC 6762 §7.1, shared), scoped to the link they came from.
+    enum_known: HashMap<String, (u32, Instant, String)>,
+    /// Whether the startup QU batch was already sent (RFC 6762 §5.4:
+    /// QU only on wake/interface-activation batch, QM afterwards).
+    startup_qu_sent: bool,
+    /// Queries are on hold because no family can transmit (no usable
+    /// link on either, or `-i` naming only down links): nothing is
+    /// counted as sent and no schedule advances until one resumes.
+    transmit_held: bool,
+    /// Recently overheard QM questions from other queriers (RFC 6762 §7.3):
+    /// key (lowercased name, type) -> (seen_at, remote KA targets lowercased
+    /// and dot-trimmed, ingress iface). Consumed to suppress our own
+    /// duplicate once; pruned after OVERHEARD_WINDOW. Own loopback and QU
+    /// questions are never stored.
+    overheard: HashMap<(String, u16), (Instant, HashSet<String>, String)>,
+}
+
+impl Scheduler {
+    /// Learn a service type from an enumeration answer and track it as a
+    /// known answer (RFC 6762 §7.1) until it expires or says goodbye.
+    pub(super) fn note_enum_type(&mut self, target: &str, rec: &browse::RawRecord) {
+        let key = target.to_lowercase();
+        self.known_types.insert(key.clone());
+        if rec.ttl > 0 {
+            self.enum_known
+                .insert(key, (rec.ttl, rec.received_at, rec.iface.clone()));
+        } else {
+            self.enum_known.remove(&key);
+        }
+    }
+
+    /// Every learned service type, from enumeration or announcements.
+    pub(super) fn type_names(&self) -> impl Iterator<Item = &String> {
+        self.known_types.iter().chain(self.enum_known.keys())
+    }
+
+    /// An answer refreshed this interest: its refresh summary is done.
+    pub(super) fn refresh_answered(&mut self, key: &(String, u16)) {
+        self.requeries.remove(key);
+    }
+
+    /// RFC 6762 §5.2: a unique answer ends discovery for this interest;
+    /// the 80%-TTL refresh takes over.
+    pub(super) fn dampen(&mut self, key: &(String, u16)) {
+        if let Some(entry) = self.continuous.get_mut(key) {
+            entry.interval = MAX_CONTINUOUS_INTERVAL;
+            entry.next_due = Instant::now() + MAX_CONTINUOUS_INTERVAL;
+        }
+    }
+
+    /// Query provenance of one interest (`App::provenance_key`).
+    pub(super) fn history(&self, key: &(String, u16)) -> Option<&InterestQueryState> {
+        self.query_history.get(key)
+    }
+
+    pub(super) fn continuous(&self) -> &HashMap<(String, u16), ContinuousQuery> {
+        &self.continuous
+    }
+
+    pub(super) fn known_types(&self) -> &HashSet<String> {
+        &self.known_types
+    }
+
+    pub(super) fn requeries(&self) -> &HashMap<(String, u16), (Instant, u8)> {
+        &self.requeries
+    }
+
+    pub(super) fn query_history(&self) -> &HashMap<(String, u16), InterestQueryState> {
+        &self.query_history
+    }
+
+    pub(super) fn enum_known(&self) -> &HashMap<String, (u32, Instant, String)> {
+        &self.enum_known
+    }
+
+    /// Prune schedules to live interests. `live` holds every
+    /// (lowercased name, type) the cache still has; enumeration known
+    /// answers are added here before they expire at 100% TTL.
+    pub(super) fn evict(&mut self, mut live: HashSet<(String, u16)>) {
+        for t in self.enum_known.keys() {
+            live.insert((t.clone(), 12));
+        }
+        self.requeries
+            .retain(|k, _| live.contains(&(k.0.to_lowercase(), k.1)));
+        self.continuous.retain(|k, _| live.contains(k));
+        // Provenance outlives short schedule gaps but not dead
+        // interests: keep entries with a live schedule key or a recent
+        // event, so a recently expired interest still reports its
+        // terminal state in dumps.
+        self.query_history.retain(|k, v| {
+            live.contains(k)
+                || [
+                    v.transmitted,
+                    v.suppressed,
+                    v.observed.as_ref().map(|o| o.at),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|t| t.elapsed() < INTEREST_GRACE)
+        });
+        // Overheard QM queries are single-use and short-lived (§7.3).
+        self.overheard
+            .retain(|_, (seen, _, _)| seen.elapsed() < OVERHEARD_WINDOW);
+        // Expire enumeration known answers at 100% TTL; prune the type
+        // cache to live interests so it cannot grow without bound.
+        self.enum_known
+            .retain(|_, (ttl, received, _)| received.elapsed().as_secs() as u32 <= *ttl);
+        let live_types: HashSet<String> = live
+            .iter()
+            .filter(|(_, t)| *t == 12)
+            .map(|(n, _)| n.clone())
+            .collect();
+        self.known_types.retain(|t| live_types.contains(t));
+    }
+}
+
+/// Direct state access for tests that set up a schedule.
+#[cfg(test)]
+impl Scheduler {
+    pub(super) fn refresh_rows(&self) -> &HashMap<RefreshRow, RowRefresh> {
+        &self.refresh_rows
+    }
+
+    pub(super) fn overheard(&self) -> &HashMap<(String, u16), (Instant, HashSet<String>, String)> {
+        &self.overheard
+    }
+
+    pub(super) fn continuous_mut(&mut self) -> &mut HashMap<(String, u16), ContinuousQuery> {
+        &mut self.continuous
+    }
+
+    pub(super) fn known_types_mut(&mut self) -> &mut HashSet<String> {
+        &mut self.known_types
+    }
+
+    pub(super) fn requeries_mut(&mut self) -> &mut HashMap<(String, u16), (Instant, u8)> {
+        &mut self.requeries
+    }
+
+    pub(super) fn refresh_rows_mut(&mut self) -> &mut HashMap<RefreshRow, RowRefresh> {
+        &mut self.refresh_rows
+    }
+
+    pub(super) fn query_history_mut(&mut self) -> &mut HashMap<(String, u16), InterestQueryState> {
+        &mut self.query_history
+    }
+
+    pub(super) fn startup_qu_sent_mut(&mut self) -> &mut bool {
+        &mut self.startup_qu_sent
+    }
+}
+
 impl App {
     /// Per-interest summary for the TUI: latest event age/kind,
     /// owning timer and deadline, plus whether local demand ever
@@ -75,7 +265,7 @@ impl App {
     pub(super) fn known_enum_answers(&self) -> Vec<browse::KnownAnswer> {
         let now = Instant::now();
         let mut out = Vec::new();
-        for (svc_type, (ttl, received, iface)) in &self.enum_known {
+        for (svc_type, (ttl, received, iface)) in &self.scheduler.enum_known {
             let elapsed = now.duration_since(*received).as_secs() as u32;
             let remaining = ttl.saturating_sub(elapsed);
             if *ttl == 0 || remaining * 2 < *ttl {
@@ -109,7 +299,7 @@ impl App {
         // four unanswered queries.
         let mut pending: HashMap<(String, u16), Vec<PendingRow>> = HashMap::new();
         let mut live_rows: HashSet<RefreshRow> = HashSet::new();
-        let tracked = &self.refresh_rows;
+        let tracked = &self.scheduler.refresh_rows;
         let mut scan = |rec: &browse::RawRecord| {
             if rec.ttl == 0 {
                 return;
@@ -147,7 +337,9 @@ impl App {
         }
         // No maintenance without a live record (RFC 6762 §5.2 deletes at
         // 100%); a replaced row is gone with its old identity.
-        self.refresh_rows.retain(|r, _| live_rows.contains(r));
+        self.scheduler
+            .refresh_rows
+            .retain(|r, _| live_rows.contains(r));
         let fired: Vec<_> = if send {
             pending
                 .iter()
@@ -178,21 +370,25 @@ impl App {
                 if !due {
                     continue;
                 }
-                let state = self.refresh_rows.entry(row.clone()).or_insert(RowRefresh {
-                    next_due: now,
-                    attempts: 0,
-                });
+                let state = self
+                    .scheduler
+                    .refresh_rows
+                    .entry(row.clone())
+                    .or_insert(RowRefresh {
+                        next_due: now,
+                        attempts: 0,
+                    });
                 state.attempts += 1;
                 state.next_due = now + refresh_step(*ttl, jitter_pct);
             }
         }
         // Per-question summary for the UI: rows that used up their four
         // attempts drop out and are left to expire at 100%.
-        self.requeries.clear();
+        self.scheduler.requeries.clear();
         for (key, rows) in pending {
             let summary = rows
                 .iter()
-                .filter_map(|(row, _, _)| self.refresh_rows.get(row))
+                .filter_map(|(row, _, _)| self.scheduler.refresh_rows.get(row))
                 .filter(|s| s.attempts < REFRESH_ATTEMPTS)
                 .fold(None, |acc: Option<(Instant, u8)>, s| {
                     Some(match acc {
@@ -201,7 +397,7 @@ impl App {
                     })
                 });
             if let Some(summary) = summary {
-                self.requeries.insert(key, summary);
+                self.scheduler.requeries.insert(key, summary);
             }
         }
     }
@@ -287,6 +483,7 @@ impl App {
         query_interfaces.dedup();
         let query_interfaces = query_interfaces.join(", ");
         let entry = self
+            .scheduler
             .query_history
             .entry(Self::provenance_key(name, rtype))
             .or_default();
@@ -308,6 +505,7 @@ impl App {
     /// and browser asked (RFC 6762 §5.4/§11 context).
     pub(super) fn note_observed(&mut self, q: &browse::RawRecord, ev: &browse::Event) {
         let entry = self
+            .scheduler
             .query_history
             .entry(Self::provenance_key(&q.name, q.rtype))
             .or_default();
@@ -370,6 +568,7 @@ impl App {
             }
             // Rows that used up their four attempts only wait to expire.
             if self
+                .scheduler
                 .refresh_rows
                 .get(&refresh_row(rec))
                 .is_some_and(|s| s.attempts >= REFRESH_ATTEMPTS)
@@ -403,14 +602,16 @@ impl App {
         // a-z, so compare through `provenance_key` everywhere (`É`
         // and `é` must hit the same interest).
         let key = Self::provenance_key(&key.0, key.1);
-        let state = self.query_history.get(&key).cloned();
+        let state = self.scheduler.query_history.get(&key).cloned();
         let (attempt, refresh_due) = self
+            .scheduler
             .requeries
             .iter()
             .find(|(k, _)| Self::provenance_key(&k.0, k.1) == key)
             .map(|(_, (due, count))| (*count, Some(*due)))
             .unwrap_or((0, None));
         let browse_due = self
+            .scheduler
             .continuous
             .iter()
             .find(|(k, _)| Self::provenance_key(&k.0, k.1) == key)
@@ -490,7 +691,7 @@ impl App {
             desired.entry(key).or_insert(name);
         };
         want(ENUM_SERVICE.to_string(), 12);
-        for t in &self.known_types {
+        for t in &self.scheduler.known_types {
             want(t.clone(), 12);
         }
         for p in &self.pending_instances {
@@ -524,9 +725,11 @@ impl App {
         let now = Instant::now();
         let desired = self.desired_continuous();
         // Drop interests that went away (no queries without active interest).
-        self.continuous.retain(|k, _| desired.contains_key(k));
+        self.scheduler
+            .continuous
+            .retain(|k, _| desired.contains_key(k));
         for (key, qname) in desired {
-            let (due, send_name) = match self.continuous.get(&key) {
+            let (due, send_name) = match self.scheduler.continuous.get(&key) {
                 Some(entry) => (now >= entry.next_due, entry.qname.clone()),
                 None => {
                     // RFC 6762 §5.2: first query delayed 20-120ms random.
@@ -544,7 +747,7 @@ impl App {
                     } else {
                         (now + rand_range(20, 120), Duration::from_secs(1))
                     };
-                    self.continuous.insert(
+                    self.scheduler.continuous.insert(
                         key.clone(),
                         ContinuousQuery {
                             next_due,
@@ -577,6 +780,7 @@ impl App {
             let qu = key.1 == 12
                 && is_enum_name(&key.0)
                 && self
+                    .scheduler
                     .continuous
                     .get(&key)
                     .is_some_and(|e| e.interval == Duration::from_secs(1));
@@ -594,7 +798,7 @@ impl App {
                 continue;
             }
             if qu {
-                self.startup_qu_sent = true;
+                self.scheduler.startup_qu_sent = true;
                 // Keep the flag for the passive-mode test; per-name QU above
                 // no longer depends on it.
             }
@@ -640,13 +844,17 @@ impl App {
             // browsed without waiting for a record-bearing service entry.
             // Lowercased: `_HTTP` and `_http` are the same type (RFC 6763 §7).
             for svc in &self.services {
-                self.known_types.insert(svc.service_type.to_lowercase());
+                self.scheduler
+                    .known_types
+                    .insert(svc.service_type.to_lowercase());
             }
             for p in &self.pending_instances {
-                self.known_types.insert(p.service_type.to_lowercase());
+                self.scheduler
+                    .known_types
+                    .insert(p.service_type.to_lowercase());
             }
-            for t in self.enum_known.keys() {
-                self.known_types.insert(t.clone());
+            for t in self.scheduler.enum_known.keys() {
+                self.scheduler.known_types.insert(t.clone());
             }
 
             // While no family can transmit, queries would be queued and
@@ -659,19 +867,19 @@ impl App {
             // first-query path (20–120 ms jitter, dampening, startup QU).
             let can_transmit = self.query_tx.transmit().any();
             if !can_transmit {
-                if !self.transmit_held {
+                if !self.scheduler.transmit_held {
                     log::info!("mex: no family can transmit; queries on hold");
                 }
-                self.transmit_held = true;
+                self.scheduler.transmit_held = true;
                 // Keep the refresh bookkeeping honest without sending:
                 // expired or replaced rows drop out, live rows keep their
                 // attempts and next due time.
                 self.update_refreshes(false);
             } else {
-                if self.transmit_held {
+                if self.scheduler.transmit_held {
                     log::info!("mex: transmission resumed; restarting discovery");
-                    self.continuous.clear();
-                    self.transmit_held = false;
+                    self.scheduler.continuous.clear();
+                    self.scheduler.transmit_held = false;
                     // Links just came back: take a fresh interface
                     // snapshot first, so resumed queries record the
                     // interfaces they really went out on.
@@ -697,7 +905,8 @@ impl App {
     /// latest timestamp per interest, which is why this runs at ingest.
     pub(super) fn response_trigger(&self, rec: &browse::RawRecord) -> Option<browse::QueryTrigger> {
         let name = Self::provenance_key(&rec.name, rec.rtype).0;
-        self.query_history
+        self.scheduler
+            .query_history
             .iter()
             .filter(|((n, _), _)| *n == name)
             .flat_map(|((_, rtype), state)| {
@@ -740,7 +949,8 @@ impl App {
                 remote.insert(ka.rdata.trim_end_matches('.').to_lowercase());
             }
         }
-        self.overheard
+        self.scheduler
+            .overheard
             .insert(key, (Instant::now(), remote, q.iface.clone()));
     }
 
@@ -756,7 +966,7 @@ impl App {
         local_ka: &[browse::KnownAnswer],
     ) -> bool {
         let lookup = (key.0.trim_end_matches('.').to_lowercase(), key.1);
-        let (seen, remote, iface) = match self.overheard.get(&lookup) {
+        let (seen, remote, iface) = match self.scheduler.overheard.get(&lookup) {
             Some(v) => v.clone(),
             None => return false,
         };
@@ -770,7 +980,7 @@ impl App {
             }
         }
         if remote.iter().all(|r| local.contains(r)) {
-            self.overheard.remove(&lookup);
+            self.scheduler.overheard.remove(&lookup);
             return true;
         }
         false
@@ -795,7 +1005,7 @@ impl App {
     }
 
     pub(super) fn advance_continuous(&mut self, key: &(String, u16), now: Instant) {
-        if let Some(entry) = self.continuous.get_mut(key) {
+        if let Some(entry) = self.scheduler.continuous.get_mut(key) {
             let current = entry.interval.max(Duration::from_secs(1));
             entry.next_due = now + current;
             entry.interval = (current * 2).min(MAX_CONTINUOUS_INTERVAL);
@@ -806,7 +1016,7 @@ impl App {
     /// so the two §5.2 timers don't emit back-to-back duplicates.
     pub(super) fn postpone_continuous_for_refresh(&mut self, key: &(String, u16), now: Instant) {
         let mut postponed = false;
-        for (ckey, entry) in self.continuous.iter_mut() {
+        for (ckey, entry) in self.scheduler.continuous.iter_mut() {
             if ckey.1 == key.1 && ckey.0.eq_ignore_ascii_case(&key.0) {
                 let floor = now + entry.interval.max(Duration::from_secs(1));
                 if entry.next_due < floor {
@@ -817,7 +1027,9 @@ impl App {
         }
         if !postponed {
             let ckey = Self::continuous_key(&key.0, key.1);
-            if let std::collections::hash_map::Entry::Vacant(e) = self.continuous.entry(ckey) {
+            if let std::collections::hash_map::Entry::Vacant(e) =
+                self.scheduler.continuous.entry(ckey)
+            {
                 e.insert(ContinuousQuery {
                     next_due: now + Duration::from_secs(1),
                     interval: Duration::from_secs(1),

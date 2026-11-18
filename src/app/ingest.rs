@@ -189,14 +189,7 @@ impl App {
             // `_HTTP` and `_http` announcements coalesce (RFC 6763 §7).
             // The full answer is also filed on the selectable enumeration
             // row so the Answers pane shows what each link advertises.
-            self.known_types.insert(target.to_lowercase());
-            let enum_key = target.to_lowercase();
-            if rec.ttl > 0 {
-                self.enum_known
-                    .insert(enum_key, (rec.ttl, rec.received_at, rec.iface.clone()));
-            } else {
-                self.enum_known.remove(&enum_key);
-            }
+            self.scheduler.note_enum_type(target, rec);
             if let Some(entry) = self
                 .enum_entries
                 .iter_mut()
@@ -232,7 +225,7 @@ impl App {
                     elapsed <= r.ttl && in_refresh_window(elapsed, r.ttl)
                 });
                 if !still_expiring {
-                    self.requeries.remove(&key);
+                    self.scheduler.refresh_answered(&key);
                 }
             }
             return;
@@ -343,10 +336,7 @@ impl App {
         for p in &self.pending_instances {
             consider(&p.service_type);
         }
-        for t in &self.known_types {
-            consider(t);
-        }
-        for t in self.enum_known.keys() {
+        for t in self.scheduler.type_names() {
             consider(t);
         }
         best
@@ -748,17 +738,14 @@ impl App {
                 elapsed <= r.ttl && in_refresh_window(elapsed, r.ttl)
             });
             if !still_expiring {
-                self.requeries.remove(&key);
+                self.scheduler.refresh_answered(&key);
             }
             // RFC 6762 §5.2: a unique answer (cache-flush bit) means no
             // other answers are forthcoming, so dampen the exponential
             // discovery stream and let the 80%-TTL refresh take over.
             if rec.flush_bit {
                 let ckey = Self::continuous_key(rec.name.trim_end_matches('.'), rec.rtype);
-                if let Some(entry) = self.continuous.get_mut(&ckey) {
-                    entry.interval = MAX_CONTINUOUS_INTERVAL;
-                    entry.next_due = Instant::now() + MAX_CONTINUOUS_INTERVAL;
-                }
+                self.scheduler.dampen(&ckey);
             }
         }
         // Host-owned records (addresses, and e.g. HINFO for the host
