@@ -24,6 +24,7 @@ pub(super) fn draw_hex_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: 
         if let Some((bytes, title)) = app.selected_detail_bytes() {
             let fields = app.selected_detail_fields().unwrap_or_default();
             let selected_field = app
+                .view_state()
                 .hex_selected_field
                 .get()
                 .filter(|index| *index < fields.len());
@@ -56,7 +57,7 @@ pub(super) fn draw_hex_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: 
             // In-pane focus cue (the hex pane has no cursor to highlight):
             // the body text goes bold while focused. The border already
             // brightens, but that alone is easy to miss when tabbing panes.
-            let empty_style = if app.focus == Focus::Hex {
+            let empty_style = if app.view_state().focus == Focus::Hex {
                 Style::default()
                     .fg(Color::Gray)
                     .add_modifier(Modifier::BOLD)
@@ -117,12 +118,12 @@ pub(super) fn draw_hex_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: 
                 .borders(Borders::ALL)
                 .title(title)
                 .border_style(border_color(
-                    app.focus == Focus::Hex,
+                    app.view_state().focus == Focus::Hex,
                     resize_active(app, DragMode::Vertical)
                         || resize_active(app, DragMode::HorizLower),
                 )),
         )
-        .style(if app.focus == Focus::Hex {
+        .style(if app.view_state().focus == Focus::Hex {
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD)

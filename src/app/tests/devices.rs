@@ -195,7 +195,7 @@ fn unattributed_findings_name_their_source() {
         .iter()
         .position(|it| matches!(it, DisplayItem::Unattributed))
         .expect("(unattributed) entry");
-    app.selected_display = pos;
+    app.view_state.selected_display = pos;
     app.clamp_selection();
     assert!(finding_line(&app, REPEATER).contains("(FritzBoxRepeater)"));
 }

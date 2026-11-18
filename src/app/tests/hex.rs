@@ -7,7 +7,7 @@ fn self_question_hex_title_matches_remote() {
     let remote: std::net::SocketAddr = "192.168.1.99:5353".parse().unwrap();
     let pkt = vec![0x12, 0x34, 0x01, 0x00];
     {
-        let sel_idx = match app.display_items().get(app.selected_display) {
+        let sel_idx = match app.display_items().get(app.view_state.selected_display) {
             Some(DisplayItem::Instance { index }) => *index,
             _ => panic!("expected instance selected"),
         };
@@ -24,7 +24,7 @@ fn self_question_hex_title_matches_remote() {
     // the self row must surface these bytes, marked as fallback.
     let fallback = vec![0xDE, 0xAD, 0xBE, 0xEF];
     {
-        let sel_idx = match app.display_items().get(app.selected_display) {
+        let sel_idx = match app.display_items().get(app.view_state.selected_display) {
             Some(DisplayItem::Instance { index }) => *index,
             _ => panic!("expected instance selected"),
         };
@@ -48,7 +48,7 @@ fn self_question_hex_title_matches_remote() {
             .expect("remote question filed");
         (raws, self_pos, remote_pos)
     };
-    app.detail_selected = raws + self_pos;
+    app.view_state.detail_selected = raws + self_pos;
     let (bytes, title) = app
         .selected_detail_bytes()
         .expect("self question has hex payload");
@@ -57,7 +57,7 @@ fn self_question_hex_title_matches_remote() {
     assert_eq!(title, " QRY PTR _ssh._tcp.local. (inferred) ");
     // Remote row returns its own query packet bytes under the
     // unmarked title.
-    app.detail_selected = raws + remote_pos;
+    app.view_state.detail_selected = raws + remote_pos;
     let (rbytes, remote_title) = app
         .selected_detail_bytes()
         .expect("remote question has hex payload");
@@ -73,7 +73,7 @@ fn enum_self_question_hex_title_matches_remote() {
         .iter()
         .position(|it| matches!(it, DisplayItem::Enum { .. }))
         .expect("enum row");
-    app.selected_display = enum_pos;
+    app.view_state.selected_display = enum_pos;
     app.clamp_selection();
     let remote: std::net::SocketAddr = "192.168.1.99:5353".parse().unwrap();
     app.enum_entries[0].questions.push((
@@ -94,7 +94,7 @@ fn enum_self_question_hex_title_matches_remote() {
             .expect("self enum question filed");
         (raws, self_pos)
     };
-    app.detail_selected = raws + self_pos;
+    app.view_state.detail_selected = raws + self_pos;
     let (bytes, title) = app
         .selected_detail_bytes()
         .expect("self enum question has hex payload");
@@ -117,9 +117,9 @@ fn questions_table_marks_hex_source_when_hosts_focused() {
             .expect("self question filed");
         (raws, pos)
     };
-    app.detail_selected = raws + self_pos;
+    app.view_state.detail_selected = raws + self_pos;
     // Hosts focus: dimmed marker, hex title names the question.
-    assert_eq!(app.focus, Focus::Services);
+    assert_eq!(app.view_state.focus, Focus::Services);
     let marked = questions_reversed_modifiers(&app);
     assert!(
         !marked.is_empty(),
@@ -131,7 +131,7 @@ fn questions_table_marks_hex_source_when_hosts_focused() {
     );
     assert!(hex_title_line(&app).contains("QRY PTR _ssh._tcp.local"));
     // Questions focus: full cursor, same title.
-    app.focus = Focus::Questions;
+    app.view_state.focus = Focus::Questions;
     let marked = questions_reversed_modifiers(&app);
     assert!(!marked.is_empty());
     assert!(
@@ -140,14 +140,14 @@ fn questions_table_marks_hex_source_when_hosts_focused() {
     );
     assert!(hex_title_line(&app).contains("QRY PTR _ssh._tcp.local"));
     // Hex focus: dimmed marker, same title.
-    app.focus = Focus::Hex;
+    app.view_state.focus = Focus::Hex;
     let marked = questions_reversed_modifiers(&app);
     assert!(!marked.is_empty());
     assert!(marked.iter().all(|m| m.contains(Modifier::DIM)));
     assert!(hex_title_line(&app).contains("QRY PTR _ssh._tcp.local"));
     // Moving the cursor across question rows updates marker and title.
     {
-        let sel_idx = match app.display_items().get(app.selected_display) {
+        let sel_idx = match app.display_items().get(app.view_state.selected_display) {
             Some(DisplayItem::Instance { index }) => *index,
             _ => panic!("expected instance selected"),
         };
@@ -166,7 +166,7 @@ fn questions_table_marks_hex_source_when_hosts_focused() {
         .iter()
         .position(|q| q.1 == "A")
         .expect("remote question filed");
-    app.detail_selected = raws + remote_pos;
+    app.view_state.detail_selected = raws + remote_pos;
     let marked = questions_reversed_modifiers(&app);
     assert!(!marked.is_empty());
     assert!(hex_title_line(&app).contains("QRY A shell.local"));
@@ -198,15 +198,15 @@ fn clicking_record_field_highlights_its_wire_bytes() {
         .and_then(|service| service.answers.iter_mut().find(|record| record.rtype == 33))
         .expect("SRV record")
         .wire = srv_wire();
-    app.detail_selected = 0;
+    app.view_state.detail_selected = 0;
 
     let before = render_to_buffer(&app, 160, 60);
-    let selected_record = app.detail_selected;
+    let selected_record = app.view_state.detail_selected;
     let (field_x, field_y) =
         find_buffer_text(&before, "Owner name").expect("owner field is displayed");
     app.mouse_down(field_x + 1, field_y);
     assert_eq!(
-        app.detail_selected, selected_record,
+        app.view_state.detail_selected, selected_record,
         "clicking a field should not change the selected record"
     );
 
@@ -282,7 +282,7 @@ fn clicking_record_field_highlights_its_wire_bytes() {
         .and_then(|service| service.answers.iter_mut().find(|record| record.rtype == 33))
         .expect("SRV record");
     srv.wire = srv_wire();
-    app.focus = Focus::Answers;
+    app.view_state.focus = Focus::Answers;
     app.move_detail_cursor(1);
     let after_record_change = render_to_buffer(&app, 160, 60);
     let (label_x, label_y) = find_buffer_text(&after_record_change, "Owner name")
@@ -313,10 +313,10 @@ fn clicking_question_name_highlights_the_selected_question_in_packet() {
     let before = render_to_buffer(&app, 160, 60);
     let (field_x, field_y) =
         find_buffer_text(&before, "QNAME").expect("question name field is displayed");
-    let selected_row = app.detail_selected;
+    let selected_row = app.view_state.detail_selected;
     app.mouse_down(field_x + 1, field_y);
     assert_eq!(
-        app.detail_selected, selected_row,
+        app.view_state.detail_selected, selected_row,
         "clicking a question field should preserve the selected row"
     );
 
@@ -541,7 +541,7 @@ fn clicking_own_question_field_highlights_its_query_bytes() {
 
     let mut app = two_group_app();
     let fallback = vec![0xde, 0xad, 0xbe, 0xef];
-    let selected_service = match app.display_items().get(app.selected_display) {
+    let selected_service = match app.display_items().get(app.view_state.selected_display) {
         Some(DisplayItem::Instance { index }) => *index,
         _ => panic!("expected instance selected"),
     };
@@ -556,8 +556,8 @@ fn clicking_own_question_field_highlights_its_query_bytes() {
         .expect("selected service")
         .ordered_answers()
         .len();
-    app.detail_selected = raw_count;
-    app.focus = Focus::Questions;
+    app.view_state.detail_selected = raw_count;
+    app.view_state.focus = Focus::Questions;
 
     let before = render_to_buffer(&app, 160, 60);
     assert!(
@@ -566,10 +566,10 @@ fn clicking_own_question_field_highlights_its_query_bytes() {
     );
     let (field_x, field_y) =
         find_buffer_text(&before, "QNAME").expect("own question name field is displayed");
-    let selected_row = app.detail_selected;
+    let selected_row = app.view_state.detail_selected;
     app.mouse_down(field_x + 1, field_y);
     assert_eq!(
-        app.detail_selected, selected_row,
+        app.view_state.detail_selected, selected_row,
         "clicking an own question field should preserve its selected row"
     );
 
@@ -623,7 +623,7 @@ fn clicking_srv_port_highlights_only_the_port_bytes() {
         .find(|record| record.rtype == 33)
         .expect("SRV record");
     record.wire = srv_wire();
-    app.detail_selected = app
+    app.view_state.detail_selected = app
         .display_detail()
         .and_then(|detail| {
             detail
@@ -681,7 +681,7 @@ fn clicking_ipv4_address_highlights_its_four_bytes() {
         .expect("selected service")
         .answers
         .push(record);
-    app.detail_selected = app
+    app.view_state.detail_selected = app
         .display_detail()
         .and_then(|detail| {
             detail
@@ -736,7 +736,7 @@ fn unknown_record_data_stays_opaque() {
         .expect("selected service")
         .answers
         .push(record);
-    app.detail_selected = app
+    app.view_state.detail_selected = app
         .display_detail()
         .and_then(|detail| {
             detail
@@ -777,7 +777,7 @@ fn clicking_txt_string_highlights_its_length_and_data() {
     wire.extend([3, b'a', b'=', b'1', 3, b'b', b'=', b'2']);
     record.wire = wire;
     ingest(&mut app, &record);
-    app.detail_selected = app
+    app.view_state.detail_selected = app
         .display_detail()
         .and_then(|detail| {
             detail
@@ -821,14 +821,14 @@ fn hex_pane_shows_focus_cue() {
     use ratatui::style::Modifier;
     // Dump state: bold body iff focused.
     let mut app = two_group_app();
-    app.focus = Focus::Hex;
+    app.view_state.focus = Focus::Hex;
     let (mods, _) = hex_body_marks(&app, 100, 30);
     assert!(!mods.is_empty());
     assert!(
         mods.iter().any(|m| m.contains(Modifier::BOLD)),
         "focused hex body must be bold"
     );
-    app.focus = Focus::Services;
+    app.view_state.focus = Focus::Services;
     let (mods, _) = hex_body_marks(&app, 100, 30);
     assert!(!mods.is_empty());
     assert!(
@@ -837,16 +837,16 @@ fn hex_pane_shows_focus_cue() {
     );
     // Empty state: cue present, same rule.
     let mut empty_app = App::new().unwrap();
-    empty_app.focus = Focus::Hex;
+    empty_app.view_state.focus = Focus::Hex;
     let (mods, _) = hex_body_marks(&empty_app, 100, 30);
     assert!(mods.iter().any(|m| m.contains(Modifier::BOLD)));
-    empty_app.focus = Focus::Services;
+    empty_app.view_state.focus = Focus::Services;
     let (mods, _) = hex_body_marks(&empty_app, 100, 30);
     assert!(mods.iter().all(|m| !m.contains(Modifier::BOLD)));
     // Scrolled state: tall dump, small pane, offset forced.
     let mut app = two_group_app();
     {
-        let sel_idx = match app.display_items().get(app.selected_display) {
+        let sel_idx = match app.display_items().get(app.view_state.selected_display) {
             Some(DisplayItem::Instance { index }) => *index,
             _ => panic!("expected instance selected"),
         };
@@ -857,13 +857,13 @@ fn hex_pane_shows_focus_cue() {
             .raw_bytes = vec![0xAB; 256];
     }
     app.layout.hex_offset.set(5);
-    app.focus = Focus::Hex;
+    app.view_state.focus = Focus::Hex;
     // Tall enough that the scrolled dump keeps a viewport in the
     // four-pane stack.
     let (mods, title) = hex_body_marks(&app, 100, 20);
     assert!(title.contains('↕'), "dump must be scrolled, got: {title}");
     assert!(mods.iter().any(|m| m.contains(Modifier::BOLD)));
-    app.focus = Focus::Services;
+    app.view_state.focus = Focus::Services;
     let (mods, _) = hex_body_marks(&app, 100, 20);
     assert!(mods.iter().all(|m| !m.contains(Modifier::BOLD)));
 }
@@ -873,7 +873,7 @@ fn answers_table_marks_hex_source_when_hosts_focused() {
     use ratatui::style::Modifier;
     let mut app = two_group_app();
     // Services focus is the Hosts pane.
-    assert_eq!(app.focus, Focus::Services);
+    assert_eq!(app.view_state.focus, Focus::Services);
     // The detail cursor sits on a record, so the hex pane follows it.
     assert!(app.selected_detail_entry().is_some());
     let marked = answers_reversed_modifiers(&app);
@@ -886,7 +886,7 @@ fn answers_table_marks_hex_source_when_hosts_focused() {
         "unfocused marker must be dim, distinct from the focused cursor"
     );
     // Focused behavior is unchanged: full cursor, no dimming.
-    app.focus = Focus::Answers;
+    app.view_state.focus = Focus::Answers;
     let marked = answers_reversed_modifiers(&app);
     assert!(!marked.is_empty());
     assert!(
@@ -896,7 +896,7 @@ fn answers_table_marks_hex_source_when_hosts_focused() {
     // Moving the host selection keeps marker and hex dump in sync: the
     // marker follows the detail cursor (test answers carry no wire
     // bytes, so the dump itself is covered by the title tests).
-    app.focus = Focus::Services;
+    app.view_state.focus = Focus::Services;
     select_instance(&mut app, "Test");
     assert!(app.selected_detail_entry().is_some());
     let marked = answers_reversed_modifiers(&app);
@@ -920,7 +920,7 @@ fn hex_pane_scrolls_and_resets() {
     app.handle_key(&plain(KeyCode::Tab));
     app.handle_key(&plain(KeyCode::Tab));
     app.handle_key(&plain(KeyCode::Tab));
-    assert_eq!(app.focus, Focus::Hex);
+    assert_eq!(app.view_state.focus, Focus::Hex);
     // Viewport is recorded at draw; fake 10 rows for the scroll math.
     app.layout.hex_viewport.set(10);
     app.handle_key(&plain(KeyCode::Char('j')));
@@ -934,7 +934,7 @@ fn hex_pane_scrolls_and_resets() {
     // Moving the record cursor restarts the dump at the top.
     app.handle_key(&plain(KeyCode::BackTab));
     app.handle_key(&plain(KeyCode::BackTab));
-    assert_eq!(app.focus, Focus::Answers);
+    assert_eq!(app.view_state.focus, Focus::Answers);
     app.handle_key(&plain(KeyCode::Char('k')));
     assert_eq!(app.layout.hex_offset.get(), 0);
     // Clicking another row restarts the dump; re-clicking keeps scroll.
@@ -943,7 +943,7 @@ fn hex_pane_scrolls_and_resets() {
     app.layout.detail_offset.set(0);
     app.layout.hex_offset.set(5);
     app.click_answers(3 + 2 + 1);
-    assert_eq!(app.detail_selected, 0);
+    assert_eq!(app.view_state.detail_selected, 0);
     assert_eq!(app.layout.hex_offset.get(), 0);
     app.layout.hex_offset.set(5);
     app.click_answers(3 + 2 + 1);
@@ -953,9 +953,9 @@ fn hex_pane_scrolls_and_resets() {
     app.layout.answers_rect.set(Rect::new(33, 3, 67, 8));
     app.layout.questions_rect.set(Rect::new(33, 11, 67, 13));
     app.layout.hex_rect.set(Rect::new(33, 24, 67, 9));
-    app.focus = Focus::Services;
+    app.view_state.focus = Focus::Services;
     app.mouse_down(40, 25);
-    assert_eq!(app.focus, Focus::Hex);
+    assert_eq!(app.view_state.focus, Focus::Hex);
 }
 
 #[test]
@@ -979,7 +979,7 @@ fn snap_to_focused_table_resets_hex_scroll() {
     // One question so Tab into Questions snaps the cursor off its record.
     let src: std::net::SocketAddr = "192.168.1.9:5353".parse().unwrap();
     let raw_count = {
-        let sel_idx = match app.display_items().get(app.selected_display) {
+        let sel_idx = match app.display_items().get(app.view_state.selected_display) {
             Some(DisplayItem::Instance { index }) => *index,
             _ => panic!("expected instance selected"),
         };
@@ -995,12 +995,12 @@ fn snap_to_focused_table_resets_hex_scroll() {
     // Park the cursor on a record, scroll the hex dump, then Tab across:
     // the snap moves the cursor and must restart the dump at the top.
     app.handle_key(&plain(KeyCode::Tab));
-    assert_eq!(app.focus, Focus::Answers);
-    assert!(app.detail_selected < raw_count);
+    assert_eq!(app.view_state.focus, Focus::Answers);
+    assert!(app.view_state.detail_selected < raw_count);
     app.layout.hex_offset.set(9);
     app.handle_key(&plain(KeyCode::Tab));
-    assert_eq!(app.focus, Focus::Questions);
-    assert_eq!(app.detail_selected, raw_count);
+    assert_eq!(app.view_state.focus, Focus::Questions);
+    assert_eq!(app.view_state.detail_selected, raw_count);
     assert_eq!(app.layout.hex_offset.get(), 0);
 }
 
@@ -1134,7 +1134,7 @@ fn select_question_row(app: &mut App, name: &str, rtype: &str, packet: Vec<u8>) 
         .expect("selected service")
         .ordered_answers()
         .len();
-    let selected_service = match app.display_items().get(app.selected_display) {
+    let selected_service = match app.display_items().get(app.view_state.selected_display) {
         Some(DisplayItem::Instance { index }) => *index,
         _ => panic!("expected instance selected"),
     };
@@ -1145,6 +1145,6 @@ fn select_question_row(app: &mut App, name: &str, rtype: &str, packet: Vec<u8>) 
         Instant::now(),
         packet,
     ));
-    app.detail_selected = raw_count;
-    app.focus = Focus::Questions;
+    app.view_state.detail_selected = raw_count;
+    app.view_state.focus = Focus::Questions;
 }

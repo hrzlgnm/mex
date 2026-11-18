@@ -161,7 +161,7 @@ pub(super) fn draw_questions_tab(
     // focused.
     let raw_count = target.ordered_answers().len();
     let cursor_in_questions =
-        app.selected_detail_entry().is_some() && app.detail_selected >= raw_count;
+        app.selected_detail_entry().is_some() && app.view_state().detail_selected >= raw_count;
 
     let table = Table::new(rows, widths)
         .header(
@@ -180,7 +180,7 @@ pub(super) fn draw_questions_tab(
                         .collect::<Vec<_>>(),
                 ))
                 .border_style(border_color(
-                    app.focus == Focus::Questions,
+                    app.view_state().focus == Focus::Questions,
                     resize_active(app, DragMode::Vertical)
                         || resize_active(app, DragMode::HorizUpper)
                         || resize_active(app, DragMode::HorizLower),
@@ -189,7 +189,7 @@ pub(super) fn draw_questions_tab(
         // The hex pane follows the detail cursor whatever holds focus, so
         // the cursor row stays marked even when unfocused — dimmed to stay
         // distinct from the focused cursor.
-        .row_highlight_style(if app.focus == Focus::Questions {
+        .row_highlight_style(if app.view_state().focus == Focus::Questions {
             Style::default().add_modifier(Modifier::REVERSED)
         } else {
             Style::default().add_modifier(Modifier::REVERSED | Modifier::DIM)
@@ -199,7 +199,7 @@ pub(super) fn draw_questions_tab(
     // so the hex source stays identifiable whatever holds focus.
     let selected_table_row = if cursor_in_questions {
         question_positions
-            .get(app.detail_selected - raw_count)
+            .get(app.view_state().detail_selected - raw_count)
             .copied()
     } else {
         None

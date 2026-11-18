@@ -153,7 +153,7 @@ fn service_with_txt(app: &mut App, rdata: &str) {
     };
     // Park the Tab cursor on the TXT row without going through
     // sync_detail_cursor (which would re-anchor to the old PTR row).
-    app.detail_selected = idx;
+    app.view_state.detail_selected = idx;
     app.detail_anchor = app
         .display_detail()
         .and_then(|d| App::identity_at_detail(&d, idx));
@@ -199,7 +199,7 @@ fn select_instance(app: &mut App, instance: &str) {
     for (i, it) in items.iter().enumerate() {
         if let DisplayItem::Instance { index } = it {
             if app.services[*index].instance == instance {
-                app.selected_display = i;
+                app.view_state.selected_display = i;
                 break;
             }
         }

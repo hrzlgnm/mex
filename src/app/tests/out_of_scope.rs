@@ -178,7 +178,7 @@ fn unmatched_sighting_is_unattributed_and_dumped() {
         .iter()
         .position(|it| matches!(it, DisplayItem::Unattributed))
         .expect("(unattributed) entry");
-    app.selected_display = pos;
+    app.view_state.selected_display = pos;
     app.clamp_selection();
     assert!(shown(&app)
         .iter()
@@ -589,7 +589,7 @@ fn row_less_target_still_lists_its_findings() {
         .iter()
         .position(|it| matches!(it, DisplayItem::Enum { .. }))
         .expect("enum row");
-    app.selected_display = enum_pos;
+    app.view_state.selected_display = enum_pos;
     app.clamp_selection();
     assert!(app.selected_detail_entry().is_none(), "no detail rows");
     let pane = shown(&app);

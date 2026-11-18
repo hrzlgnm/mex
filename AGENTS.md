@@ -81,7 +81,9 @@ Headless run (no TTY) logs to stderr.
   (unresolved targets, address-query evidence), `naming` (service type,
   label and subtype checks), `questions` (question verdicts), `scope`
   (finding display scopes).
-* `src/ui.rs` — ratatui rendering only. The only state draw writes is
+* `src/ui.rs` — ratatui rendering only. It reads focus, selection and
+  pane splits through `App::view_state()` (`app::ViewState`, changed only
+  by input). The only state draw writes is
   `app::Layout` (via `App::layout()`): pane geometry, viewport heights,
   row maps, hex hit boxes and the scroll offsets it clamps.
   Child modules per pane: `services`, `records`, `questions`, `hex`,

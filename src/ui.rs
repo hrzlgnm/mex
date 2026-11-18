@@ -126,7 +126,7 @@ pub(crate) fn draw_with_findings(frame: &mut Frame, app: &App, found: &[Anomaly]
 
     draw_header(frame, chunks[0], app);
     draw_body(frame, chunks[1], app, found);
-    if app.show_metrics {
+    if app.view_state().show_metrics {
         draw_metrics_overlay(frame, app, found);
     }
     if let Some(text) = app.status_popup() {
@@ -171,7 +171,7 @@ fn draw_body(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, found: &
     app.layout().body_rect.set(area);
     // No gutter: the abutting pane borders are the drag handles, so no
     // space is lost to divider widgets.
-    let left = app.left_pct.clamp(15, 80);
+    let left = app.view_state().left_pct.clamp(15, 80);
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(left), Constraint::Min(0)])
@@ -395,8 +395,9 @@ fn draw_detail_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, 
     // questions below with their own captions (age, not TTL), hex dump of
     // the selected entry at the bottom. The abutting pane borders are the
     // drag handles.
-    let answers = app.answers_pct.clamp(10, 70);
+    let answers = app.view_state().answers_pct.clamp(10, 70);
     let questions = app
+        .view_state()
         .questions_pct
         .clamp(10, 70)
         .min(90u16.saturating_sub(answers));
@@ -430,7 +431,8 @@ fn border_color(focused: bool, resizing: bool) -> Style {
 
 fn resize_active(app: &App, mode: DragMode) -> bool {
     // Never glow behind the metrics overlay: it owns all input while open.
-    !app.show_metrics && (app.drag == mode || app.hover.get() == mode)
+    !app.view_state().show_metrics
+        && (app.view_state().drag == mode || app.view_state().hover.get() == mode)
 }
 
 /// Source cell for the Records table (`RawRecord::source_label`).

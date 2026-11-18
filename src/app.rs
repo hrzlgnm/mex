@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+pub use view_state::ViewState;
 
 use anyhow::Result;
 use crossterm::event::{
@@ -657,31 +658,6 @@ fn fmt_bytes(bytes: u64) -> String {
 
 pub struct App {
     pub services: Vec<ServiceEntry>,
-    pub selected_display: usize,
-    /// Which pane the cursor keys act on. Tab switches panes; arrows and
-    /// j/k navigate inside the focused pane.
-    pub focus: Focus,
-    pub detail_selected: usize,
-    /// Manual scroll of the Answers table (`Ctrl-j/k`): while set, the
-    /// viewport stays where the user put it instead of following the
-    /// `j/k` cursor, so arbitrarily tall TXT expansions can be paged
-    /// through. Any cursor or fold action clears it.
-    pub detail_free_scroll: bool,
-    /// Currently selected field in the displayed resource record.
-    pub hex_selected_field: Cell<Option<usize>>,
-    /// Horizontal split: percent of the body width given to the Hosts pane.
-    /// The shared pane borders are the mouse-drag handles.
-    pub left_pct: u16,
-    /// Vertical split of the right stack: percent of its height given to
-    /// Answers and Questions (the hex pane takes the remainder). The
-    /// shared pane borders are mouse-draggable.
-    pub answers_pct: u16,
-    pub questions_pct: u16,
-    /// Active mouse drag; `None` when no button is held on a pane border.
-    pub drag: DragMode,
-    /// Pane border under the mouse cursor, for highlight. Updated on
-    /// `Moved`/`Drag` events; render-only.
-    pub hover: Cell<DragMode>,
     pub packet_count: u64,
     pub start_time: Instant,
     pub running: bool,
@@ -691,8 +667,6 @@ pub struct App {
     /// all usable links; `Some` restricts joins, queries, and ingress to
     /// the named links. Local-address detection stays global.
     pub interfaces: Option<HashSet<String>>,
-    /// Metrics overlay popup (`m` toggles, `m`/`Esc` closes).
-    pub show_metrics: bool,
     /// Cumulative v2 counters (traffic, queries, suppressions).
     pub metrics: MetricsCounters,
     /// Bumped by anything that can change the list or detail selection
@@ -793,6 +767,8 @@ pub struct App {
     status_msg: Option<(String, Instant)>,
     /// Last-frame geometry and scroll offsets; see [`Layout`].
     layout: Layout,
+    /// Focus, selection, pane splits and overlays; see [`ViewState`].
+    view_state: ViewState,
 }
 
 pub struct ServiceEntry {
@@ -1073,6 +1049,11 @@ fn finding_matches_question(
 }
 
 impl App {
+    /// Focus, selection, pane splits and overlays; see [`ViewState`].
+    pub fn view_state(&self) -> &ViewState {
+        &self.view_state
+    }
+
     /// Last-frame geometry and scroll offsets; see [`Layout`].
     pub fn layout(&self) -> &Layout {
         &self.layout
@@ -1101,12 +1082,11 @@ impl App {
             interfaces
         );
         Ok(Self {
+            view_state: ViewState::default(),
             layout: Layout::default(),
             passive,
             interfaces,
             services: Vec::new(),
-            selected_display: 0,
-            focus: Focus::default(),
             packet_count: 0,
             start_time: Instant::now(),
             running: true,
@@ -1125,16 +1105,8 @@ impl App {
             expanded_txt: HashSet::new(),
             local_ips: browse::local_ips(),
             overheard: HashMap::new(),
-            detail_selected: 0,
-            detail_free_scroll: false,
-            hex_selected_field: Cell::new(None),
-            left_pct: 33,
             // The Answers pane holds finding child rows (#248): it gets
             // the larger share.
-            answers_pct: 50,
-            questions_pct: 25,
-            drag: DragMode::None,
-            hover: Cell::new(DragMode::None),
             detail_svc_key: None,
             detail_enum_key: None,
             detail_unattributed: false,
@@ -1158,7 +1130,6 @@ impl App {
             address_denials: Vec::new(),
             withheld_addrs: HashMap::new(),
             status_msg: None,
-            show_metrics: false,
             metrics: MetricsCounters::default(),
             state_gen: 0,
             clamped_gen: None,
@@ -1572,6 +1543,7 @@ mod schedule;
 mod sightings;
 mod state_dump;
 mod view;
+mod view_state;
 
 #[cfg(test)]
 mod tests;

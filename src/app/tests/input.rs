@@ -75,30 +75,30 @@ fn scroll_pins_viewport_and_cursor_resumes_follow() {
         kind: KeyEventKind::Press,
         state: KeyEventState::empty(),
     };
-    assert!(!app.detail_free_scroll);
+    assert!(!app.view_state.detail_free_scroll);
     // Ctrl+J now dumps state (like the sibling); viewport scroll
     // uses J instead.
     app.handle_key(&plain(KeyCode::Char('J')));
-    assert!(app.detail_free_scroll);
+    assert!(app.view_state.detail_free_scroll);
     assert_eq!(app.layout.detail_offset.get(), 1);
     app.handle_key(&ctrl(KeyCode::Char('k')));
     assert_eq!(app.layout.detail_offset.get(), 0);
     // Tab focuses Answers; moving the record cursor resumes follow.
     app.handle_key(&plain(KeyCode::Tab));
-    assert_eq!(app.focus, Focus::Answers);
-    let before = app.detail_selected;
+    assert_eq!(app.view_state.focus, Focus::Answers);
+    let before = app.view_state.detail_selected;
     assert!(before > 0);
     app.handle_key(&plain(KeyCode::Char('k')));
-    assert!(!app.detail_free_scroll);
-    assert_eq!(app.detail_selected, before - 1);
+    assert!(!app.view_state.detail_free_scroll);
+    assert_eq!(app.view_state.detail_selected, before - 1);
     // Tab cycles Answers -> Questions -> Hex -> Services: no
     // Anomalies stop (#248).
     app.handle_key(&plain(KeyCode::Tab));
-    assert_eq!(app.focus, Focus::Questions);
+    assert_eq!(app.view_state.focus, Focus::Questions);
     app.handle_key(&plain(KeyCode::Tab));
-    assert_eq!(app.focus, Focus::Hex);
+    assert_eq!(app.view_state.focus, Focus::Hex);
     app.handle_key(&plain(KeyCode::Tab));
-    assert_eq!(app.focus, Focus::Services);
+    assert_eq!(app.view_state.focus, Focus::Services);
 }
 
 #[test]
@@ -111,23 +111,23 @@ fn tab_cycles_services_answers_questions() {
         kind: KeyEventKind::Press,
         state: KeyEventState::empty(),
     };
-    assert_eq!(app.focus, Focus::Services);
+    assert_eq!(app.view_state.focus, Focus::Services);
     // Service navigation in the Services pane: j moves to the next
     // selectable stop (Test).
     let stops = selectable_positions(&app);
     let test = stops[2];
     app.handle_key(&plain(KeyCode::Char('j')));
-    assert_eq!(app.selected_display, test);
-    let detail_before = app.detail_selected;
+    assert_eq!(app.view_state.selected_display, test);
+    let detail_before = app.view_state.detail_selected;
     // Tab focuses Answers: j now moves the record cursor instead.
     app.handle_key(&plain(KeyCode::Tab));
-    assert_eq!(app.focus, Focus::Answers);
+    assert_eq!(app.view_state.focus, Focus::Answers);
     app.handle_key(&plain(KeyCode::Char('j')));
-    assert_eq!(app.selected_display, test);
-    assert_eq!(app.detail_selected, detail_before + 1);
+    assert_eq!(app.view_state.selected_display, test);
+    assert_eq!(app.view_state.detail_selected, detail_before + 1);
     // BackTab steps back to Services.
     app.handle_key(&plain(KeyCode::BackTab));
-    assert_eq!(app.focus, Focus::Services);
+    assert_eq!(app.view_state.focus, Focus::Services);
 }
 
 #[test]
@@ -145,7 +145,7 @@ fn questions_pane_moves_within_questions() {
     let src: std::net::SocketAddr = "192.168.1.9:5353".parse().unwrap();
     let old = Instant::now() - Duration::from_secs(60);
     {
-        let sel_idx = match app.display_items().get(app.selected_display) {
+        let sel_idx = match app.display_items().get(app.view_state.selected_display) {
             Some(DisplayItem::Instance { index }) => *index,
             _ => panic!("expected instance selected"),
         };
@@ -172,21 +172,21 @@ fn questions_pane_moves_within_questions() {
         .len();
     // Tab twice to reach Questions; the cursor snaps to its first row.
     app.handle_key(&plain(KeyCode::Tab));
-    assert_eq!(app.focus, Focus::Answers);
+    assert_eq!(app.view_state.focus, Focus::Answers);
     app.handle_key(&plain(KeyCode::Tab));
-    assert_eq!(app.focus, Focus::Questions);
-    assert_eq!(app.detail_selected, raw_count);
+    assert_eq!(app.view_state.focus, Focus::Questions);
+    assert_eq!(app.view_state.detail_selected, raw_count);
     // j/k stay inside the question rows; the selection is untouched.
-    let selected_before = app.selected_display;
+    let selected_before = app.view_state.selected_display;
     app.handle_key(&plain(KeyCode::Char('j')));
-    assert_eq!(app.detail_selected, raw_count + 1);
-    assert_eq!(app.selected_display, selected_before);
+    assert_eq!(app.view_state.detail_selected, raw_count + 1);
+    assert_eq!(app.view_state.selected_display, selected_before);
     app.handle_key(&plain(KeyCode::Char('k')));
-    assert_eq!(app.detail_selected, raw_count);
+    assert_eq!(app.view_state.detail_selected, raw_count);
     app.handle_key(&plain(KeyCode::Home));
-    assert_eq!(app.detail_selected, raw_count);
+    assert_eq!(app.view_state.detail_selected, raw_count);
     app.handle_key(&plain(KeyCode::End));
-    assert_eq!(app.detail_selected, raw_count + 1);
+    assert_eq!(app.view_state.detail_selected, raw_count + 1);
     // Enter has nothing to expand here and must not fold the host.
     app.handle_key(&plain(KeyCode::Enter));
     assert!(app.collapsed_hosts.is_empty());
@@ -234,13 +234,13 @@ fn records_home_end_and_paging() {
     app.layout.record_viewport.set(2);
     app.handle_key(&key(KeyCode::Tab));
     app.handle_key(&key(KeyCode::End));
-    assert_eq!(app.detail_selected, 2);
+    assert_eq!(app.view_state.detail_selected, 2);
     app.handle_key(&key(KeyCode::Home));
-    assert_eq!(app.detail_selected, 0);
+    assert_eq!(app.view_state.detail_selected, 0);
     app.handle_key(&key(KeyCode::Char(' ')));
-    assert_eq!(app.detail_selected, 2);
+    assert_eq!(app.view_state.detail_selected, 2);
     app.handle_key(&key(KeyCode::Char('b')));
-    assert_eq!(app.detail_selected, 0);
+    assert_eq!(app.view_state.detail_selected, 0);
 }
 
 #[test]
@@ -248,9 +248,9 @@ fn expand_clears_manual_scroll() {
     let mut app = App::new().unwrap();
     service_with_txt(&mut app, "a=1; b=2");
     app.scroll_detail(5);
-    assert!(app.detail_free_scroll);
+    assert!(app.view_state.detail_free_scroll);
     assert!(app.toggle_txt_expanded());
-    assert!(!app.detail_free_scroll);
+    assert!(!app.view_state.detail_free_scroll);
 }
 
 #[cfg(unix)]
@@ -287,11 +287,11 @@ fn jk_moves_service_selection() {
     // Cursor starts on Shell; j moves to Test, k back to Shell.
     let shell = selectable_positions(&app)[1];
     let test = selectable_positions(&app)[2];
-    assert_eq!(app.selected_display, shell);
+    assert_eq!(app.view_state.selected_display, shell);
     app.handle_key(&plain_key(KeyCode::Char('j')));
-    assert_eq!(app.selected_display, test);
+    assert_eq!(app.view_state.selected_display, test);
     app.handle_key(&plain_key(KeyCode::Char('k')));
-    assert_eq!(app.selected_display, shell);
+    assert_eq!(app.view_state.selected_display, shell);
 }
 
 #[test]
@@ -299,16 +299,16 @@ fn hl_jumps_between_groups() {
     let mut app = two_group_app();
     let stops = selectable_positions(&app);
     let (first, shell, test) = (stops[0], stops[1], stops[2]);
-    assert_eq!(app.selected_display, shell);
+    assert_eq!(app.view_state.selected_display, shell);
     app.handle_key(&plain_key(KeyCode::Char('l')));
-    assert_eq!(app.selected_display, test);
+    assert_eq!(app.view_state.selected_display, test);
     app.handle_key(&plain_key(KeyCode::Char('h')));
-    assert_eq!(app.selected_display, shell);
+    assert_eq!(app.view_state.selected_display, shell);
     // Shift jumps to the first/last group.
     app.handle_key(&plain_key(KeyCode::Char('L')));
-    assert_eq!(app.selected_display, *stops.last().unwrap());
+    assert_eq!(app.view_state.selected_display, *stops.last().unwrap());
     app.handle_key(&plain_key(KeyCode::Char('H')));
-    assert_eq!(app.selected_display, first);
+    assert_eq!(app.view_state.selected_display, first);
 }
 
 #[test]
@@ -316,11 +316,11 @@ fn arrows_jump_between_groups_like_hl() {
     let mut app = two_group_app();
     let stops = selectable_positions(&app);
     let (shell, test) = (stops[1], stops[2]);
-    assert_eq!(app.selected_display, shell);
+    assert_eq!(app.view_state.selected_display, shell);
     app.handle_key(&plain_key(KeyCode::Right));
-    assert_eq!(app.selected_display, test);
+    assert_eq!(app.view_state.selected_display, test);
     app.handle_key(&plain_key(KeyCode::Left));
-    assert_eq!(app.selected_display, shell);
+    assert_eq!(app.view_state.selected_display, shell);
 }
 
 #[test]
@@ -330,15 +330,15 @@ fn home_end_and_space_paging() {
     let stops = selectable_positions(&app);
     let (first, last) = (stops[0], *stops.last().unwrap());
     app.handle_key(&plain_key(KeyCode::End));
-    assert_eq!(app.selected_display, last);
+    assert_eq!(app.view_state.selected_display, last);
     app.handle_key(&plain_key(KeyCode::Home));
-    assert_eq!(app.selected_display, first);
+    assert_eq!(app.view_state.selected_display, first);
     // Space pages down one viewport (2 stops); b pages back up.
     app.handle_key(&plain_key(KeyCode::Char(' ')));
-    assert_eq!(app.selected_display, stops[2]);
+    assert_eq!(app.view_state.selected_display, stops[2]);
     assert!(app.collapsed_hosts.is_empty());
     app.handle_key(&plain_key(KeyCode::Char('b')));
-    assert_eq!(app.selected_display, first);
+    assert_eq!(app.view_state.selected_display, first);
 }
 
 #[test]
@@ -353,7 +353,7 @@ fn shift_arrows_and_jk_scroll_detail() {
         state: KeyEventState::empty(),
     };
     app.handle_key(&shift(KeyCode::Down));
-    assert!(app.detail_free_scroll);
+    assert!(app.view_state.detail_free_scroll);
     assert_eq!(app.layout.detail_offset.get(), 1);
     app.handle_key(&plain_key(KeyCode::Char('J')));
     assert_eq!(app.layout.detail_offset.get(), 2);
@@ -382,29 +382,29 @@ fn shifted_jk_scroll_in_all_reported_shapes() {
     };
     // Answers focus, where plain j/k move the record cursor.
     app.handle_key(&plain(KeyCode::Tab));
-    assert_eq!(app.focus, Focus::Answers);
-    let cursor = app.detail_selected;
+    assert_eq!(app.view_state.focus, Focus::Answers);
+    let cursor = app.view_state.detail_selected;
     // Uppercase, with and without SHIFT flagged (terminal-dependent).
     app.handle_key(&plain(KeyCode::Char('J')));
     app.handle_key(&shift(KeyCode::Char('J')));
     assert_eq!(app.layout.detail_offset.get(), 2);
-    assert_eq!(app.detail_selected, cursor);
+    assert_eq!(app.view_state.detail_selected, cursor);
     app.handle_key(&plain(KeyCode::Char('K')));
     app.handle_key(&shift(KeyCode::Char('K')));
     assert_eq!(app.layout.detail_offset.get(), 0);
-    assert_eq!(app.detail_selected, cursor);
+    assert_eq!(app.view_state.detail_selected, cursor);
     // Lowercase + SHIFT (other keyboard protocols) scrolls too and
     // never moves the cursor.
     app.handle_key(&shift(KeyCode::Char('j')));
     assert_eq!(app.layout.detail_offset.get(), 1);
-    assert_eq!(app.detail_selected, cursor);
+    assert_eq!(app.view_state.detail_selected, cursor);
     app.handle_key(&shift(KeyCode::Char('k')));
     assert_eq!(app.layout.detail_offset.get(), 0);
-    assert_eq!(app.detail_selected, cursor);
-    assert!(app.detail_free_scroll);
+    assert_eq!(app.view_state.detail_selected, cursor);
+    assert!(app.view_state.detail_free_scroll);
     // Plain lowercase still moves the cursor instead of scrolling.
     app.handle_key(&plain(KeyCode::Char('k')));
-    assert_eq!(app.detail_selected, cursor - 1);
+    assert_eq!(app.view_state.detail_selected, cursor - 1);
 }
 
 #[test]
@@ -420,7 +420,7 @@ fn star_collapses_and_unfolds_all_groups() {
     }
     // Cursor still sits on a selectable stop.
     let items = app.display_items();
-    assert!(app.is_selectable(&items[app.selected_display]));
+    assert!(app.is_selectable(&items[app.view_state.selected_display]));
     // Second press unfolds everything again.
     app.handle_key(&star);
     assert!(app.collapsed_hosts.is_empty());
@@ -463,13 +463,13 @@ fn mouse_drag_moves_splits_with_clamp() {
     app.layout.body_rect.set(Rect::new(0, 3, 100, 40));
     app.layout.right_rect.set(Rect::new(33, 3, 67, 30));
     app.set_left_from_x(5);
-    assert_eq!(app.left_pct, 15);
+    assert_eq!(app.view_state.left_pct, 15);
     app.set_left_from_x(50);
-    assert_eq!(app.left_pct, 50);
-    app.questions_pct = 25;
+    assert_eq!(app.view_state.left_pct, 50);
+    app.view_state.questions_pct = 25;
     app.set_answers_from_y(3 + 27);
     assert_shares(&app);
-    app.answers_pct = 50;
+    app.view_state.answers_pct = 50;
     app.set_questions_from_y(3 + 27);
     assert_shares(&app);
 }
@@ -499,26 +499,26 @@ fn mouse_down_drag_sequence_moves_seams() {
     // Seams come from the computed layout: the top border row of
     // the lower pane is always a grab zone.
     for mode in [DragMode::HorizUpper, DragMode::HorizLower] {
-        app.answers_pct = 30;
-        app.questions_pct = 25;
+        app.view_state.answers_pct = 30;
+        app.view_state.questions_pct = 25;
         render_to_buffer(&app, 100, 40);
         let (lower, before) = seam_target(&app, mode);
         assert!(lower.height > 2, "pane needs a grabbable border");
         app.handle_mouse(&down(lower.x + 5, lower.y));
-        assert_eq!(app.drag, mode);
+        assert_eq!(app.view_state.drag, mode);
         app.handle_mouse(&drag(lower.x + 5, lower.y + 6));
         assert!(
             seam_target(&app, mode).1 > before,
             "{mode:?} drag must grow its share"
         );
         app.handle_mouse(&up());
-        assert_eq!(app.drag, DragMode::None);
+        assert_eq!(app.view_state.drag, DragMode::None);
         assert_shares(&app);
     }
     // Extremes through the mouse path: clamps hold and neighbors
     // keep their minimums.
-    app.answers_pct = 30;
-    app.questions_pct = 25;
+    app.view_state.answers_pct = 30;
+    app.view_state.questions_pct = 25;
     render_to_buffer(&app, 100, 40);
     let right = app.layout.right_rect.get();
     let bottom = right.y + right.height - 1;
@@ -526,17 +526,17 @@ fn mouse_down_drag_sequence_moves_seams() {
     // leaving hex its 10%.
     let (hex_top, _) = seam_target(&app, DragMode::HorizLower);
     app.handle_mouse(&down(hex_top.x + 5, hex_top.y));
-    assert_eq!(app.drag, DragMode::HorizLower);
+    assert_eq!(app.view_state.drag, DragMode::HorizLower);
     app.handle_mouse(&drag(hex_top.x + 5, bottom));
-    assert_eq!(app.drag, DragMode::HorizLower);
-    assert_eq!(app.questions_pct, 60);
-    assert_eq!(app.answers_pct, 30);
+    assert_eq!(app.view_state.drag, DragMode::HorizLower);
+    assert_eq!(app.view_state.questions_pct, 60);
+    assert_eq!(app.view_state.answers_pct, 30);
     // Upper seam slammed to the top: answers pins at 10%.
     let (questions_top, _) = seam_target(&app, DragMode::HorizUpper);
     app.handle_mouse(&down(questions_top.x + 5, questions_top.y));
-    assert_eq!(app.drag, DragMode::HorizUpper);
+    assert_eq!(app.view_state.drag, DragMode::HorizUpper);
     app.handle_mouse(&drag(questions_top.x + 5, right.y));
-    assert_eq!(app.answers_pct, 10);
+    assert_eq!(app.view_state.answers_pct, 10);
     assert_shares(&app);
 }
 
@@ -547,15 +547,15 @@ fn pane_shares_keep_minimums_at_extremes() {
     app.layout.body_rect.set(Rect::new(0, 3, 100, 40));
     app.layout.right_rect.set(Rect::new(33, 3, 67, 30));
     // Slam every divider against the bottom, then the top.
-    app.questions_pct = 25;
+    app.view_state.questions_pct = 25;
     app.set_answers_from_y(3 + 30);
     assert_shares(&app);
-    app.answers_pct = 30;
+    app.view_state.answers_pct = 30;
     app.set_questions_from_y(3 + 30);
     assert_shares(&app);
     app.set_answers_from_y(3);
     assert_shares(&app);
-    assert_eq!(app.answers_pct, 10);
+    assert_eq!(app.view_state.answers_pct, 10);
     // The clamped model still renders every pane at normal and
     // small sizes: no share collapses to zero rows.
     for (width, height) in [(100, 30), (60, 12)] {
@@ -616,7 +616,7 @@ fn mouse_down_on_border_starts_drag() {
         modifiers: KeyModifiers::empty(),
     };
     app.handle_mouse(&down);
-    assert_eq!(app.drag, DragMode::Vertical);
+    assert_eq!(app.view_state.drag, DragMode::Vertical);
 }
 
 #[test]
@@ -637,7 +637,7 @@ fn mouse_click_unfold_above_keeps_selection() {
     app.click_service_list(3 + 1 + header as u16);
     assert!(!app.is_host_collapsed("shell.local"));
     assert!(
-        matches!(app.display_items().get(app.selected_display),
+        matches!(app.display_items().get(app.view_state.selected_display),
             Some(DisplayItem::Instance { index }) if app.services[*index].instance == "Test"),
         "selection must stay on Test, not jump into the unfolded host",
     );
@@ -649,8 +649,10 @@ fn mouse_click_unfold_above_keeps_selection() {
         .expect("shell header");
     app.click_service_list(3 + 1 + header as u16);
     assert!(app.is_host_collapsed("shell.local"));
-    assert!(matches!(app.display_items().get(app.selected_display),
-            Some(DisplayItem::Instance { index }) if app.services[*index].instance == "Test"),);
+    assert!(
+        matches!(app.display_items().get(app.view_state.selected_display),
+            Some(DisplayItem::Instance { index }) if app.services[*index].instance == "Test"),
+    );
 }
 
 #[test]
@@ -664,38 +666,38 @@ fn mouse_wheel_moves_focused_pane_like_jk() {
         modifiers: KeyModifiers::empty(),
     };
     // Services: one notch moves the list selection one stop.
-    app.focus = Focus::Services;
-    let before = app.selected_display;
+    app.view_state.focus = Focus::Services;
+    let before = app.view_state.selected_display;
     app.handle_mouse(&wheel(MouseEventKind::ScrollDown));
-    assert_ne!(app.selected_display, before);
+    assert_ne!(app.view_state.selected_display, before);
     app.handle_mouse(&wheel(MouseEventKind::ScrollUp));
-    assert_eq!(app.selected_display, before);
+    assert_eq!(app.view_state.selected_display, before);
     // Answers: one notch moves the record cursor one row.
     service_with_txt(&mut app, "a=1; b=2");
-    app.focus = Focus::Answers;
-    let cursor = app.detail_selected;
+    app.view_state.focus = Focus::Answers;
+    let cursor = app.view_state.detail_selected;
     assert!(cursor > 0);
     app.handle_mouse(&wheel(MouseEventKind::ScrollUp));
-    assert_eq!(app.detail_selected, cursor - 1);
+    assert_eq!(app.view_state.detail_selected, cursor - 1);
     app.handle_mouse(&wheel(MouseEventKind::ScrollDown));
-    assert_eq!(app.detail_selected, cursor);
+    assert_eq!(app.view_state.detail_selected, cursor);
     // Hex: one notch scrolls the dump one line.
-    app.focus = Focus::Hex;
+    app.view_state.focus = Focus::Hex;
     app.handle_mouse(&wheel(MouseEventKind::ScrollDown));
     assert_eq!(app.layout.hex_offset.get(), 1);
     app.handle_mouse(&wheel(MouseEventKind::ScrollUp));
     assert_eq!(app.layout.hex_offset.get(), 0);
     // Metrics overlay owns the wheel while open.
-    app.show_metrics = true;
+    app.view_state.show_metrics = true;
     app.handle_mouse(&wheel(MouseEventKind::ScrollDown));
     assert_eq!(app.layout.metrics_scroll.get(), 1);
-    assert_eq!(app.detail_selected, cursor);
+    assert_eq!(app.view_state.detail_selected, cursor);
     // Horizontal wheel is ignored everywhere.
-    app.show_metrics = false;
+    app.view_state.show_metrics = false;
     app.handle_mouse(&wheel(MouseEventKind::ScrollLeft));
     app.handle_mouse(&wheel(MouseEventKind::ScrollRight));
     assert_eq!(app.layout.hex_offset.get(), 0);
-    assert_eq!(app.detail_selected, cursor);
+    assert_eq!(app.view_state.detail_selected, cursor);
 }
 
 #[test]
@@ -717,7 +719,7 @@ fn mouse_wheel_moves_question_cursor() {
         modifiers: KeyModifiers::empty(),
     };
     let src: std::net::SocketAddr = "192.168.1.9:5353".parse().unwrap();
-    let sel_idx = match app.display_items().get(app.selected_display) {
+    let sel_idx = match app.display_items().get(app.view_state.selected_display) {
         Some(DisplayItem::Instance { index }) => *index,
         _ => panic!("expected instance selected"),
     };
@@ -733,19 +735,19 @@ fn mouse_wheel_moves_question_cursor() {
     }
     app.handle_key(&plain(KeyCode::Tab));
     app.handle_key(&plain(KeyCode::Tab));
-    assert_eq!(app.focus, Focus::Questions);
-    assert_eq!(app.detail_selected, raws);
+    assert_eq!(app.view_state.focus, Focus::Questions);
+    assert_eq!(app.view_state.detail_selected, raws);
     app.handle_mouse(&wheel(MouseEventKind::ScrollDown));
-    assert_eq!(app.detail_selected, raws + 1);
+    assert_eq!(app.view_state.detail_selected, raws + 1);
     app.handle_mouse(&wheel(MouseEventKind::ScrollUp));
-    assert_eq!(app.detail_selected, raws);
+    assert_eq!(app.view_state.detail_selected, raws);
 }
 
 #[test]
 fn mouse_click_selects_service_and_focuses() {
     use ratatui::layout::Rect;
     let mut app = two_group_app();
-    app.focus = Focus::Answers;
+    app.view_state.focus = Focus::Answers;
     // Left pane shows: enum header, enum row, then host groups.
     let items = app.display_items();
     let first_instance = items
@@ -760,8 +762,8 @@ fn mouse_click_selects_service_and_focuses() {
     app.layout.hex_rect.set(Rect::new(33, 23, 67, 10));
     let row = 3 + 1 + first_instance as u16;
     app.click_service_list(row);
-    assert_eq!(app.focus, Focus::Services);
-    assert_eq!(app.selected_display, first_instance);
+    assert_eq!(app.view_state.focus, Focus::Services);
+    assert_eq!(app.view_state.selected_display, first_instance);
 }
 
 #[test]
@@ -789,7 +791,7 @@ fn mouse_click_answers_selects_record() {
     use ratatui::layout::Rect;
     let mut app = App::new().unwrap();
     service_with_txt(&mut app, "a=1; b=2");
-    app.focus = Focus::Services;
+    app.view_state.focus = Focus::Services;
     app.layout.right_rect.set(Rect::new(33, 3, 67, 30));
     app.layout.answers_rect.set(Rect::new(33, 3, 67, 20));
     app.layout.questions_rect.set(Rect::new(33, 24, 67, 8));
@@ -806,11 +808,11 @@ fn mouse_click_answers_selects_record() {
     assert!(raws >= 2);
     // A click on the finding child row selects its parent record.
     app.click_answers(3 + 2 + (info + 1) as u16);
-    assert_eq!(app.focus, Focus::Answers);
-    assert_eq!(app.detail_selected, 0);
+    assert_eq!(app.view_state.focus, Focus::Answers);
+    assert_eq!(app.view_state.detail_selected, 0);
     let row = 3 + 2 + (info + 2) as u16;
     app.click_answers(row);
-    assert_eq!(app.detail_selected, 1);
+    assert_eq!(app.view_state.detail_selected, 1);
 }
 
 #[test]
@@ -828,7 +830,7 @@ fn mouse_click_answers_child_selects_parent() {
     // Clicking the first child must land on the TXT parent (index 2).
     let row = 3 + 2 + 4u16;
     app.click_answers(row);
-    assert_eq!(app.detail_selected, 2);
+    assert_eq!(app.view_state.detail_selected, 2);
 }
 
 /// Display positions of every selectable stop in order.
@@ -854,13 +856,21 @@ fn plain_key(code: KeyCode) -> KeyEvent {
 /// Layout budget for the right stack: every pane keeps at least 10%
 /// and leaves at least 10% for the hex pane.
 fn assert_shares(app: &App) {
-    assert!(app.answers_pct >= 10, "answers: {}", app.answers_pct);
-    assert!(app.questions_pct >= 10, "questions: {}", app.questions_pct);
     assert!(
-        app.answers_pct + app.questions_pct <= 90,
+        app.view_state.answers_pct >= 10,
+        "answers: {}",
+        app.view_state.answers_pct
+    );
+    assert!(
+        app.view_state.questions_pct >= 10,
+        "questions: {}",
+        app.view_state.questions_pct
+    );
+    assert!(
+        app.view_state.answers_pct + app.view_state.questions_pct <= 90,
         "hex keeps >= 10: {}+{}",
-        app.answers_pct,
-        app.questions_pct,
+        app.view_state.answers_pct,
+        app.view_state.questions_pct,
     );
 }
 
@@ -868,7 +878,7 @@ fn assert_shares(app: &App) {
 /// mode: one dispatch shared by seam lookup and share reads.
 fn seam_target(app: &App, mode: DragMode) -> (ratatui::layout::Rect, u16) {
     match mode {
-        DragMode::HorizUpper => (app.layout.questions_rect.get(), app.answers_pct),
-        _ => (app.layout.hex_rect.get(), app.questions_pct),
+        DragMode::HorizUpper => (app.layout.questions_rect.get(), app.view_state.answers_pct),
+        _ => (app.layout.hex_rect.get(), app.view_state.questions_pct),
     }
 }

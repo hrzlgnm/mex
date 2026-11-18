@@ -142,7 +142,7 @@ fn cursor_and_txt_expansion_stay_on_their_link() {
         .iter()
         .position(|r| r.rtype == 16 && r.ifindex == 3)
         .unwrap();
-    app.detail_selected = wlan_idx;
+    app.view_state.detail_selected = wlan_idx;
     app.detail_anchor = app
         .display_detail()
         .and_then(|d| App::identity_at_detail(&d, wlan_idx));
