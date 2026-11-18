@@ -40,6 +40,13 @@ Headless run (no TTY) logs to stderr.
   just `rdlength=<n>` (on-wire RDLENGTH) and renders as `TYPEnn`; the
   packet walk relabels them opaque before `Packet::parse`, so their rdata
   is never decoded. EDNS0 OPT pseudo-records are skipped entirely.
+  Child modules: `iface` (interface discovery and `-i` selection),
+  `listener` (sockets, mio loop, budgets), `send` (query encoding,
+  per-interface sending, `SentCopies`), `wire` (packet walk, record and
+  question rows, field extraction, type names). `browse.rs` keeps the
+  shared types (`RawRecord`, `Event`, `QueryTx`, `TransmitState`,
+  `DropStats`) and `spawn`, and re-exports the public API at its old
+  paths.
 * `src/app.rs` — browser state, query scheduling, ingest/expire, selection.
   Out-of-scope records, known answers and questions go to `sightings`
   (never rows, never query drivers; capped, expired by TTL/time), with
