@@ -389,22 +389,26 @@ fn knulp_app() -> App {
     app
 }
 
-/// The service of `instance`, given bare (`Test`) or with its type
-/// (`Test._http._tcp.local`): the first label names it.
+/// The service of `instance`, given bare (`Test`) or as its full
+/// `instance.service_type` (`Test._http._tcp.local`). Matches the whole
+/// name, so dotted instance labels and two types sharing an instance
+/// label resolve to the right service.
 fn service_of<'a>(app: &'a App, instance: &str) -> &'a ServiceEntry {
-    let inst = instance.split('.').next().unwrap();
+    let full = instance.trim_end_matches('.');
     app.services
         .iter()
-        .find(|s| s.instance == inst)
-        .expect("service")
+        .find(|s| {
+            s.instance == full || service_key(&s.instance, &s.service_type) == full.to_lowercase()
+        })
+        .unwrap_or_else(|| panic!("no service {instance}"))
 }
 
-/// Row types of a service's live rows (TTL > 0).
+/// Row types of a service's live rows: not a goodbye and not past TTL.
 fn live_rows(app: &App, instance: &str) -> Vec<u16> {
     service_of(app, instance)
         .answers
         .iter()
-        .filter(|r| r.ttl > 0)
+        .filter(|r| record_liveness(r) == RecordLiveness::Live)
         .map(|r| r.rtype)
         .collect()
 }
