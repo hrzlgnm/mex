@@ -1,3 +1,6 @@
+// Copyright 2026 hrzlgnm
+// SPDX-License-Identifier: MIT
+
 use super::*;
 
 /// Short display form for a service type: `_http._tcp.local.` → `http.tcp`.

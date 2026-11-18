@@ -1,3 +1,6 @@
+// Copyright 2026 hrzlgnm
+// SPDX-License-Identifier: MIT
+
 // --- #264: one source heard on two links keeps a copy per link ---
 
 use super::*;

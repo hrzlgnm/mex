@@ -1,3 +1,6 @@
+// Copyright 2026 hrzlgnm
+// SPDX-License-Identifier: MIT
+
 // --- Out-of-scope types (#239) ---
 
 use super::*;

@@ -1,3 +1,6 @@
+// Copyright 2026 hrzlgnm
+// SPDX-License-Identifier: MIT
+
 use ratatui::layout::Rect;
 use std::cell::{Cell, RefCell};
 

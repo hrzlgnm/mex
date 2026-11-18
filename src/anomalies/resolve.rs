@@ -1,3 +1,6 @@
+// Copyright 2026 hrzlgnm
+// SPDX-License-Identifier: MIT
+
 use super::*;
 
 pub(super) const ADDRESS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
