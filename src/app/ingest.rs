@@ -35,7 +35,7 @@ impl App {
                 // record, so findings can tell a reply to our own query
                 // from one to someone else's.
                 let mut rec = rec.clone();
-                rec.trigger = self.response_trigger(&rec);
+                rec.trigger = self.scheduler.response_trigger(&rec);
                 self.ingest_sighting(SightingKind::Response, rec);
                 continue;
             }
@@ -50,7 +50,7 @@ impl App {
             if !anomalies::is_mdns_question_type(q.rtype) {
                 // Provenance still notes the ask, so a response it
                 // triggers can name it.
-                self.note_observed(q, ev);
+                self.scheduler.note_observed(q, ev.source);
                 self.ingest_sighting(SightingKind::Question, q.clone());
                 continue;
             }
@@ -744,7 +744,7 @@ impl App {
             // other answers are forthcoming, so dampen the exponential
             // discovery stream and let the 80%-TTL refresh take over.
             if rec.flush_bit {
-                let ckey = Self::continuous_key(rec.name.trim_end_matches('.'), rec.rtype);
+                let ckey = Scheduler::continuous_key(rec.name.trim_end_matches('.'), rec.rtype);
                 self.scheduler.dampen(&ckey);
             }
         }
