@@ -135,7 +135,7 @@ pub(crate) fn draw_with_findings(frame: &mut Frame, app: &App, found: &[Anomaly]
 }
 
 fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    let uptime = chrono::Duration::from_std(app.start_time.elapsed()).unwrap_or_default();
+    let uptime = chrono::Duration::from_std(app.start_time().elapsed()).unwrap_or_default();
     let uptime_str = format!(
         "{:02}:{:02}:{:02}",
         uptime.num_hours(),
@@ -152,10 +152,10 @@ fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         ),
         Span::raw(format!(
             "│ {} pkts │ {} svcs │ uptime {}{}  [q] quit [tab] pane [j/k] move [enter] fold [*] all [m] metrics",
-            app.packet_count,
-            app.services.len(),
+            app.packet_count(),
+            app.services().len(),
             uptime_str,
-            if app.passive { " │ passive" } else { "" },
+            if app.is_passive() { " │ passive" } else { "" },
         )),
     ]);
 

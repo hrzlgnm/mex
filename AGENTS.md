@@ -64,7 +64,7 @@ Headless run (no TTY) logs to stderr.
   browsing, cache refresh, known answers, §7.3 suppression), `ingest`
   (record handlers, `push_record`, goodbyes), `denials`, `sightings`,
   `questions` (question routing), `input` (keys, mouse, selection),
-  `view` (read-only accessors for `ui`), `metrics`, `findings`
+  `view` (read-only accessors for `ui`; `App` has no public fields), `metrics`, `findings`
   (analyzer snapshot), `state_dump`. `app.rs` keeps the types, constants,
   free helpers, construction, run loops and eviction. Child-module
   methods are `pub(super)` (same reach as a private `app` method).
