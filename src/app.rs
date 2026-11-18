@@ -657,27 +657,27 @@ fn fmt_bytes(bytes: u64) -> String {
 }
 
 pub struct App {
-    pub services: Vec<ServiceEntry>,
-    pub packet_count: u64,
-    pub start_time: Instant,
-    pub running: bool,
+    services: Vec<ServiceEntry>,
+    packet_count: u64,
+    start_time: Instant,
+    running: bool,
     /// Listen-only mode (`--passive`): never transmit queries.
-    pub passive: bool,
+    passive: bool,
     /// Explicit interface selection (`-i/--interfaces`): `None` browses
     /// all usable links; `Some` restricts joins, queries, and ingress to
     /// the named links. Local-address detection stays global.
-    pub interfaces: Option<HashSet<String>>,
+    interfaces: Option<HashSet<String>>,
     /// Cumulative v2 counters (traffic, queries, suppressions).
-    pub metrics: MetricsCounters,
+    metrics: MetricsCounters,
     /// Bumped by anything that can change the list or detail selection
     /// (ingest, eviction, input); `evict_expired` re-clamps the cursors
     /// only when it moved past `clamped_gen`, not on every idle tick.
     state_gen: u64,
     clamped_gen: Option<u64>,
     /// Cached usable/skipped link snapshot, refreshed on the 10s tick.
-    pub link_stats: browse::LinkStats,
+    link_stats: browse::LinkStats,
     /// Refused-packet accounting from the listener thread (RFC 6762 §11).
-    pub drop_stats: Arc<browse::DropStats>,
+    drop_stats: Arc<browse::DropStats>,
 
     rx: mpsc::Receiver<browse::Event>,
     query_tx: browse::QueryTx,
@@ -746,11 +746,11 @@ pub struct App {
     /// Selectable enumeration row. Always present so our own enumeration
     /// demand has a home; answers and questions file here instead of
     /// being skipped as noise.
-    pub enum_entries: Vec<EnumEntry>,
+    enum_entries: Vec<EnumEntry>,
     pending_instances: Vec<PendingService>,
     pending_addrs: HashMap<String, Vec<browse::RawRecord>>,
     next_pending_addr_prune: Instant,
-    pub raw_events: Vec<browse::Event>,
+    raw_events: Vec<browse::Event>,
     /// Out-of-scope records and questions (`anomalies::is_mdns_answer_type`
     /// / `is_mdns_question_type` false), kept only as evidence for
     /// findings: never Answers or Questions rows, never query drivers.

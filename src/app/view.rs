@@ -673,4 +673,29 @@ impl App {
             }
         }
     }
+
+    /// Services currently browsed, indexed by `DisplayItem::Service`.
+    pub fn services(&self) -> &[ServiceEntry] {
+        &self.services
+    }
+
+    /// Enumeration rows, indexed by `DisplayItem::Enum`.
+    pub fn enum_entries(&self) -> &[EnumEntry] {
+        &self.enum_entries
+    }
+
+    /// mDNS packets received since startup.
+    pub fn packet_count(&self) -> u64 {
+        self.packet_count
+    }
+
+    /// When browsing started, for the uptime in the header.
+    pub fn start_time(&self) -> Instant {
+        self.start_time
+    }
+
+    /// Listen-only mode (`--passive`): never transmit queries.
+    pub fn is_passive(&self) -> bool {
+        self.passive
+    }
 }

@@ -87,7 +87,7 @@ pub(super) fn draw_service_list(
                     ListItem::new(Line::from(spans))
                 }
                 DisplayItem::Instance { index } => {
-                    let svc = &app.services[*index];
+                    let svc = &app.services()[*index];
                     let last = is_last_instance(i);
                     let branch = if last { "└─" } else { "├─" };
                     let active = if svc.is_active { "●" } else { "○" };
@@ -110,7 +110,7 @@ pub(super) fn draw_service_list(
                     ListItem::new(Line::from(spans))
                 }
                 DisplayItem::Enum { index } => {
-                    let entry = &app.enum_entries[*index];
+                    let entry = &app.enum_entries()[*index];
                     let last = is_last_instance(i);
                     let branch = if last { "└─" } else { "├─" };
                     let mut spans = vec![Span::raw(format!(
@@ -137,7 +137,7 @@ pub(super) fn draw_service_list(
             format!(" Hosts: {} ", app.host_display_name(crate::app::ENUM_HOST))
         }
         Some(DisplayItem::Instance { index }) => {
-            let key = app.services[*index]
+            let key = app.services()[*index]
                 .hostname
                 .trim_end_matches('.')
                 .to_lowercase();
