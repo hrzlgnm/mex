@@ -48,6 +48,10 @@ use wire::*;
 const MDNS_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 const MDNS_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
 const MDNS_PORT: u16 = 5353;
+
+/// DNS-SD service type enumeration name (RFC 6763 §9), without the
+/// trailing root dot.
+pub(crate) const ENUM_SERVICE: &str = "_services._dns-sd._udp.local";
 /// How often the listener re-enumerates interfaces: picks up
 /// bridges and other links that appear at runtime, drops dead ones from
 /// the transmit set, and re-joins flapped ones (replug or down/up with

@@ -5,8 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use crate::app::ENUM_SERVICE;
-use crate::browse::{rtype_from_str, RawRecord};
+use crate::browse::{rtype_from_str, RawRecord, ENUM_SERVICE};
 
 mod naming;
 mod questions;
