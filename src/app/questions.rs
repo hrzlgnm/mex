@@ -54,14 +54,8 @@ impl App {
         }
     }
 
-    /// File one question row, refreshing the timestamp when the same
-    /// (name, type, source) asks again. Caps the list at `QUESTION_CAP`
-    /// rows (the window ages rows out separately, in `evict_expired`).
-    /// Returns true when an old row was evicted, so callers can count
-    /// drops for the dump truncation marker.
-    ///
-    /// Prefer `file_question_counted` at call sites: it files the row
-    /// and bumps the entry's eviction counter in one call.
+    /// File one question row (see `file_question_row`) and count an
+    /// evicted row in `drops`, for the dump truncation marker.
     pub(super) fn file_question_counted(
         rows: &mut Vec<QuestionRow>,
         drops: &mut u64,
@@ -76,8 +70,14 @@ impl App {
         }
     }
 
-    /// Short label for the record types we ever transmit (the only ones
-    /// `route_own_question` can see).
+    /// File one question row, refreshing the timestamp when the same
+    /// (name, type, source) asks again. Caps the list at `QUESTION_CAP`
+    /// rows (the window ages rows out separately, in `evict_expired`).
+    /// Returns true when an old row was evicted, so callers can count
+    /// drops for the dump truncation marker.
+    ///
+    /// Prefer `file_question_counted` at call sites: it files the row
+    /// and bumps the entry's eviction counter in one call.
     pub(super) fn file_question_row(
         rows: &mut Vec<QuestionRow>,
         name: String,

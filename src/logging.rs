@@ -1,13 +1,10 @@
 // Copyright 2026 hrzlgnm
 // SPDX-License-Identifier: MIT
 
-use super::*;
+use anyhow::Result;
 
-/// Minimal log sink with no new dependencies. The file sink (if
-/// `--log-file` is given) records Info and above; headless stderr gets
-/// Warn and above so routine traffic stays quiet. TUI mode without a
-/// file installs no logger at all — writing to the terminal would
-/// corrupt the interface.
+use crate::APP_NAME;
+
 /// Mutable logger state. Held in a global so `init_logging` can reconfigure
 /// thresholds and sinks even after the (process-wide, first-wins) logger has
 /// been installed; this keeps level changes observable in tests.
@@ -26,6 +23,11 @@ pub(super) static LOGGER_STATE: std::sync::Mutex<LoggerState> =
         stderr_level: log::LevelFilter::Warn,
     });
 
+/// Minimal log sink with no new dependencies. The file sink (if
+/// `--log-file` is given) records Info and above; headless stderr gets
+/// Warn and above so routine traffic stays quiet. TUI mode without a
+/// file installs no logger at all — writing to the terminal would
+/// corrupt the interface.
 pub(super) struct MexLogger;
 
 pub(super) static LOGGER: MexLogger = MexLogger;
