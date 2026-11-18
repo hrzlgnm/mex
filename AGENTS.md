@@ -73,6 +73,12 @@ Headless run (no TTY) logs to stderr.
   (`App::address_book`), exact match first (own announcement beats a
   proxy), then IPv6 interface-ID match for link-local sources
   (inferred). Presentation and dumps only; never feeds the analyzer.
+* `src/anomalies.rs` — the analyzer: finding types, the snapshot views,
+  `analyze_observations`, dedup and the conflicting-answers check. Child
+  modules: `records` (record claims, SRV targets, TTLs), `resolve`
+  (unresolved targets, address-query evidence), `naming` (service type,
+  label and subtype checks), `questions` (question verdicts), `scope`
+  (finding display scopes).
 * `src/ui.rs` — ratatui rendering only, no state mutations.
 
 ## Query scheduling (RFC 6762 §5.2, §5.4, §7.1)
