@@ -112,6 +112,38 @@ fn cached_unique_txt_of_a_pending_instance_skips_initial_query() {
 }
 
 #[test]
+fn pending_instance_rows_get_the_80_percent_refresh() {
+    // Dampening a pending instance's TXT stream relies on the 80%-TTL
+    // refresh taking over (§5.2); it must cover pending rows too, or a
+    // short-TTL TXT expires unrefreshed while the instance waits for SRV.
+    let mut app = App::new().unwrap();
+    ingest(&mut app, &ptr_record(4500));
+    let mut txt = txt_record("a=1");
+    txt.flush_bit = true;
+    ingest(&mut app, &txt);
+    assert!(
+        app.services.is_empty(),
+        "no SRV: the instance is still pending"
+    );
+    let key = Scheduler::provenance_key("Test._http._tcp.local", 16);
+    assert!(app.next_refresh_due(&key).is_some(), "refresh is projected");
+    // Age the TXT (TTL 120) past 80% of its lifetime.
+    for rec in &mut app.pending_instances[0].answers {
+        if rec.rtype == 16 {
+            rec.received_at = Instant::now() - Duration::from_secs(100);
+        }
+    }
+    app.requery_expiring();
+    assert!(
+        app.scheduler
+            .requeries()
+            .keys()
+            .any(|k| k.1 == 16 && k.0.eq_ignore_ascii_case("Test._http._tcp.local")),
+        "the pending TXT row is refreshed"
+    );
+}
+
+#[test]
 fn dampened_address_interest_stays_visible() {
     let mut app = App::new().unwrap();
     ingest_srv_with_addresses(&mut app, true);
