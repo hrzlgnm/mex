@@ -1044,7 +1044,14 @@ impl App {
     /// Whether a live unique (cache-flush) answer for `key` is cached and
     /// still before its 80%-TTL refresh window.
     pub(super) fn has_fresh_unique_answer(&self, key: &(String, u16)) -> bool {
-        self.services.iter().flat_map(|s| &s.answers).any(|r| {
+        // Pending instances count too: they already drive SRV/TXT
+        // interest (`desired_continuous`) before their SRV arrives.
+        let mut rows = self
+            .services
+            .iter()
+            .flat_map(|s| &s.answers)
+            .chain(self.pending_instances.iter().flat_map(|p| &p.answers));
+        rows.any(|r| {
             if !r.flush_bit
                 || r.ttl == 0
                 || r.rtype != key.1
