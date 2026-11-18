@@ -881,7 +881,12 @@ impl App {
         self.view_state.detail_free_scroll = false;
         let before = self.view_state.detail_selected;
         let (lo, hi) = self.detail_range();
-        self.view_state.detail_selected = if hi <= lo || first { lo } else { hi - 1 };
+        // An empty focused table has no edge row: keep the selection and
+        // its anchor, like `move_detail_cursor`.
+        if hi <= lo {
+            return;
+        }
+        self.view_state.detail_selected = if first { lo } else { hi - 1 };
         self.detail_anchor = self
             .display_detail()
             .and_then(|d| Self::identity_at_detail(&d, self.view_state.detail_selected));

@@ -247,6 +247,36 @@ fn records_home_end_and_paging() {
 }
 
 #[test]
+fn home_end_on_an_empty_pane_keep_the_selection() {
+    use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
+    let mut app = App::new().unwrap();
+    service_with_txt(&mut app, "a=1; b=2");
+    let key = |code| KeyEvent {
+        code,
+        modifiers: KeyModifiers::empty(),
+        kind: KeyEventKind::Press,
+        state: KeyEventState::empty(),
+    };
+    // Last answer selected, then focus the (empty) Questions pane.
+    app.handle_key(&key(KeyCode::Tab));
+    app.handle_key(&key(KeyCode::End));
+    let selected = app.view_state.detail_selected;
+    app.handle_key(&key(KeyCode::Tab));
+    assert_eq!(app.view_state.focus, Focus::Questions);
+    let anchor = app.detail_anchor.clone();
+    assert!(anchor.is_some());
+    // Like j/k there, Home/End have no row to move to: nothing changes.
+    for code in [KeyCode::Home, KeyCode::End] {
+        app.handle_key(&key(code));
+        assert_eq!(app.view_state.detail_selected, selected, "{code:?}");
+        assert!(
+            app.detail_anchor == anchor,
+            "{code:?} keeps the identity anchor"
+        );
+    }
+}
+
+#[test]
 fn expand_clears_manual_scroll() {
     let mut app = App::new().unwrap();
     service_with_txt(&mut app, "a=1; b=2");
