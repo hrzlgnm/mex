@@ -125,7 +125,7 @@ fn huge_ttl_unique_answer_does_not_overflow() {
     let mut app = App::new().unwrap();
     ingest_srv_with_addresses(&mut app, true);
     cached_a_row(&mut app).ttl = u32::MAX;
-    assert!(app.has_fresh_unique_answer(&App::continuous_key("test.local", 1)));
+    assert!(app.has_fresh_unique_answer(&Scheduler::continuous_key("test.local", 1)));
 }
 
 #[test]
@@ -133,7 +133,7 @@ fn unique_answer_matches_non_ascii_case() {
     let mut app = App::new().unwrap();
     ingest_srv_with_addresses(&mut app, true);
     cached_a_row(&mut app).name = "Étage.local.".to_string();
-    assert!(app.has_fresh_unique_answer(&App::continuous_key("étage.local", 1)));
+    assert!(app.has_fresh_unique_answer(&Scheduler::continuous_key("étage.local", 1)));
 }
 
 #[test]
@@ -858,7 +858,7 @@ fn query_interfaces_survive_link_changes_and_exclude_inactive_selection() {
     app.link_stats.v4.clear();
     app.interfaces = None;
     assert_eq!(
-        app.scheduler.query_history_mut()[&App::provenance_key("test.local", 1)]
+        app.scheduler.query_history_mut()[&Scheduler::provenance_key("test.local", 1)]
             .transmitted_interfaces,
         "br0"
     );

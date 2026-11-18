@@ -113,6 +113,175 @@ impl Scheduler {
         &self.enum_known
     }
 
+    /// Map key for `continuous` and `requeries`: lowercased name per
+    /// RFC 6763 §7 / RFC 1035 §2.3.1 (service types and subtypes compare
+    /// case-insensitively; host names too). The query itself keeps wire
+    /// case via `qname` / the desired-map value.
+    pub(super) fn continuous_key(name: &str, rtype: u16) -> (String, u16) {
+        (name.to_lowercase(), rtype)
+    }
+
+    /// Provenance map key: dot-trimmed lowercased name plus type, so
+    /// wire case and trailing dots collapse the way the scheduler keys
+    /// do (RFC 6763 §7).
+    pub(super) fn provenance_key(name: &str, rtype: u16) -> (String, u16) {
+        (name.trim_end_matches('.').to_lowercase(), rtype)
+    }
+
+    /// Record an observed remote question with its packet timestamp,
+    /// querier, and ingress interface, so dumps can identify which link
+    /// and browser asked (RFC 6762 §5.4/§11 context).
+    pub(super) fn note_observed(&mut self, q: &browse::RawRecord, from: std::net::SocketAddr) {
+        let entry = self
+            .query_history
+            .entry(Self::provenance_key(&q.name, q.rtype))
+            .or_default();
+        entry.observed = Some(ObservedQuery {
+            at: q.received_at,
+            from,
+            iface: q.iface.clone(),
+        });
+    }
+
+    /// The question a response record most likely answered: the latest
+    /// question for its owner name, any type, ours (transmitted) or a
+    /// remote querier's (observed), at most `TRIGGER_WINDOW` before the
+    /// record arrived. mDNS responses carry no question section
+    /// (RFC 6762 §6), so timing is all there is. Provenance keeps only the
+    /// latest timestamp per interest, which is why this runs at ingest.
+    pub(super) fn response_trigger(&self, rec: &browse::RawRecord) -> Option<browse::QueryTrigger> {
+        let name = Self::provenance_key(&rec.name, rec.rtype).0;
+        self.query_history
+            .iter()
+            .filter(|((n, _), _)| *n == name)
+            .flat_map(|((_, rtype), state)| {
+                [
+                    (state.transmitted, true),
+                    (state.observed.as_ref().map(|o| o.at), false),
+                ]
+                .into_iter()
+                .filter_map(move |(at, own)| at.map(|at| (at, own, *rtype)))
+            })
+            .filter(|(at, _, _)| {
+                *at <= rec.received_at && rec.received_at.duration_since(*at) <= TRIGGER_WINDOW
+            })
+            .max_by_key(|(at, _, _)| *at)
+            .map(|(_, own, rtype)| browse::QueryTrigger {
+                question: format!(
+                    "{}. {}",
+                    rec.name.trim_end_matches('.'),
+                    browse::rtype_label(rtype)
+                ),
+                own,
+            })
+    }
+
+    /// RFC 6762 §7.3: if we overheard the same QM question recently and its
+    /// Known-Answer section holds nothing we wouldn't send ourselves,
+    /// treat our query as sent. Consumes the entry so one overheard query
+    /// suppresses one transmission. `local_ka` is the KA list we computed
+    /// for the send; filtering is scoped to the link the overheard query
+    /// arrived on.
+    pub(super) fn suppressed_by_overheard(
+        &mut self,
+        key: &(String, u16),
+        local_ka: &[browse::KnownAnswer],
+    ) -> bool {
+        let lookup = (key.0.trim_end_matches('.').to_lowercase(), key.1);
+        let (seen, remote, iface) = match self.overheard.get(&lookup) {
+            Some(v) => v.clone(),
+            None => return false,
+        };
+        if seen.elapsed() >= OVERHEARD_WINDOW {
+            return false;
+        }
+        let mut local = HashSet::new();
+        for ka in local_ka {
+            if ka.iface.is_empty() || iface.is_empty() || ka.iface == iface {
+                local.insert(ka.target.trim_end_matches('.').to_lowercase());
+            }
+        }
+        if remote.iter().all(|r| local.contains(r)) {
+            self.overheard.remove(&lookup);
+            return true;
+        }
+        false
+    }
+
+    pub(super) fn advance_continuous(&mut self, key: &(String, u16), now: Instant) {
+        if let Some(entry) = self.continuous.get_mut(key) {
+            let current = entry.interval.max(Duration::from_secs(1));
+            entry.next_due = now + current;
+            entry.interval = (current * 2).min(MAX_CONTINUOUS_INTERVAL);
+        }
+    }
+
+    /// Postpone the exponential stream after a refresh (real or suppressed)
+    /// so the two §5.2 timers don't emit back-to-back duplicates.
+    pub(super) fn postpone_continuous_for_refresh(&mut self, key: &(String, u16), now: Instant) {
+        let mut postponed = false;
+        for (ckey, entry) in self.continuous.iter_mut() {
+            if ckey.1 == key.1 && ckey.0.eq_ignore_ascii_case(&key.0) {
+                let floor = now + entry.interval.max(Duration::from_secs(1));
+                if entry.next_due < floor {
+                    entry.next_due = floor;
+                }
+                postponed = true;
+            }
+        }
+        if !postponed {
+            let ckey = Self::continuous_key(&key.0, key.1);
+            if let std::collections::hash_map::Entry::Vacant(e) = self.continuous.entry(ckey) {
+                e.insert(ContinuousQuery {
+                    next_due: now + Duration::from_secs(1),
+                    interval: Duration::from_secs(1),
+                    qname: key.0.clone(),
+                });
+            }
+        }
+    }
+
+    /// Record our own transmit or suppression for an interest, with the
+    /// links a transmit went out on.
+    pub(super) fn note_query(
+        &mut self,
+        name: &str,
+        rtype: u16,
+        origin: QueryOrigin,
+        at: Instant,
+        interfaces: String,
+    ) {
+        let entry = self
+            .query_history
+            .entry(Self::provenance_key(name, rtype))
+            .or_default();
+        match origin {
+            QueryOrigin::Transmitted => {
+                entry.transmitted = Some(at);
+                entry.transmitted_interfaces = interfaces;
+            }
+            QueryOrigin::Suppressed => entry.suppressed = Some(at),
+            QueryOrigin::Observed => {
+                // Observed questions carry their own packet timestamp
+                // and source; use `note_observed` instead.
+            }
+        }
+    }
+
+    /// Remember a remote QM question and the known answers it carried
+    /// (RFC 6762 §7.3), to suppress our own duplicate once.
+    pub(super) fn note_overheard(&mut self, q: &browse::RawRecord, kas: &[browse::RawRecord]) {
+        let key = (q.name.trim_end_matches('.').to_lowercase(), q.rtype);
+        let mut remote = HashSet::new();
+        for ka in kas {
+            if ka.rtype == q.rtype && ka.name.eq_ignore_ascii_case(&q.name) {
+                remote.insert(ka.rdata.trim_end_matches('.').to_lowercase());
+            }
+        }
+        self.overheard
+            .insert(key, (Instant::now(), remote, q.iface.clone()));
+    }
+
     /// Prune schedules to live interests. `live` holds every
     /// (lowercased name, type) the cache still has; enumeration known
     /// answers are added here before they expire at 100% TTL.
@@ -196,7 +365,7 @@ impl App {
     /// existed. Unknown names yield an empty summary with blank cells.
     pub fn interest_summary(&self, name: &str, rtype: u16) -> InterestSummary {
         let now = Instant::now();
-        let view = self.interest_view(&Self::provenance_key(name, rtype));
+        let view = self.interest_view(&Scheduler::provenance_key(name, rtype));
         InterestSummary {
             timer: view.timer,
             next_due_in_secs: view
@@ -418,7 +587,7 @@ impl App {
         } else {
             Vec::new()
         };
-        if self.suppressed_by_overheard(key, &ka) {
+        if self.scheduler.suppressed_by_overheard(key, &ka) {
             log::debug!("mex: suppressed refresh query for {} (overheard)", key.0);
             self.metrics.suppressed_refresh += 1;
             self.metrics.suppressed_times.push_back(now);
@@ -445,23 +614,8 @@ impl App {
         // exponential stream for the same question: otherwise the two
         // timers can fire on the same tick and emit back-to-back
         // duplicates (RFC 6762 §5.2 spacing).
-        self.postpone_continuous_for_refresh(key, now);
+        self.scheduler.postpone_continuous_for_refresh(key, now);
         true
-    }
-
-    /// Map key for `continuous` and `requeries`: lowercased name per
-    /// RFC 6763 §7 / RFC 1035 §2.3.1 (service types and subtypes compare
-    /// case-insensitively; host names too). The query itself keeps wire
-    /// case via `qname` / the desired-map value.
-    pub(super) fn continuous_key(name: &str, rtype: u16) -> (String, u16) {
-        (name.to_lowercase(), rtype)
-    }
-
-    /// Provenance map key: dot-trimmed lowercased name plus type, so
-    /// wire case and trailing dots collapse the way the scheduler keys
-    /// do (RFC 6763 §7).
-    pub(super) fn provenance_key(name: &str, rtype: u16) -> (String, u16) {
-        (name.trim_end_matches('.').to_lowercase(), rtype)
     }
 
     /// Record a query event for an interest: we transmitted it or §7.3
@@ -482,38 +636,8 @@ impl App {
         query_interfaces.sort();
         query_interfaces.dedup();
         let query_interfaces = query_interfaces.join(", ");
-        let entry = self
-            .scheduler
-            .query_history
-            .entry(Self::provenance_key(name, rtype))
-            .or_default();
-        match origin {
-            QueryOrigin::Transmitted => {
-                entry.transmitted = Some(at);
-                entry.transmitted_interfaces = query_interfaces;
-            }
-            QueryOrigin::Suppressed => entry.suppressed = Some(at),
-            QueryOrigin::Observed => {
-                // Observed questions carry their own packet timestamp
-                // and source; use `note_observed` instead.
-            }
-        }
-    }
-
-    /// Record an observed remote question with its packet timestamp,
-    /// querier, and ingress interface, so dumps can identify which link
-    /// and browser asked (RFC 6762 §5.4/§11 context).
-    pub(super) fn note_observed(&mut self, q: &browse::RawRecord, ev: &browse::Event) {
-        let entry = self
-            .scheduler
-            .query_history
-            .entry(Self::provenance_key(&q.name, q.rtype))
-            .or_default();
-        entry.observed = Some(ObservedQuery {
-            at: q.received_at,
-            from: ev.source,
-            iface: q.iface.clone(),
-        });
+        self.scheduler
+            .note_query(name, rtype, origin, at, query_interfaces);
     }
 
     /// Whether a live (unexpired, nonzero-TTL) answer row exists for a
@@ -523,7 +647,7 @@ impl App {
         let live_row = |rec: &browse::RawRecord| {
             // Canonical key comparison (not ASCII-only): `É` and `é`
             // must hit the same interest.
-            Self::provenance_key(&rec.name, rec.rtype).0 == key.0
+            Scheduler::provenance_key(&rec.name, rec.rtype).0 == key.0
                 && rec.ttl > 0
                 && Self::remaining_ttl(rec) > 0
         };
@@ -561,7 +685,7 @@ impl App {
                 _ => return None,
             }
             if rec.rtype != key.1
-                || Self::provenance_key(&rec.name, rec.rtype).0 != key.0
+                || Scheduler::provenance_key(&rec.name, rec.rtype).0 != key.0
                 || rec.received_at.elapsed().as_secs() as u32 > rec.ttl
             {
                 return None;
@@ -601,20 +725,20 @@ impl App {
         // depending on the map, and eq_ignore_ascii_case only folds
         // a-z, so compare through `provenance_key` everywhere (`É`
         // and `é` must hit the same interest).
-        let key = Self::provenance_key(&key.0, key.1);
+        let key = Scheduler::provenance_key(&key.0, key.1);
         let state = self.scheduler.query_history.get(&key).cloned();
         let (attempt, refresh_due) = self
             .scheduler
             .requeries
             .iter()
-            .find(|(k, _)| Self::provenance_key(&k.0, k.1) == key)
+            .find(|(k, _)| Scheduler::provenance_key(&k.0, k.1) == key)
             .map(|(_, (due, count))| (*count, Some(*due)))
             .unwrap_or((0, None));
         let browse_due = self
             .scheduler
             .continuous
             .iter()
-            .find(|(k, _)| Self::provenance_key(&k.0, k.1) == key)
+            .find(|(k, _)| Scheduler::provenance_key(&k.0, k.1) == key)
             .map(|(_, e)| e.next_due);
         let (timer, next_due) = match (refresh_due, browse_due) {
             (Some(due), _) => (TimerKind::Refresh, Some(due)),
@@ -687,7 +811,7 @@ impl App {
     pub(super) fn desired_continuous(&self) -> HashMap<(String, u16), String> {
         let mut desired = HashMap::new();
         let mut want = |name: String, rtype: u16| {
-            let key = Self::continuous_key(&name, rtype);
+            let key = Scheduler::continuous_key(&name, rtype);
             desired.entry(key).or_insert(name);
         };
         want(ENUM_SERVICE.to_string(), 12);
@@ -787,14 +911,14 @@ impl App {
             // RFC 6762 §7.3: another querier just asked the same QM
             // question with no KA we wouldn't send — treat ours as sent.
             // QU elicits unicast and is never suppressed.
-            if !qu && self.suppressed_by_overheard(&key, &ka) {
+            if !qu && self.scheduler.suppressed_by_overheard(&key, &ka) {
                 log::debug!("mex: suppressed continuous query for {} (overheard)", key.0);
                 let now = Instant::now();
                 self.metrics.suppressed_continuous += 1;
                 self.metrics.suppressed_times.push_back(now);
                 self.note_query(&key.0, key.1, QueryOrigin::Suppressed, now);
                 self.route_own_question(&key.0, key.1, false);
-                self.advance_continuous(&key, now);
+                self.scheduler.advance_continuous(&key, now);
                 continue;
             }
             if qu {
@@ -831,7 +955,7 @@ impl App {
             // current interval, then double for the following gap, so the
             // stream is 1s, 2s, 4s, ... (doubling before use would skip
             // the 1s gap and start at 2s).
-            self.advance_continuous(&key, now);
+            self.scheduler.advance_continuous(&key, now);
         }
     }
 
@@ -897,40 +1021,6 @@ impl App {
         }
     }
 
-    /// The question a response record most likely answered: the latest
-    /// question for its owner name, any type, ours (transmitted) or a
-    /// remote querier's (observed), at most `TRIGGER_WINDOW` before the
-    /// record arrived. mDNS responses carry no question section
-    /// (RFC 6762 §6), so timing is all there is. Provenance keeps only the
-    /// latest timestamp per interest, which is why this runs at ingest.
-    pub(super) fn response_trigger(&self, rec: &browse::RawRecord) -> Option<browse::QueryTrigger> {
-        let name = Self::provenance_key(&rec.name, rec.rtype).0;
-        self.scheduler
-            .query_history
-            .iter()
-            .filter(|((n, _), _)| *n == name)
-            .flat_map(|((_, rtype), state)| {
-                [
-                    (state.transmitted, true),
-                    (state.observed.as_ref().map(|o| o.at), false),
-                ]
-                .into_iter()
-                .filter_map(move |(at, own)| at.map(|at| (at, own, *rtype)))
-            })
-            .filter(|(at, _, _)| {
-                *at <= rec.received_at && rec.received_at.duration_since(*at) <= TRIGGER_WINDOW
-            })
-            .max_by_key(|(at, _, _)| *at)
-            .map(|(_, own, rtype)| browse::QueryTrigger {
-                question: format!(
-                    "{}. {}",
-                    rec.name.trim_end_matches('.'),
-                    browse::rtype_label(rtype)
-                ),
-                own,
-            })
-    }
-
     /// Record an overheard QM question for duplicate question suppression
     /// (RFC 6762 §7.3). Own loopback and QU questions are never stored.
     /// The remote Known-Answer set is stored dot-trimmed and lowercased;
@@ -942,48 +1032,7 @@ impl App {
         if self.is_local_source(&ev.source) {
             return;
         }
-        let key = (q.name.trim_end_matches('.').to_lowercase(), q.rtype);
-        let mut remote = HashSet::new();
-        for ka in &ev.query_kas {
-            if ka.rtype == q.rtype && ka.name.eq_ignore_ascii_case(&q.name) {
-                remote.insert(ka.rdata.trim_end_matches('.').to_lowercase());
-            }
-        }
-        self.scheduler
-            .overheard
-            .insert(key, (Instant::now(), remote, q.iface.clone()));
-    }
-
-    /// RFC 6762 §7.3: if we overheard the same QM question recently and its
-    /// Known-Answer section holds nothing we wouldn't send ourselves,
-    /// treat our query as sent. Consumes the entry so one overheard query
-    /// suppresses one transmission. `local_ka` is the KA list we computed
-    /// for the send; filtering is scoped to the link the overheard query
-    /// arrived on.
-    pub(super) fn suppressed_by_overheard(
-        &mut self,
-        key: &(String, u16),
-        local_ka: &[browse::KnownAnswer],
-    ) -> bool {
-        let lookup = (key.0.trim_end_matches('.').to_lowercase(), key.1);
-        let (seen, remote, iface) = match self.scheduler.overheard.get(&lookup) {
-            Some(v) => v.clone(),
-            None => return false,
-        };
-        if seen.elapsed() >= OVERHEARD_WINDOW {
-            return false;
-        }
-        let mut local = HashSet::new();
-        for ka in local_ka {
-            if ka.iface.is_empty() || iface.is_empty() || ka.iface == iface {
-                local.insert(ka.target.trim_end_matches('.').to_lowercase());
-            }
-        }
-        if remote.iter().all(|r| local.contains(r)) {
-            self.scheduler.overheard.remove(&lookup);
-            return true;
-        }
-        false
+        self.scheduler.note_overheard(q, &ev.query_kas);
     }
 
     /// Advance the exponential stream as if a query had been sent (shared
@@ -1002,40 +1051,5 @@ impl App {
             let elapsed = r.received_at.elapsed().as_secs() as u32;
             !in_refresh_window(elapsed, r.ttl)
         })
-    }
-
-    pub(super) fn advance_continuous(&mut self, key: &(String, u16), now: Instant) {
-        if let Some(entry) = self.scheduler.continuous.get_mut(key) {
-            let current = entry.interval.max(Duration::from_secs(1));
-            entry.next_due = now + current;
-            entry.interval = (current * 2).min(MAX_CONTINUOUS_INTERVAL);
-        }
-    }
-
-    /// Postpone the exponential stream after a refresh (real or suppressed)
-    /// so the two §5.2 timers don't emit back-to-back duplicates.
-    pub(super) fn postpone_continuous_for_refresh(&mut self, key: &(String, u16), now: Instant) {
-        let mut postponed = false;
-        for (ckey, entry) in self.scheduler.continuous.iter_mut() {
-            if ckey.1 == key.1 && ckey.0.eq_ignore_ascii_case(&key.0) {
-                let floor = now + entry.interval.max(Duration::from_secs(1));
-                if entry.next_due < floor {
-                    entry.next_due = floor;
-                }
-                postponed = true;
-            }
-        }
-        if !postponed {
-            let ckey = Self::continuous_key(&key.0, key.1);
-            if let std::collections::hash_map::Entry::Vacant(e) =
-                self.scheduler.continuous.entry(ckey)
-            {
-                e.insert(ContinuousQuery {
-                    next_due: now + Duration::from_secs(1),
-                    interval: Duration::from_secs(1),
-                    qname: key.0.clone(),
-                });
-            }
-        }
     }
 }

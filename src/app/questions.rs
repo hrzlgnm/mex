@@ -5,7 +5,7 @@ impl App {
     /// who is asking (and the hex pane can show the query packet).
     /// Enumeration questions file on their selectable enumeration row.
     pub(super) fn route_question(&mut self, q: &browse::RawRecord, ev: &browse::Event) {
-        self.note_observed(q, ev);
+        self.scheduler.note_observed(q, ev.source);
         let name = q.name.trim_end_matches('.').to_lowercase();
         if is_enum_name(&name) {
             for entry in &mut self.enum_entries {

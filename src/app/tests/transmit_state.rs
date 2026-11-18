@@ -22,7 +22,7 @@ fn queries_hold_while_no_family_can_transmit() {
     assert!(
         app.scheduler
             .query_history()
-            .get(&App::provenance_key(&key.0, key.1))
+            .get(&Scheduler::provenance_key(&key.0, key.1))
             .is_none_or(|s| s.transmitted.is_none()),
         "no phantom transmission"
     );
@@ -48,7 +48,7 @@ fn one_family_transmitting_keeps_queries_going() {
     assert!(app
         .scheduler
         .query_history()
-        .get(&App::provenance_key(&key.0, key.1))
+        .get(&Scheduler::provenance_key(&key.0, key.1))
         .is_some_and(|s| s.transmitted.is_some()));
 }
 

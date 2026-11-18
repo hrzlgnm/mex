@@ -17,6 +17,7 @@ mod question_window;
 mod questions;
 mod review_followups;
 mod schedule;
+mod scheduler;
 mod srv_target;
 mod state_dump;
 mod transmit_state;
@@ -121,7 +122,7 @@ fn mark_address_queries(app: &mut App, hostname: &str, age: Duration) {
     let sent_at = Instant::now() - age;
     for rtype in [1, 28] {
         app.scheduler.query_history_mut().insert(
-            App::provenance_key(hostname, rtype),
+            Scheduler::provenance_key(hostname, rtype),
             InterestQueryState {
                 transmitted: Some(sent_at),
                 ..InterestQueryState::default()

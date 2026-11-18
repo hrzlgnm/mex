@@ -203,17 +203,17 @@ impl App {
         let mut interest_keys: HashSet<(String, u16)> =
             self.scheduler.query_history().keys().cloned().collect();
         for key in self.scheduler.requeries().keys() {
-            interest_keys.insert(Self::provenance_key(&key.0, key.1));
+            interest_keys.insert(Scheduler::provenance_key(&key.0, key.1));
         }
         for key in self.scheduler.continuous().keys() {
-            interest_keys.insert(Self::provenance_key(&key.0, key.1));
+            interest_keys.insert(Scheduler::provenance_key(&key.0, key.1));
         }
         // Answer-only interests (e.g. passive captures, answers without
         // any observed query): provenance and schedules know nothing
         // about them, but the dump must still list what was retained.
         // Origin stays absent rather than invented.
         let mut answer_key = |name: &str, rtype: u16| {
-            interest_keys.insert(Self::provenance_key(name, rtype));
+            interest_keys.insert(Scheduler::provenance_key(name, rtype));
         };
         for svc in &self.services {
             for rec in &svc.answers {
