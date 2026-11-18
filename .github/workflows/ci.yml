@@ -117,34 +117,7 @@ jobs:
     needs:
       - check-release
     if: always() && needs.check-release.outputs.is_release != 'true'
-    runs-on: ubuntu-slim
-    steps:
-      - name: 🔄 Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-
-      # Every source, workflow and config file that can hold a comment
-      # carries the Copyright / SPDX-License-Identifier header. The
-      # identifier must sit in the first or last 5 lines (header or
-      # footer; room for a shebang): a mention mid-file does not count.
-      - name: 📜 Check SPDX headers
-        shell: bash
-        run: |
-          missing=()
-          while IFS= read -r -d '' f; do
-            # No pipe into `grep -q`: under pipefail its early exit
-            # would fail the pipeline via SIGPIPE in head/tail.
-            edges=$(head -n 5 -- "$f"; tail -n 5 -- "$f")
-            if ! grep -q 'SPDX-License-Identifier' <<<"$edges"; then
-              missing+=("$f")
-            fi
-          done < <(git ls-files -z -- '*.rs' '*.yml' '*.yaml' '*.toml' '*.sh' '*.json5')
-          if [ "${#missing[@]}" -gt 0 ]; then
-            echo "::error::Files without an SPDX-License-Identifier header or footer:"
-            printf '%s\n' "${missing[@]}"
-            exit 1
-          fi
+    uses: hrzlgnm/actions/.github/workflows/spdx-reusable.yml@0d30078875c008b02cb2575ce5af3bd222ef2ee3 # v2.15.0
 
   lint:
     name: "📎 Lint"
