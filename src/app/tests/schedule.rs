@@ -67,6 +67,28 @@ fn cached_unique_address_skips_initial_query() {
 }
 
 #[test]
+fn cached_unique_txt_of_a_pending_instance_skips_initial_query() {
+    // PTR and a unique TXT, no SRV yet: the instance stays pending, but
+    // its TXT interest already has a fresh unique answer (RFC 6762 §5.2).
+    let mut app = App::new().unwrap();
+    ingest(&mut app, &ptr_record(120));
+    let mut txt = txt_record("a=1");
+    txt.flush_bit = true;
+    ingest(&mut app, &txt);
+    assert!(
+        app.services.is_empty(),
+        "no SRV: the instance is still pending"
+    );
+    app.poll_continuous();
+    let entry = app
+        .scheduler
+        .continuous()
+        .get(&("test._http._tcp.local".to_string(), 16))
+        .expect("TXT interest of the pending instance");
+    assert_eq!(entry.interval, MAX_CONTINUOUS_INTERVAL);
+}
+
+#[test]
 fn dampened_address_interest_stays_visible() {
     let mut app = App::new().unwrap();
     ingest_srv_with_addresses(&mut app, true);
