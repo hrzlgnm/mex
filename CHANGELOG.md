@@ -1,5 +1,64 @@
 # Changelog
 
+## [0.20.3](https://github.com/hrzlgnm/mex/compare/v0.20.2...v0.20.3) (2026-11-18)
+
+
+### Bug Fixes
+
+* cap the per-source packet counters ([#314](https://github.com/hrzlgnm/mex/issues/314)) ([01350f1](https://github.com/hrzlgnm/mex/commit/01350f13d87fe13678de989ca6491c8143a3460d))
+* dedup Questions rows by name case-insensitively ([#310](https://github.com/hrzlgnm/mex/issues/310)) ([03ec56a](https://github.com/hrzlgnm/mex/commit/03ec56a341230fdd66e15884fa1fdc18319ea991))
+* don't overflow the half-TTL known-answer check on huge TTLs ([#308](https://github.com/hrzlgnm/mex/issues/308)) ([3db7178](https://github.com/hrzlgnm/mex/commit/3db717848b528b248161692f360a5fcbcf4556df))
+* keep the selection on Home/End in an empty pane ([#309](https://github.com/hrzlgnm/mex/issues/309)) ([27a440b](https://github.com/hrzlgnm/mex/commit/27a440b897d3f693eec13bc0a67427a8f1b89f9d))
+* let pending instances' unique answers dampen discovery ([#313](https://github.com/hrzlgnm/mex/issues/313)) ([4071a36](https://github.com/hrzlgnm/mex/commit/4071a3608410f956e2ce785d821f2143e90e6da7))
+* refresh pending instances' rows at 80% of their TTL ([#317](https://github.com/hrzlgnm/mex/issues/317)) ([32364a7](https://github.com/hrzlgnm/mex/commit/32364a7a93abb19e1658678dc8fc99a2e3d6acdb))
+
+
+### Dependencies
+
+* lock file maintenance ([#311](https://github.com/hrzlgnm/mex/issues/311)) ([752e6f6](https://github.com/hrzlgnm/mex/commit/752e6f6c04cfd7441680ff02c275e7b2e1368bee))
+* update hrzlgnm/actions action to v2.15.0 ([#312](https://github.com/hrzlgnm/mex/issues/312)) ([6c555c7](https://github.com/hrzlgnm/mex/commit/6c555c71ab530387c37a82ee2d281f794de8ba82))
+
+
+### Documentation
+
+* describe the logger's default log file correctly ([#318](https://github.com/hrzlgnm/mex/issues/318)) ([386b8d7](https://github.com/hrzlgnm/mex/commit/386b8d759e85d89a2cd8e28e41b22d2832442c0c))
+
+
+### Code Refactoring
+
+* collect draw-measured state in app::Layout ([#290](https://github.com/hrzlgnm/mex/issues/290)) ([ca195d4](https://github.com/hrzlgnm/mex/commit/ca195d45c1d05aff23dd6e7f82001bfdeab91630))
+* collect focus, selection and splits in app::ViewState ([#291](https://github.com/hrzlgnm/mex/issues/291)) ([eb99dd7](https://github.com/hrzlgnm/mex/commit/eb99dd783b437abcc6f1ec7d7c1bacf483c50018))
+* give NSEC address denials their own type ([#295](https://github.com/hrzlgnm/mex/issues/295)) ([8b987d2](https://github.com/hrzlgnm/mex/commit/8b987d2507174ee5398f3d396fb008bf25ac495e))
+* make the remaining App fields private ([#292](https://github.com/hrzlgnm/mex/issues/292)) ([c733f7d](https://github.com/hrzlgnm/mex/commit/c733f7d053e271f8c927cf032fb9998c953d8401))
+* move ENUM_SERVICE to browse to break the anomalies-app cycle ([#289](https://github.com/hrzlgnm/mex/issues/289)) ([0bbf729](https://github.com/hrzlgnm/mex/commit/0bbf729382644df22cea22193f691e1b595e6211))
+* move scheduling state into app::Scheduler ([#296](https://github.com/hrzlgnm/mex/issues/296)) ([0900054](https://github.com/hrzlgnm/mex/commit/09000541a4656db6af056d4a16a3d026a8ce3dec))
+* move the cache-independent scheduling rules onto Scheduler ([#298](https://github.com/hrzlgnm/mex/issues/298)) ([84cd573](https://github.com/hrzlgnm/mex/commit/84cd57351a37a174613cd9ebfbf766b1c3a98751))
+* move the logger out of main into its own module ([#284](https://github.com/hrzlgnm/mex/issues/284)) ([963ab33](https://github.com/hrzlgnm/mex/commit/963ab3392fc0f78a3afb893137bc12c8932a2408))
+* split anomalies into records, resolve, naming, questions and scope modules ([#282](https://github.com/hrzlgnm/mex/issues/282)) ([d3cd54a](https://github.com/hrzlgnm/mex/commit/d3cd54a38bc3ea07d8254fb4e1e8b5957256aa9c))
+* split App methods into child modules by job ([#280](https://github.com/hrzlgnm/mex/issues/280)) ([ba959a0](https://github.com/hrzlgnm/mex/commit/ba959a0ef902bfede3d0c2e612e570a4a9220958))
+* split app tests into topic modules ([#279](https://github.com/hrzlgnm/mex/issues/279)) ([87f3b05](https://github.com/hrzlgnm/mex/commit/87f3b05a4b14451d5ef84629a33a404d47ff1887))
+* split browse into iface, listener, send and wire modules ([#281](https://github.com/hrzlgnm/mex/issues/281)) ([ebe8e0e](https://github.com/hrzlgnm/mex/commit/ebe8e0ef4ad6d8701d91adb1ee8bb11aca7b9a37))
+* split ui into per-pane modules ([#283](https://github.com/hrzlgnm/mex/issues/283)) ([e3edd76](https://github.com/hrzlgnm/mex/commit/e3edd76b04cc93ebd0f91614484bc86d1fa80d10))
+
+
+### Tests
+
+* let service_of prefer a full-key match over a bare instance ([#319](https://github.com/hrzlgnm/mex/issues/319)) ([3d9ddb3](https://github.com/hrzlgnm/mex/commit/3d9ddb3db8e6f0e6a4858f98358dc9db6da14f00))
+* match row helpers on the full instance name and real liveness ([#315](https://github.com/hrzlgnm/mex/issues/315)) ([264efef](https://github.com/hrzlgnm/mex/commit/264efef672abe8b8b199d7ccd4f7a2ce3ecf6411))
+* merge duplicate row helpers and file [#255](https://github.com/hrzlgnm/mex/issues/255) tests under denials ([#302](https://github.com/hrzlgnm/mex/issues/302)) ([79c22c7](https://github.com/hrzlgnm/mex/commit/79c22c79426ebc8d0bac52213507aa4b664954eb))
+* move the logger tests next to the logger ([#299](https://github.com/hrzlgnm/mex/issues/299)) ([63b7714](https://github.com/hrzlgnm/mex/commit/63b7714e5a8c41bf6c1eeb0d0a5647dbbbbf2904))
+* split anomalies tests into topic modules ([#300](https://github.com/hrzlgnm/mex/issues/300)) ([f4cf54b](https://github.com/hrzlgnm/mex/commit/f4cf54b150313f0422b30356bd66df65abe916aa))
+* split browse tests into topic modules ([#301](https://github.com/hrzlgnm/mex/issues/301)) ([2cf38ea](https://github.com/hrzlgnm/mex/commit/2cf38ea63a77269ee1d8c5c6e48e079ca3355e56))
+
+
+### Continuous Integration
+
+* check macOS with clippy on Linux instead of a PR macOS build ([#288](https://github.com/hrzlgnm/mex/issues/288)) ([5977d49](https://github.com/hrzlgnm/mex/commit/5977d495e2576eddf85c37fde1a7edbf1c019bc7))
+* check SPDX headers with the shared reusable workflow ([#320](https://github.com/hrzlgnm/mex/issues/320)) ([12bcad7](https://github.com/hrzlgnm/mex/commit/12bcad7b94d8a5b473d1e399a4579b758a67ef6a))
+* fail when a source or config file lacks its SPDX header ([#305](https://github.com/hrzlgnm/mex/issues/305)) ([a30c09d](https://github.com/hrzlgnm/mex/commit/a30c09dd9f0afbab46633ceb7e6754ab51a71571))
+* require the SPDX identifier in a file's header or footer ([#307](https://github.com/hrzlgnm/mex/issues/307)) ([2904a35](https://github.com/hrzlgnm/mex/commit/2904a35e870da2e4479b4ad825bb6b37c102d416))
+* trim PR builds to one target per OS family and skip the unchanged-deps SBOM ([#287](https://github.com/hrzlgnm/mex/issues/287)) ([0376ddc](https://github.com/hrzlgnm/mex/commit/0376ddc9cd2ccd40b69582154024abde74cef6c0))
+
 ## [0.20.2](https://github.com/hrzlgnm/mex/compare/v0.20.1...v0.20.2) (2026-11-17)
 
 
