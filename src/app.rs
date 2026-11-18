@@ -1,6 +1,7 @@
 // Copyright 2026 hrzlgnm
 // SPDX-License-Identifier: MIT
 
+use denials::AddressDenials;
 pub use layout::Layout;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -547,58 +548,6 @@ impl Sighting {
     }
 }
 
-/// How a responder said an address type is absent for a service.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DenialForm {
-    /// RFC 6762 §6.1: a hostname-owned NSEC, arriving in the same packet
-    /// as the service's SRV for that host, whose bitmap lists the types
-    /// that exist; absent address types are denied.
-    Rfc,
-    /// Older python-zeroconf: an instance-owned NSEC whose bitmap lists
-    /// only the *missing* address types (inverted bitmap).
-    Legacy,
-}
-
-impl DenialForm {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            DenialForm::Rfc => "rfc",
-            DenialForm::Legacy => "legacy",
-        }
-    }
-}
-
-/// A service's own responder said it has no address of `rtype` (A or
-/// AAAA): rows of that type stay off this service while it is live.
-#[derive(Debug, Clone)]
-struct AddressDenial {
-    /// Lowercased `instance.service_type` (`service_key`).
-    service: String,
-    rtype: u16,
-    /// The hostname it applies to (RFC form); `None` for every host of
-    /// the service (legacy, instance-owned form).
-    host: Option<String>,
-    form: DenialForm,
-    source: std::net::SocketAddr,
-    ttl: u32,
-    received_at: Instant,
-}
-
-impl AddressDenial {
-    fn is_live(&self) -> bool {
-        self.ttl > 0 && self.received_at.elapsed().as_secs() <= u64::from(self.ttl)
-    }
-
-    /// Whether this denial is about an address of `rtype` owned by `host`.
-    fn applies_to(&self, rtype: u16, host: &str) -> bool {
-        self.rtype == rtype && self.host.as_deref().is_none_or(|h| h == host)
-    }
-
-    fn covers(&self, service: &str, rtype: u16, host: &str) -> bool {
-        self.service == service && self.applies_to(rtype, host) && self.is_live()
-    }
-}
-
 /// Lowercased `instance.service_type`, the identity address denials use.
 fn service_key(instance: &str, service_type: &str) -> String {
     format!("{instance}.{service_type}").to_lowercase()
@@ -756,12 +705,8 @@ pub struct App {
     /// findings: never Answers or Questions rows, never query drivers.
     /// Oldest first, capped at `SIGHTINGS_CAP`.
     sightings: Vec<Sighting>,
-    /// Address types a service's own responder denies via NSEC (#245):
-    /// rows of that type are never filed on that service.
-    address_denials: Vec<AddressDenial>,
-    /// Address records withheld from every service of their host by a
-    /// denial, by lowercased host: the Hosts header still lists them.
-    withheld_addrs: HashMap<String, Vec<browse::RawRecord>>,
+    /// NSEC address denials (#245) and the addresses they withhold.
+    address_denials: AddressDenials,
     /// Transient confirmation popup (e.g. state-dump result), shown for
     /// a few seconds and dismissed by any key.
     status_msg: Option<(String, Instant)>,
@@ -1127,8 +1072,7 @@ impl App {
             next_pending_addr_prune: Instant::now(),
             raw_events: Vec::new(),
             sightings: Vec::new(),
-            address_denials: Vec::new(),
-            withheld_addrs: HashMap::new(),
+            address_denials: AddressDenials::default(),
             status_msg: None,
             metrics: MetricsCounters::default(),
             state_gen: 0,
@@ -1379,11 +1323,7 @@ impl App {
                 !records.is_empty()
             });
         }
-        // Withheld addresses live for their TTL.
-        self.withheld_addrs.retain(|_, rows| {
-            rows.retain(|r| r.ttl > 0 && r.received_at.elapsed().as_secs() <= u64::from(r.ttl));
-            !rows.is_empty()
-        });
+        self.address_denials.expire_withheld();
         Self::expire_stale_services(&mut self.services);
         let before = self.services.len();
         self.services
@@ -1399,8 +1339,7 @@ impl App {
         // (or pending instance) does: pruned after both were pruned, so a
         // returning instance never inherits a stale denial.
         let owners = self.live_service_keys();
-        self.address_denials
-            .retain(|d| d.is_live() && owners.contains(&d.service));
+        self.address_denials.retain_owned_by(&owners);
         // Questions rows age out once their querier stopped asking for
         // the question window (#238); not a drop, so no counter moves.
         let fresh = |q: &QuestionRow| now.saturating_duration_since(q.3) <= QUESTION_WINDOW;

@@ -122,24 +122,10 @@ impl App {
                 .collect(),
             questions_truncated: svc.questions_dropped > 0,
             questions_dropped: svc.questions_dropped,
-            address_denials: self.dump_denials(&service_key(&svc.instance, &svc.service_type)),
+            address_denials: self
+                .address_denials
+                .dump(&service_key(&svc.instance, &svc.service_type)),
         }
-    }
-
-    /// Live address denials of one service, for the dump (#245).
-    pub(super) fn dump_denials(&self, service: &str) -> Vec<dump::DumpDenial> {
-        self.address_denials
-            .iter()
-            .filter(|d| d.service == service && d.is_live())
-            .map(|d| dump::DumpDenial {
-                rtype_str: browse::rtype_label(d.rtype),
-                form: d.form.as_str().to_string(),
-                host: d.host.clone(),
-                source: d.source.to_string(),
-                ttl_remaining_secs: u64::from(d.ttl)
-                    .saturating_sub(d.received_at.elapsed().as_secs()),
-            })
-            .collect()
     }
 
     /// Snapshot of mex's own browse state.

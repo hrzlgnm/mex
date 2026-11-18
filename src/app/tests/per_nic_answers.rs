@@ -179,10 +179,7 @@ fn stale_pending_copy_does_not_shadow_a_live_withheld_one() {
         .entry("fritz.box".to_string())
         .or_default()
         .push(stale);
-    app.withheld_addrs
-        .entry("fritz.box".to_string())
-        .or_default()
-        .push(live);
+    app.address_denials.withhold(&live);
     assert_eq!(conflicts(&app).len(), 1, "the live withheld copy counts");
 }
 
