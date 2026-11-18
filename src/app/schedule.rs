@@ -508,6 +508,12 @@ impl App {
         for entry in &self.enum_entries {
             entry.answers.iter().for_each(&mut scan);
         }
+        // Pending instances (PTR seen, SRV not yet) keep their rows fresh
+        // too: their unique answers dampen discovery, so this refresh is
+        // what maintains them.
+        for p in &self.pending_instances {
+            p.answers.iter().for_each(&mut scan);
+        }
         // No maintenance without a live record (RFC 6762 §5.2 deletes at
         // 100%); a replaced row is gone with its old identity.
         self.scheduler
@@ -671,8 +677,8 @@ impl App {
 
     /// Earliest point at which the refresh scan will trigger for an
     /// interest: 80% of TTL past each live row's receipt, minimum
-    /// across rows. Matches the scan's coverage exactly (services +
-    /// enumeration answers, browsable types only) so the projection
+    /// across rows. Matches the scan's coverage exactly (services,
+    /// enumeration answers and pending instances, browsable types only) so the projection
     /// never predicts a refresh the scheduler would not send. `None`
     /// in passive mode: a passive browser transmits nothing, so no
     /// refresh is ever due.
@@ -711,6 +717,7 @@ impl App {
             .iter()
             .flat_map(|s| s.answers.iter())
             .chain(self.enum_entries.iter().flat_map(|e| e.answers.iter()))
+            .chain(self.pending_instances.iter().flat_map(|p| p.answers.iter()))
             .filter_map(deadline)
             .min()?;
         // A row already past 80% with no entry yet fires on the next
