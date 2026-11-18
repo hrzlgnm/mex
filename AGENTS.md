@@ -80,6 +80,9 @@ Headless run (no TTY) logs to stderr.
   label and subtype checks), `questions` (question verdicts), `scope`
   (finding display scopes).
 * `src/ui.rs` — ratatui rendering only, no state mutations.
+  Child modules per pane: `services`, `records`, `questions`, `hex`,
+  `metrics` (overlay); `ui.rs` keeps terminal init/restore/suspend, the
+  frame layout and shared cell/finding helpers.
 
 ## Query scheduling (RFC 6762 §5.2, §5.4, §7.1)
 
