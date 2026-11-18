@@ -25,6 +25,29 @@ fn known_answers_carry_their_ingress_interface() {
 }
 
 #[test]
+fn huge_ttl_ptr_is_a_known_answer_without_overflow() {
+    // A responder may announce any 32-bit TTL; the half-TTL check must
+    // not overflow (debug builds panicked here).
+    let mut app = App::new().unwrap();
+    ingest(&mut app, &ptr_record(u32::MAX));
+    ingest(&mut app, &srv_record(120));
+    let kas = app.known_ptrs("_http._tcp.local");
+    assert_eq!(kas.len(), 1, "a fresh huge-TTL PTR is still a known answer");
+}
+
+#[test]
+fn huge_ttl_enumeration_answer_is_a_known_answer_without_overflow() {
+    let mut app = App::new().unwrap();
+    let mut rec = ptr_record(u32::MAX);
+    rec.name = "_services._dns-sd._udp.local.".to_string();
+    rec.rdata = "_http._tcp.local.".to_string();
+    app.scheduler.note_enum_type("_http._tcp.local", &rec);
+    let kas = app.known_enum_answers();
+    assert_eq!(kas.len(), 1);
+    assert_eq!(kas[0].target, "_http._tcp.local");
+}
+
+#[test]
 fn hostname_case_preserved_in_queries() {
     let mut app = App::new().unwrap();
     ingest(&mut app, &ptr_record(120));

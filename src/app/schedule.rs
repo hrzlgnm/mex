@@ -403,7 +403,8 @@ impl App {
                 return;
             }
             let remaining = Self::remaining_ttl(rec);
-            if remaining * 2 < rec.ttl {
+            // u64: twice a 32-bit TTL overflows u32.
+            if u64::from(remaining) * 2 < u64::from(rec.ttl) {
                 return;
             }
             let target = rec.rdata.trim_end_matches('.').to_string();
@@ -440,7 +441,7 @@ impl App {
         for (svc_type, (ttl, received, iface)) in &self.scheduler.enum_known {
             let elapsed = now.duration_since(*received).as_secs() as u32;
             let remaining = ttl.saturating_sub(elapsed);
-            if *ttl == 0 || remaining * 2 < *ttl {
+            if *ttl == 0 || u64::from(remaining) * 2 < u64::from(*ttl) {
                 continue;
             }
             out.push(browse::KnownAnswer {
