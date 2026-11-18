@@ -1,3 +1,6 @@
+// Copyright 2026 hrzlgnm
+// SPDX-License-Identifier: MIT
+
 use super::*;
 
 pub fn local_ips() -> HashSet<IpAddr> {

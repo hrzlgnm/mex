@@ -1,3 +1,6 @@
+// Copyright 2026 hrzlgnm
+// SPDX-License-Identifier: MIT
+
 use super::*;
 
 pub(super) fn check_type_format(svc: &ServiceView, service_id: &str, out: &mut Vec<Anomaly>) {

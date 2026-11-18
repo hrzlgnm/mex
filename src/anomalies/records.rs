@@ -1,3 +1,6 @@
+// Copyright 2026 hrzlgnm
+// SPDX-License-Identifier: MIT
+
 use super::*;
 
 /// TTLs below this are churn risks; above this are stale-cache risks.

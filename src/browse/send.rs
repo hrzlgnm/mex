@@ -1,3 +1,6 @@
+// Copyright 2026 hrzlgnm
+// SPDX-License-Identifier: MIT
+
 use super::*;
 
 /// What a send outcome means for the log, after dedup.

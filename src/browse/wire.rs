@@ -1,3 +1,6 @@
+// Copyright 2026 hrzlgnm
+// SPDX-License-Identifier: MIT
+
 use super::*;
 
 /// Whether a parsed DNS name holds bytes outside UTF-8. Must run on

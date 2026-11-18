@@ -1,3 +1,6 @@
+// Copyright 2026 hrzlgnm
+// SPDX-License-Identifier: MIT
+
 // --- #248 PR 2: the findings a target shows, read from its Answers
 // pane (the Anomalies pane is gone) ---
 

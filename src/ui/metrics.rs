@@ -1,3 +1,6 @@
+// Copyright 2026 hrzlgnm
+// SPDX-License-Identifier: MIT
+
 use super::*;
 
 pub(super) fn draw_metrics_overlay(frame: &mut Frame, app: &App, found: &[Anomaly]) {

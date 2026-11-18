@@ -1,3 +1,6 @@
+// Copyright 2026 hrzlgnm
+// SPDX-License-Identifier: MIT
+
 use super::*;
 
 /// Query scheduling state (RFC 6762 §5.2, §5.4, §7.1, §7.3).

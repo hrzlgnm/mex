@@ -1,3 +1,6 @@
+// Copyright 2026 hrzlgnm
+// SPDX-License-Identifier: MIT
+
 // --- #238: Questions rows age out by a time window ---
 
 use super::*;

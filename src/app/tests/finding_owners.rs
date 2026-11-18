@@ -1,3 +1,6 @@
+// Copyright 2026 hrzlgnm
+// SPDX-License-Identifier: MIT
+
 // --- #248: findings next to their owner ---
 
 use super::*;
