@@ -29,10 +29,7 @@ fn status_popup_shows_while_fresh() {
     use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
     let mut app = App::new().unwrap();
     assert!(app.status_popup().is_none());
-    let shown = |app: &App, text: &str| {
-        let buf = render_to_buffer(app, 100, 30);
-        rect_text(&buf, buf.area).contains(text)
-    };
+    let shown = |app: &App, text: &str| screen(app, 100, 30).iter().any(|l| l.contains(text));
     let msg = "Dump saved: probe-popup.json";
     assert!(!shown(&app, msg));
     app.status_msg = Some((msg.to_string(), Instant::now()));

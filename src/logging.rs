@@ -333,20 +333,10 @@ mod tests {
 
     #[test]
     fn default_log_dir_respects_xdg_state_home() {
-        // Scoped env override, serialized with the other tests that set
-        // these vars.
         let _guard = TEST_LOG_LOCK.lock().unwrap();
         let tmp = std::env::temp_dir().join(format!("mex-logdir-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let old = std::env::var_os("XDG_STATE_HOME");
-        std::env::set_var("XDG_STATE_HOME", &tmp);
-        let dir = super::default_log_dir();
-        match old {
-            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-            None => std::env::remove_var("XDG_STATE_HOME"),
-        }
-        assert_eq!(dir, tmp.join("mex"));
-        assert!(dir.ends_with("mex"));
+        let _xdg = EnvVarGuard::set("XDG_STATE_HOME", tmp.as_os_str());
+        assert_eq!(super::default_log_dir(), tmp.join("mex"));
     }
 
     #[test]
@@ -403,26 +393,38 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    /// Run `f` with `XDG_STATE_HOME` set to `value`, restoring it after.
-    fn with_xdg_state_home<T>(value: &std::ffi::OsStr, f: impl FnOnce() -> T) -> T {
-        let old = std::env::var_os("XDG_STATE_HOME");
-        std::env::set_var("XDG_STATE_HOME", value);
-        let out = f();
-        match old {
-            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-            None => std::env::remove_var("XDG_STATE_HOME"),
+    /// Sets an environment variable for one test and restores it on
+    /// drop, also when an assertion fails. Hold `TEST_LOG_LOCK` while it
+    /// lives: no other test reads these variables without it.
+    struct EnvVarGuard {
+        name: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &std::ffi::OsStr) -> Self {
+            let old = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, old }
         }
-        out
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(v) => std::env::set_var(self.name, v),
+                None => std::env::remove_var(self.name),
+            }
+        }
     }
 
     #[test]
     fn default_log_dir_falls_back_to_home_without_xdg_state_home() {
         let _guard = TEST_LOG_LOCK.lock().unwrap();
-        let Some(home) = std::env::var_os("HOME") else {
-            return;
-        };
-        let dir = with_xdg_state_home("".as_ref(), super::default_log_dir);
-        assert_eq!(dir, std::path::PathBuf::from(home).join(".local/state/mex"));
+        let home = std::env::temp_dir().join(format!("mex-home-{}", std::process::id()));
+        let _home = EnvVarGuard::set("HOME", home.as_os_str());
+        let _xdg = EnvVarGuard::set("XDG_STATE_HOME", "".as_ref());
+        assert_eq!(super::default_log_dir(), home.join(".local/state/mex"));
     }
 
     #[cfg(target_os = "linux")]
@@ -466,15 +468,14 @@ mod tests {
     fn an_unusable_default_log_dir_degrades_instead_of_failing() {
         let _guard = TEST_LOG_LOCK.lock().unwrap();
         let parent = unopenable("default");
+        let _xdg = EnvVarGuard::set("XDG_STATE_HOME", parent.as_os_str());
         // Headless keeps going on stderr only; the TUI stays silent.
-        with_xdg_state_home(parent.as_os_str(), || {
-            super::init_logging(None, false, None).expect("headless continues");
+        super::init_logging(None, false, None).expect("headless continues");
+        {
             let state = super::LOGGER_STATE.lock().unwrap();
             assert!(state.file.is_none() && state.stderr, "stderr only");
-        });
-        with_xdg_state_home(parent.as_os_str(), || {
-            super::init_logging(None, true, None).expect("the TUI continues");
-        });
+        }
+        super::init_logging(None, true, None).expect("the TUI continues");
         super::MexLogger::install(None, false, None);
         let _ = std::fs::remove_file(&parent);
     }

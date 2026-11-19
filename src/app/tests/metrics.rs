@@ -408,15 +408,6 @@ fn per_source_counters_stay_bounded_and_keep_the_top_talker() {
     assert_eq!(m.source_rx.get(&busy), Some(&50));
 }
 
-/// The metrics overlay's value for `key`.
-fn metrics_value(app: &App, key: &str) -> String {
-    app.metrics_rows()
-        .into_iter()
-        .find(|(k, _)| k == key)
-        .unwrap_or_else(|| panic!("no metrics row {key}"))
-        .1
-}
-
 #[test]
 fn metrics_describe_received_traffic() {
     let mut app = App::new().unwrap();
@@ -510,12 +501,11 @@ fn metrics_summarize_discovery_and_refresh_schedules() {
 #[test]
 fn metrics_split_current_answers_by_liveness() {
     let mut app = test_service_app();
-    let live_before: usize = metrics_value(&app, "answers current")
-        .split(' ')
-        .next()
-        .and_then(|n| n.parse().ok())
-        .expect("live count");
-    assert!(live_before >= 2, "PTR and SRV are live");
+    assert_eq!(
+        metrics_value(&app, "answers current"),
+        "2 live, 0 expired, 0 goodbye",
+        "the fixture's PTR and SRV"
+    );
     // The SRV outlives its TTL; the PTR is withdrawn by a goodbye.
     for svc in &mut app.services {
         for rec in &mut svc.answers {
@@ -527,43 +517,8 @@ fn metrics_split_current_answers_by_liveness() {
     ingest(&mut app, &ptr_record(0));
     assert_eq!(
         metrics_value(&app, "answers current"),
-        format!("{} live, 1 expired, 1 goodbye", live_before - 2)
+        "0 live, 1 expired, 1 goodbye"
     );
-}
-
-fn press(app: &mut App, code: crossterm::event::KeyCode) {
-    press_with(app, code, crossterm::event::KeyModifiers::empty());
-}
-
-fn press_with(
-    app: &mut App,
-    code: crossterm::event::KeyCode,
-    modifiers: crossterm::event::KeyModifiers,
-) {
-    use crossterm::event::{KeyEventKind, KeyEventState};
-    app.handle_key(&KeyEvent {
-        code,
-        modifiers,
-        kind: KeyEventKind::Press,
-        state: KeyEventState::empty(),
-    });
-}
-
-/// The whole frame as text, one line per terminal row.
-fn screen(app: &App, width: u16, height: u16) -> Vec<String> {
-    let buf = render_to_buffer(app, width, height);
-    rect_text(&buf, buf.area)
-        .lines()
-        .map(str::to_string)
-        .collect()
-}
-
-/// Whether a rendered line shows `key` with `value` next to it.
-fn shows_row(lines: &[String], key: &str, value: &str) -> bool {
-    lines.iter().any(|l| {
-        l.split_once(key)
-            .is_some_and(|(_, rest)| rest.trim_start().starts_with(value))
-    })
 }
 
 #[test]
@@ -643,12 +598,7 @@ fn metrics_overlay_pans_long_values_and_resets() {
     // 40 columns leave values only a few cells; the key column stays put.
     let mut app = two_group_app();
     press(&mut app, KeyCode::Char('m'));
-    let value = app
-        .metrics_rows()
-        .into_iter()
-        .find(|(k, _)| k == "bytes")
-        .expect("bytes row")
-        .1;
+    let value = metrics_value(&app, "bytes");
     assert!(value.chars().count() > 12, "long enough to pan: {value}");
     // `shows_row` skips the gap after the key, so match from the first
     // visible non-blank character.

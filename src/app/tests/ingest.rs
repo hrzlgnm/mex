@@ -946,15 +946,6 @@ fn has_live_a(app: &App, instance: &str) -> bool {
         })
 }
 
-/// The metrics overlay's `services` row: total, active and inactive.
-fn services_row(app: &App) -> String {
-    app.metrics_rows()
-        .into_iter()
-        .find(|(k, _)| k == "services")
-        .expect("services row")
-        .1
-}
-
 /// Backdate every answer of `rtype` past its TTL.
 fn expire_answers(app: &mut App, rtype: u16) {
     for svc in &mut app.services {
@@ -969,11 +960,11 @@ fn expire_answers(app: &mut App, rtype: u16) {
 #[test]
 fn a_service_whose_ptr_expires_turns_inactive_even_with_a_live_srv() {
     let mut app = test_service_app();
-    assert_eq!(services_row(&app), "1 (1 active, 0 inactive)");
+    assert_eq!(metrics_value(&app, "services"), "1 (1 active, 0 inactive)");
     expire_answers(&mut app, 12);
     app.evict_expired();
     assert_eq!(
-        services_row(&app),
+        metrics_value(&app, "services"),
         "1 (0 active, 1 inactive)",
         "withdrawn although the SRV is still answered"
     );
@@ -983,8 +974,58 @@ fn a_service_whose_ptr_expires_turns_inactive_even_with_a_live_srv() {
 fn a_service_seen_only_by_its_srv_turns_inactive_when_it_expires() {
     let mut app = App::new().unwrap();
     ingest(&mut app, &srv_record(120));
-    assert_eq!(services_row(&app), "1 (1 active, 0 inactive)");
+    assert_eq!(metrics_value(&app, "services"), "1 (1 active, 0 inactive)");
     expire_answers(&mut app, 33);
     app.evict_expired();
-    assert_eq!(services_row(&app), "1 (0 active, 1 inactive)");
+    assert_eq!(metrics_value(&app, "services"), "1 (0 active, 1 inactive)");
+}
+
+#[test]
+fn subtype_without_wire_labels_is_parsed_from_its_name() {
+    // Records without raw owner labels fall back to the text name.
+    let mut app = test_service_app();
+    let mut sub = raw_record(
+        "_printer._sub._http._tcp.local.",
+        12,
+        "PTR",
+        "Test._http._tcp.local.",
+        120,
+    );
+    sub.owner_labels.clear();
+    ingest(&mut app, &sub);
+    assert_eq!(app.services[0].subtypes, vec![b"_printer".to_vec()]);
+}
+
+#[test]
+fn enumeration_goodbyes_withdraw_the_row_or_file_a_new_one() {
+    let mut app = App::new().unwrap();
+    let responder = "192.168.1.2:5353";
+    ingest(&mut app, &enum_row("_http._tcp.local.", 4500, responder, 0));
+    let enum_answers = |app: &App| {
+        app.enum_entries
+            .iter()
+            .flat_map(|e| e.answers.iter())
+            .map(|r| (r.rdata.clone(), r.ttl))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        enum_answers(&app),
+        vec![("_http._tcp.local.".to_string(), 4500)]
+    );
+
+    // A goodbye for the announced type replaces its row...
+    ingest(&mut app, &enum_row("_http._tcp.local.", 0, responder, 0));
+    assert_eq!(
+        enum_answers(&app),
+        vec![("_http._tcp.local.".to_string(), 0)]
+    );
+    // ...and one for a type never announced is still shown.
+    ingest(&mut app, &enum_row("_ipp._tcp.local.", 0, responder, 0));
+    assert_eq!(
+        enum_answers(&app),
+        vec![
+            ("_http._tcp.local.".to_string(), 0),
+            ("_ipp._tcp.local.".to_string(), 0)
+        ]
+    );
 }

@@ -963,23 +963,14 @@ fn seam_target(app: &App, mode: DragMode) -> (ratatui::layout::Rect, u16) {
 
 #[test]
 fn q_esc_and_ctrl_c_quit_also_from_the_metrics_overlay() {
-    use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
-    for (code, ctrl) in [
-        (KeyCode::Char('q'), false),
-        (KeyCode::Esc, false),
-        (KeyCode::Char('c'), true),
+    use crossterm::event::KeyModifiers;
+    for (code, modifiers) in [
+        (KeyCode::Char('q'), KeyModifiers::empty()),
+        (KeyCode::Esc, KeyModifiers::empty()),
+        (KeyCode::Char('c'), KeyModifiers::CONTROL),
     ] {
         let mut app = App::new().unwrap();
-        app.handle_key(&KeyEvent {
-            code,
-            modifiers: if ctrl {
-                KeyModifiers::CONTROL
-            } else {
-                KeyModifiers::empty()
-            },
-            kind: KeyEventKind::Press,
-            state: KeyEventState::empty(),
-        });
+        press_with(&mut app, code, modifiers);
         assert!(!app.running, "{code:?} quits");
     }
     // In the overlay `Esc` only closes it; `q` still quits.
