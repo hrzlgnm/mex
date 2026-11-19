@@ -407,3 +407,284 @@ fn per_source_counters_stay_bounded_and_keep_the_top_talker() {
     assert!(m.source_rx.len() <= SOURCE_RX_CAP);
     assert_eq!(m.source_rx.get(&busy), Some(&50));
 }
+
+/// The metrics overlay's value for `key`.
+fn metrics_value(app: &App, key: &str) -> String {
+    app.metrics_rows()
+        .into_iter()
+        .find(|(k, _)| k == key)
+        .unwrap_or_else(|| panic!("no metrics row {key}"))
+        .1
+}
+
+#[test]
+fn metrics_describe_received_traffic() {
+    let mut app = App::new().unwrap();
+    assert_eq!(metrics_value(&app, "last packet"), "—");
+    let on_eth0 = |mut rec: browse::RawRecord| {
+        rec.iface = "eth0".to_string();
+        rec
+    };
+    // One response: PTR, SRV (flush bit) and an out-of-scope MX.
+    let mut response = packet(vec![
+        on_eth0(ptr_record(120)),
+        on_eth0(srv_record(120)),
+        on_eth0(raw_record("Test.local.", 15, "MX", "10 mx.local.", 120)),
+    ]);
+    response.raw_bytes = vec![0; 300];
+    ingest_packet(&mut app, response);
+    // One QM question from the same responder.
+    let mut ask = query_event("_http._tcp.local.", 12, "PTR", false, vec![], test_source());
+    ask.questions[0].iface = "eth0".to_string();
+    ingest_packet(&mut app, ask);
+
+    assert!(
+        metrics_value(&app, "last packet").ends_with(" ago"),
+        "a packet arrived"
+    );
+    assert!(metrics_value(&app, "answers ever").ends_with("other 1)"));
+    assert!(metrics_value(&app, "flush-bit / goodbyes").starts_with("33% flush"));
+    assert!(metrics_value(&app, "questions").contains("(0 QU / 1 QM)"));
+    assert_eq!(metrics_value(&app, "rx eth0"), "2");
+    assert_eq!(
+        metrics_value(&app, &format!("talker {}", test_source())),
+        "2 pkts"
+    );
+}
+
+#[test]
+fn metrics_summarize_discovery_and_refresh_schedules() {
+    let mut app = App::new().unwrap();
+    assert_eq!(
+        metrics_value(&app, "continuous interests"),
+        "0 · next in — · no interests"
+    );
+    assert_eq!(
+        metrics_value(&app, "requeries"),
+        "0 pending · 0 overdue · none unanswered"
+    );
+
+    let now = Instant::now();
+    for (name, interval, overdue) in [
+        ("_a._tcp.local", 2, true),
+        ("_b._tcp.local", 2, false),
+        ("_c._tcp.local", 180, false),
+        ("_d._tcp.local", 7200, false),
+    ] {
+        app.scheduler.continuous_mut().insert(
+            (name.to_string(), 12),
+            ContinuousQuery {
+                next_due: if overdue {
+                    now - Duration::from_secs(1)
+                } else {
+                    now + Duration::from_secs(interval)
+                },
+                interval: Duration::from_secs(interval),
+                qname: name.to_string(),
+            },
+        );
+    }
+    // Discovery groups interests by interval (shortest first) and is
+    // due now for the overdue one.
+    assert_eq!(
+        metrics_value(&app, "continuous interests"),
+        "4 · next in 0ms · 2s×2 3m×1 1h×1"
+    );
+
+    for (name, due_in, misses) in [("a.local", -1, 1), ("b.local", 60, 2), ("c.local", -1, 4)] {
+        let due = if due_in < 0 {
+            now - Duration::from_secs(1)
+        } else {
+            now + Duration::from_secs(due_in as u64)
+        };
+        app.scheduler
+            .requeries_mut()
+            .insert((name.to_string(), 1), (due, misses));
+    }
+    assert_eq!(
+        metrics_value(&app, "requeries"),
+        "3 pending · 2 overdue · miss×1:1 ×2:1 ×3:0 ×4:1"
+    );
+}
+
+#[test]
+fn metrics_split_current_answers_by_liveness() {
+    let mut app = test_service_app();
+    let live_before: usize = metrics_value(&app, "answers current")
+        .split(' ')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .expect("live count");
+    assert!(live_before >= 2, "PTR and SRV are live");
+    // The SRV outlives its TTL; the PTR is withdrawn by a goodbye.
+    for svc in &mut app.services {
+        for rec in &mut svc.answers {
+            if rec.rtype == 33 {
+                rec.received_at = Instant::now() - Duration::from_secs(121);
+            }
+        }
+    }
+    ingest(&mut app, &ptr_record(0));
+    assert_eq!(
+        metrics_value(&app, "answers current"),
+        format!("{} live, 1 expired, 1 goodbye", live_before - 2)
+    );
+}
+
+fn press(app: &mut App, code: crossterm::event::KeyCode) {
+    press_with(app, code, crossterm::event::KeyModifiers::empty());
+}
+
+fn press_with(
+    app: &mut App,
+    code: crossterm::event::KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) {
+    use crossterm::event::{KeyEventKind, KeyEventState};
+    app.handle_key(&KeyEvent {
+        code,
+        modifiers,
+        kind: KeyEventKind::Press,
+        state: KeyEventState::empty(),
+    });
+}
+
+/// The whole frame as text, one line per terminal row.
+fn screen(app: &App, width: u16, height: u16) -> Vec<String> {
+    let buf = render_to_buffer(app, width, height);
+    rect_text(&buf, buf.area)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether a rendered line shows `key` with `value` next to it.
+fn shows_row(lines: &[String], key: &str, value: &str) -> bool {
+    lines.iter().any(|l| {
+        l.split_once(key)
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with(value))
+    })
+}
+
+#[test]
+fn metrics_overlay_opens_with_m_and_closes_with_esc() {
+    use crossterm::event::KeyCode;
+    let mut app = two_group_app();
+    let closed = screen(&app, 100, 40);
+    assert!(!closed.iter().any(|l| l.contains("METRIC")));
+
+    press(&mut app, KeyCode::Char('m'));
+    let open = screen(&app, 100, 40);
+    assert!(
+        open.iter().any(|l| l.contains(" Metrics (m/Esc close")),
+        "overlay title shown"
+    );
+    assert!(open
+        .iter()
+        .any(|l| l.contains("METRIC") && l.contains("VALUE")));
+    assert!(open.iter().any(|l| l.contains("Session")), "first section");
+    assert!(shows_row(&open, "hosts", "2"), "live state in the table");
+
+    press(&mut app, KeyCode::Esc);
+    let closed = screen(&app, 100, 40);
+    assert!(!closed.iter().any(|l| l.contains("METRIC")), "Esc closes");
+}
+
+#[test]
+fn metrics_overlay_scrolls_to_the_ends_and_by_pages() {
+    use crossterm::event::KeyCode;
+    // 20 rows leave the overlay far fewer lines than it has rows.
+    let mut app = two_group_app();
+    press(&mut app, KeyCode::Char('m'));
+    let last_key = app.metrics_rows().last().expect("rows").0.clone();
+    let first_page = screen(&app, 100, 20);
+    assert!(first_page.iter().any(|l| l.contains("uptime")));
+    assert!(!first_page.iter().any(|l| l.contains(&last_key)));
+
+    press(&mut app, KeyCode::End);
+    let end = screen(&app, 100, 20);
+    assert!(
+        end.iter().any(|l| l.contains(&last_key)),
+        "End shows the last row"
+    );
+    assert!(!end.iter().any(|l| l.contains("uptime")));
+
+    // On the first page, by rows: `uptime`'s value ticks between frames.
+    let on_first_page = |lines: &[String]| {
+        lines.iter().any(|l| l.contains("uptime")) && !lines.iter().any(|l| l.contains(&last_key))
+    };
+
+    press(&mut app, KeyCode::Home);
+    assert!(
+        on_first_page(&screen(&app, 100, 20)),
+        "Home returns to the top"
+    );
+
+    press(&mut app, KeyCode::PageDown);
+    let paged = screen(&app, 100, 20);
+    assert!(
+        !paged.iter().any(|l| l.contains("uptime")),
+        "a page down leaves the first page"
+    );
+    assert!(
+        !paged.iter().any(|l| l.contains(&last_key)),
+        "not to the end"
+    );
+    press(&mut app, KeyCode::PageUp);
+    assert!(
+        on_first_page(&screen(&app, 100, 20)),
+        "a page up comes back"
+    );
+}
+
+#[test]
+fn metrics_overlay_pans_long_values_and_resets() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    // 40 columns leave values only a few cells; the key column stays put.
+    let mut app = two_group_app();
+    press(&mut app, KeyCode::Char('m'));
+    let value = app
+        .metrics_rows()
+        .into_iter()
+        .find(|(k, _)| k == "bytes")
+        .expect("bytes row")
+        .1;
+    assert!(value.chars().count() > 12, "long enough to pan: {value}");
+    // `shows_row` skips the gap after the key, so match from the first
+    // visible non-blank character.
+    let shown_from = |skip: usize| {
+        let rest: String = value.chars().skip(skip).collect();
+        rest.trim_start().chars().take(4).collect::<String>()
+    };
+    // The positions compared below must look different on screen.
+    assert_ne!(shown_from(0), shown_from(4));
+    assert_ne!(shown_from(4), shown_from(5));
+    assert!(shows_row(&screen(&app, 40, 40), "bytes", &shown_from(0)));
+
+    for _ in 0..4 {
+        press(&mut app, KeyCode::Char('l'));
+    }
+    press(&mut app, KeyCode::Right);
+    assert!(
+        shows_row(&screen(&app, 40, 40), "bytes", &shown_from(5)),
+        "five steps right"
+    );
+    press(&mut app, KeyCode::Char('h'));
+    assert!(
+        shows_row(&screen(&app, 40, 40), "bytes", &shown_from(4)),
+        "one step back"
+    );
+
+    press_with(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+    press_with(&mut app, KeyCode::Left, KeyModifiers::CONTROL);
+    assert!(
+        shows_row(&screen(&app, 40, 40), "bytes", &shown_from(4)),
+        "Ctrl pans ten and back"
+    );
+
+    press(&mut app, KeyCode::Char('0'));
+    assert!(
+        shows_row(&screen(&app, 40, 40), "bytes", &shown_from(0)),
+        "0 resets the pan"
+    );
+}
