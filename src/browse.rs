@@ -248,7 +248,8 @@ pub struct QueryRequest {
 /// link of both families (solicited queries reach v6-only responders
 /// too).
 pub struct QueryTx {
-    tx: mpsc::Sender<QueryRequest>,
+    /// `None` only while dropping: closing it stops the listener.
+    tx: Option<mpsc::Sender<QueryRequest>>,
     waker: Arc<mio::Waker>,
     transmit: Arc<TransmitState>,
 }
@@ -353,13 +354,25 @@ impl QueryTx {
     /// `send_query` and cannot be reflected here. Wakes may coalesce:
     /// the queue is the source of truth, drained on every loop pass.
     pub fn send(&self, req: QueryRequest) -> bool {
-        if self.tx.send(req).is_err() {
+        if self.tx.as_ref().is_none_or(|tx| tx.send(req).is_err()) {
             return false;
         }
         if let Err(e) = self.waker.wake() {
             log::warn!("mex: cannot wake listener: {e}");
         }
         true
+    }
+}
+
+/// Dropping the sender stops the listener: the closed queue is seen on
+/// the wake, so the thread exits and closes its sockets with the app
+/// instead of on the next datagram, which may never come.
+impl Drop for QueryTx {
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        if let Err(e) = self.waker.wake() {
+            log::warn!("mex: cannot wake listener to stop: {e}");
+        }
     }
 }
 
@@ -426,6 +439,7 @@ pub fn spawn(
     let shared = SharedWithApp {
         drops: drops.clone(),
         transmit: transmit.clone(),
+        waker: waker.clone(),
     };
     let mut listener = Listener::new(poll, v4, v6, tx, query_rx, shared, selection);
     // First interface refresh before returning: the transmit flags then
@@ -436,7 +450,7 @@ pub fn spawn(
     thread::spawn(move || listener.run());
     Ok((
         QueryTx {
-            tx: query_tx,
+            tx: Some(query_tx),
             waker,
             transmit,
         },
