@@ -24,8 +24,9 @@ Headless run (no TTY) logs to stderr.
   (readiness via a duplicate handle, reads via pktinfo, drained with a
   per-pass budget, then re-armed); `QueryTx::send` wakes it, queued queries
   are sent with a per-pass budget too, and the poll timeout is the 10 s
-  interface refresh. The v6 socket is v6-only. Startup fails only when
-  neither family's socket opens.
+  interface refresh. Dropping the app's `QueryTx` wakes the loop and
+  stops it, so the sockets close with the app. The v6 socket is
+  v6-only. Startup fails only when neither family's socket opens.
   Down, point-to-point, `lo`/`docker`/`veth` interfaces are skipped,
   unless explicitly selected via `-i/--interfaces` (user intent wins;
   selected-but-down links wait for the rejoin refresh). A family with no

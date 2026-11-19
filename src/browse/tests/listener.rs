@@ -72,7 +72,7 @@ fn query_send_wakes_the_poll_and_is_drained() {
     let waker = Arc::new(mio::Waker::new(poll.registry(), WAKER_TOKEN).unwrap());
     let (tx, rx) = mpsc::channel();
     let query_tx = QueryTx {
-        tx,
+        tx: Some(tx),
         waker,
         transmit: Arc::new(TransmitState::new(true, true)),
     };
@@ -99,13 +99,43 @@ fn query_send_wakes_the_poll_and_is_drained() {
     let mut names = Vec::new();
     assert_eq!(
         drain_queries(&rx, QUERY_BUDGET, |q| names.push(q.name.clone())),
-        (2, false)
+        (2, QueueState::Empty)
     );
     assert_eq!(names, vec!["_http._tcp.local"; 2]);
     assert_eq!(
         drain_queries(&rx, QUERY_BUDGET, |_| {}),
-        (0, false),
+        (0, QueueState::Empty),
         "drained once"
+    );
+}
+
+#[test]
+fn dropping_the_query_sender_wakes_and_stops_the_listener() {
+    // The app dropping its QueryTx must stop the listener at once, so
+    // its sockets close with the app: waiting for the next datagram
+    // leaks them on a quiet network (the AUR build ran out of file
+    // descriptors after ~200 test apps).
+    let mut poll = mio::Poll::new().unwrap();
+    let waker = Arc::new(mio::Waker::new(poll.registry(), WAKER_TOKEN).unwrap());
+    // The listener's handle (`SharedWithApp::waker`).
+    let _listener_waker = waker.clone();
+    let (tx, rx) = mpsc::channel();
+    let query_tx = QueryTx {
+        tx: Some(tx),
+        waker,
+        transmit: Arc::new(TransmitState::new(true, true)),
+    };
+    drop(query_tx);
+    let mut events = mio::Events::with_capacity(4);
+    poll.poll(&mut events, Some(Duration::from_secs(5)))
+        .unwrap();
+    assert!(
+        events.iter().any(|e| e.token() == WAKER_TOKEN),
+        "the drop woke the listener"
+    );
+    assert_eq!(
+        drain_queries(&rx, QUERY_BUDGET, |_| {}),
+        (0, QueueState::Closed)
     );
 }
 
@@ -126,11 +156,11 @@ fn query_drain_is_budgeted_per_pass() {
     let mut sent = Vec::new();
     assert_eq!(
         drain_queries(&rx, 3, |q| sent.push(q.name.clone())),
-        (3, true)
+        (3, QueueState::More)
     );
     assert_eq!(
         drain_queries(&rx, 3, |q| sent.push(q.name.clone())),
-        (2, false)
+        (2, QueueState::Empty)
     );
     assert_eq!(
         sent,
@@ -153,6 +183,7 @@ fn listener_runs_with_one_family_missing() {
     // socket is skipped by refresh and reads.
     let poll = mio::Poll::new().unwrap();
     let v4 = FamilySocket::open(Family::V4, poll.registry()).expect("v4 socket");
+    let waker = Arc::new(mio::Waker::new(poll.registry(), WAKER_TOKEN).unwrap());
     let (tx, _rx) = mpsc::channel();
     let (_query_tx, query_rx) = mpsc::channel();
     let mut listener = Listener::new(
@@ -164,6 +195,7 @@ fn listener_runs_with_one_family_missing() {
         SharedWithApp {
             drops: Arc::new(DropStats::default()),
             transmit: Arc::new(TransmitState::new(true, false)),
+            waker,
         },
         Some(HashSet::new()),
     );

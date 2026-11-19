@@ -173,29 +173,46 @@ pub(super) fn require_transport(v4_open: bool, v6_open: bool) -> Result<()> {
 /// burst of queries can't hold off reads (and overflow receive buffers).
 pub(super) const QUERY_BUDGET: usize = 64;
 
+/// What a query drain left behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum QueueState {
+    /// Nothing waiting.
+    Empty,
+    /// The budget was reached; more may be waiting.
+    More,
+    /// The app dropped its `QueryTx`: the listener must stop.
+    Closed,
+}
+
 /// Send up to `budget` queued queries. Returns how many were sent and
-/// whether more may be waiting (the budget was reached). Wakes may
-/// coalesce, so the queue is drained on every pass.
+/// what is left in the queue. Wakes may coalesce, so the queue is
+/// drained on every pass.
 pub(super) fn drain_queries(
     rx: &mpsc::Receiver<QueryRequest>,
     budget: usize,
     mut send: impl FnMut(&QueryRequest),
-) -> (usize, bool) {
+) -> (usize, QueueState) {
     let mut sent = 0;
     while sent < budget {
-        let Ok(req) = rx.try_recv() else {
-            return (sent, false);
-        };
-        send(&req);
-        sent += 1;
+        match rx.try_recv() {
+            Ok(req) => {
+                send(&req);
+                sent += 1;
+            }
+            Err(mpsc::TryRecvError::Empty) => return (sent, QueueState::Empty),
+            Err(mpsc::TryRecvError::Disconnected) => return (sent, QueueState::Closed),
+        }
     }
-    (sent, true)
+    (sent, QueueState::More)
 }
 
 /// State the listener updates and the app thread reads.
 pub(super) struct SharedWithApp {
     pub(super) drops: Arc<DropStats>,
     pub(super) transmit: Arc<TransmitState>,
+    /// Kept open by the listener: a wake from the app's `QueryTx` drop
+    /// would be lost if the drop closed the waker's last handle first.
+    pub(super) waker: Arc<mio::Waker>,
 }
 
 /// The single listener: one thread, one poll loop over both family
@@ -225,6 +242,8 @@ pub(super) struct Listener {
     pub(super) sent_copies: SentCopies,
     pub(super) transmit: Arc<TransmitState>,
     pub(super) buf: Vec<u8>,
+    /// See `SharedWithApp::waker`.
+    _waker: Arc<mio::Waker>,
 }
 
 impl Listener {
@@ -237,7 +256,11 @@ impl Listener {
         shared: SharedWithApp,
         selection: Option<HashSet<String>>,
     ) -> Self {
-        let SharedWithApp { drops, transmit } = shared;
+        let SharedWithApp {
+            drops,
+            transmit,
+            waker,
+        } = shared;
         Self {
             poll,
             v4,
@@ -257,6 +280,7 @@ impl Listener {
             sent_copies: SentCopies::default(),
             transmit,
             buf: vec![0u8; 65535],
+            _waker: waker,
         }
     }
 
@@ -267,7 +291,9 @@ impl Listener {
                 self.refresh();
                 self.next_refresh = Instant::now() + IFACE_REFRESH;
             }
-            self.send_queued();
+            if !self.send_queued() {
+                return;
+            }
             // Sockets left over from a budget-capped pass go first.
             for family in [Family::V4, Family::V6] {
                 if self.socket(family).is_some_and(|s| s.pending) && !self.read_family(family) {
@@ -369,7 +395,8 @@ impl Listener {
     }
 
     /// Send queued queries (up to the budget) on each open family.
-    pub(super) fn send_queued(&mut self) {
+    /// Returns `false` when the app has stopped (its `QueryTx` is gone).
+    pub(super) fn send_queued(&mut self) -> bool {
         let Self {
             v4,
             v6,
@@ -380,7 +407,7 @@ impl Listener {
             sent_copies,
             ..
         } = self;
-        let (_, more) = drain_queries(query_rx, QUERY_BUDGET, |req| {
+        let (_, queue) = drain_queries(query_rx, QUERY_BUDGET, |req| {
             for socket in [v4.as_ref(), v6.as_ref()].into_iter().flatten() {
                 send_on_all_interfaces(
                     &socket.pktinfo,
@@ -393,7 +420,8 @@ impl Listener {
                 );
             }
         });
-        self.queries_pending = more;
+        self.queries_pending = queue == QueueState::More;
+        queue != QueueState::Closed
     }
 
     /// Drain one family's socket within the budget. Re-arms readiness
