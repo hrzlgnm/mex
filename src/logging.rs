@@ -395,14 +395,17 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
+    /// Only the XDG tests below use it (not built for macOS or Windows).
     /// Sets an environment variable for one test and restores it on
     /// drop, also when an assertion fails. Hold `TEST_LOG_LOCK` while it
     /// lives: no other test reads these variables without it.
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     struct EnvVarGuard {
         name: &'static str,
         old: Option<std::ffi::OsString>,
     }
 
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     impl EnvVarGuard {
         fn set(name: &'static str, value: &std::ffi::OsStr) -> Self {
             let old = std::env::var_os(name);
@@ -411,6 +414,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             match &self.old {
