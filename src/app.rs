@@ -89,7 +89,7 @@ pub enum RecordLiveness {
 }
 
 /// Liveness of one record row, shared by the finding filter, the pane
-/// copy, and the metrics counts so the three cannot disagree about
+/// copy, and the diagnostics counts so the three cannot disagree about
 /// what counts as gone.
 pub(crate) fn record_liveness(rec: &browse::RawRecord) -> RecordLiveness {
     if rec.ttl == 0 {
@@ -467,14 +467,14 @@ const OVERHEARD_WINDOW: Duration = Duration::from_secs(2);
 /// reaching back to an unrelated earlier question.
 const TRIGGER_WINDOW: Duration = Duration::from_secs(1);
 /// Packet arrival times older than this are dropped from the rate window.
-const METRICS_WINDOW: Duration = Duration::from_secs(300);
+const DIAGNOSTICS_WINDOW: Duration = Duration::from_secs(300);
 
 /// Bound on out-of-scope sightings, so a peer flooding distinct
 /// unsupported records cannot grow state without limit. The oldest is
-/// evicted first and counted in `MetricsCounters::sightings_dropped`.
+/// evicted first and counted in `DiagnosticsCounters::sightings_dropped`.
 const SIGHTINGS_CAP: usize = 256;
 
-/// Most distinct packet sources counted in `MetricsCounters::source_rx`.
+/// Most distinct packet sources counted in `DiagnosticsCounters::source_rx`.
 /// The overlay shows only the top talkers; the cap keeps spoofed or
 /// churning source addresses from growing the map without bound.
 const SOURCE_RX_CAP: usize = 256;
@@ -559,12 +559,12 @@ fn service_key(instance: &str, service_type: &str) -> String {
     format!("{instance}.{service_type}").to_lowercase()
 }
 
-/// Cumulative v2 traffic/query counters for the metrics overlay. Derived
+/// Cumulative v2 traffic/query counters for the diagnostics overlay. Derived
 /// snapshot rows come from here plus live state; per-packet maps stay
 /// bounded by network size (tens of responders/interfaces), and the
 /// per-source map is capped at `SOURCE_RX_CAP` against spoofed sources.
 #[derive(Debug, Default)]
-pub struct MetricsCounters {
+pub struct DiagnosticsCounters {
     pub bytes_total: u64,
     pub packet_times: VecDeque<Instant>,
     pub last_packet_at: Option<Instant>,
@@ -592,7 +592,7 @@ pub struct MetricsCounters {
     pub sightings_dropped: u64,
 }
 
-impl MetricsCounters {
+impl DiagnosticsCounters {
     /// Count one packet from `src`. At `SOURCE_RX_CAP` distinct sources a
     /// new one evicts the quietest, so the busiest talkers stay exact.
     pub(super) fn count_source(&mut self, src: std::net::SocketAddr) {
@@ -642,7 +642,7 @@ pub struct App {
     /// the named links. Local-address detection stays global.
     interfaces: Option<HashSet<String>>,
     /// Cumulative v2 counters (traffic, queries, suppressions).
-    metrics: MetricsCounters,
+    diagnostics: DiagnosticsCounters,
     /// Bumped by anything that can change the list or detail selection
     /// (ingest, eviction, input); `evict_expired` re-clamps the cursors
     /// only when it moved past `clamped_gen`, not on every idle tick.
@@ -828,7 +828,7 @@ impl EnumEntry {
 
 /// Right-pane target: a real service or an enumeration row. The Answers /
 /// Questions / Hex panes render through this so both kinds share one
-/// cursor, one hex lookup, and one metrics definition.
+/// cursor, one hex lookup, and one diagnostics definition.
 pub enum DetailTarget<'a> {
     Service(&'a ServiceEntry),
     Enum(&'a EnumEntry),
@@ -1049,7 +1049,7 @@ impl App {
             sightings: Vec::new(),
             address_denials: AddressDenials::default(),
             status_msg: None,
-            metrics: MetricsCounters::default(),
+            diagnostics: DiagnosticsCounters::default(),
             scheduler: Scheduler::default(),
             state_gen: 0,
             clamped_gen: None,
@@ -1107,7 +1107,7 @@ impl App {
                         Event::Key(key) => {
                             if key.kind == KeyEventKind::Press {
                                 // Unix suspend precedes all key handling (even
-                                // the metrics overlay): raw mode delivers
+                                // the diagnostics overlay): raw mode delivers
                                 // Ctrl+Z as a key event, not SIGTSTP.
                                 #[cfg(unix)]
                                 if Self::is_suspend_key(&key) {
@@ -1209,7 +1209,7 @@ impl App {
             .filter(|ev| !has_nonzero_rcode(ev))
             .any(|ev| ev.answers.iter().any(|rec| rec.rtype == 33 && rec.ttl > 0));
         for ev in &batch {
-            self.note_packet_metrics(ev);
+            self.note_packet_diagnostics(ev);
             self.raw_events.push(ev.clone());
         }
         if self.raw_events.len() > 2000 {
@@ -1218,20 +1218,20 @@ impl App {
         }
         // Prune the sliding rate windows even on idle ticks.
         while self
-            .metrics
+            .diagnostics
             .packet_times
             .front()
-            .is_some_and(|t| t.elapsed() > METRICS_WINDOW)
+            .is_some_and(|t| t.elapsed() > DIAGNOSTICS_WINDOW)
         {
-            self.metrics.packet_times.pop_front();
+            self.diagnostics.packet_times.pop_front();
         }
         while self
-            .metrics
+            .diagnostics
             .suppressed_times
             .front()
-            .is_some_and(|t| t.elapsed() > METRICS_WINDOW)
+            .is_some_and(|t| t.elapsed() > DIAGNOSTICS_WINDOW)
         {
-            self.metrics.suppressed_times.pop_front();
+            self.diagnostics.suppressed_times.pop_front();
         }
 
         if !batch.is_empty() {
@@ -1305,7 +1305,7 @@ impl App {
         self.services
             .retain(|s| s.is_active || now.duration_since(s.last_seen) < grace);
         let services_expired = before - self.services.len();
-        self.metrics.services_expired_total += services_expired as u64;
+        self.diagnostics.services_expired_total += services_expired as u64;
         if services_expired > 0 {
             self.touch();
         }
@@ -1415,11 +1415,11 @@ impl App {
 }
 
 mod denials;
+mod diagnostics;
 mod findings;
 mod ingest;
 mod input;
 mod layout;
-mod metrics;
 mod questions;
 mod schedule;
 mod sightings;

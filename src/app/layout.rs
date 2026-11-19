@@ -36,12 +36,12 @@ pub struct Layout {
     pub questions_rect: Cell<Rect>,
     pub hex_rect: Cell<Rect>,
     pub hex_field_hits: RefCell<Vec<(Rect, usize)>>,
-    /// Scroll offset inside the metrics popup (viewport recorded at draw).
-    pub metrics_scroll: Cell<usize>,
-    pub metrics_viewport: Cell<usize>,
-    /// Horizontal scroll offset inside the metrics popup, in chars: the
+    /// Scroll offset inside the diagnostics popup (viewport recorded at draw).
+    pub diagnostics_scroll: Cell<usize>,
+    pub diagnostics_viewport: Cell<usize>,
+    /// Horizontal scroll offset inside the diagnostics popup, in chars: the
     /// key column stays frozen while long values pan left.
-    pub metrics_hscroll: Cell<usize>,
+    pub diagnostics_hscroll: Cell<usize>,
     /// Row -> record index of the Answers table as last drawn (`None` per
     /// info, block or unowned row), so a click hits what was on screen
     /// even if findings changed since. `None` before the first draw.

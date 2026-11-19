@@ -95,12 +95,12 @@ impl App {
         let no_ctrl_alt = !key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
-        // `m` toggles the metrics overlay from anywhere.
-        if no_ctrl_alt && matches!(key.code, KeyCode::Char('m') | KeyCode::Char('M')) {
-            self.view_state.show_metrics = !self.view_state.show_metrics;
-            if self.view_state.show_metrics {
-                self.layout.metrics_scroll.set(0);
-                self.layout.metrics_hscroll.set(0);
+        // `d` toggles the diagnostics overlay from anywhere.
+        if no_ctrl_alt && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D')) {
+            self.view_state.show_diagnostics = !self.view_state.show_diagnostics;
+            if self.view_state.show_diagnostics {
+                self.layout.diagnostics_scroll.set(0);
+                self.layout.diagnostics_hscroll.set(0);
                 // The overlay owns all input while open: drop any active
                 // resize so borders behind it never glow.
                 self.view_state.drag = DragMode::None;
@@ -109,35 +109,39 @@ impl App {
             return;
         }
         // While the overlay is open it owns every key except Ctrl+C:
-        // `m`/`Esc` closes, `q` quits, the rest scrolls. Uppercase and
+        // `d`/`Esc` closes, `q` quits, the rest scrolls. Uppercase and
         // lowercase + SHIFT report the same intent on all protocols.
-        if self.view_state.show_metrics {
+        if self.view_state.show_diagnostics {
             match key.code {
-                KeyCode::Esc => self.view_state.show_metrics = false,
+                KeyCode::Esc => self.view_state.show_diagnostics = false,
                 KeyCode::Char('q') => self.running = false,
-                KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => self.scroll_metrics(-1),
-                KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => self.scroll_metrics(1),
-                KeyCode::Home => self.scroll_metrics_edge(true),
-                KeyCode::End => self.scroll_metrics_edge(false),
-                KeyCode::PageUp | KeyCode::Char('b') => self.page_metrics(-1),
-                KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => self.page_metrics(1),
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+                    self.scroll_diagnostics(-1)
+                }
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+                    self.scroll_diagnostics(1)
+                }
+                KeyCode::Home => self.scroll_diagnostics_edge(true),
+                KeyCode::End => self.scroll_diagnostics_edge(false),
+                KeyCode::PageUp | KeyCode::Char('b') => self.page_diagnostics(-1),
+                KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => {
+                    self.page_diagnostics(1)
+                }
                 // Horizontal pan over long values (key column stays
                 // frozen): Ctrl jumps ten chars, `0` jumps back.
-                KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('H') => {
-                    self.scroll_metrics_h(if key.modifiers.contains(KeyModifiers::CONTROL) {
+                KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('H') => self
+                    .scroll_diagnostics_h(if key.modifiers.contains(KeyModifiers::CONTROL) {
                         -10
                     } else {
                         -1
-                    })
-                }
-                KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L') => {
-                    self.scroll_metrics_h(if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    }),
+                KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L') => self
+                    .scroll_diagnostics_h(if key.modifiers.contains(KeyModifiers::CONTROL) {
                         10
                     } else {
                         1
-                    })
-                }
-                KeyCode::Char('0') => self.layout.metrics_hscroll.set(0),
+                    }),
+                KeyCode::Char('0') => self.layout.diagnostics_hscroll.set(0),
                 _ => {}
             }
             return;
@@ -329,10 +333,10 @@ impl App {
 
     /// Wheel notch: exactly one j/k press in the focused pane. Cursor panes
     /// move the cursor (the hex dump follows); free-scroll panes nudge the
-    /// viewport. The metrics overlay owns the wheel while open.
+    /// viewport. The diagnostics overlay owns the wheel while open.
     pub(super) fn mouse_wheel(&mut self, delta: isize) {
-        if self.view_state.show_metrics {
-            self.scroll_metrics(delta);
+        if self.view_state.show_diagnostics {
+            self.scroll_diagnostics(delta);
             return;
         }
         match self.view_state.focus {
@@ -342,17 +346,17 @@ impl App {
         }
     }
 
-    /// Horizontal wheel notch: pans metrics values while the overlay is
+    /// Horizontal wheel notch: pans diagnostics values while the overlay is
     /// open, ignored everywhere else.
     pub(super) fn mouse_hwheel(&mut self, delta: isize) {
-        if self.view_state.show_metrics {
-            self.scroll_metrics_h(delta);
+        if self.view_state.show_diagnostics {
+            self.scroll_diagnostics_h(delta);
         }
     }
 
     pub(super) fn mouse_down(&mut self, col: u16, row: u16) {
-        // The metrics overlay owns all input while open (closed via m/Esc).
-        if self.view_state.show_metrics {
+        // The diagnostics overlay owns all input while open (closed via d/Esc).
+        if self.view_state.show_diagnostics {
             return;
         }
         match self.divider_at(col, row) {
@@ -390,8 +394,8 @@ impl App {
     }
 
     pub(super) fn mouse_drag(&mut self, col: u16, row: u16) {
-        // The metrics overlay owns all input while open (closed via m/Esc).
-        if self.view_state.show_metrics {
+        // The diagnostics overlay owns all input while open (closed via d/Esc).
+        if self.view_state.show_diagnostics {
             return;
         }
         match self.view_state.drag {
@@ -414,8 +418,8 @@ impl App {
     }
 
     pub(super) fn mouse_moved(&mut self, col: u16, row: u16) {
-        // The metrics overlay owns all input while open (closed via m/Esc).
-        if self.view_state.show_metrics {
+        // The diagnostics overlay owns all input while open (closed via d/Esc).
+        if self.view_state.show_diagnostics {
             return;
         }
         // Some terminals report drags as Moved; keep following the active
@@ -937,7 +941,7 @@ impl App {
 
     /// Nudge a cursorless viewport offset, saturating at zero. Upper
     /// clamping happens at render time, where the line count is known.
-    /// Shared by the Hex and metrics panes.
+    /// Shared by the Hex and diagnostics panes.
     pub(super) fn bump_offset(offset: &Cell<usize>, delta: isize) {
         let cur = offset.get();
         let next = if delta < 0 {
@@ -979,28 +983,28 @@ impl App {
         self.layout.hex_field_hits.borrow_mut().clear();
     }
 
-    /// Scroll the metrics overlay; upper clamping happens at render time.
-    pub(super) fn scroll_metrics(&mut self, delta: isize) {
-        Self::bump_offset(&self.layout.metrics_scroll, delta);
+    /// Scroll the diagnostics overlay; upper clamping happens at render time.
+    pub(super) fn scroll_diagnostics(&mut self, delta: isize) {
+        Self::bump_offset(&self.layout.diagnostics_scroll, delta);
     }
 
-    pub(super) fn scroll_metrics_edge(&mut self, first: bool) {
+    pub(super) fn scroll_diagnostics_edge(&mut self, first: bool) {
         if first {
-            self.layout.metrics_scroll.set(0);
+            self.layout.diagnostics_scroll.set(0);
         } else {
-            self.layout.metrics_scroll.set(usize::MAX / 2);
+            self.layout.diagnostics_scroll.set(usize::MAX / 2);
         }
     }
 
-    pub(super) fn page_metrics(&mut self, pages: isize) {
-        let steps = Self::page_offset(&self.layout.metrics_viewport, pages);
-        self.scroll_metrics(steps);
+    pub(super) fn page_diagnostics(&mut self, pages: isize) {
+        let steps = Self::page_offset(&self.layout.diagnostics_viewport, pages);
+        self.scroll_diagnostics(steps);
     }
 
-    /// Pan the metrics overlay horizontally (chars); upper clamping
+    /// Pan the diagnostics overlay horizontally (chars); upper clamping
     /// happens at render time against the longest value.
-    pub(super) fn scroll_metrics_h(&mut self, delta: isize) {
-        Self::bump_offset(&self.layout.metrics_hscroll, delta);
+    pub(super) fn scroll_diagnostics_h(&mut self, delta: isize) {
+        Self::bump_offset(&self.layout.diagnostics_hscroll, delta);
     }
 
     /// Identity of the table row at an index (raw answers first, then

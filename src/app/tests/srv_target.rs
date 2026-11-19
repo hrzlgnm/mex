@@ -479,7 +479,10 @@ fn shared_target_question_is_listed_once_in_global_views() {
         .collect();
     assert_eq!(dumped.len(), 1, "dump lists the question once");
     assert!(dumped[0].also_services.is_empty());
-    assert_eq!(dump.metrics["anomalies_total"], dump.anomalies.len() as u64);
+    assert_eq!(
+        dump.diagnostics["anomalies_total"],
+        dump.anomalies.len() as u64
+    );
 
     // The overlay summary counts it once, like the dump: its total
     // equals the deduplicated dump list, not the per-service filings.

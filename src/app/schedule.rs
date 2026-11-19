@@ -599,12 +599,12 @@ impl App {
         };
         if self.scheduler.suppressed_by_overheard(key, &ka) {
             log::debug!("mex: suppressed refresh query for {} (overheard)", key.0);
-            self.metrics.suppressed_refresh += 1;
-            self.metrics.suppressed_times.push_back(now);
+            self.diagnostics.suppressed_refresh += 1;
+            self.diagnostics.suppressed_times.push_back(now);
             self.note_query(&key.0, key.1, QueryOrigin::Suppressed, now);
         } else {
-            self.metrics.q_sent_refresh += 1;
-            self.metrics.ka_sent += ka.len() as u64;
+            self.diagnostics.q_sent_refresh += 1;
+            self.diagnostics.ka_sent += ka.len() as u64;
             if self.query_tx.send(browse::QueryRequest {
                 name: key.0.clone(),
                 record_type: rt,
@@ -925,8 +925,8 @@ impl App {
             if !qu && self.scheduler.suppressed_by_overheard(&key, &ka) {
                 log::debug!("mex: suppressed continuous query for {} (overheard)", key.0);
                 let now = Instant::now();
-                self.metrics.suppressed_continuous += 1;
-                self.metrics.suppressed_times.push_back(now);
+                self.diagnostics.suppressed_continuous += 1;
+                self.diagnostics.suppressed_times.push_back(now);
                 self.note_query(&key.0, key.1, QueryOrigin::Suppressed, now);
                 self.route_own_question(&key.0, key.1, false);
                 self.scheduler.advance_continuous(&key, now);
@@ -937,16 +937,16 @@ impl App {
                 // Keep the flag for the passive-mode test; per-name QU above
                 // no longer depends on it.
             }
-            self.metrics.q_sent_continuous += 1;
+            self.diagnostics.q_sent_continuous += 1;
             log::debug!(
                 "mex: sending continuous query for {} (qu={})",
                 send_name,
                 qu
             );
             if qu {
-                self.metrics.qu_sent += 1;
+                self.diagnostics.qu_sent += 1;
             }
-            self.metrics.ka_sent += ka.len() as u64;
+            self.diagnostics.ka_sent += ka.len() as u64;
             if self.query_tx.send(browse::QueryRequest {
                 name: send_name.clone(),
                 record_type: rt,

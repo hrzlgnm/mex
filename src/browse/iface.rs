@@ -11,7 +11,7 @@ pub fn local_ips() -> HashSet<IpAddr> {
     out
 }
 
-/// Snapshot of usable vs skipped links for the metrics view. Refreshed on
+/// Snapshot of usable vs skipped links for the diagnostics view. Refreshed on
 /// demand from `if_addrs` (same source as the listener joins), so the App
 /// thread sees link changes without new thread communication.
 #[derive(Debug, Clone, Default)]
@@ -27,7 +27,7 @@ pub struct LinkStats {
     pub inactive: Vec<String>,
 }
 
-/// Effective join set for the metrics view: usable links under the
+/// Effective join set for the diagnostics view: usable links under the
 /// default skip policy, or the selected usable links under an explicit
 /// selection (which overrides the policy). Unselected usable links are
 /// reported as skipped so the snapshot still enumerates every link.

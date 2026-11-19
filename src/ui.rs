@@ -25,13 +25,13 @@ use crate::app::{App, DisplayItem, DragMode, Focus};
 use crate::devices::{AddressBook, DeviceName};
 use std::collections::HashSet;
 
+mod diagnostics;
 mod hex;
-mod metrics;
 mod questions;
 mod records;
 mod services;
+use diagnostics::*;
 use hex::*;
-use metrics::*;
 use questions::*;
 use records::*;
 use services::*;
@@ -126,8 +126,8 @@ pub(crate) fn draw_with_findings(frame: &mut Frame, app: &App, found: &[Anomaly]
 
     draw_header(frame, chunks[0], app);
     draw_body(frame, chunks[1], app, found);
-    if app.view_state().show_metrics {
-        draw_metrics_overlay(frame, app, found);
+    if app.view_state().show_diagnostics {
+        draw_diagnostics_overlay(frame, app, found);
     }
     if let Some(text) = app.status_popup() {
         draw_status_popup(frame, text);
@@ -151,7 +151,7 @@ fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 .fg(Color::Cyan),
         ),
         Span::raw(format!(
-            "│ {} pkts │ {} svcs │ uptime {}{}  [q] quit [tab] pane [j/k] move [enter] fold [*] all [m] metrics",
+            "│ {} pkts │ {} svcs │ uptime {}{}  [q] quit [tab] pane [j/k] move [enter] fold [*] all [d] diagnostics",
             app.packet_count(),
             app.services().len(),
             uptime_str,
@@ -430,8 +430,8 @@ fn border_color(focused: bool, resizing: bool) -> Style {
 }
 
 fn resize_active(app: &App, mode: DragMode) -> bool {
-    // Never glow behind the metrics overlay: it owns all input while open.
-    !app.view_state().show_metrics
+    // Never glow behind the diagnostics overlay: it owns all input while open.
+    !app.view_state().show_diagnostics
         && (app.view_state().drag == mode || app.view_state().hover.get() == mode)
 }
 

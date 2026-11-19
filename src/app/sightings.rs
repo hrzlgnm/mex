@@ -79,7 +79,7 @@ impl App {
         self.sightings.push(Sighting { kind, rec });
         if self.sightings.len() > SIGHTINGS_CAP {
             self.sightings.remove(0);
-            self.metrics.sightings_dropped += 1;
+            self.diagnostics.sightings_dropped += 1;
         }
         self.touch();
     }

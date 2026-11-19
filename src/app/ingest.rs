@@ -674,7 +674,7 @@ impl App {
             is_active: true,
             last_event: None,
         });
-        self.metrics.services_seen_total += 1;
+        self.diagnostics.services_seen_total += 1;
         self.services.len() - 1
     }
 

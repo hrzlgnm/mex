@@ -68,8 +68,8 @@ fn enum_answers_file_on_selectable_row() {
     assert!(app.scheduler.known_types().contains("_http._tcp.local"));
     assert_eq!(app.enum_entries[0].answers.len(), 1);
     assert_eq!(app.group_labels()[0], "(enumeration)");
-    // Metrics carry a per-name row for the enumeration name.
-    let rows = app.metrics_rows();
+    // Diagnostics carry a per-name row for the enumeration name.
+    let rows = app.diagnostics_rows();
     assert!(rows.iter().any(|(k, _)| k.contains("_dns-sd._udp")));
 }
 

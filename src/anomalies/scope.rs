@@ -20,7 +20,7 @@ pub(super) fn finding_scope(a: &Anomaly) -> String {
 /// host name it asks for (e.g. `fritz.box A` lands on each service whose
 /// SRV target is `fritz.box`), so the analyzer emits one finding per
 /// such service. Per-service panes need that fan-out; global views
-/// (metrics overlay, state dump) list the question once instead. Each
+/// (diagnostics overlay, state dump) list the question once instead. Each
 /// kept finding comes with the other services it also filed on, in
 /// order. Non-question findings pass through untouched.
 pub(crate) fn collapse_questions(found: &[Anomaly]) -> Vec<(&Anomaly, Vec<&str>)> {
@@ -74,7 +74,7 @@ where
 }
 
 /// Display scope for a finding, shared by the inline finding rows and
-/// the metrics overlay: empty for service-level findings and enumeration
+/// the diagnostics overlay: empty for service-level findings and enumeration
 /// rows (constant owner; the message carries the target instead), the
 /// QRY or `TYPE name` identity otherwise — plus `= rdata` when siblings
 /// share the identity so every row stays tellable-apart, unless the

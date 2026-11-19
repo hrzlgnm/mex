@@ -157,14 +157,14 @@ browsed as before.
 | `*` | collapse all host groups / unfold all |
 | `Ctrl+↑/↓`, `Ctrl+k`, `Shift+↑/↓`, `J` / `K` | scroll Answers viewport freely (Hex viewport when Hex focused) |
 | `Ctrl+J` | dump mex state to JSON, `<timestamp>-mex-<version>.json` (experimental; redaction is heuristic, review before sharing) |
-| `m` | metrics overlay (traffic, discovery, queries, links) |
-| `q` / `Esc` / `Ctrl+C` | quit (`m` / `Esc` closes the overlay first) |
+| `d` | diagnostics overlay (traffic, discovery, queries, links) |
+| `q` / `Esc` / `Ctrl+C` | quit (`d` / `Esc` closes the overlay first) |
 | `Ctrl+Z` (unix) | suspend to shell (`fg` resumes) |
 | mouse drag on pane borders | resize panes |
 | mouse click | focus pane + move cursor (host header folds) |
 | mouse wheel | move cursor one row / scroll one line (focused pane; overlay when open) |
 
-The header always shows the live hints. In the metrics overlay, `j`/`k`
+The header always shows the live hints. In the diagnostics overlay, `j`/`k`
 and paging keys scroll instead, and `Tab`/`Enter` do nothing.
 
 ## Anomalies
@@ -213,8 +213,8 @@ question, a finding row starts in the second column (TTL / LAST) and
 repeats neither the source nor the icon: the parent row shows both. In
 `service` / `host` blocks and the `(unattributed)` view, where no parent
 row names the responder, it shows `<icon>` and the announcer/querier
-(with its device name) in the source column. The metrics overlay
-(`m`) shows only a session-wide summary (`N error · N warning · N info`);
+(with its device name) in the source column. The diagnostics overlay
+(`d`) shows only a session-wide summary (`N error · N warning · N info`);
 `Ctrl+J` state dumps include the full list. A question that asks for a
 name shared by several services (e.g. an SRV target) shows on each of
 their panes, but the summary and the dump count it once
@@ -270,7 +270,7 @@ keeps its own, named with its interface like an Answers row
 (`169.254.1.1:5353@enp0s25`). Findings from known
 answers are always info, and a known answer's TTL (the querier's
 remaining one) gets no TTL checks. EDNS0 OPT pseudo-records are not records and
-are ignored. At most 256 sightings are kept; the metrics overlay counts
+are ignored. At most 256 sightings are kept; the diagnostics overlay counts
 evictions.
 
 Reverse-mapping PTRs (`*.in-addr.arpa`, `*.ip6.arpa`) are exempt from

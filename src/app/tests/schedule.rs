@@ -227,8 +227,8 @@ fn enum_gets_qu_on_first_send() {
         .expect("enum interest seeded")
         .next_due = past;
     app.poll_continuous();
-    assert_eq!(app.metrics.qu_sent, 1);
-    assert_eq!(app.metrics.q_sent_continuous, 1);
+    assert_eq!(app.diagnostics.qu_sent, 1);
+    assert_eq!(app.diagnostics.q_sent_continuous, 1);
 }
 
 #[test]
@@ -328,7 +328,7 @@ fn stale_row_gets_four_refreshes_then_stops() {
         make_refresh_due(&mut app, "_services._dns-sd._udp.local", 12);
     }
     assert_eq!(
-        app.metrics.q_sent_refresh, 4,
+        app.diagnostics.q_sent_refresh, 4,
         "after four misses the row expires at 100%; no new cycle"
     );
 }
@@ -354,7 +354,7 @@ fn new_answer_rearms_a_spent_row() {
         app.requery_expiring();
         make_refresh_due(&mut app, "_services._dns-sd._udp.local", 12);
     }
-    assert_eq!(app.metrics.q_sent_refresh, 4);
+    assert_eq!(app.diagnostics.q_sent_refresh, 4);
     // The responder re-announces late, then that row ages into its
     // window again: it is a new row and gets its own refresh cycle.
     let row = app.enum_entries[0]
@@ -364,7 +364,7 @@ fn new_answer_rearms_a_spent_row() {
         .unwrap();
     row.received_at = Instant::now() - Duration::from_secs(3700);
     app.requery_expiring();
-    assert_eq!(app.metrics.q_sent_refresh, 5);
+    assert_eq!(app.diagnostics.q_sent_refresh, 5);
 }
 
 #[test]
@@ -410,7 +410,7 @@ fn shared_address_row_counts_one_attempt_per_query() {
         app.requery_expiring();
         make_refresh_due(&mut app, "test.local", 1);
     }
-    assert_eq!(app.metrics.q_sent_refresh, 4);
+    assert_eq!(app.diagnostics.q_sent_refresh, 4);
 }
 
 #[test]
@@ -420,14 +420,14 @@ fn newly_due_sibling_is_not_held_by_a_pending_deadline() {
         .answers
         .push(enum_row("_ipp._tcp.local.", 4500, "192.168.1.4:5353", 3600));
     app.requery_expiring();
-    assert_eq!(app.metrics.q_sent_refresh, 1);
+    assert_eq!(app.diagnostics.q_sent_refresh, 1);
     // A TTL 60 sibling reaches 80% while the 4500s row's next attempt
     // is ~225s away: it must be asked about in its own window.
     app.enum_entries[0]
         .answers
         .push(enum_row("_http._tcp.local.", 60, "192.168.1.3:5353", 48));
     app.requery_expiring();
-    assert_eq!(app.metrics.q_sent_refresh, 2);
+    assert_eq!(app.diagnostics.q_sent_refresh, 2);
 }
 
 #[test]
@@ -441,7 +441,7 @@ fn late_sibling_gets_its_own_four_attempts() {
         app.requery_expiring();
         make_refresh_due(&mut app, key, 12);
     }
-    assert_eq!(app.metrics.q_sent_refresh, 3);
+    assert_eq!(app.diagnostics.q_sent_refresh, 3);
     // The sibling enters its window just before the first row's
     // fourth attempt; that shared query is only its first.
     app.enum_entries[0]
@@ -451,7 +451,7 @@ fn late_sibling_gets_its_own_four_attempts() {
         app.requery_expiring();
         make_refresh_due(&mut app, key, 12);
     }
-    assert_eq!(app.metrics.q_sent_refresh, 7);
+    assert_eq!(app.diagnostics.q_sent_refresh, 7);
 }
 
 #[test]
@@ -461,7 +461,7 @@ fn spent_rows_are_not_projected_as_due() {
         app.requery_expiring();
         make_refresh_due(&mut app, "_services._dns-sd._udp.local", 12);
     }
-    assert_eq!(app.metrics.q_sent_refresh, 4);
+    assert_eq!(app.diagnostics.q_sent_refresh, 4);
     let key = ("_services._dns-sd._udp.local".to_string(), 12);
     assert!(!app.scheduler.requeries().contains_key(&key));
     // Only the fresh TTL 60 row is left to refresh, at 80% (48s).
@@ -650,7 +650,7 @@ fn pihole_cycle_expires_after_four_misses_then_rescues() {
         .requeries()
         .keys()
         .any(|(n, t)| n == "Test._http._tcp.local" && *t == 33));
-    assert_eq!(app.metrics.q_sent_refresh, 4);
+    assert_eq!(app.diagnostics.q_sent_refresh, 4);
     // Row past TTL with no pending refresh: abandoned, while the
     // continuous stream stays live for hourly rediscovery (§5.2).
     age_srv(&mut app, 130);
@@ -881,10 +881,10 @@ fn qu_and_local_source_never_suppress() {
 fn active_mode_sends_due_queries() {
     let mut app = due_query_setup();
     app.send_queries();
-    assert_eq!(app.metrics.q_sent_refresh, 1);
+    assert_eq!(app.diagnostics.q_sent_refresh, 1);
     // The refresh postpones the continuous twin for the same key
     // instead of emitting back-to-back duplicates.
-    assert_eq!(app.metrics.q_sent_continuous, 0);
+    assert_eq!(app.diagnostics.q_sent_continuous, 0);
     let entry = app
         .scheduler
         .continuous()
@@ -912,8 +912,8 @@ fn passive_mode_sends_nothing() {
         .expect("still scheduled");
     assert_eq!(entry.next_due, due);
     assert_eq!(entry.interval, Duration::from_secs(2));
-    assert_eq!(app.metrics.q_sent_continuous, 0);
-    assert_eq!(app.metrics.q_sent_refresh, 0);
+    assert_eq!(app.diagnostics.q_sent_continuous, 0);
+    assert_eq!(app.diagnostics.q_sent_refresh, 0);
     assert!(app.scheduler.requeries().is_empty());
     assert!(!*app.scheduler.startup_qu_sent_mut());
 }

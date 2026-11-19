@@ -4,17 +4,17 @@
 use super::*;
 
 #[test]
-fn metrics_hosts_exclude_enumeration_group() {
+fn diagnostics_hosts_exclude_enumeration_group() {
     let app = App::new().unwrap();
     let row = app
-        .metrics_rows()
+        .diagnostics_rows()
         .into_iter()
         .find(|(k, _)| k == "hosts")
         .expect("hosts row");
     assert_eq!(row.1, "0");
     let app = two_group_app();
     let row = app
-        .metrics_rows()
+        .diagnostics_rows()
         .into_iter()
         .find(|(k, _)| k == "hosts")
         .expect("hosts row");
@@ -22,11 +22,11 @@ fn metrics_hosts_exclude_enumeration_group() {
 }
 
 #[test]
-fn metrics_queriers_exclude_self() {
+fn diagnostics_queriers_exclude_self() {
     let mut app = two_group_app();
     app.route_own_question("_http._tcp.local.", 12, false);
     let row = app
-        .metrics_rows()
+        .diagnostics_rows()
         .into_iter()
         .find(|(k, _)| k == "questions")
         .expect("questions row");
@@ -38,7 +38,7 @@ fn metrics_queriers_exclude_self() {
 }
 
 #[test]
-fn metrics_questions_count_one_shot_queriers() {
+fn diagnostics_questions_count_one_shot_queriers() {
     let mut app = two_group_app();
     let stub: std::net::SocketAddr = "192.168.1.9:45678".parse().unwrap();
     app.ingest_event(&query_event(
@@ -50,7 +50,7 @@ fn metrics_questions_count_one_shot_queriers() {
         stub,
     ));
     let row = app
-        .metrics_rows()
+        .diagnostics_rows()
         .into_iter()
         .find(|(k, _)| k == "questions")
         .expect("questions row");
@@ -58,7 +58,7 @@ fn metrics_questions_count_one_shot_queriers() {
 }
 
 #[test]
-fn packet_metrics_count_by_type_and_iface() {
+fn packet_diagnostics_count_by_type_and_iface() {
     let mut app = App::new().unwrap();
     let mut rec = ptr_record(120);
     rec.iface = "br0".to_string();
@@ -72,26 +72,26 @@ fn packet_metrics_count_by_type_and_iface() {
         raw_bytes: vec![0u8; 100],
         source: test_source(),
     };
-    app.note_packet_metrics(&ev);
-    assert_eq!(app.metrics.records_total, 1);
-    assert_eq!(app.metrics.records_by_type.get(&12), Some(&1));
-    assert_eq!(app.metrics.flush_seen, 1);
-    assert_eq!(app.metrics.bytes_total, 100);
-    assert_eq!(app.metrics.iface_rx.get("br0"), Some(&1));
-    assert_eq!(app.metrics.source_rx.get(&test_source()), Some(&1));
-    assert!(app.metrics.last_packet_at.is_some());
+    app.note_packet_diagnostics(&ev);
+    assert_eq!(app.diagnostics.records_total, 1);
+    assert_eq!(app.diagnostics.records_by_type.get(&12), Some(&1));
+    assert_eq!(app.diagnostics.flush_seen, 1);
+    assert_eq!(app.diagnostics.bytes_total, 100);
+    assert_eq!(app.diagnostics.iface_rx.get("br0"), Some(&1));
+    assert_eq!(app.diagnostics.source_rx.get(&test_source()), Some(&1));
+    assert!(app.diagnostics.last_packet_at.is_some());
 }
 
 #[test]
-fn packet_metrics_buckets_unmapped_link_by_index() {
+fn packet_diagnostics_buckets_unmapped_link_by_index() {
     let mut app = App::new().unwrap();
     let mut rec = ptr_record(120);
     rec.iface = String::new();
     rec.ifindex = 7;
-    app.note_packet_metrics(&event_for(&rec));
-    assert_eq!(app.metrics.iface_rx.get("if#7"), Some(&1));
+    app.note_packet_diagnostics(&event_for(&rec));
+    assert_eq!(app.diagnostics.iface_rx.get("if#7"), Some(&1));
     assert!(
-        !app.metrics.iface_rx.contains_key(""),
+        !app.diagnostics.iface_rx.contains_key(""),
         "no opaque empty bucket"
     );
     assert_eq!(App::link_key("", 0), "if#0");
@@ -99,7 +99,7 @@ fn packet_metrics_buckets_unmapped_link_by_index() {
 }
 
 #[test]
-fn packet_metrics_counts_goodbyes_and_qu() {
+fn packet_diagnostics_counts_goodbyes_and_qu() {
     let mut app = App::new().unwrap();
     let ev = browse::Event {
         answers: vec![ptr_record(0)],
@@ -129,16 +129,16 @@ fn packet_metrics_counts_goodbyes_and_qu() {
         raw_bytes: Vec::new(),
         source: remote_source(),
     };
-    app.note_packet_metrics(&ev);
-    assert_eq!(app.metrics.goodbyes_seen, 1);
-    assert_eq!(app.metrics.questions_total, 1);
-    assert_eq!(app.metrics.qu_questions_seen, 1);
-    assert_eq!(app.metrics.qm_questions_seen, 0);
-    assert_eq!(app.metrics.kas_seen, 1);
+    app.note_packet_diagnostics(&ev);
+    assert_eq!(app.diagnostics.goodbyes_seen, 1);
+    assert_eq!(app.diagnostics.questions_total, 1);
+    assert_eq!(app.diagnostics.qu_questions_seen, 1);
+    assert_eq!(app.diagnostics.qm_questions_seen, 0);
+    assert_eq!(app.diagnostics.kas_seen, 1);
 }
 
 #[test]
-fn metrics_toggle_and_scroll_keys() {
+fn diagnostics_toggle_and_scroll_keys() {
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
     let mut app = App::new().unwrap();
     let key = |code| KeyEvent {
@@ -147,32 +147,32 @@ fn metrics_toggle_and_scroll_keys() {
         kind: KeyEventKind::Press,
         state: KeyEventState::empty(),
     };
-    assert!(!app.view_state.show_metrics);
-    app.handle_key(&key(KeyCode::Char('m')));
-    assert!(app.view_state.show_metrics);
-    assert_eq!(app.layout.metrics_scroll.get(), 0);
-    assert_eq!(app.layout.metrics_hscroll.get(), 0);
+    assert!(!app.view_state.show_diagnostics);
+    app.handle_key(&key(KeyCode::Char('d')));
+    assert!(app.view_state.show_diagnostics);
+    assert_eq!(app.layout.diagnostics_scroll.get(), 0);
+    assert_eq!(app.layout.diagnostics_hscroll.get(), 0);
     app.handle_key(&key(KeyCode::Char('j')));
-    assert_eq!(app.layout.metrics_scroll.get(), 1);
+    assert_eq!(app.layout.diagnostics_scroll.get(), 1);
     app.handle_key(&key(KeyCode::Char('k')));
-    assert_eq!(app.layout.metrics_scroll.get(), 0);
+    assert_eq!(app.layout.diagnostics_scroll.get(), 0);
     // Uppercase reports the same intent.
     app.handle_key(&key(KeyCode::Char('J')));
-    assert_eq!(app.layout.metrics_scroll.get(), 1);
+    assert_eq!(app.layout.diagnostics_scroll.get(), 1);
     app.handle_key(&key(KeyCode::Char('K')));
-    assert_eq!(app.layout.metrics_scroll.get(), 0);
+    assert_eq!(app.layout.diagnostics_scroll.get(), 0);
     // Horizontal pan: h/l and arrows move one char, Ctrl jumps ten,
     // `0` jumps back. The key column stays frozen (no vertical move).
     app.handle_key(&key(KeyCode::Char('l')));
-    assert_eq!(app.layout.metrics_hscroll.get(), 1);
+    assert_eq!(app.layout.diagnostics_hscroll.get(), 1);
     app.handle_key(&key(KeyCode::Right));
-    assert_eq!(app.layout.metrics_hscroll.get(), 2);
+    assert_eq!(app.layout.diagnostics_hscroll.get(), 2);
     app.handle_key(&key(KeyCode::Char('h')));
-    assert_eq!(app.layout.metrics_hscroll.get(), 1);
+    assert_eq!(app.layout.diagnostics_hscroll.get(), 1);
     app.handle_key(&key(KeyCode::Left));
-    assert_eq!(app.layout.metrics_hscroll.get(), 0);
+    assert_eq!(app.layout.diagnostics_hscroll.get(), 0);
     app.handle_key(&key(KeyCode::Char('h')));
-    assert_eq!(app.layout.metrics_hscroll.get(), 0);
+    assert_eq!(app.layout.diagnostics_hscroll.get(), 0);
     let ctrl = |code| KeyEvent {
         code,
         modifiers: KeyModifiers::CONTROL,
@@ -180,28 +180,28 @@ fn metrics_toggle_and_scroll_keys() {
         state: KeyEventState::empty(),
     };
     app.handle_key(&ctrl(KeyCode::Char('l')));
-    assert_eq!(app.layout.metrics_hscroll.get(), 10);
+    assert_eq!(app.layout.diagnostics_hscroll.get(), 10);
     app.handle_key(&ctrl(KeyCode::Right));
-    assert_eq!(app.layout.metrics_hscroll.get(), 20);
+    assert_eq!(app.layout.diagnostics_hscroll.get(), 20);
     app.handle_key(&key(KeyCode::Char('0')));
-    assert_eq!(app.layout.metrics_hscroll.get(), 0);
-    assert_eq!(app.layout.metrics_scroll.get(), 0);
+    assert_eq!(app.layout.diagnostics_hscroll.get(), 0);
+    assert_eq!(app.layout.diagnostics_scroll.get(), 0);
     app.handle_key(&key(KeyCode::Char('k')));
-    assert_eq!(app.layout.metrics_scroll.get(), 0);
+    assert_eq!(app.layout.diagnostics_scroll.get(), 0);
     // Tab must not escape the overlay.
     app.handle_key(&key(KeyCode::Tab));
-    assert!(app.view_state.show_metrics);
+    assert!(app.view_state.show_diagnostics);
     assert_eq!(app.view_state.focus, Focus::Services);
     app.handle_key(&key(KeyCode::Esc));
-    assert!(!app.view_state.show_metrics);
+    assert!(!app.view_state.show_diagnostics);
 }
 
 #[test]
-fn metrics_rows_has_all_sections() {
+fn diagnostics_rows_has_all_sections() {
     let mut app = App::new().unwrap();
     ingest(&mut app, &ptr_record(120));
     ingest(&mut app, &srv_record(120));
-    let rows = app.metrics_rows();
+    let rows = app.diagnostics_rows();
     let headers: Vec<&str> = rows
         .iter()
         .filter(|(_, v)| v.is_empty())
@@ -217,13 +217,13 @@ fn metrics_rows_has_all_sections() {
 }
 
 #[test]
-fn metrics_service_counters() {
+fn diagnostics_service_counters() {
     let mut app = App::new().unwrap();
-    assert_eq!(app.metrics.services_seen_total, 0);
+    assert_eq!(app.diagnostics.services_seen_total, 0);
     ingest(&mut app, &ptr_record(120));
     ingest(&mut app, &srv_record(120));
-    assert_eq!(app.metrics.services_seen_total, 1);
-    assert_eq!(app.metrics.services_expired_total, 0);
+    assert_eq!(app.diagnostics.services_seen_total, 1);
+    assert_eq!(app.diagnostics.services_expired_total, 0);
     // Goodbye + grace expiry removes the service.
     ingest(&mut app, &ptr_record(0));
     for svc in &mut app.services {
@@ -231,11 +231,11 @@ fn metrics_service_counters() {
     }
     app.evict_expired();
     assert!(app.services.is_empty());
-    assert_eq!(app.metrics.services_expired_total, 1);
+    assert_eq!(app.diagnostics.services_expired_total, 1);
 }
 
 #[test]
-fn metrics_suppression_counter() {
+fn diagnostics_suppression_counter() {
     let mut app = App::new().unwrap();
     ingest(&mut app, &ptr_record(120));
     ingest(&mut app, &srv_record(120));
@@ -258,21 +258,21 @@ fn metrics_suppression_counter() {
     );
     app.ingest_event(&ev);
     app.poll_continuous();
-    assert_eq!(app.metrics.suppressed_continuous, 1);
-    assert_eq!(app.metrics.q_sent_continuous, 0);
+    assert_eq!(app.diagnostics.suppressed_continuous, 1);
+    assert_eq!(app.diagnostics.q_sent_continuous, 0);
 }
 
 #[test]
-fn metrics_offlink_row_counts_refusals() {
+fn diagnostics_offlink_row_counts_refusals() {
     let app = App::new().unwrap();
-    let rows = app.metrics_rows();
+    let rows = app.diagnostics_rows();
     let (_, value) = rows
         .iter()
         .find(|(k, _)| k == "refused off-link")
         .expect("refused row");
     assert_eq!(value, "0 total");
     app.drop_stats.note("203.0.113.9:5353".parse().unwrap());
-    let rows = app.metrics_rows();
+    let rows = app.diagnostics_rows();
     let (_, value) = rows
         .iter()
         .find(|(k, _)| k == "refused off-link")
@@ -282,11 +282,11 @@ fn metrics_offlink_row_counts_refusals() {
 }
 
 #[test]
-fn interface_selection_is_stored_and_shown_in_metrics() {
+fn interface_selection_is_stored_and_shown_in_diagnostics() {
     use std::collections::HashSet;
     let sel = HashSet::from(["br0".to_string()]);
     let app = App::new_with(false, Some(sel)).unwrap();
-    let rows = app.metrics_rows();
+    let rows = app.diagnostics_rows();
     let (_, value) = rows
         .iter()
         .find(|(k, _)| k == "selected")
@@ -294,18 +294,18 @@ fn interface_selection_is_stored_and_shown_in_metrics() {
     assert_eq!(value, "br0");
     // No selection: no row, default behavior unchanged.
     let app = App::new().unwrap();
-    assert!(app.metrics_rows().iter().all(|(k, _)| k != "selected"));
+    assert!(app.diagnostics_rows().iter().all(|(k, _)| k != "selected"));
 }
 
 #[test]
-fn metrics_suppression_row_shows_recency() {
+fn diagnostics_suppression_row_shows_recency() {
     let mut app = App::new().unwrap();
-    app.metrics.suppressed_continuous = 2;
-    app.metrics.suppressed_times.push_back(Instant::now());
-    app.metrics
+    app.diagnostics.suppressed_continuous = 2;
+    app.diagnostics.suppressed_times.push_back(Instant::now());
+    app.diagnostics
         .suppressed_times
         .push_back(Instant::now() - Duration::from_secs(120));
-    let rows = app.metrics_rows();
+    let rows = app.diagnostics_rows();
     let (_, value) = rows
         .iter()
         .find(|(k, _)| k == "suppressed queries")
@@ -315,7 +315,7 @@ fn metrics_suppression_row_shows_recency() {
 }
 
 #[test]
-fn metrics_has_no_flickering_overheard_rows() {
+fn diagnostics_has_no_flickering_overheard_rows() {
     let mut app = App::new().unwrap();
     // A live overheard QM question must not sprout short-lived rows:
     // suppression context lives in the counter row (total + last
@@ -330,7 +330,7 @@ fn metrics_has_no_flickering_overheard_rows() {
     );
     app.ingest_event(&ev);
     assert_eq!(app.scheduler.overheard().len(), 1);
-    let rows = app.metrics_rows();
+    let rows = app.diagnostics_rows();
     assert!(
         rows.iter()
             .all(|(k, _)| !k.starts_with("heard ") && k != "overheard now"),
@@ -343,7 +343,7 @@ fn metrics_has_no_flickering_overheard_rows() {
 }
 
 #[test]
-fn metrics_overlay_suppresses_resize_hover() {
+fn diagnostics_overlay_suppresses_resize_hover() {
     use crossterm::event::{
         KeyCode, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
@@ -363,14 +363,14 @@ fn metrics_overlay_suppresses_resize_hover() {
     app.handle_mouse(&moved);
     assert_eq!(app.view_state.hover.get(), DragMode::Vertical);
     // Opening the overlay clears resize state...
-    let m = KeyEvent {
-        code: KeyCode::Char('m'),
+    let d = KeyEvent {
+        code: KeyCode::Char('d'),
         modifiers: KeyModifiers::empty(),
         kind: KeyEventKind::Press,
         state: KeyEventState::empty(),
     };
-    app.handle_key(&m);
-    assert!(app.view_state.show_metrics);
+    app.handle_key(&d);
+    assert!(app.view_state.show_diagnostics);
     assert_eq!(app.view_state.drag, DragMode::None);
     assert_eq!(app.view_state.hover.get(), DragMode::None);
     // ...and motion over a seam while open stays inert.
@@ -385,8 +385,8 @@ fn metrics_overlay_suppresses_resize_hover() {
     app.handle_mouse(&down);
     assert_eq!(app.view_state.drag, DragMode::None);
     // Closing restores hover tracking.
-    app.handle_key(&m);
-    assert!(!app.view_state.show_metrics);
+    app.handle_key(&d);
+    assert!(!app.view_state.show_diagnostics);
     app.handle_mouse(&moved);
     assert_eq!(app.view_state.hover.get(), DragMode::Vertical);
 }
@@ -395,7 +395,7 @@ fn metrics_overlay_suppresses_resize_hover() {
 fn per_source_counters_stay_bounded_and_keep_the_top_talker() {
     // Spoofed or churning source addresses must not grow the per-source
     // map without bound; the overlay shows only the top talkers.
-    let mut m = MetricsCounters::default();
+    let mut m = DiagnosticsCounters::default();
     let busy: SocketAddr = "192.168.1.2:5353".parse().unwrap();
     for _ in 0..50 {
         m.count_source(busy);
@@ -409,9 +409,9 @@ fn per_source_counters_stay_bounded_and_keep_the_top_talker() {
 }
 
 #[test]
-fn metrics_describe_received_traffic() {
+fn diagnostics_describe_received_traffic() {
     let mut app = App::new().unwrap();
-    assert_eq!(metrics_value(&app, "last packet"), "—");
+    assert_eq!(diagnostics_value(&app, "last packet"), "—");
     let on_eth0 = |mut rec: browse::RawRecord| {
         rec.iface = "eth0".to_string();
         rec
@@ -430,28 +430,28 @@ fn metrics_describe_received_traffic() {
     ingest_packet(&mut app, ask);
 
     assert!(
-        metrics_value(&app, "last packet").ends_with(" ago"),
+        diagnostics_value(&app, "last packet").ends_with(" ago"),
         "a packet arrived"
     );
-    assert!(metrics_value(&app, "answers ever").ends_with("other 1)"));
-    assert!(metrics_value(&app, "flush-bit / goodbyes").starts_with("33% flush"));
-    assert!(metrics_value(&app, "questions").contains("(0 QU / 1 QM)"));
-    assert_eq!(metrics_value(&app, "rx eth0"), "2");
+    assert!(diagnostics_value(&app, "answers ever").ends_with("other 1)"));
+    assert!(diagnostics_value(&app, "flush-bit / goodbyes").starts_with("33% flush"));
+    assert!(diagnostics_value(&app, "questions").contains("(0 QU / 1 QM)"));
+    assert_eq!(diagnostics_value(&app, "rx eth0"), "2");
     assert_eq!(
-        metrics_value(&app, &format!("talker {}", test_source())),
+        diagnostics_value(&app, &format!("talker {}", test_source())),
         "2 pkts"
     );
 }
 
 #[test]
-fn metrics_summarize_discovery_and_refresh_schedules() {
+fn diagnostics_summarize_discovery_and_refresh_schedules() {
     let mut app = App::new().unwrap();
     assert_eq!(
-        metrics_value(&app, "continuous interests"),
+        diagnostics_value(&app, "continuous interests"),
         "0 · next in — · no interests"
     );
     assert_eq!(
-        metrics_value(&app, "requeries"),
+        diagnostics_value(&app, "requeries"),
         "0 pending · 0 overdue · none unanswered"
     );
 
@@ -478,7 +478,7 @@ fn metrics_summarize_discovery_and_refresh_schedules() {
     // Discovery groups interests by interval (shortest first) and is
     // due now for the overdue one.
     assert_eq!(
-        metrics_value(&app, "continuous interests"),
+        diagnostics_value(&app, "continuous interests"),
         "4 · next in 0ms · 2s×2 3m×1 1h×1"
     );
 
@@ -493,16 +493,16 @@ fn metrics_summarize_discovery_and_refresh_schedules() {
             .insert((name.to_string(), 1), (due, misses));
     }
     assert_eq!(
-        metrics_value(&app, "requeries"),
+        diagnostics_value(&app, "requeries"),
         "3 pending · 2 overdue · miss×1:1 ×2:1 ×3:0 ×4:1"
     );
 }
 
 #[test]
-fn metrics_split_current_answers_by_liveness() {
+fn diagnostics_split_current_answers_by_liveness() {
     let mut app = test_service_app();
     assert_eq!(
-        metrics_value(&app, "answers current"),
+        diagnostics_value(&app, "answers current"),
         "2 live, 0 expired, 0 goodbye",
         "the fixture's PTR and SRV"
     );
@@ -516,42 +516,42 @@ fn metrics_split_current_answers_by_liveness() {
     }
     ingest(&mut app, &ptr_record(0));
     assert_eq!(
-        metrics_value(&app, "answers current"),
+        diagnostics_value(&app, "answers current"),
         "0 live, 1 expired, 1 goodbye"
     );
 }
 
 #[test]
-fn metrics_overlay_opens_with_m_and_closes_with_esc() {
+fn diagnostics_overlay_opens_with_d_and_closes_with_esc() {
     use crossterm::event::KeyCode;
     let mut app = two_group_app();
     let closed = screen(&app, 100, 40);
-    assert!(!closed.iter().any(|l| l.contains("METRIC")));
+    assert!(!closed.iter().any(|l| l.contains("KEY")));
 
-    press(&mut app, KeyCode::Char('m'));
+    press(&mut app, KeyCode::Char('d'));
     let open = screen(&app, 100, 40);
     assert!(
-        open.iter().any(|l| l.contains(" Metrics (m/Esc close")),
+        open.iter().any(|l| l.contains(" Diagnostics (d/Esc close")),
         "overlay title shown"
     );
     assert!(open
         .iter()
-        .any(|l| l.contains("METRIC") && l.contains("VALUE")));
+        .any(|l| l.contains("KEY") && l.contains("VALUE")));
     assert!(open.iter().any(|l| l.contains("Session")), "first section");
     assert!(shows_row(&open, "hosts", "2"), "live state in the table");
 
     press(&mut app, KeyCode::Esc);
     let closed = screen(&app, 100, 40);
-    assert!(!closed.iter().any(|l| l.contains("METRIC")), "Esc closes");
+    assert!(!closed.iter().any(|l| l.contains("KEY")), "Esc closes");
 }
 
 #[test]
-fn metrics_overlay_scrolls_to_the_ends_and_by_pages() {
+fn diagnostics_overlay_scrolls_to_the_ends_and_by_pages() {
     use crossterm::event::KeyCode;
     // 20 rows leave the overlay far fewer lines than it has rows.
     let mut app = two_group_app();
-    press(&mut app, KeyCode::Char('m'));
-    let last_key = app.metrics_rows().last().expect("rows").0.clone();
+    press(&mut app, KeyCode::Char('d'));
+    let last_key = app.diagnostics_rows().last().expect("rows").0.clone();
     let first_page = screen(&app, 100, 20);
     assert!(first_page.iter().any(|l| l.contains("uptime")));
     assert!(!first_page.iter().any(|l| l.contains(&last_key)));
@@ -593,12 +593,12 @@ fn metrics_overlay_scrolls_to_the_ends_and_by_pages() {
 }
 
 #[test]
-fn metrics_overlay_pans_long_values_and_resets() {
+fn diagnostics_overlay_pans_long_values_and_resets() {
     use crossterm::event::{KeyCode, KeyModifiers};
     // 40 columns leave values only a few cells; the key column stays put.
     let mut app = two_group_app();
-    press(&mut app, KeyCode::Char('m'));
-    let value = metrics_value(&app, "bytes");
+    press(&mut app, KeyCode::Char('d'));
+    let value = diagnostics_value(&app, "bytes");
     assert!(value.chars().count() > 12, "long enough to pan: {value}");
     // `shows_row` skips the gap after the key, so match from the first
     // visible non-blank character.

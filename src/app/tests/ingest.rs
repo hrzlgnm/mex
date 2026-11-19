@@ -960,11 +960,14 @@ fn expire_answers(app: &mut App, rtype: u16) {
 #[test]
 fn a_service_whose_ptr_expires_turns_inactive_even_with_a_live_srv() {
     let mut app = test_service_app();
-    assert_eq!(metrics_value(&app, "services"), "1 (1 active, 0 inactive)");
+    assert_eq!(
+        diagnostics_value(&app, "services"),
+        "1 (1 active, 0 inactive)"
+    );
     expire_answers(&mut app, 12);
     app.evict_expired();
     assert_eq!(
-        metrics_value(&app, "services"),
+        diagnostics_value(&app, "services"),
         "1 (0 active, 1 inactive)",
         "withdrawn although the SRV is still answered"
     );
@@ -974,10 +977,16 @@ fn a_service_whose_ptr_expires_turns_inactive_even_with_a_live_srv() {
 fn a_service_seen_only_by_its_srv_turns_inactive_when_it_expires() {
     let mut app = App::new().unwrap();
     ingest(&mut app, &srv_record(120));
-    assert_eq!(metrics_value(&app, "services"), "1 (1 active, 0 inactive)");
+    assert_eq!(
+        diagnostics_value(&app, "services"),
+        "1 (1 active, 0 inactive)"
+    );
     expire_answers(&mut app, 33);
     app.evict_expired();
-    assert_eq!(metrics_value(&app, "services"), "1 (0 active, 1 inactive)");
+    assert_eq!(
+        diagnostics_value(&app, "services"),
+        "1 (0 active, 1 inactive)"
+    );
 }
 
 #[test]

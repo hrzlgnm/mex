@@ -3,16 +3,16 @@
 
 use super::*;
 
-pub(super) fn draw_metrics_overlay(frame: &mut Frame, app: &App, found: &[Anomaly]) {
+pub(super) fn draw_diagnostics_overlay(frame: &mut Frame, app: &App, found: &[Anomaly]) {
     let area = centered_rect(80, 85, frame.area());
     frame.render_widget(Clear, area);
 
-    let rows = app.metrics_rows_in(found);
+    let rows = app.diagnostics_rows_in(found);
     let total = rows.len();
     let viewport = (area.height as usize).saturating_sub(4);
-    app.layout().metrics_viewport.set(viewport);
-    let offset = clamp_scroll(app.layout().metrics_scroll.get(), total, viewport);
-    app.layout().metrics_scroll.set(offset);
+    app.layout().diagnostics_viewport.set(viewport);
+    let offset = clamp_scroll(app.layout().diagnostics_scroll.get(), total, viewport);
+    app.layout().diagnostics_scroll.set(offset);
 
     // Compact key column: size to the longest key (single-space indent
     // plus one cell of padding) instead of a fixed 38% split, so values
@@ -39,10 +39,10 @@ pub(super) fn draw_metrics_overlay(frame: &mut Frame, app: &App, found: &[Anomal
         .unwrap_or(0);
     let hscroll = app
         .layout()
-        .metrics_hscroll
+        .diagnostics_hscroll
         .get()
         .min(longest.saturating_sub(value_w.max(1)));
-    app.layout().metrics_hscroll.set(hscroll);
+    app.layout().diagnostics_hscroll.set(hscroll);
 
     let section_style = Style::default()
         .add_modifier(Modifier::BOLD)
@@ -67,7 +67,7 @@ pub(super) fn draw_metrics_overlay(frame: &mut Frame, app: &App, found: &[Anomal
     let widths = [Constraint::Length(key_w), Constraint::Min(0)];
     let table = Table::new(body, widths)
         .header(
-            Row::new(vec!["METRIC", "VALUE"]).style(
+            Row::new(vec!["KEY", "VALUE"]).style(
                 Style::default()
                     .add_modifier(Modifier::BOLD)
                     .fg(Color::Cyan),
@@ -76,14 +76,14 @@ pub(super) fn draw_metrics_overlay(frame: &mut Frame, app: &App, found: &[Anomal
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Metrics (m/Esc close · j/k ↕ · h/l ↔) ")
+                .title(" Diagnostics (d/Esc close · j/k ↕ · h/l ↔) ")
                 .border_style(Style::default().fg(Color::White)),
         );
 
     let mut state = TableState::default();
     *state.offset_mut() = offset;
     frame.render_stateful_widget(table, area, &mut state);
-    app.layout().metrics_scroll.set(state.offset());
+    app.layout().diagnostics_scroll.set(state.offset());
 }
 
 /// Skip `skip` chars of `s` for horizontal panning. Char-boundary safe;
