@@ -7,12 +7,12 @@ use std::net::SocketAddr;
 mod conflicting_answers;
 mod denials;
 mod devices;
+mod diagnostics;
 mod finding_owners;
 mod finding_targets;
 mod hex;
 mod ingest;
 mod input;
-mod metrics;
 mod out_of_scope;
 mod per_link_copies;
 mod per_nic_answers;
@@ -473,9 +473,9 @@ fn shown(app: &App) -> Vec<(anomalies::Anomaly, Option<usize>)> {
         .collect()
 }
 
-/// The metrics overlay's `Anomalies` summary value.
+/// The diagnostics overlay's `Anomalies` summary value.
 fn summary(app: &App) -> String {
-    let rows = app.metrics_rows();
+    let rows = app.diagnostics_rows();
     let at = rows
         .iter()
         .position(|(k, v)| k == "Anomalies" && v.is_empty())
@@ -594,12 +594,12 @@ fn ask(app: &mut App, name: &str, source: SocketAddr) {
     app.ingest_event(&query_event(name, 16, "TXT", false, Vec::new(), source));
 }
 
-/// The metrics overlay's value for `key`.
-fn metrics_value(app: &App, key: &str) -> String {
-    app.metrics_rows()
+/// The diagnostics overlay's value for `key`.
+fn diagnostics_value(app: &App, key: &str) -> String {
+    app.diagnostics_rows()
         .into_iter()
         .find(|(k, _)| k == key)
-        .unwrap_or_else(|| panic!("no metrics row {key}"))
+        .unwrap_or_else(|| panic!("no diagnostics row {key}"))
         .1
 }
 

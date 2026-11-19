@@ -174,7 +174,7 @@ fn unmatched_sighting_is_unattributed_and_dumped() {
     assert_eq!(row.service, anomalies::UNATTRIBUTED_SERVICE);
     assert_eq!(row.rtype_str.as_deref(), Some("TYPE6"));
     assert_eq!(row.rdata.as_deref(), Some("rdlength=49"));
-    assert_eq!(dump.metrics["sightings_current"], 1);
+    assert_eq!(dump.diagnostics["sightings_current"], 1);
     // Shown under the `(unattributed)` entry, grouped by name.
     let pos = app
         .display_items()
@@ -246,12 +246,12 @@ fn sightings_are_capped_and_drops_counted() {
         );
     }
     assert_eq!(app.sightings.len(), SIGHTINGS_CAP);
-    assert_eq!(app.metrics.sightings_dropped, 1);
+    assert_eq!(app.diagnostics.sightings_dropped, 1);
     assert!(
         !app.sightings.iter().any(|s| s.rec.name == "h0.example."),
         "oldest evicted first"
     );
-    assert_eq!(app.state_dump().metrics["sightings_dropped"], 1);
+    assert_eq!(app.state_dump().diagnostics["sightings_dropped"], 1);
 }
 
 #[test]

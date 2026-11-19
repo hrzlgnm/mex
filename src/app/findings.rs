@@ -5,7 +5,7 @@ use super::*;
 
 impl App {
     /// Nerd Font level icon for an anomaly severity, shown in place of the
-    /// severity word in metrics keys. FontAwesome subset (single cell in
+    /// severity word in diagnostics keys. FontAwesome subset (single cell in
     /// every Nerd Font): U+F057 times-circle (error), U+F071 warning
     /// (warning), U+F05A info-circle (info).
     pub(crate) fn anomaly_level_icon(severity: anomalies::Severity) -> char {

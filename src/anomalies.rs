@@ -32,7 +32,7 @@ pub const ENUMERATION_SERVICE: &str = "enumeration";
 
 /// Catch-all service identity for out-of-scope sightings whose owner
 /// name matches no known service, pending instance or host (e.g. a
-/// router's `fritz.box.` SOA). Shown in the metrics overlay and dumps.
+/// router's `fritz.box.` SOA). Shown in the diagnostics overlay and dumps.
 pub const UNATTRIBUTED_SERVICE: &str = "unattributed";
 
 /// Types mex accepts both as mDNS answers and as questions: A, NS,

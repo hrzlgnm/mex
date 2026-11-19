@@ -6,7 +6,7 @@ use std::cell::Cell;
 use super::{DragMode, Focus};
 
 /// What the user is looking at: focus, selection, pane splits, drag and
-/// hover, and the metrics overlay.
+/// hover, and the diagnostics overlay.
 ///
 /// Only input handling changes it; `ui` reads it through
 /// `App::view_state()`.
@@ -36,8 +36,8 @@ pub struct ViewState {
     /// Pane border under the mouse cursor, for highlight. Updated on
     /// `Moved`/`Drag` events; render-only.
     pub hover: Cell<DragMode>,
-    /// Metrics overlay popup (`m` toggles, `m`/`Esc` closes).
-    pub show_metrics: bool,
+    /// Diagnostics overlay popup (`d` toggles, `d`/`Esc` closes).
+    pub show_diagnostics: bool,
 }
 
 impl Default for ViewState {
@@ -53,7 +53,7 @@ impl Default for ViewState {
             questions_pct: 25,
             drag: DragMode::None,
             hover: Cell::new(DragMode::None),
-            show_metrics: false,
+            show_diagnostics: false,
         }
     }
 }

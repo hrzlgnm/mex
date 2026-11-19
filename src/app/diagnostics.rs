@@ -4,32 +4,32 @@
 use super::*;
 
 impl App {
-    /// Cumulative per-packet accounting for the metrics overlay.
-    pub(super) fn note_packet_metrics(&mut self, ev: &browse::Event) {
+    /// Cumulative per-packet accounting for the diagnostics overlay.
+    pub(super) fn note_packet_diagnostics(&mut self, ev: &browse::Event) {
         let now = Instant::now();
-        let m = &mut self.metrics;
-        m.bytes_total += ev.raw_bytes.len() as u64;
-        m.packet_times.push_back(now);
-        m.last_packet_at = Some(now);
-        m.records_total += ev.answers.len() as u64;
+        let diag = &mut self.diagnostics;
+        diag.bytes_total += ev.raw_bytes.len() as u64;
+        diag.packet_times.push_back(now);
+        diag.last_packet_at = Some(now);
+        diag.records_total += ev.answers.len() as u64;
         for rec in &ev.answers {
-            *m.records_by_type.entry(rec.rtype).or_insert(0) += 1;
+            *diag.records_by_type.entry(rec.rtype).or_insert(0) += 1;
             if rec.flush_bit {
-                m.flush_seen += 1;
+                diag.flush_seen += 1;
             }
             if rec.ttl == 0 {
-                m.goodbyes_seen += 1;
+                diag.goodbyes_seen += 1;
             }
         }
-        m.questions_total += ev.questions.len() as u64;
+        diag.questions_total += ev.questions.len() as u64;
         for q in &ev.questions {
             if q.qu {
-                m.qu_questions_seen += 1;
+                diag.qu_questions_seen += 1;
             } else {
-                m.qm_questions_seen += 1;
+                diag.qm_questions_seen += 1;
             }
         }
-        m.kas_seen += ev.query_kas.len() as u64;
+        diag.kas_seen += ev.query_kas.len() as u64;
         // Ingress link of the packet: first record/question/KA. A name
         // that never resolved falls back to the kernel index (`if#7`)
         // so unmapped traffic stays identifiable instead of piling up
@@ -41,23 +41,24 @@ impl App {
             .or(ev.query_kas.first())
             .map(|r| (r.iface.as_str(), r.ifindex))
             .unwrap_or(("", 0));
-        *m.iface_rx
+        *diag
+            .iface_rx
             .entry(Self::link_key(iface, ifindex))
             .or_insert(0) += 1;
-        m.count_source(ev.source);
+        diag.count_source(ev.source);
     }
 
-    /// Rows for the metrics overlay: `(key, value)` with an empty value
+    /// Rows for the diagnostics overlay: `(key, value)` with an empty value
     /// marking a section header. Pure snapshot of cumulative counters plus
     /// live state; cheap enough to rebuild every frame.
     #[cfg(test)]
-    pub fn metrics_rows(&self) -> Vec<(String, String)> {
-        self.metrics_rows_in(&self.anomalies())
+    pub fn diagnostics_rows(&self) -> Vec<(String, String)> {
+        self.diagnostics_rows_in(&self.anomalies())
     }
 
-    /// `metrics_rows` over a precomputed finding set (see
+    /// `diagnostics_rows` over a precomputed finding set (see
     /// `anomaly_counts_in`), so the overlay shares the frame's analyzer run.
-    pub fn metrics_rows_in(&self, found: &[anomalies::Anomaly]) -> Vec<(String, String)> {
+    pub fn diagnostics_rows_in(&self, found: &[anomalies::Anomaly]) -> Vec<(String, String)> {
         let mut rows: Vec<(String, String)> = Vec::new();
         let section = |rows: &mut Vec<(String, String)>, name: &str| {
             rows.push((name.to_string(), String::new()));
@@ -78,26 +79,29 @@ impl App {
         };
         kv(&mut rows, "pkt/min overall", format!("{per_min:.1}"));
         let last_60 = self
-            .metrics
+            .diagnostics
             .packet_times
             .iter()
             .filter(|t| t.elapsed() <= Duration::from_secs(60))
             .count();
         kv(&mut rows, "pkt/min last 60s", last_60.to_string());
         let avg = self
-            .metrics
+            .diagnostics
             .bytes_total
             .checked_div(self.packet_count)
             .unwrap_or(0);
         kv(
             &mut rows,
             "bytes",
-            format!("{} (avg {avg} B/pkt)", fmt_bytes(self.metrics.bytes_total)),
+            format!(
+                "{} (avg {avg} B/pkt)",
+                fmt_bytes(self.diagnostics.bytes_total)
+            ),
         );
         kv(
             &mut rows,
             "last packet",
-            self.metrics
+            self.diagnostics
                 .last_packet_at
                 .map(|t| format!("{} ago", fmt_age(t.elapsed().as_secs())))
                 .unwrap_or_else(|| "—".to_string()),
@@ -122,7 +126,7 @@ impl App {
             format!(
                 "{} / {}",
                 self.sightings.len(),
-                self.metrics.sightings_dropped
+                self.diagnostics.sightings_dropped
             ),
         );
         let (tx_v4, tx_v6) = self.query_tx.transmit().flags();
@@ -137,7 +141,7 @@ impl App {
             "services ever / expired",
             format!(
                 "{} / {}",
-                self.metrics.services_seen_total, self.metrics.services_expired_total
+                self.diagnostics.services_seen_total, self.diagnostics.services_expired_total
             ),
         );
         kv(
@@ -203,17 +207,37 @@ impl App {
             "answers ever",
             format!(
                 "{} (PTR {} · SRV {} · TXT {} · A {} · AAAA {} · other {})",
-                self.metrics.records_total,
-                self.metrics.records_by_type.get(&12).copied().unwrap_or(0),
-                self.metrics.records_by_type.get(&33).copied().unwrap_or(0),
-                self.metrics.records_by_type.get(&16).copied().unwrap_or(0),
-                self.metrics.records_by_type.get(&1).copied().unwrap_or(0),
-                self.metrics.records_by_type.get(&28).copied().unwrap_or(0),
+                self.diagnostics.records_total,
+                self.diagnostics
+                    .records_by_type
+                    .get(&12)
+                    .copied()
+                    .unwrap_or(0),
+                self.diagnostics
+                    .records_by_type
+                    .get(&33)
+                    .copied()
+                    .unwrap_or(0),
+                self.diagnostics
+                    .records_by_type
+                    .get(&16)
+                    .copied()
+                    .unwrap_or(0),
+                self.diagnostics
+                    .records_by_type
+                    .get(&1)
+                    .copied()
+                    .unwrap_or(0),
+                self.diagnostics
+                    .records_by_type
+                    .get(&28)
+                    .copied()
+                    .unwrap_or(0),
                 self.other_records_total(),
             ),
         );
-        let flush_pct = if self.metrics.records_total > 0 {
-            self.metrics.flush_seen as f64 * 100.0 / self.metrics.records_total as f64
+        let flush_pct = if self.diagnostics.records_total > 0 {
+            self.diagnostics.flush_seen as f64 * 100.0 / self.diagnostics.records_total as f64
         } else {
             0.0
         };
@@ -222,7 +246,7 @@ impl App {
             "flush-bit / goodbyes",
             format!(
                 "{:.0}% flush · {} goodbyes",
-                flush_pct, self.metrics.goodbyes_seen
+                flush_pct, self.diagnostics.goodbyes_seen
             ),
         );
         let current_q: usize = self
@@ -268,17 +292,17 @@ impl App {
             format!(
                 "{current_q} current ({} queriers{querier_breakdown}) · {} ever ({} QU / {} QM) · {} KAs seen",
                 queriers.len(),
-                self.metrics.questions_total,
-                self.metrics.qu_questions_seen,
-                self.metrics.qm_questions_seen,
-                self.metrics.kas_seen,
+                self.diagnostics.questions_total,
+                self.diagnostics.qu_questions_seen,
+                self.diagnostics.qm_questions_seen,
+                self.diagnostics.kas_seen,
             ),
         );
 
         // Query engine.
         section(&mut rows, "Queries");
-        let sent = self.metrics.q_sent_continuous + self.metrics.q_sent_refresh;
-        let supp = self.metrics.suppressed_continuous + self.metrics.suppressed_refresh;
+        let sent = self.diagnostics.q_sent_continuous + self.diagnostics.q_sent_refresh;
+        let supp = self.diagnostics.suppressed_continuous + self.diagnostics.suppressed_refresh;
         let supp_pct = if sent + supp > 0 {
             supp as f64 * 100.0 / (sent + supp) as f64
         } else {
@@ -289,7 +313,9 @@ impl App {
             "sent",
             format!(
                 "{sent} ({} continuous · {} refresh · {} QU)",
-                self.metrics.q_sent_continuous, self.metrics.q_sent_refresh, self.metrics.qu_sent
+                self.diagnostics.q_sent_continuous,
+                self.diagnostics.q_sent_refresh,
+                self.diagnostics.qu_sent
             ),
         );
         kv(
@@ -305,9 +331,9 @@ impl App {
             "KAs attached",
             format!(
                 "{} ({:.1}/query)",
-                self.metrics.ka_sent,
+                self.diagnostics.ka_sent,
                 if sent > 0 {
-                    self.metrics.ka_sent as f64 / sent as f64
+                    self.diagnostics.ka_sent as f64 / sent as f64
                 } else {
                     0.0
                 }
@@ -390,7 +416,7 @@ impl App {
         );
         kv(&mut rows, "refused off-link", self.offlink_row());
         kv(&mut rows, "malformed packets", self.malformed_row());
-        let mut iface_rows: Vec<(&String, &u64)> = self.metrics.iface_rx.iter().collect();
+        let mut iface_rows: Vec<(&String, &u64)> = self.diagnostics.iface_rx.iter().collect();
         iface_rows.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
         for (iface, count) in iface_rows.iter().take(8) {
             kv(&mut rows, &format!("rx {iface}"), count.to_string());
@@ -403,7 +429,7 @@ impl App {
             );
         }
         let mut talkers: Vec<(&std::net::SocketAddr, &u64)> =
-            self.metrics.source_rx.iter().collect();
+            self.diagnostics.source_rx.iter().collect();
         talkers.sort_by(|a, b| b.1.cmp(a.1));
         for (src, count) in talkers.iter().take(5) {
             kv(&mut rows, &format!("talker {src}"), format!("{count} pkts"));
@@ -461,7 +487,7 @@ impl App {
     }
 
     pub(super) fn other_records_total(&self) -> u64 {
-        self.metrics
+        self.diagnostics
             .records_by_type
             .iter()
             .filter(|(t, _)| !matches!(**t, 12 | 33 | 16 | 1 | 28))
@@ -537,7 +563,7 @@ impl App {
     }
 
     pub(super) fn suppressions_last_60s(&self) -> usize {
-        self.metrics
+        self.diagnostics
             .suppressed_times
             .iter()
             .filter(|t| t.elapsed() <= Duration::from_secs(60))

@@ -136,11 +136,11 @@ impl App {
         let book = self.address_book();
         let mut service_types: Vec<String> = self.scheduler.known_types().iter().cloned().collect();
         service_types.sort();
-        let mut metrics = std::collections::BTreeMap::new();
-        let m = &self.metrics;
-        metrics.insert("packets".to_string(), self.packet_count);
-        metrics.insert("bytes_total".to_string(), m.bytes_total);
-        metrics.insert("records_total".to_string(), m.records_total);
+        let mut diagnostics = std::collections::BTreeMap::new();
+        let diag = &self.diagnostics;
+        diagnostics.insert("packets".to_string(), self.packet_count);
+        diagnostics.insert("bytes_total".to_string(), diag.bytes_total);
+        diagnostics.insert("records_total".to_string(), diag.records_total);
         for (t, label) in [
             (12, "ptr"),
             (33, "srv"),
@@ -148,57 +148,60 @@ impl App {
             (1, "a"),
             (28, "aaaa"),
         ] {
-            metrics.insert(
+            diagnostics.insert(
                 format!("records_{label}"),
-                m.records_by_type.get(&t).copied().unwrap_or(0),
+                diag.records_by_type.get(&t).copied().unwrap_or(0),
             );
         }
-        metrics.insert("records_other".to_string(), self.other_records_total());
-        metrics.insert("questions_total".to_string(), m.questions_total);
-        metrics.insert("questions_qu".to_string(), m.qu_questions_seen);
-        metrics.insert("questions_qm".to_string(), m.qm_questions_seen);
-        metrics.insert("kas_seen".to_string(), m.kas_seen);
-        metrics.insert("goodbyes_seen".to_string(), m.goodbyes_seen);
-        metrics.insert("flush_seen".to_string(), m.flush_seen);
-        metrics.insert("q_sent_continuous".to_string(), m.q_sent_continuous);
-        metrics.insert("q_sent_refresh".to_string(), m.q_sent_refresh);
-        metrics.insert("qu_sent".to_string(), m.qu_sent);
-        metrics.insert("ka_sent".to_string(), m.ka_sent);
-        metrics.insert("suppressed_continuous".to_string(), m.suppressed_continuous);
-        metrics.insert("suppressed_refresh".to_string(), m.suppressed_refresh);
-        metrics.insert(
+        diagnostics.insert("records_other".to_string(), self.other_records_total());
+        diagnostics.insert("questions_total".to_string(), diag.questions_total);
+        diagnostics.insert("questions_qu".to_string(), diag.qu_questions_seen);
+        diagnostics.insert("questions_qm".to_string(), diag.qm_questions_seen);
+        diagnostics.insert("kas_seen".to_string(), diag.kas_seen);
+        diagnostics.insert("goodbyes_seen".to_string(), diag.goodbyes_seen);
+        diagnostics.insert("flush_seen".to_string(), diag.flush_seen);
+        diagnostics.insert("q_sent_continuous".to_string(), diag.q_sent_continuous);
+        diagnostics.insert("q_sent_refresh".to_string(), diag.q_sent_refresh);
+        diagnostics.insert("qu_sent".to_string(), diag.qu_sent);
+        diagnostics.insert("ka_sent".to_string(), diag.ka_sent);
+        diagnostics.insert(
+            "suppressed_continuous".to_string(),
+            diag.suppressed_continuous,
+        );
+        diagnostics.insert("suppressed_refresh".to_string(), diag.suppressed_refresh);
+        diagnostics.insert(
             "pending_addrs".to_string(),
             self.pending_addrs_count() as u64,
         );
-        metrics.insert("services_current".to_string(), self.services.len() as u64);
-        metrics.insert(
+        diagnostics.insert("services_current".to_string(), self.services.len() as u64);
+        diagnostics.insert(
             "services_active".to_string(),
             self.services.iter().filter(|s| s.is_active).count() as u64,
         );
-        metrics.insert("services_seen_total".to_string(), m.services_seen_total);
+        diagnostics.insert("services_seen_total".to_string(), diag.services_seen_total);
         let (tx_v4, tx_v6) = self.query_tx.transmit().flags();
-        metrics.insert("transmit_v4".to_string(), u64::from(tx_v4));
-        metrics.insert("transmit_v6".to_string(), u64::from(tx_v6));
-        metrics.insert("sightings_current".to_string(), self.sightings.len() as u64);
-        metrics.insert("sightings_dropped".to_string(), m.sightings_dropped);
-        metrics.insert(
+        diagnostics.insert("transmit_v4".to_string(), u64::from(tx_v4));
+        diagnostics.insert("transmit_v6".to_string(), u64::from(tx_v6));
+        diagnostics.insert("sightings_current".to_string(), self.sightings.len() as u64);
+        diagnostics.insert("sightings_dropped".to_string(), diag.sightings_dropped);
+        diagnostics.insert(
             "services_expired_total".to_string(),
-            m.services_expired_total,
+            diag.services_expired_total,
         );
-        metrics.insert("service_types".to_string(), service_types.len() as u64);
-        metrics.insert(
+        diagnostics.insert("service_types".to_string(), service_types.len() as u64);
+        diagnostics.insert(
             "enum_known".to_string(),
             self.scheduler.enum_known().len() as u64,
         );
-        metrics.insert(
+        diagnostics.insert(
             "continuous_interests".to_string(),
             self.scheduler.continuous().len() as u64,
         );
-        metrics.insert(
+        diagnostics.insert(
             "requery_pending".to_string(),
             self.scheduler.requeries().len() as u64,
         );
-        metrics.insert(
+        diagnostics.insert(
             "uptime_secs".to_string(),
             self.start_time.elapsed().as_secs(),
         );
@@ -276,22 +279,22 @@ impl App {
         // The dump is session-wide: a question filed on several services
         // is listed once, naming the other services in `also_services`.
         let found = anomalies::collapse_questions(&all);
-        metrics.insert("anomalies_total".to_string(), found.len() as u64);
-        metrics.insert(
+        diagnostics.insert("anomalies_total".to_string(), found.len() as u64);
+        diagnostics.insert(
             "anomalies_error".to_string(),
             found
                 .iter()
                 .filter(|(a, _)| matches!(a.severity, anomalies::Severity::Error))
                 .count() as u64,
         );
-        metrics.insert(
+        diagnostics.insert(
             "anomalies_warning".to_string(),
             found
                 .iter()
                 .filter(|(a, _)| matches!(a.severity, anomalies::Severity::Warning))
                 .count() as u64,
         );
-        metrics.insert(
+        diagnostics.insert(
             "malformed_packets".to_string(),
             self.drop_stats.malformed_total(),
         );
@@ -307,7 +310,7 @@ impl App {
                 .map(|s| self.dump_service(s, &book))
                 .collect(),
             service_types,
-            metrics,
+            diagnostics,
             passive: self.passive,
             enum_groups: self
                 .enum_entries

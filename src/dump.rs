@@ -196,7 +196,7 @@ pub struct StateDump {
     pub services: Vec<DumpService>,
     /// Live browse set, as stored (lowercase, dotless).
     pub service_types: Vec<String>,
-    pub metrics: BTreeMap<String, u64>,
+    pub diagnostics: BTreeMap<String, u64>,
     pub enum_groups: Vec<RawGroup>,
     pub pending: Vec<RawGroup>,
     /// Authoritative per-interest query state (uncapped).

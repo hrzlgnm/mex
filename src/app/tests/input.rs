@@ -720,13 +720,13 @@ fn mouse_wheel_moves_focused_pane_like_jk() {
     assert_eq!(app.layout.hex_offset.get(), 1);
     app.handle_mouse(&wheel(MouseEventKind::ScrollUp));
     assert_eq!(app.layout.hex_offset.get(), 0);
-    // Metrics overlay owns the wheel while open.
-    app.view_state.show_metrics = true;
+    // Diagnostics overlay owns the wheel while open.
+    app.view_state.show_diagnostics = true;
     app.handle_mouse(&wheel(MouseEventKind::ScrollDown));
-    assert_eq!(app.layout.metrics_scroll.get(), 1);
+    assert_eq!(app.layout.diagnostics_scroll.get(), 1);
     assert_eq!(app.view_state.detail_selected, cursor);
     // Horizontal wheel is ignored everywhere.
-    app.view_state.show_metrics = false;
+    app.view_state.show_diagnostics = false;
     app.handle_mouse(&wheel(MouseEventKind::ScrollLeft));
     app.handle_mouse(&wheel(MouseEventKind::ScrollRight));
     assert_eq!(app.layout.hex_offset.get(), 0);
@@ -962,7 +962,7 @@ fn seam_target(app: &App, mode: DragMode) -> (ratatui::layout::Rect, u16) {
 }
 
 #[test]
-fn q_esc_and_ctrl_c_quit_also_from_the_metrics_overlay() {
+fn q_esc_and_ctrl_c_quit_also_from_the_diagnostics_overlay() {
     use crossterm::event::KeyModifiers;
     for (code, modifiers) in [
         (KeyCode::Char('q'), KeyModifiers::empty()),
@@ -975,14 +975,14 @@ fn q_esc_and_ctrl_c_quit_also_from_the_metrics_overlay() {
     }
     // In the overlay `Esc` only closes it; `q` still quits.
     let mut app = App::new().unwrap();
-    app.handle_key(&plain_key(KeyCode::Char('m')));
+    app.handle_key(&plain_key(KeyCode::Char('d')));
     app.handle_key(&plain_key(KeyCode::Esc));
     assert!(app.running);
-    app.handle_key(&plain_key(KeyCode::Char('m')));
+    app.handle_key(&plain_key(KeyCode::Char('d')));
     app.handle_key(&plain_key(KeyCode::Char('q')));
     assert!(!app.running);
     let mut app = App::new().unwrap();
-    app.handle_key(&plain_key(KeyCode::Char('m')));
+    app.handle_key(&plain_key(KeyCode::Char('d')));
     press_with(
         &mut app,
         KeyCode::Char('c'),

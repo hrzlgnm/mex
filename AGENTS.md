@@ -46,7 +46,7 @@ Headless run (no TTY) logs to stderr.
   python-zeroconf) hear our queries; our own looped-back query copies are
   dropped by exact bytes (`SentCopies`, one drop per sent copy). The
   loopback interface stays out unless selected with `-i`. Unicast-dst
-  packets from off-link subnets are refused (RFC 6762 §11) with a metrics
+  packets from off-link subnets are refused (RFC 6762 §11) with a diagnostics
   counter.
   Only in-scope types (`anomalies::is_mdns_answer_type` /
   `is_mdns_question_type`) are decoded or named; every other record keeps
@@ -81,7 +81,7 @@ Headless run (no TTY) logs to stderr.
   `Scheduler`, unit-tested without an `App` in `app/tests/scheduler.rs`), `ingest`
   (record handlers, `push_record`, goodbyes), `denials`, `sightings`,
   `questions` (question routing), `input` (keys, mouse, selection),
-  `view` (read-only accessors for `ui`; `App` has no public fields), `metrics`, `findings`
+  `view` (read-only accessors for `ui`; `App` has no public fields), `diagnostics`, `findings`
   (analyzer snapshot), `state_dump`. `app.rs` keeps the types, constants,
   free helpers, construction, run loops and eviction. Child-module
   methods are `pub(super)` (same reach as a private `app` method).
@@ -105,7 +105,7 @@ Headless run (no TTY) logs to stderr.
   `app::Layout` (via `App::layout()`): pane geometry, viewport heights,
   row maps, hex hit boxes and the scroll offsets it clamps.
   Child modules per pane: `services`, `records`, `questions`, `hex`,
-  `metrics` (overlay); `ui.rs` keeps terminal init/restore/suspend, the
+  `diagnostics` (overlay); `ui.rs` keeps terminal init/restore/suspend, the
   frame layout and shared cell/finding helpers.
 
 ## Query scheduling (RFC 6762 §5.2, §5.4, §7.1)

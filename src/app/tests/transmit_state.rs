@@ -10,10 +10,10 @@ fn queries_hold_while_no_family_can_transmit() {
     let mut app = App::new().unwrap();
     let key = due_http_stream(&mut app);
     app.query_tx.transmit().pin(false, false);
-    let sent_before = app.metrics.q_sent_continuous;
+    let sent_before = app.diagnostics.q_sent_continuous;
     app.send_queries();
     assert_eq!(
-        app.metrics.q_sent_continuous, sent_before,
+        app.diagnostics.q_sent_continuous, sent_before,
         "nothing counted"
     );
     let entry = app
@@ -36,9 +36,9 @@ fn one_family_transmitting_keeps_queries_going() {
     let mut app = App::new().unwrap();
     let key = due_http_stream(&mut app);
     app.query_tx.transmit().pin(false, true);
-    let sent_before = app.metrics.q_sent_continuous;
+    let sent_before = app.diagnostics.q_sent_continuous;
     app.send_queries();
-    assert!(app.metrics.q_sent_continuous > sent_before);
+    assert!(app.diagnostics.q_sent_continuous > sent_before);
     assert_eq!(
         app.scheduler
             .continuous()
@@ -63,10 +63,16 @@ fn refresh_attempts_are_kept_while_held() {
         app.send_queries();
         make_refresh_due(&mut app, "_services._dns-sd._udp.local", 12);
     }
-    assert_eq!(app.metrics.q_sent_refresh, 0, "no attempt used while held");
+    assert_eq!(
+        app.diagnostics.q_sent_refresh, 0,
+        "no attempt used while held"
+    );
     app.query_tx.transmit().pin(true, true);
     app.send_queries();
-    assert_eq!(app.metrics.q_sent_refresh, 1, "refresh goes out on resume");
+    assert_eq!(
+        app.diagnostics.q_sent_refresh, 1,
+        "refresh goes out on resume"
+    );
 }
 
 #[test]
@@ -77,7 +83,7 @@ fn held_records_still_expire_at_ttl() {
     app.query_tx.transmit().pin(false, false);
     app.enum_entries[0].answers[1].received_at = Instant::now() - Duration::from_secs(4600);
     app.send_queries();
-    assert_eq!(app.metrics.q_sent_refresh, 0);
+    assert_eq!(app.diagnostics.q_sent_refresh, 0);
     assert_eq!(
         record_liveness(&app.enum_entries[0].answers[1]),
         RecordLiveness::Expired
@@ -106,16 +112,16 @@ fn resume_restarts_discovery_with_the_startup_schedule() {
 }
 
 #[test]
-fn transmit_state_shows_in_metrics_and_dump() {
+fn transmit_state_shows_in_diagnostics_and_dump() {
     let app = App::new().unwrap();
     app.query_tx.transmit().pin(false, true);
     assert!(app
-        .metrics_rows()
+        .diagnostics_rows()
         .iter()
         .any(|(k, v)| k == "transmit" && v == "v4 paused · v6 ok"));
     let dump = app.state_dump();
-    assert_eq!(dump.metrics["transmit_v4"], 0);
-    assert_eq!(dump.metrics["transmit_v6"], 1);
+    assert_eq!(dump.diagnostics["transmit_v4"], 0);
+    assert_eq!(dump.diagnostics["transmit_v6"], 1);
 }
 
 #[test]
@@ -140,7 +146,7 @@ fn hold_drops_expired_refresh_summaries_and_keeps_live_attempts() {
     make_refresh_due(&mut app, "_services._dns-sd._udp.local", 12);
     app.send_queries();
     assert_eq!(attempts(&app), 1, "no attempt used while held");
-    assert_eq!(app.metrics.q_sent_refresh, 1);
+    assert_eq!(app.diagnostics.q_sent_refresh, 1);
     // The record expires during the hold: its summary goes too.
     app.enum_entries[0].answers[1].received_at = Instant::now() - Duration::from_secs(4600);
     app.send_queries();

@@ -78,7 +78,7 @@ fn state_dump_models_mex_state() {
         "passive",
         "services",
         "service_types",
-        "metrics",
+        "diagnostics",
         "enum_groups",
         "pending",
     ] {
@@ -286,5 +286,5 @@ fn state_dump_reports_pending_address_count() {
         &raw_record("lonely.local.", 1, "A", "192.168.1.9", 120),
     );
 
-    assert_eq!(app.state_dump().metrics["pending_addrs"], 1);
+    assert_eq!(app.state_dump().diagnostics["pending_addrs"], 1);
 }

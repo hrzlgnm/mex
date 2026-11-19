@@ -310,7 +310,7 @@ fn gone_rows_name_goodbye_and_expiry_in_the_ttl_cell() {
 }
 
 #[test]
-fn metrics_overlay_keeps_the_summary_and_lists_no_findings() {
+fn diagnostics_overlay_keeps_the_summary_and_lists_no_findings() {
     let mut app = App::new().unwrap();
     assert_eq!(summary(&app), "none");
     let mut bad = ptr_record(4500);
@@ -330,7 +330,7 @@ fn metrics_overlay_keeps_the_summary_and_lists_no_findings() {
     );
     assert!(count(anomalies::Severity::Error) >= 1);
     // The summary is the section's only row: no per-finding rows.
-    let rows = app.metrics_rows();
+    let rows = app.diagnostics_rows();
     let at = rows.iter().position(|(k, _)| k == "Anomalies").unwrap();
     let section: Vec<_> = rows[at + 1..]
         .iter()

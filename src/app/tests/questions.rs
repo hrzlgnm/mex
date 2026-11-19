@@ -78,7 +78,7 @@ fn active_sends_file_self_questions() {
     let mut app = due_query_setup();
     assert!(app.services[0].questions.is_empty());
     app.send_queries();
-    assert_eq!(app.metrics.q_sent_refresh, 1);
+    assert_eq!(app.diagnostics.q_sent_refresh, 1);
     // Dampened interests with cached unique answers file pending
     // rows too; the refresh send itself files exactly one PTR row.
     let filed: Vec<_> = app.services[0]
