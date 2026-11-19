@@ -110,33 +110,51 @@ fn query_send_wakes_the_poll_and_is_drained() {
 }
 
 #[test]
-fn dropping_the_query_sender_wakes_and_stops_the_listener() {
+fn dropping_the_query_sender_stops_the_listener() {
     // The app dropping its QueryTx must stop the listener at once, so
     // its sockets close with the app: waiting for the next datagram
     // leaks them on a quiet network (the AUR build ran out of file
-    // descriptors after ~200 test apps).
-    let mut poll = mio::Poll::new().unwrap();
+    // descriptors after ~200 test apps). No datagram arrives here, and
+    // only the listener and the QueryTx hold the waker, as in `spawn`;
+    // without a delivered wake the loop would sleep until the 10 s
+    // interface refresh.
+    let poll = mio::Poll::new().unwrap();
     let waker = Arc::new(mio::Waker::new(poll.registry(), WAKER_TOKEN).unwrap());
-    // The listener's handle (`SharedWithApp::waker`).
-    let _listener_waker = waker.clone();
-    let (tx, rx) = mpsc::channel();
+    let transmit = Arc::new(TransmitState::new(false, false));
+    let (tx, _events) = mpsc::channel();
+    let (query_tx, query_rx) = mpsc::channel();
+    let mut listener = Listener::new(
+        poll,
+        None,
+        None,
+        tx,
+        query_rx,
+        SharedWithApp {
+            drops: Arc::new(DropStats::default()),
+            transmit: transmit.clone(),
+            waker: waker.clone(),
+        },
+        Some(HashSet::new()),
+    );
+    listener.next_refresh = Instant::now() + IFACE_REFRESH;
+    let (done_tx, done_rx) = mpsc::channel();
+    let thread = thread::spawn(move || {
+        listener.run();
+        let _ = done_tx.send(());
+    });
     let query_tx = QueryTx {
-        tx: Some(tx),
+        tx: Some(query_tx),
         waker,
-        transmit: Arc::new(TransmitState::new(true, true)),
+        transmit,
     };
+    // Let the loop reach its poll before the drop.
+    thread::sleep(Duration::from_millis(50));
     drop(query_tx);
-    let mut events = mio::Events::with_capacity(4);
-    poll.poll(&mut events, Some(Duration::from_secs(5)))
-        .unwrap();
     assert!(
-        events.iter().any(|e| e.token() == WAKER_TOKEN),
-        "the drop woke the listener"
+        done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+        "the listener stopped when its QueryTx was dropped"
     );
-    assert_eq!(
-        drain_queries(&rx, QUERY_BUDGET, |_| {}),
-        (0, QueueState::Closed)
-    );
+    thread.join().unwrap();
 }
 
 #[test]
