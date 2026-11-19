@@ -886,6 +886,51 @@ fn plain_key(code: KeyCode) -> KeyEvent {
     }
 }
 
+fn left_click(app: &mut App, column: u16, row: u16) {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    app.handle_mouse(&MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::empty(),
+    });
+}
+
+/// Screen row of the first line inside `area` that contains `needle`.
+fn row_showing(buf: &ratatui::buffer::Buffer, area: ratatui::layout::Rect, needle: &str) -> u16 {
+    rect_text(buf, area)
+        .lines()
+        .position(|l| l.contains(needle))
+        .map(|i| area.y + i as u16)
+        .unwrap_or_else(|| panic!("{needle} not shown"))
+}
+
+#[test]
+fn clicking_a_question_selects_it() {
+    let mut app = test_service_app();
+    select_instance(&mut app, "Test");
+    ask(&mut app, "Test._http._tcp.local.", querier(1));
+    ask(&mut app, "Test._http._tcp.local.", querier(2));
+    let raws = service_of(&app, "Test").ordered_answers().len();
+    let buf = render_to_buffer(&app, 120, 40);
+    let area = app.layout.questions_rect.get();
+    // Newest first: querier 1's older question is on the second row.
+    let second = row_showing(&buf, area, &querier(1).ip().to_string());
+
+    left_click(&mut app, area.x + 2, second);
+    assert_eq!(app.view_state.focus, Focus::Questions);
+    assert_eq!(
+        app.view_state.detail_selected,
+        raws + 1,
+        "the cursor lands on the clicked question"
+    );
+
+    // The header row selects nothing.
+    let before = app.view_state.detail_selected;
+    left_click(&mut app, area.x + 2, area.y + 1);
+    assert_eq!(app.view_state.detail_selected, before);
+}
+
 /// Layout budget for the right stack: every pane keeps at least 10%
 /// and leaves at least 10% for the hex pane.
 fn assert_shares(app: &App) {
@@ -914,4 +959,133 @@ fn seam_target(app: &App, mode: DragMode) -> (ratatui::layout::Rect, u16) {
         DragMode::HorizUpper => (app.layout.questions_rect.get(), app.view_state.answers_pct),
         _ => (app.layout.hex_rect.get(), app.view_state.questions_pct),
     }
+}
+
+#[test]
+fn q_esc_and_ctrl_c_quit_also_from_the_metrics_overlay() {
+    use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
+    for (code, ctrl) in [
+        (KeyCode::Char('q'), false),
+        (KeyCode::Esc, false),
+        (KeyCode::Char('c'), true),
+    ] {
+        let mut app = App::new().unwrap();
+        app.handle_key(&KeyEvent {
+            code,
+            modifiers: if ctrl {
+                KeyModifiers::CONTROL
+            } else {
+                KeyModifiers::empty()
+            },
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        });
+        assert!(!app.running, "{code:?} quits");
+    }
+    // In the overlay `Esc` only closes it; `q` still quits.
+    let mut app = App::new().unwrap();
+    app.handle_key(&plain_key(KeyCode::Char('m')));
+    app.handle_key(&plain_key(KeyCode::Esc));
+    assert!(app.running);
+    app.handle_key(&plain_key(KeyCode::Char('m')));
+    app.handle_key(&plain_key(KeyCode::Char('q')));
+    assert!(!app.running);
+}
+
+#[test]
+fn arrow_and_page_keys_move_between_questions() {
+    let mut app = test_service_app();
+    select_instance(&mut app, "Test");
+    for i in 1..=3 {
+        ask(&mut app, "Test._http._tcp.local.", querier(i));
+    }
+    let raws = service_of(&app, "Test").ordered_answers().len();
+    render_to_buffer(&app, 120, 40);
+    // Tab to Answers, again to Questions: the cursor snaps to the first.
+    app.handle_key(&plain_key(KeyCode::Tab));
+    app.handle_key(&plain_key(KeyCode::Tab));
+    assert_eq!(app.view_state.focus, Focus::Questions);
+    assert_eq!(app.view_state.detail_selected, raws);
+
+    app.handle_key(&plain_key(KeyCode::Down));
+    assert_eq!(app.view_state.detail_selected, raws + 1);
+    app.handle_key(&plain_key(KeyCode::Up));
+    assert_eq!(app.view_state.detail_selected, raws);
+    app.handle_key(&plain_key(KeyCode::PageDown));
+    assert_eq!(
+        app.view_state.detail_selected,
+        raws + 2,
+        "a page down stops on the last question"
+    );
+    app.handle_key(&plain_key(KeyCode::PageUp));
+    assert_eq!(
+        app.view_state.detail_selected, raws,
+        "a page up stops on the first question"
+    );
+}
+
+#[test]
+fn cursor_on_an_aged_out_question_parks_on_the_last_answer() {
+    let mut app = test_service_app();
+    select_instance(&mut app, "Test");
+    ask(&mut app, "Test._http._tcp.local.", querier(1));
+    ask(&mut app, "Test._http._tcp.local.", querier(2));
+    let raws = service_of(&app, "Test").ordered_answers().len();
+    render_to_buffer(&app, 120, 40);
+    app.handle_key(&plain_key(KeyCode::Tab));
+    app.handle_key(&plain_key(KeyCode::Tab));
+    // Newest first: querier 1's question is the second one.
+    app.handle_key(&plain_key(KeyCode::Down));
+    assert_eq!(app.view_state.detail_selected, raws + 1);
+
+    let expired = Instant::now()
+        .checked_sub(QUESTION_WINDOW + Duration::from_secs(60))
+        .expect("monotonic clock far enough from boot");
+    for svc in &mut app.services {
+        for q in &mut svc.questions {
+            if q.2 == querier(1) {
+                q.3 = expired;
+            }
+        }
+    }
+    app.evict_expired();
+    app.clamp_selection();
+    assert_eq!(
+        app.view_state.detail_selected,
+        raws - 1,
+        "parked on the last answer, not on the row that moved up"
+    );
+}
+
+#[test]
+fn plus_folds_and_unfolds_the_enumeration_group() {
+    let mut app = app_with_stale_enum_row();
+    let is_enum_row = |it: &DisplayItem| matches!(it, DisplayItem::Enum { .. });
+    let row = app
+        .display_items()
+        .iter()
+        .position(is_enum_row)
+        .expect("an enumeration row");
+    app.view_state.selected_display = row;
+
+    app.handle_key(&plain_key(KeyCode::Char('+')));
+    assert!(
+        !app.display_items().iter().any(is_enum_row),
+        "folded: only the group header is left"
+    );
+    let header = app
+        .display_items()
+        .iter()
+        .position(|it| matches!(it, DisplayItem::Host { label } if label == ENUM_HOST))
+        .expect("enumeration header");
+    assert_eq!(
+        app.view_state.selected_display, header,
+        "cursor on the header"
+    );
+
+    app.handle_key(&plain_key(KeyCode::Char('+')));
+    assert!(
+        app.display_items().iter().any(is_enum_row),
+        "unfolded again"
+    );
 }
