@@ -1,6 +1,8 @@
 // Copyright 2026 hrzlgnm
 // SPDX-License-Identifier: MIT
 
+#![forbid(unsafe_code)]
+
 mod anomalies;
 mod app;
 mod browse;
