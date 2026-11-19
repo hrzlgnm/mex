@@ -9,6 +9,16 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
+Test coverage (CI's informational `📊 Coverage` job does the same and
+attaches `lcov.info` plus an HTML report to the run):
+
+```sh
+rustup component add llvm-tools-preview                  # once
+cargo install --locked cargo-llvm-cov --version 0.9.1    # once, as CI
+cargo llvm-cov --locked --ignore-filename-regex '(^|/)src/.*/tests/' --summary-only
+cargo llvm-cov --locked --ignore-filename-regex '(^|/)src/.*/tests/' --open
+```
+
 No codegen, no external commands. Multicast sockets need no root.
 Headless run (no TTY) logs to stderr.
 

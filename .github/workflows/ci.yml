@@ -179,6 +179,60 @@ jobs:
         shell: bash
         run: cargo test --locked
 
+  # Informational only: not part of CI Status and no threshold, so the
+  # coverage tooling never blocks a merge. Kept apart from `test` and
+  # without sccache, so instrumented objects stay out of the build caches.
+  coverage:
+    name: "📊 Coverage"
+    needs:
+      - changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    env:
+      # Report production code only: tests live in `src/*/tests/`.
+      COVERAGE_IGNORE_REGEX: "(^|/)src/.*/tests/"
+    steps:
+      - name: 🔄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: 🦀 Setup Rust cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          components: llvm-tools-preview
+
+      - name: 🧰 Install cargo-llvm-cov
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: cargo-llvm-cov@0.9.1
+
+      - name: 🧪 Run tests with coverage
+        shell: bash
+        run: cargo llvm-cov --locked --no-report
+
+      - name: 📊 Render coverage reports
+        shell: bash
+        run: |
+          report() { cargo llvm-cov report --ignore-filename-regex "$COVERAGE_IGNORE_REGEX" "$@"; }
+          mkdir -p coverage
+          {
+            echo '## 📊 Coverage'
+            echo
+            echo '```text'
+            report --summary-only
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          report --lcov --output-path coverage/lcov.info
+          report --html --output-dir coverage
+
+      - name: 📤 Upload coverage reports
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage
+          path: coverage/
+          retention-days: 14
+
   build:
     name: "🔨 Build"
     needs:
