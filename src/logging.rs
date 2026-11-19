@@ -333,7 +333,9 @@ mod tests {
 
     #[test]
     fn default_log_dir_respects_xdg_state_home() {
-        // Scoped env override: no other test reads these vars.
+        // Scoped env override, serialized with the other tests that set
+        // these vars.
+        let _guard = TEST_LOG_LOCK.lock().unwrap();
         let tmp = std::env::temp_dir().join(format!("mex-logdir-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let old = std::env::var_os("XDG_STATE_HOME");
@@ -399,5 +401,81 @@ mod tests {
         assert!(logged.contains("sink-probe-xyz"), "got: {logged}");
         assert!(logged.contains("sink-probe-info-xyz"), "got: {logged}");
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Run `f` with `XDG_STATE_HOME` set to `value`, restoring it after.
+    fn with_xdg_state_home<T>(value: &std::ffi::OsStr, f: impl FnOnce() -> T) -> T {
+        let old = std::env::var_os("XDG_STATE_HOME");
+        std::env::set_var("XDG_STATE_HOME", value);
+        let out = f();
+        match old {
+            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+        out
+    }
+
+    #[test]
+    fn default_log_dir_falls_back_to_home_without_xdg_state_home() {
+        let _guard = TEST_LOG_LOCK.lock().unwrap();
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let dir = with_xdg_state_home("".as_ref(), super::default_log_dir);
+        assert_eq!(dir, std::path::PathBuf::from(home).join(".local/state/mex"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_log_write_is_kept_for_the_status_line() {
+        let _guard = TEST_LOG_LOCK.lock().unwrap();
+        let _ = super::take_log_error();
+        // /dev/full opens fine but every write fails with ENOSPC.
+        super::init_logging(Some("/dev/full"), false, None).unwrap();
+        log::warn!("write-failure-probe");
+        let error = super::take_log_error().expect("the failure is kept");
+        assert!(error.starts_with("log write failed: "), "got: {error}");
+        assert_eq!(super::take_log_error(), None, "taken once");
+        // Leave the shared logger silent for the rest of the test binary.
+        super::MexLogger::install(None, false, None);
+    }
+
+    /// A path whose parent is a regular file, so it can never be opened.
+    fn unopenable(tag: &str) -> std::path::PathBuf {
+        let file = std::env::temp_dir().join(format!("mex-notadir-{tag}-{}", std::process::id()));
+        std::fs::write(&file, b"").unwrap();
+        file
+    }
+
+    #[test]
+    fn an_unopenable_log_file_fails_fast() {
+        let _guard = TEST_LOG_LOCK.lock().unwrap();
+        let parent = unopenable("explicit");
+        let path = parent.join("mex.log");
+        let err = super::init_logging(Some(path.to_str().unwrap()), false, None)
+            .expect_err("an explicit bad path is an error");
+        assert!(
+            err.to_string()
+                .starts_with(&format!("cannot open log file {}", path.display())),
+            "got: {err}"
+        );
+        let _ = std::fs::remove_file(&parent);
+    }
+
+    #[test]
+    fn an_unusable_default_log_dir_degrades_instead_of_failing() {
+        let _guard = TEST_LOG_LOCK.lock().unwrap();
+        let parent = unopenable("default");
+        // Headless keeps going on stderr only; the TUI stays silent.
+        with_xdg_state_home(parent.as_os_str(), || {
+            super::init_logging(None, false, None).expect("headless continues");
+            let state = super::LOGGER_STATE.lock().unwrap();
+            assert!(state.file.is_none() && state.stderr, "stderr only");
+        });
+        with_xdg_state_home(parent.as_os_str(), || {
+            super::init_logging(None, true, None).expect("the TUI continues");
+        });
+        super::MexLogger::install(None, false, None);
+        let _ = std::fs::remove_file(&parent);
     }
 }
