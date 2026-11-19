@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.20.5](https://github.com/hrzlgnm/mex/compare/v0.20.4...v0.20.5) (2026-11-19)
+
+
+### Dependencies
+
+* lock file maintenance ([#332](https://github.com/hrzlgnm/mex/issues/332)) ([354c836](https://github.com/hrzlgnm/mex/commit/354c8362a114fa95120bd44ffaf22b10a32bf5b7))
+* update taiki-e/install-action action to v2.90.6 ([#327](https://github.com/hrzlgnm/mex/issues/327)) ([4eb8e27](https://github.com/hrzlgnm/mex/commit/4eb8e27c0818eff7e2477c1afb0c7fc9b207341e))
+
+
+### Code Refactoring
+
+* rename metrics to diagnostics ([#331](https://github.com/hrzlgnm/mex/issues/331)) ([5fc3ea8](https://github.com/hrzlgnm/mex/commit/5fc3ea8bb92cec749fe9b58506d5f0da9ba06af7))
+
+
+### Tests
+
+* raise files below 90% line coverage ([#328](https://github.com/hrzlgnm/mex/issues/328)) ([888a359](https://github.com/hrzlgnm/mex/commit/888a3594b1425bfe2ca831ec1380c2724f339fd8))
+
+
+### Continuous Integration
+
+* report test coverage on every code change ([#324](https://github.com/hrzlgnm/mex/issues/324)) ([b670426](https://github.com/hrzlgnm/mex/commit/b670426c63f75fd3789e48e81a32240ac44d968f))
+
 ## [0.20.4](https://github.com/hrzlgnm/mex/compare/v0.20.3...v0.20.4) (2026-11-19)
 
 
