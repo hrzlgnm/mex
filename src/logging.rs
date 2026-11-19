@@ -331,6 +331,8 @@ mod tests {
         }
     }
 
+    // XDG paths: macOS and Windows use their native log directories.
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     #[test]
     fn default_log_dir_respects_xdg_state_home() {
         let _guard = TEST_LOG_LOCK.lock().unwrap();
@@ -418,6 +420,8 @@ mod tests {
         }
     }
 
+    // XDG paths: macOS and Windows use their native log directories.
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     #[test]
     fn default_log_dir_falls_back_to_home_without_xdg_state_home() {
         let _guard = TEST_LOG_LOCK.lock().unwrap();
@@ -464,6 +468,8 @@ mod tests {
         let _ = std::fs::remove_file(&parent);
     }
 
+    // XDG paths: macOS and Windows use their native log directories.
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     #[test]
     fn an_unusable_default_log_dir_degrades_instead_of_failing() {
         let _guard = TEST_LOG_LOCK.lock().unwrap();
@@ -475,7 +481,13 @@ mod tests {
             let state = super::LOGGER_STATE.lock().unwrap();
             assert!(state.file.is_none() && state.stderr, "stderr only");
         }
+        // The TUI case on its own: from a silent logger, it must stay so.
+        super::MexLogger::install(None, false, None);
         super::init_logging(None, true, None).expect("the TUI continues");
+        {
+            let state = super::LOGGER_STATE.lock().unwrap();
+            assert!(state.file.is_none() && !state.stderr, "silent");
+        }
         super::MexLogger::install(None, false, None);
         let _ = std::fs::remove_file(&parent);
     }

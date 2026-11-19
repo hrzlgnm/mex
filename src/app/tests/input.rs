@@ -981,6 +981,14 @@ fn q_esc_and_ctrl_c_quit_also_from_the_metrics_overlay() {
     app.handle_key(&plain_key(KeyCode::Char('m')));
     app.handle_key(&plain_key(KeyCode::Char('q')));
     assert!(!app.running);
+    let mut app = App::new().unwrap();
+    app.handle_key(&plain_key(KeyCode::Char('m')));
+    press_with(
+        &mut app,
+        KeyCode::Char('c'),
+        crossterm::event::KeyModifiers::CONTROL,
+    );
+    assert!(!app.running, "Ctrl+C quits from the overlay");
 }
 
 #[test]

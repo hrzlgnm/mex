@@ -609,6 +609,7 @@ fn metrics_overlay_pans_long_values_and_resets() {
     // The positions compared below must look different on screen.
     assert_ne!(shown_from(0), shown_from(4));
     assert_ne!(shown_from(4), shown_from(5));
+    assert_ne!(shown_from(4), shown_from(14));
     assert!(shows_row(&screen(&app, 40, 40), "bytes", &shown_from(0)));
 
     for _ in 0..4 {
@@ -626,6 +627,10 @@ fn metrics_overlay_pans_long_values_and_resets() {
     );
 
     press_with(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+    assert!(
+        shows_row(&screen(&app, 40, 40), "bytes", &shown_from(14)),
+        "Ctrl pans ten right"
+    );
     press_with(&mut app, KeyCode::Left, KeyModifiers::CONTROL);
     assert!(
         shows_row(&screen(&app, 40, 40), "bytes", &shown_from(4)),
