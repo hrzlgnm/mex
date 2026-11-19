@@ -706,3 +706,49 @@ fn name_with_invalid_label() -> simple_dns::Name<'static> {
     );
     simple_dns::Name::new_with_labels(labels)
 }
+
+/// Wire bytes of one `a.local` record of `rtype` whose RDATA is the name
+/// `b.local`, with `rdlength` written as given.
+fn name_record_wire(rtype: u16, rdlength: u16) -> Vec<u8> {
+    let name = |first: u8| [&[1, first][..], &[5][..], b"local", &[0][..]].concat();
+    let mut wire = name(b'a');
+    wire.extend_from_slice(&rtype.to_be_bytes());
+    wire.extend_from_slice(&1u16.to_be_bytes()); // IN
+    wire.extend_from_slice(&120u32.to_be_bytes());
+    wire.extend_from_slice(&rdlength.to_be_bytes());
+    wire.extend(name(b'b'));
+    wire
+}
+
+#[test]
+fn ns_and_cname_targets_get_their_own_field() {
+    // 9-byte owner, 10 bytes of type/class/TTL/length, 9-byte target.
+    for (rtype, label) in [(2, "Name server"), (5, "Canonical name")] {
+        let fields = record_fields(&name_record_wire(rtype, 9), rtype);
+        let target = fields.last().expect("fields");
+        assert_eq!(
+            (target.label.as_str(), target.start, target.end),
+            (label, 19, 28),
+            "rtype {rtype}"
+        );
+    }
+}
+
+#[test]
+fn inconsistent_record_wire_is_one_whole_field() {
+    let whole = |wire: &[u8]| {
+        let fields = record_fields(wire, 5);
+        assert_eq!(fields.len(), 1, "got {fields:?}");
+        assert_eq!(
+            (fields[0].label.as_str(), fields[0].start, fields[0].end),
+            ("Record", 0, wire.len())
+        );
+    };
+    // RDATA length disagrees with the bytes present.
+    whole(&name_record_wire(5, 8));
+    // Header cut off after the owner name and type.
+    whole(&name_record_wire(5, 9)[..11]);
+    // Owner name never terminates.
+    whole(&[3, b'a', b'b']);
+    assert!(record_fields(&[], 5).is_empty(), "nothing to show");
+}

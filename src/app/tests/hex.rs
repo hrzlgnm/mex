@@ -930,6 +930,13 @@ fn hex_pane_scrolls_and_resets() {
     assert_eq!(app.layout.hex_offset.get(), 1);
     app.handle_key(&plain(KeyCode::Char(' ')));
     assert_eq!(app.layout.hex_offset.get(), 11);
+    // And back: a line with `k`, a page with PageUp.
+    app.handle_key(&plain(KeyCode::Char('k')));
+    assert_eq!(app.layout.hex_offset.get(), 10);
+    app.handle_key(&plain(KeyCode::PageUp));
+    assert_eq!(app.layout.hex_offset.get(), 0);
+    app.handle_key(&plain(KeyCode::Down));
+    assert_eq!(app.layout.hex_offset.get(), 1);
     app.handle_key(&plain(KeyCode::Home));
     assert_eq!(app.layout.hex_offset.get(), 0);
     app.handle_key(&plain(KeyCode::End));

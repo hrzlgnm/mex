@@ -301,3 +301,82 @@ fn enumeration_ptr_with_overlong_subtype_flags_row() {
         .iter()
         .any(|a| a.kind == AnomalyKind::TypeFormat && a.service == "enumeration"));
 }
+
+/// Findings for one `_services._dns-sd._udp.local` PTR pointing at
+/// `target`; `wire` overrides the target's raw labels (`None` drops
+/// them, as for records without wire data).
+fn enumeration_findings(target: &str, wire: Option<Option<Vec<Vec<u8>>>>) -> Vec<Anomaly> {
+    let mut enum_rec = rec(
+        "_services._dns-sd._udp.local.",
+        12,
+        "PTR",
+        &format!("{target}."),
+        4500,
+        false,
+    );
+    if let Some(labels) = wire {
+        enum_rec.ptr_target_labels = labels;
+    }
+    let snap = Snapshot {
+        services: Vec::new(),
+        enum_answers: vec![&enum_rec],
+        pending_hosts: HashSet::new(),
+        questions: Vec::new(),
+        sightings: Vec::new(),
+        host_addresses: Vec::new(),
+        device_names: HashMap::new(),
+    };
+    analyze(&snap)
+}
+
+#[test]
+fn enumerated_types_name_the_rule_they_break() {
+    let not_local = "must end in .local (RFC 6762 §3)";
+    let bad_proto = "protocol must be _tcp or _udp";
+    let bad_shape = "expected _service._tcp.local or subtype._sub._service._tcp.local";
+    for (target, reason) in [
+        ("_http._tcp.example", not_local),
+        ("_printer._sub._http._sctp.local", bad_proto),
+        ("_printer._sub._http._tcp.example", not_local),
+        ("_printer._xub._http._tcp.local", bad_shape),
+    ] {
+        let found = enumeration_findings(target, None);
+        let message = found
+            .iter()
+            .find(|a| a.kind == AnomalyKind::TypeFormat)
+            .unwrap_or_else(|| panic!("{target} should be flagged, got {found:?}"))
+            .message
+            .clone();
+        assert_eq!(message, format!("bad enumerated type {target}: {reason}"));
+    }
+    // A bad service label inside a subtype target is flagged too.
+    let found = enumeration_findings("_printer._sub._-bad._tcp.local", None);
+    assert!(found.iter().any(|a| a.kind == AnomalyKind::TypeFormat));
+}
+
+#[test]
+fn enumerated_non_ascii_service_label_is_flagged() {
+    let labels = vec![b"_h\xfftp".to_vec(), b"_tcp".to_vec(), b"local".to_vec()];
+    let found = enumeration_findings("_h?tp._tcp.local", Some(Some(labels)));
+    let finding = found
+        .iter()
+        .find(|a| a.kind == AnomalyKind::TypeFormat)
+        .expect("type-format finding");
+    assert!(
+        finding.message.ends_with(": service label must be ASCII"),
+        "got: {}",
+        finding.message
+    );
+}
+
+#[test]
+fn enumerated_subtype_without_wire_labels_is_still_recognized() {
+    // Records without raw target labels fall back to the text form.
+    let found = enumeration_findings("_printer._sub._http._tcp.local", Some(None));
+    assert!(
+        found.iter().any(|a| a.kind == AnomalyKind::EnumSubtype),
+        "got: {found:?}"
+    );
+    let found = enumeration_findings("_http._tcp.local", Some(None));
+    assert!(found.is_empty(), "a base type stays quiet, got: {found:?}");
+}

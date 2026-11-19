@@ -29,8 +29,16 @@ fn status_popup_shows_while_fresh() {
     use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
     let mut app = App::new().unwrap();
     assert!(app.status_popup().is_none());
-    app.status_msg = Some(("hello".to_string(), Instant::now()));
-    assert_eq!(app.status_popup().as_deref(), Some("hello"));
+    let shown = |app: &App, text: &str| screen(app, 100, 30).iter().any(|l| l.contains(text));
+    let msg = "Dump saved: probe-popup.json";
+    assert!(!shown(&app, msg));
+    app.status_msg = Some((msg.to_string(), Instant::now()));
+    assert_eq!(app.status_popup().as_deref(), Some(msg));
+    assert!(shown(&app, msg), "drawn while fresh");
+    // Expired after 3 s even without a key.
+    app.status_msg = Some((msg.to_string(), Instant::now() - Duration::from_secs(4)));
+    assert!(!shown(&app, msg), "gone after 3 s");
+    app.status_msg = Some((msg.to_string(), Instant::now()));
     // Any key dismisses it.
     let plain = KeyEvent {
         code: KeyCode::Char('x'),
@@ -40,6 +48,7 @@ fn status_popup_shows_while_fresh() {
     };
     app.handle_key(&plain);
     assert!(app.status_popup().is_none());
+    assert!(!shown(&app, msg), "dismissed by a key");
 }
 
 #[test]

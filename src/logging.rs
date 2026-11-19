@@ -331,20 +331,14 @@ mod tests {
         }
     }
 
+    // XDG paths: macOS and Windows use their native log directories.
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     #[test]
     fn default_log_dir_respects_xdg_state_home() {
-        // Scoped env override: no other test reads these vars.
+        let _guard = TEST_LOG_LOCK.lock().unwrap();
         let tmp = std::env::temp_dir().join(format!("mex-logdir-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let old = std::env::var_os("XDG_STATE_HOME");
-        std::env::set_var("XDG_STATE_HOME", &tmp);
-        let dir = super::default_log_dir();
-        match old {
-            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-            None => std::env::remove_var("XDG_STATE_HOME"),
-        }
-        assert_eq!(dir, tmp.join("mex"));
-        assert!(dir.ends_with("mex"));
+        let _xdg = EnvVarGuard::set("XDG_STATE_HOME", tmp.as_os_str());
+        assert_eq!(super::default_log_dir(), tmp.join("mex"));
     }
 
     #[test]
@@ -399,5 +393,106 @@ mod tests {
         assert!(logged.contains("sink-probe-xyz"), "got: {logged}");
         assert!(logged.contains("sink-probe-info-xyz"), "got: {logged}");
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Only the XDG tests below use it (not built for macOS or Windows).
+    /// Sets an environment variable for one test and restores it on
+    /// drop, also when an assertion fails. Hold `TEST_LOG_LOCK` while it
+    /// lives: no other test reads these variables without it.
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    struct EnvVarGuard {
+        name: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &std::ffi::OsStr) -> Self {
+            let old = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, old }
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(v) => std::env::set_var(self.name, v),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
+    // XDG paths: macOS and Windows use their native log directories.
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[test]
+    fn default_log_dir_falls_back_to_home_without_xdg_state_home() {
+        let _guard = TEST_LOG_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!("mex-home-{}", std::process::id()));
+        let _home = EnvVarGuard::set("HOME", home.as_os_str());
+        let _xdg = EnvVarGuard::set("XDG_STATE_HOME", "".as_ref());
+        assert_eq!(super::default_log_dir(), home.join(".local/state/mex"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_log_write_is_kept_for_the_status_line() {
+        let _guard = TEST_LOG_LOCK.lock().unwrap();
+        let _ = super::take_log_error();
+        // /dev/full opens fine but every write fails with ENOSPC.
+        super::init_logging(Some("/dev/full"), false, None).unwrap();
+        log::warn!("write-failure-probe");
+        let error = super::take_log_error().expect("the failure is kept");
+        assert!(error.starts_with("log write failed: "), "got: {error}");
+        assert_eq!(super::take_log_error(), None, "taken once");
+        // Leave the shared logger silent for the rest of the test binary.
+        super::MexLogger::install(None, false, None);
+    }
+
+    /// A path whose parent is a regular file, so it can never be opened.
+    fn unopenable(tag: &str) -> std::path::PathBuf {
+        let file = std::env::temp_dir().join(format!("mex-notadir-{tag}-{}", std::process::id()));
+        std::fs::write(&file, b"").unwrap();
+        file
+    }
+
+    #[test]
+    fn an_unopenable_log_file_fails_fast() {
+        let _guard = TEST_LOG_LOCK.lock().unwrap();
+        let parent = unopenable("explicit");
+        let path = parent.join("mex.log");
+        let err = super::init_logging(Some(path.to_str().unwrap()), false, None)
+            .expect_err("an explicit bad path is an error");
+        assert!(
+            err.to_string()
+                .starts_with(&format!("cannot open log file {}", path.display())),
+            "got: {err}"
+        );
+        let _ = std::fs::remove_file(&parent);
+    }
+
+    // XDG paths: macOS and Windows use their native log directories.
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[test]
+    fn an_unusable_default_log_dir_degrades_instead_of_failing() {
+        let _guard = TEST_LOG_LOCK.lock().unwrap();
+        let parent = unopenable("default");
+        let _xdg = EnvVarGuard::set("XDG_STATE_HOME", parent.as_os_str());
+        // Headless keeps going on stderr only; the TUI stays silent.
+        super::init_logging(None, false, None).expect("headless continues");
+        {
+            let state = super::LOGGER_STATE.lock().unwrap();
+            assert!(state.file.is_none() && state.stderr, "stderr only");
+        }
+        // The TUI case on its own: from a silent logger, it must stay so.
+        super::MexLogger::install(None, false, None);
+        super::init_logging(None, true, None).expect("the TUI continues");
+        {
+            let state = super::LOGGER_STATE.lock().unwrap();
+            assert!(state.file.is_none() && !state.stderr, "silent");
+        }
+        super::MexLogger::install(None, false, None);
+        let _ = std::fs::remove_file(&parent);
     }
 }
