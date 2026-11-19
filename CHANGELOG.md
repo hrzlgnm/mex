@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.20.4](https://github.com/hrzlgnm/mex/compare/v0.20.3...v0.20.4) (2026-11-19)
+
+
+### Bug Fixes
+
+* stop the listener when the app drops its query sender ([#321](https://github.com/hrzlgnm/mex/issues/321)) ([e41579a](https://github.com/hrzlgnm/mex/commit/e41579ab302c3fb372c6d728012c5a121215050a))
+
 ## [0.20.3](https://github.com/hrzlgnm/mex/compare/v0.20.2...v0.20.3) (2026-11-18)
 
 
