@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.22.0](https://github.com/hrzlgnm/mex/compare/v0.21.0...v0.22.0) (2026-11-20)
+
+
+### Features
+
+* **ui:** emphasize the focused pane with a thick border ([#340](https://github.com/hrzlgnm/mex/issues/340)) ([a1838e2](https://github.com/hrzlgnm/mex/commit/a1838e28075043ed28ceaa4fefedab843d9b3388))
+
 ## [0.21.0](https://github.com/hrzlgnm/mex/compare/v0.20.5...v0.21.0) (2026-11-20)
 
 
