@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.21.0](https://github.com/hrzlgnm/mex/compare/v0.20.5...v0.21.0) (2026-11-20)
+
+
+### Features
+
+* show rusage and memory in diagnostics ([#338](https://github.com/hrzlgnm/mex/issues/338)) ([3020ad7](https://github.com/hrzlgnm/mex/commit/3020ad76380c3adf510b1c346a57894bfe099621))
+
+
+### Dependencies
+
+* lock file maintenance ([#339](https://github.com/hrzlgnm/mex/issues/339)) ([b07adbb](https://github.com/hrzlgnm/mex/commit/b07adbb5cf9e9d1711df63f74c4de77b27014654))
+* update rust crate clap to v4.6.9 ([#333](https://github.com/hrzlgnm/mex/issues/333)) ([07d9c16](https://github.com/hrzlgnm/mex/commit/07d9c16f7ec90508b009c1eec2f7a0b2d252a9a9))
+
+
+### Continuous Integration
+
+* add Codecov test coverage badge to README ([#336](https://github.com/hrzlgnm/mex/issues/336)) ([39939d2](https://github.com/hrzlgnm/mex/commit/39939d29b2819c0245ff453ceef6949955e0fd13))
+
 ## [0.20.5](https://github.com/hrzlgnm/mex/compare/v0.20.4...v0.20.5) (2026-11-19)
 
 
