@@ -188,6 +188,9 @@ jobs:
       - changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # Needed to checkout code
+      id-token: write # Needed for tokenless Codecov upload via GitHub OIDC
     env:
       # Report production code only: tests live in `src/*/tests/`.
       COVERAGE_IGNORE_REGEX: "(^|/)src/.*/tests/"
@@ -232,6 +235,16 @@ jobs:
           name: coverage
           path: coverage/
           retention-days: 14
+
+      # Best-effort: coverage stays informational and never gates CI. The
+      # action skips OIDC on fork PRs, where the badge still reflects main.
+      - name: 📊 Upload coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          use_oidc: true
+          files: coverage/lcov.info
+          disable_search: true
+          fail_ci_if_error: false
 
   build:
     name: "🔨 Build"
