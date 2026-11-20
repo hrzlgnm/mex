@@ -8,6 +8,7 @@
 [![AUR Version](https://img.shields.io/aur/version/mex)](https://aur.archlinux.org/packages/mex)
 [![License: MIT](https://img.shields.io/github/license/hrzlgnm/mex)](https://github.com/hrzlgnm/mex/blob/main/LICENSE)
 [![Build Status](https://img.shields.io/github/actions/workflow/status/hrzlgnm/mex/ci.yml)](https://github.com/hrzlgnm/mex/actions)
+[![Test Coverage](https://codecov.io/gh/hrzlgnm/mex/branch/main/graph/badge.svg)](https://codecov.io/gh/hrzlgnm/mex)
 
 <p align="center">
   <img src="packaging/linux/mex.svg" width="128" height="128" alt="mex icon">
