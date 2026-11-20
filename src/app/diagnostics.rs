@@ -435,6 +435,16 @@ impl App {
             kv(&mut rows, &format!("talker {src}"), format!("{count} pkts"));
         }
 
+        // mex's own cost, sampled live per open frame (one cheap
+        // rusage read plus a small procfs read on Linux): the network
+        // sections above, then the tool. Nothing measurable
+        // (Windows): no section at all.
+        let process = rusage::rows(&rusage::sample());
+        if !process.is_empty() {
+            section(&mut rows, "Process");
+            rows.extend(process);
+        }
+
         // Anomalies last: only the session-wide summary. Each finding
         // sits next to its owner in the main panes (#248), and `Ctrl+J`
         // dumps the full list.

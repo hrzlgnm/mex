@@ -158,7 +158,7 @@ browsed as before.
 | `*` | collapse all host groups / unfold all |
 | `Ctrl+↑/↓`, `Ctrl+k`, `Shift+↑/↓`, `J` / `K` | scroll Answers viewport freely (Hex viewport when Hex focused) |
 | `Ctrl+J` | dump mex state to JSON, `<timestamp>-mex-<version>.json` (experimental; redaction is heuristic, review before sharing) |
-| `d` | diagnostics overlay (traffic, discovery, queries, links) |
+| `d` | diagnostics overlay (traffic, discovery, queries, links, process) |
 | `q` / `Esc` / `Ctrl+C` | quit (`d` / `Esc` closes the overlay first) |
 | `Ctrl+Z` (unix) | suspend to shell (`fg` resumes) |
 | mouse drag on pane borders | resize panes |

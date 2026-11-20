@@ -1421,6 +1421,7 @@ mod ingest;
 mod input;
 mod layout;
 mod questions;
+mod rusage;
 mod schedule;
 mod sightings;
 mod state_dump;

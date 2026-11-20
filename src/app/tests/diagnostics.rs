@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 use super::*;
+use crate::app::rusage;
 
 #[test]
 fn diagnostics_hosts_exclude_enumeration_group() {
@@ -202,18 +203,34 @@ fn diagnostics_rows_has_all_sections() {
     ingest(&mut app, &ptr_record(120));
     ingest(&mut app, &srv_record(120));
     let rows = app.diagnostics_rows();
-    let headers: Vec<&str> = rows
+    // mex's own cost sits between the network sections and the
+    // anomalies summary. Nothing measurable — Windows, or a failed
+    // rusage read (a supported degrade) — means no section at all,
+    // so the expectations follow the live sample instead of
+    // assuming it.
+    let process = rusage::rows(&rusage::sample());
+    let mut headers = vec!["Session", "Discovery", "Queries", "Links"];
+    if !process.is_empty() {
+        headers.push("Process");
+    }
+    headers.push("Anomalies");
+    let shown: Vec<&str> = rows
         .iter()
         .filter(|(_, v)| v.is_empty())
         .map(|(k, _)| k.as_str())
         .collect();
-    assert_eq!(
-        headers,
-        vec!["Session", "Discovery", "Queries", "Links", "Anomalies"]
-    );
+    assert_eq!(shown, headers);
     assert!(rows.iter().any(|(k, _)| k == "packets"));
     assert!(rows.iter().any(|(k, _)| k == "sent"));
     assert!(rows.iter().any(|(k, _)| k == "usable v4"));
+    if !process.is_empty() {
+        for key in ["cpu", "memory", "page faults", "ctx switches"] {
+            assert!(
+                rows.iter().any(|(k, _)| k == key),
+                "missing Process row {key}"
+            );
+        }
+    }
 }
 
 #[test]

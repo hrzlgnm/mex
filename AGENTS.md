@@ -82,7 +82,9 @@ Headless run (no TTY) logs to stderr.
   (record handlers, `push_record`, goodbyes), `denials`, `sightings`,
   `questions` (question routing), `input` (keys, mouse, selection),
   `view` (read-only accessors for `ui`; `App` has no public fields), `diagnostics`, `findings`
-  (analyzer snapshot), `state_dump`. `app.rs` keeps the types, constants,
+  (analyzer snapshot), `state_dump`, `rusage` (mex's own process cost:
+  rusage plus current-memory sample, pure rows and dump entries).
+  `app.rs` keeps the types, constants,
   free helpers, construction, run loops and eviction. Child-module
   methods are `pub(super)` (same reach as a private `app` method).
   Its tests live in `src/app/tests/`: shared fixtures in `mod.rs`, one
