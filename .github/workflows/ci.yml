@@ -240,6 +240,7 @@ jobs:
       # action skips OIDC on fork PRs, where the badge still reflects main.
       - name: 📊 Upload coverage to Codecov
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        continue-on-error: true # Also covers failures before the upload step (e.g. OIDC token retrieval)
         with:
           use_oidc: true
           files: coverage/lcov.info
