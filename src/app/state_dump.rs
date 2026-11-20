@@ -298,6 +298,11 @@ impl App {
             "malformed_packets".to_string(),
             self.drop_stats.malformed_total(),
         );
+        // mex's own process cost: `dump_entries` inserts a key only
+        // where the platform measures it.
+        for (key, value) in rusage::dump_entries(&rusage::sample()) {
+            diagnostics.insert(key.to_string(), value);
+        }
         dump::StateDump {
             metadata: dump::Metadata {
                 dump_timestamp: dump::dump_timestamp_iso(),

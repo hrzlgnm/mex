@@ -18,6 +18,7 @@ mod per_link_copies;
 mod per_nic_answers;
 mod question_window;
 mod questions;
+mod rusage;
 mod schedule;
 mod scheduler;
 mod srv_target;
