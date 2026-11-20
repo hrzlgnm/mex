@@ -10,7 +10,23 @@ pub(super) fn draw_questions_tab(
     found: &[Anomaly],
 ) {
     let Some(target) = app.display_detail() else {
-        let empty = Paragraph::new("No service selected").style(Style::default().fg(Color::Gray));
+        // Same empty-state treatment as Answers: the pane stays a Tab stop,
+        // so its focus/resize cues must survive an empty target.
+        let focused = app.view_state().focus == Focus::Questions;
+        let empty = Paragraph::new("No service selected")
+            .style(Style::default().fg(Color::Gray))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(pane_border_type(focused))
+                    .title(" Questions ")
+                    .border_style(border_color(
+                        focused,
+                        resize_active(app, DragMode::Vertical)
+                            || resize_active(app, DragMode::HorizUpper)
+                            || resize_active(app, DragMode::HorizLower),
+                    )),
+            );
         frame.render_widget(empty, area);
         return;
     };
@@ -177,6 +193,7 @@ pub(super) fn draw_questions_tab(
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(pane_border_type(app.view_state().focus == Focus::Questions))
                 .title(Line::from(
                     std::iter::once(Span::raw(format!(" Questions: {} ", target.pane_ident())))
                         .chain(title_count_spans(shown))

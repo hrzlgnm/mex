@@ -158,6 +158,7 @@ pub(super) fn draw_service_list(
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(pane_border_type(app.view_state().focus == Focus::Services))
                 .title(title)
                 .border_style(border_color(
                     app.view_state().focus == Focus::Services,

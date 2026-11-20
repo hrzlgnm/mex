@@ -211,6 +211,57 @@ fn tiny_terminal_renders_every_right_pane() {
 }
 
 #[test]
+fn empty_right_panes_keep_focus_border() {
+    let mut app = App::new().unwrap();
+    assert!(
+        app.display_detail().is_none(),
+        "a fresh app exercises the right-pane empty states"
+    );
+    let rect_for = |app: &App, focus: Focus| {
+        let layout = &app.layout;
+        match focus {
+            Focus::Answers => layout.answers_rect.get(),
+            Focus::Questions => layout.questions_rect.get(),
+            Focus::Hex => layout.hex_rect.get(),
+            Focus::Services => unreachable!(),
+        }
+    };
+    // Each empty-state branch must keep a border so the focus cue survives
+    // when there is no target/packet to draw.
+    for focus in [Focus::Answers, Focus::Questions, Focus::Hex] {
+        app.view_state.focus = focus;
+        let buf = render_to_buffer(&app, 100, 30);
+        let area = rect_for(&app, focus);
+        let corner = buf
+            .cell((area.x, area.y))
+            .map(|c| c.symbol())
+            .unwrap_or_default();
+        assert_eq!(
+            corner, "┏",
+            "{focus:?} empty state must have a thick border"
+        );
+        assert!(
+            rect_text(&buf, area).contains(&format!("{focus:?}")),
+            "{focus:?} empty state must keep its title"
+        );
+    }
+    // Unfocused empty panes revert to the light border.
+    app.view_state.focus = Focus::Services;
+    let buf = render_to_buffer(&app, 100, 30);
+    for focus in [Focus::Answers, Focus::Questions, Focus::Hex] {
+        let area = rect_for(&app, focus);
+        let corner = buf
+            .cell((area.x, area.y))
+            .map(|c| c.symbol())
+            .unwrap_or_default();
+        assert_eq!(
+            corner, "┌",
+            "{focus:?} empty state must have a plain border"
+        );
+    }
+}
+
+#[test]
 fn synthetic_rows_and_hostnames_render_italic() {
     use ratatui::style::Modifier;
     let app = two_group_app();

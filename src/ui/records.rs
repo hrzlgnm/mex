@@ -23,7 +23,22 @@ pub(super) fn draw_records_tab(
     found: &[Anomaly],
 ) {
     let Some(target) = app.display_detail() else {
-        let empty = Paragraph::new("No service selected").style(Style::default().fg(Color::Gray));
+        // Keep the focus/resize cues even with nothing to show: the pane is
+        // still a Tab stop, so it must keep its border when focused.
+        let focused = app.view_state().focus == Focus::Answers;
+        let empty = Paragraph::new("No service selected")
+            .style(Style::default().fg(Color::Gray))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(pane_border_type(focused))
+                    .title(" Answers ")
+                    .border_style(border_color(
+                        focused,
+                        resize_active(app, DragMode::Vertical)
+                            || resize_active(app, DragMode::HorizUpper),
+                    )),
+            );
         frame.render_widget(empty, area);
         return;
     };
@@ -98,6 +113,7 @@ pub(super) fn draw_records_tab(
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(pane_border_type(app.view_state().focus == Focus::Answers))
                 .title(Line::from(title_spans))
                 .border_style(border_color(
                     app.view_state().focus == Focus::Answers,

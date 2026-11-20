@@ -58,16 +58,29 @@ pub(super) fn draw_hex_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: 
             )
         } else {
             // In-pane focus cue (the hex pane has no cursor to highlight):
-            // the body text goes bold while focused. The border already
-            // brightens, but that alone is easy to miss when tabbing panes.
-            let empty_style = if app.view_state().focus == Focus::Hex {
+            // the body text goes bold while focused, and the pane keeps its
+            // border (thick + bright when focused) like every other Tab stop.
+            let focused = app.view_state().focus == Focus::Hex;
+            let empty_style = if focused {
                 Style::default()
                     .fg(Color::Gray)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Gray)
             };
-            let empty = Paragraph::new("No raw packet data available").style(empty_style);
+            let empty = Paragraph::new("No raw packet data available")
+                .style(empty_style)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(pane_border_type(focused))
+                        .title(" Hex ")
+                        .border_style(border_color(
+                            focused,
+                            resize_active(app, DragMode::Vertical)
+                                || resize_active(app, DragMode::HorizLower),
+                        )),
+                );
             frame.render_widget(empty, area);
             app.layout().hex_field_hits.borrow_mut().clear();
             return;
@@ -119,6 +132,7 @@ pub(super) fn draw_hex_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: 
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(pane_border_type(app.view_state().focus == Focus::Hex))
                 .title(title)
                 .border_style(border_color(
                     app.view_state().focus == Focus::Hex,
