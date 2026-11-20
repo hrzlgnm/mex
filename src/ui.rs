@@ -15,8 +15,8 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Row,
-    Table, TableState, Wrap,
+    Block, BorderType, Borders, Cell, Clear, HighlightSpacing, List, ListItem, ListState,
+    Paragraph, Row, Table, TableState, Wrap,
 };
 use ratatui::Frame;
 
@@ -418,6 +418,17 @@ fn draw_detail_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App, 
     draw_hex_tab(frame, panes[2], app);
 }
 
+/// Focused panes get heavy box-drawing borders so the active pane stands out
+/// at a glance; unfocused panes keep the light default. The border still
+/// occupies a single cell, so no layout space is lost to the emphasis.
+fn pane_border_type(focused: bool) -> BorderType {
+    if focused {
+        BorderType::Thick
+    } else {
+        BorderType::Plain
+    }
+}
+
 /// Border color: resize hover/drag wins (subtle cyan seam) over focus white.
 fn border_color(focused: bool, resizing: bool) -> Style {
     Style::default().fg(if resizing {
@@ -607,6 +618,12 @@ mod tests {
         assert_eq!(clamp_scroll(100, 50, 10), 40);
         assert_eq!(clamp_scroll(7, 5, 10), 0);
         assert_eq!(clamp_scroll(3, 50, 0), 0);
+    }
+
+    #[test]
+    fn focused_pane_gets_thick_border() {
+        assert_eq!(pane_border_type(true), BorderType::Thick);
+        assert_eq!(pane_border_type(false), BorderType::Plain);
     }
 
     #[test]

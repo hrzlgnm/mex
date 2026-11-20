@@ -177,6 +177,7 @@ pub(super) fn draw_questions_tab(
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(pane_border_type(app.view_state().focus == Focus::Questions))
                 .title(Line::from(
                     std::iter::once(Span::raw(format!(" Questions: {} ", target.pane_ident())))
                         .chain(title_count_spans(shown))

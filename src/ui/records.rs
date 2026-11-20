@@ -98,6 +98,7 @@ pub(super) fn draw_records_tab(
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(pane_border_type(app.view_state().focus == Focus::Answers))
                 .title(Line::from(title_spans))
                 .border_style(border_color(
                     app.view_state().focus == Focus::Answers,

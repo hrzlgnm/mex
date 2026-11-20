@@ -180,7 +180,8 @@ fn cursor_skips_finding_rows() {
                 .collect::<String>()
         })
         .collect();
-    assert!(reversed.starts_with("│SRV"), "highlighted: {reversed}");
+    // Answers holds focus here, so its border is the heavy `┃` glyph.
+    assert!(reversed.starts_with("┃SRV"), "highlighted: {reversed}");
 }
 
 #[test]

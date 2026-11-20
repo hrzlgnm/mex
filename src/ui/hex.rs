@@ -119,6 +119,7 @@ pub(super) fn draw_hex_tab(frame: &mut Frame, area: ratatui::layout::Rect, app: 
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(pane_border_type(app.view_state().focus == Focus::Hex))
                 .title(title)
                 .border_style(border_color(
                     app.view_state().focus == Focus::Hex,
