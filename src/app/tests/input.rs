@@ -509,26 +509,7 @@ fn mouse_drag_moves_splits_with_clamp() {
 
 #[test]
 fn mouse_down_drag_sequence_moves_seams() {
-    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     let mut app = App::new().unwrap();
-    let down = |column, row| MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column,
-        row,
-        modifiers: KeyModifiers::empty(),
-    };
-    let drag = |column, row| MouseEvent {
-        kind: MouseEventKind::Drag(MouseButton::Left),
-        column,
-        row,
-        modifiers: KeyModifiers::empty(),
-    };
-    let up = || MouseEvent {
-        kind: MouseEventKind::Up(MouseButton::Left),
-        column: 40,
-        row: 20,
-        modifiers: KeyModifiers::empty(),
-    };
     // Seams come from the computed layout: the top border row of
     // the lower pane is always a grab zone.
     for mode in [DragMode::HorizUpper, DragMode::HorizLower] {
@@ -537,14 +518,14 @@ fn mouse_down_drag_sequence_moves_seams() {
         render_to_buffer(&app, 100, 40);
         let (lower, before) = seam_target(&app, mode);
         assert!(lower.height > 2, "pane needs a grabbable border");
-        app.handle_mouse(&down(lower.x + 5, lower.y));
+        app.handle_mouse(&mouse_down(lower.x + 5, lower.y));
         assert_eq!(app.view_state.drag, mode);
-        app.handle_mouse(&drag(lower.x + 5, lower.y + 6));
+        app.handle_mouse(&mouse_drag(lower.x + 5, lower.y + 6));
         assert!(
             seam_target(&app, mode).1 > before,
             "{mode:?} drag must grow its share"
         );
-        app.handle_mouse(&up());
+        app.handle_mouse(&mouse_up(40, 20));
         assert_eq!(app.view_state.drag, DragMode::None);
         assert_shares(&app);
     }
@@ -558,17 +539,17 @@ fn mouse_down_drag_sequence_moves_seams() {
     // Lower seam slammed to the bottom: questions pins at its max,
     // leaving hex its 10%.
     let (hex_top, _) = seam_target(&app, DragMode::HorizLower);
-    app.handle_mouse(&down(hex_top.x + 5, hex_top.y));
+    app.handle_mouse(&mouse_down(hex_top.x + 5, hex_top.y));
     assert_eq!(app.view_state.drag, DragMode::HorizLower);
-    app.handle_mouse(&drag(hex_top.x + 5, bottom));
+    app.handle_mouse(&mouse_drag(hex_top.x + 5, bottom));
     assert_eq!(app.view_state.drag, DragMode::HorizLower);
     assert_eq!(app.view_state.questions_pct, 60);
     assert_eq!(app.view_state.answers_pct, 30);
     // Upper seam slammed to the top: answers pins at 10%.
     let (questions_top, _) = seam_target(&app, DragMode::HorizUpper);
-    app.handle_mouse(&down(questions_top.x + 5, questions_top.y));
+    app.handle_mouse(&mouse_down(questions_top.x + 5, questions_top.y));
     assert_eq!(app.view_state.drag, DragMode::HorizUpper);
-    app.handle_mouse(&drag(questions_top.x + 5, right.y));
+    app.handle_mouse(&mouse_drag(questions_top.x + 5, right.y));
     assert_eq!(app.view_state.answers_pct, 10);
     assert_shares(&app);
 }
@@ -579,60 +560,32 @@ fn mouse_down_drag_sequence_moves_seams() {
 /// resyncs it). Release on a seam keeps the legitimate hover.
 #[test]
 fn mouse_up_resets_hover_from_release_point() {
-    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     let mut app = two_group_app();
-    let down = |column, row| MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column,
-        row,
-        modifiers: KeyModifiers::empty(),
-    };
-    let drag = |column, row| MouseEvent {
-        kind: MouseEventKind::Drag(MouseButton::Left),
-        column,
-        row,
-        modifiers: KeyModifiers::empty(),
-    };
-    let up = |column, row| MouseEvent {
-        kind: MouseEventKind::Up(MouseButton::Left),
-        column,
-        row,
-        modifiers: KeyModifiers::empty(),
-    };
-    // Grab cell of each seam under the current layout.
-    let grab_cell = |app: &App, mode: DragMode| -> (u16, u16) {
-        let left = app.layout.left_rect.get();
-        let answers = app.layout.answers_rect.get();
-        match mode {
-            DragMode::Vertical => (left.x + left.width - 1, left.y + 5),
-            DragMode::HorizUpper => (answers.x + 5, app.layout.questions_rect.get().y),
-            _ => (answers.x + 5, app.layout.hex_rect.get().y),
-        }
-    };
     for mode in [
         DragMode::Vertical,
         DragMode::HorizUpper,
         DragMode::HorizLower,
     ] {
+        app.view_state.left_pct = 33;
         app.view_state.answers_pct = 30;
         app.view_state.questions_pct = 25;
         render_to_buffer(&app, 100, 40);
-        let (col, row) = grab_cell(&app, mode);
+        let (col, row) = seam_grab_cell(&app, mode);
+        let (dcol, drow) = match mode {
+            DragMode::Vertical => (col - 5, row),
+            _ => (col, row + 3),
+        };
         // Off-seam release: the glow must go, not wait for a motion
         // event that button-motion-only terminals never send.
-        app.handle_mouse(&down(col, row));
-        assert_eq!(app.view_state.drag, mode);
-        app.handle_mouse(&drag(
-            if mode == DragMode::Vertical {
-                col - 5
-            } else {
-                col
-            },
-            row + 3,
-        ));
+        app.handle_mouse(&mouse_down(col, row));
+        assert_eq!(
+            app.view_state.drag, mode,
+            "{mode:?}: down must start the drag"
+        );
+        app.handle_mouse(&mouse_drag(dcol, drow));
         // Refresh the layout rects the drag just moved.
         render_to_buffer(&app, 100, 40);
-        app.handle_mouse(&up(2, left_off_seam_row(&app)));
+        app.handle_mouse(&mouse_up(2, left_off_seam_row(&app)));
         assert_eq!(app.view_state.drag, DragMode::None);
         assert_eq!(
             app.view_state.hover.get(),
@@ -640,19 +593,19 @@ fn mouse_up_resets_hover_from_release_point() {
             "{mode:?}: release away from any seam must clear the hover glow"
         );
         // On-seam release: the pointer rests on a grabbable seam, so
-        // the hover glow legitimately stays.
-        app.handle_mouse(&down(col, row));
-        app.handle_mouse(&drag(
-            if mode == DragMode::Vertical {
-                col - 5
-            } else {
-                col
-            },
-            row + 3,
-        ));
+        // the hover glow legitimately stays. Re-grab wherever the seam
+        // now sits, so the down is a real grab, not a stale position.
         render_to_buffer(&app, 100, 40);
-        let (col, row) = grab_cell(&app, mode);
-        app.handle_mouse(&up(col, row));
+        let (col, row) = seam_grab_cell(&app, mode);
+        app.handle_mouse(&mouse_down(col, row));
+        assert_eq!(
+            app.view_state.drag, mode,
+            "{mode:?}: re-grab must start the drag"
+        );
+        app.handle_mouse(&mouse_drag(dcol, drow));
+        render_to_buffer(&app, 100, 40);
+        let (col, row) = seam_grab_cell(&app, mode);
+        app.handle_mouse(&mouse_up(col, row));
         assert_eq!(app.view_state.drag, DragMode::None);
         assert_eq!(
             app.view_state.hover.get(),

@@ -275,26 +275,40 @@ fn ring_cells(r: ratatui::layout::Rect) -> Vec<(u16, u16)> {
     cells
 }
 
+/// Pane identity for the border-ring assertions: keyed by enum so a
+/// misspelled glowing pane cannot silently downgrade a check.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TestPane {
+    Hosts,
+    Answers,
+    Questions,
+    Hex,
+}
+
 /// A pane's border ring plus whether it currently holds focus.
-fn pane_rings(app: &App) -> Vec<(&'static str, ratatui::layout::Rect, bool)> {
+fn pane_rings(app: &App) -> Vec<(TestPane, ratatui::layout::Rect, bool)> {
     let focus = app.view_state.focus;
     vec![
         (
-            "Hosts",
+            TestPane::Hosts,
             app.layout.left_rect.get(),
             focus == Focus::Services,
         ),
         (
-            "Answers",
+            TestPane::Answers,
             app.layout.answers_rect.get(),
             focus == Focus::Answers,
         ),
         (
-            "Questions",
+            TestPane::Questions,
             app.layout.questions_rect.get(),
             focus == Focus::Questions,
         ),
-        ("Hex", app.layout.hex_rect.get(), focus == Focus::Hex),
+        (
+            TestPane::Hex,
+            app.layout.hex_rect.get(),
+            focus == Focus::Hex,
+        ),
     ]
 }
 
@@ -312,7 +326,7 @@ fn plain_ring_cells(r: ratatui::layout::Rect) -> Vec<(u16, u16)> {
 fn assert_rest_border_colors(
     app: &App,
     buf: &ratatui::buffer::Buffer,
-    glowing: &[&str],
+    glowing: &[TestPane],
     context: &str,
 ) {
     use ratatui::style::Color;
@@ -323,68 +337,74 @@ fn assert_rest_border_colors(
                 assert_eq!(
                     fg,
                     Some(Color::Cyan),
-                    "{context}: {name} border at {col},{row} must keep the hover glow"
+                    "{context}: {name:?} border at {col},{row} must keep the hover glow"
                 );
             } else {
                 let want = if focused { Color::White } else { Color::Gray };
                 assert_eq!(
                     fg, Some(want),
-                    "{context}: {name} border at {col},{row} must sit at a rest color, not the drag glow"
+                    "{context}: {name:?} border at {col},{row} must sit at a rest color, not the drag glow"
                 );
             }
         }
     }
 }
 
+/// Spec case (1), all three seams: after down, drag and up, the next
+/// render with no motion event shows no cyan border cell anywhere and
+/// the focused pane is back to its focus color. Case (2) pins the
+/// complement: a release on a seam keeps that seam's hover glow.
 #[test]
 fn mouse_up_without_motion_ends_the_resize_glow() {
-    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-    let down = |column, row| MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column,
-        row,
-        modifiers: KeyModifiers::empty(),
-    };
-    let drag = |column, row| MouseEvent {
-        kind: MouseEventKind::Drag(MouseButton::Left),
-        column,
-        row,
-        modifiers: KeyModifiers::empty(),
-    };
-    let up = |column, row| MouseEvent {
-        kind: MouseEventKind::Up(MouseButton::Left),
-        column,
-        row,
-        modifiers: KeyModifiers::empty(),
-    };
-    // Release away from any seam, with no motion event afterwards: the
-    // very next frame must show the rest colors, not the drag glow.
-    let mut app = two_group_app();
-    app.view_state.focus = Focus::Answers;
-    render_to_buffer(&app, 100, 40);
-    let left = app.layout.left_rect.get();
-    app.handle_mouse(&down(left.x + left.width - 1, left.y + 5));
-    app.handle_mouse(&drag(left.x + left.width - 6, left.y + 5));
-    app.handle_mouse(&up(2, left.y + 1));
-    let buf = render_to_buffer(&app, 100, 40);
-    assert_rest_border_colors(&app, &buf, &[], "release off-seam without motion");
+    for mode in [
+        DragMode::Vertical,
+        DragMode::HorizUpper,
+        DragMode::HorizLower,
+    ] {
+        let mut app = two_group_app();
+        app.view_state.focus = Focus::Answers;
+        render_to_buffer(&app, 100, 40);
+        let (col, row) = seam_grab_cell(&app, mode);
+        app.handle_mouse(&mouse_down(col, row));
+        assert_eq!(
+            app.view_state.drag, mode,
+            "{mode:?} down must start the drag"
+        );
+        // Move the seam so the release point cannot sit on it.
+        let (dcol, drow) = match mode {
+            DragMode::Vertical => (col - 5, row),
+            _ => (col, row + 3),
+        };
+        app.handle_mouse(&mouse_drag(dcol, drow));
+        // Release inside the Hosts pane, off every seam; no motion
+        // event follows (button-motion-only terminals never send one).
+        let left = app.layout.left_rect.get();
+        app.handle_mouse(&mouse_up(2, left.y + 1));
+        let buf = render_to_buffer(&app, 100, 40);
+        assert_rest_border_colors(&app, &buf, &[], "release off-seam without motion");
+    }
     // Release on the Questions/Hex seam itself: the pointer rests on a
     // grabbable seam, so that seam legitimately keeps the hover glow
     // while the other panes return to their own colors.
     let mut app = two_group_app();
     app.view_state.focus = Focus::Answers;
     render_to_buffer(&app, 100, 40);
-    let answers = app.layout.answers_rect.get();
-    app.handle_mouse(&down(answers.x + 5, app.layout.hex_rect.get().y));
-    app.handle_mouse(&drag(answers.x + 5, app.layout.hex_rect.get().y + 3));
+    let (col, row) = seam_grab_cell(&app, DragMode::HorizLower);
+    app.handle_mouse(&mouse_down(col, row));
+    assert_eq!(
+        app.view_state.drag,
+        DragMode::HorizLower,
+        "down on the lower seam must start the drag"
+    );
+    app.handle_mouse(&mouse_drag(col, row + 3));
     render_to_buffer(&app, 100, 40);
-    let hex = app.layout.hex_rect.get();
-    app.handle_mouse(&up(answers.x + 5, hex.y));
+    let (col, row) = seam_grab_cell(&app, DragMode::HorizLower);
+    app.handle_mouse(&mouse_up(col, row));
     let buf = render_to_buffer(&app, 100, 40);
     assert_rest_border_colors(
         &app,
         &buf,
-        &["Questions", "Hex"],
+        &[TestPane::Questions, TestPane::Hex],
         "release on the lower seam",
     );
 }

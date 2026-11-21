@@ -362,7 +362,7 @@ fn diagnostics_has_no_flickering_overheard_rows() {
 #[test]
 fn diagnostics_overlay_suppresses_resize_hover() {
     use crossterm::event::{
-        KeyCode, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        KeyCode, KeyEventKind, KeyEventState, KeyModifiers, MouseEvent, MouseEventKind,
     };
     use ratatui::layout::Rect;
     let mut app = App::new().unwrap();
@@ -393,17 +393,22 @@ fn diagnostics_overlay_suppresses_resize_hover() {
     // ...and motion over a seam while open stays inert.
     app.handle_mouse(&moved);
     assert_eq!(app.view_state.hover.get(), DragMode::None);
-    let down = MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: 32,
-        row: 5,
-        modifiers: KeyModifiers::empty(),
-    };
-    app.handle_mouse(&down);
+    app.handle_mouse(&mouse_down(32, 5));
     assert_eq!(app.view_state.drag, DragMode::None);
-    // Closing restores hover tracking.
+    // A release while the overlay is open is inert too: no resize
+    // state may resurface behind it.
+    app.handle_mouse(&mouse_up(32, 5));
+    assert_eq!(app.view_state.drag, DragMode::None);
+    assert_eq!(
+        app.view_state.hover.get(),
+        DragMode::None,
+        "release behind the overlay must not set the hover glow"
+    );
+    // Closing restores hover tracking; nothing resurfaces before the
+    // next motion event.
     app.handle_key(&d);
     assert!(!app.view_state.show_diagnostics);
+    assert_eq!(app.view_state.hover.get(), DragMode::None);
     app.handle_mouse(&moved);
     assert_eq!(app.view_state.hover.get(), DragMode::Vertical);
 }

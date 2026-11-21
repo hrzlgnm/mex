@@ -36,7 +36,8 @@ pub struct ViewState {
     /// Pane border under the mouse cursor, for highlight. Kept in sync
     /// with the last known pointer position: `Moved`/`Drag` recompute
     /// it, and a left-button release recomputes it from the release
-    /// point so a finished drag never leaves the glow stuck.
+    /// point so a finished drag never leaves the glow stuck. While the
+    /// diagnostics overlay owns input, events leave it alone.
     /// Render-only.
     pub hover: Cell<DragMode>,
     /// Diagnostics overlay popup (`d` toggles, `d`/`Esc` closes).

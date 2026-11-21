@@ -163,6 +163,53 @@ fn service_with_txt(app: &mut App, rdata: &str) {
         .and_then(|d| App::identity_at_detail(&d, idx));
 }
 
+/// Left-button mouse event builders shared by the resize tests:
+/// down starts a drag, drag follows the pointer, up releases.
+fn mouse_down(column: u16, row: u16) -> crossterm::event::MouseEvent {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::empty(),
+    }
+}
+
+/// Drag with the left button held (see `mouse_down`).
+fn mouse_drag(column: u16, row: u16) -> crossterm::event::MouseEvent {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::empty(),
+    }
+}
+
+/// Release with the pointer at this position (see `mouse_down`).
+fn mouse_up(column: u16, row: u16) -> crossterm::event::MouseEvent {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::empty(),
+    }
+}
+
+/// Grab cell of each seam kind under the current layout: the cell a
+/// `mouse_down` there starts the matching drag from.
+fn seam_grab_cell(app: &App, mode: DragMode) -> (u16, u16) {
+    let left = app.layout.left_rect.get();
+    let answers = app.layout.answers_rect.get();
+    match mode {
+        DragMode::Vertical => (left.x + left.width - 1, left.y + 5),
+        DragMode::HorizUpper => (answers.x + 5, app.layout.questions_rect.get().y),
+        DragMode::HorizLower => (answers.x + 5, app.layout.hex_rect.get().y),
+        DragMode::None => unreachable!("None has no seam to grab"),
+    }
+}
+
 /// Render the full UI into a test buffer at the given size. Shared
 /// core for the render-based regression tests below.
 fn render_to_buffer(app: &App, width: u16, height: u16) -> ratatui::buffer::Buffer {
