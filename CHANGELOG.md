@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.22.1](https://github.com/hrzlgnm/mex/compare/v0.22.0...v0.22.1) (2026-11-21)
+
+
+### Bug Fixes
+
+* **ui:** end the resize glow when a mouse drag is released ([#346](https://github.com/hrzlgnm/mex/issues/346)) ([72e6e05](https://github.com/hrzlgnm/mex/commit/72e6e056bd2ddfbcad07fc2ba1ba9c70c5447d6d))
+
+
+### Dependencies
+
+* lock file maintenance ([#347](https://github.com/hrzlgnm/mex/issues/347)) ([71c6174](https://github.com/hrzlgnm/mex/commit/71c6174067e5216096d0ecfad5cad77af4d41c07))
+* update rust crate url to v2.5.9 ([#342](https://github.com/hrzlgnm/mex/issues/342)) ([2baeab6](https://github.com/hrzlgnm/mex/commit/2baeab6c2b9da4de06cc7285a3db1a9a58268fb1))
+* update taiki-e/install-action action to v2.90.7 ([#344](https://github.com/hrzlgnm/mex/issues/344)) ([0205572](https://github.com/hrzlgnm/mex/commit/020557207e3c1643b088761ef1460554f47c1422))
+
 ## [0.22.0](https://github.com/hrzlgnm/mex/compare/v0.21.0...v0.22.0) (2026-11-20)
 
 
