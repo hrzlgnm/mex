@@ -621,6 +621,40 @@ fn left_off_seam_row(app: &App) -> u16 {
     left.y.saturating_add(1)
 }
 
+/// A drag that did not start on a seam never resizes, but hover keeps
+/// tracking the pointer while the button is held.
+#[test]
+fn drag_without_a_seam_start_tracks_hover_but_never_resizes() {
+    let mut app = two_group_app();
+    app.view_state.left_pct = 40;
+    app.view_state.answers_pct = 30;
+    app.view_state.questions_pct = 25;
+    render_to_buffer(&app, 100, 40);
+    let left = app.layout.left_rect.get();
+    // Press inside the Hosts pane: no drag starts.
+    app.handle_mouse(&mouse_down(2, left.y + 1));
+    assert_eq!(app.view_state.drag, DragMode::None);
+    // Drag away within the pane: no resize, hover stays empty.
+    app.handle_mouse(&mouse_drag(5, left.y + 1));
+    assert_eq!(
+        app.view_state.left_pct, 40,
+        "a drag that did not start on a seam must not resize"
+    );
+    assert_eq!(app.view_state.hover.get(), DragMode::None);
+    // Crossing the vertical seam with the button held: hover follows,
+    // resizing still does not start.
+    let right = app.layout.right_rect.get();
+    app.handle_mouse(&mouse_drag(right.x, left.y + 1));
+    assert_eq!(
+        app.view_state.left_pct, 40,
+        "reaching a seam mid-drag must not start resizing"
+    );
+    assert_eq!(app.view_state.hover.get(), DragMode::Vertical);
+    // Release returns to rest.
+    app.handle_mouse(&mouse_up(2, left.y + 1));
+    assert_eq!(app.view_state.hover.get(), DragMode::None);
+}
+
 #[test]
 fn pane_shares_keep_minimums_at_extremes() {
     use ratatui::layout::Rect;
