@@ -33,8 +33,12 @@ pub struct ViewState {
     pub questions_pct: u16,
     /// Active mouse drag; `None` when no button is held on a pane border.
     pub drag: DragMode,
-    /// Pane border under the mouse cursor, for highlight. Updated on
-    /// `Moved`/`Drag` events; render-only.
+    /// Pane border under the mouse cursor, for highlight. Kept in sync
+    /// with the last known pointer position: `Moved`/`Drag` recompute
+    /// it, and a left-button release recomputes it from the release
+    /// point so a finished drag never leaves the glow stuck. While the
+    /// diagnostics overlay owns input, events leave it alone.
+    /// Render-only.
     pub hover: Cell<DragMode>,
     /// Diagnostics overlay popup (`d` toggles, `d`/`Esc` closes).
     pub show_diagnostics: bool,

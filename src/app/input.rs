@@ -321,7 +321,18 @@ impl App {
                 self.mouse_moved(mouse.column, mouse.row);
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                // The overlay owns all input while open: a release
+                // behind it is inert (no drag can be active there).
+                if self.view_state.show_diagnostics {
+                    return;
+                }
+                // Release ends the drag entirely: recompute the hover
+                // glow from the release point, exactly as a plain
+                // motion there would. Without this the glow sticks
+                // until the next motion event, which button-motion-only
+                // terminals never send.
                 self.view_state.drag = DragMode::None;
+                self.set_hover_from(mouse.column, mouse.row);
             }
             MouseEventKind::ScrollDown => self.mouse_wheel(1),
             MouseEventKind::ScrollUp => self.mouse_wheel(-1),
@@ -363,7 +374,7 @@ impl App {
             DragMode::None => {}
             mode => {
                 self.view_state.drag = mode;
-                self.view_state.hover.set(mode);
+                self.set_hover_from(col, row);
                 return;
             }
         }
@@ -412,7 +423,7 @@ impl App {
                 self.view_state.hover.set(DragMode::HorizLower);
             }
             DragMode::None => {
-                self.view_state.hover.set(self.divider_at(col, row));
+                self.set_hover_from(col, row);
             }
         }
     }
@@ -427,8 +438,15 @@ impl App {
         if self.view_state.drag != DragMode::None {
             self.mouse_drag(col, row);
         } else {
-            self.view_state.hover.set(self.divider_at(col, row));
+            self.set_hover_from(col, row);
         }
+    }
+
+    /// Recompute the hover glow from a pointer position, exactly as a
+    /// plain motion event there would. Motion, drag-end and press all
+    /// go through this so the paths cannot drift apart.
+    pub(super) fn set_hover_from(&mut self, col: u16, row: u16) {
+        self.view_state.hover.set(self.divider_at(col, row));
     }
 
     /// Click in the Hosts pane: instances select, headers fold. Mirrors the
