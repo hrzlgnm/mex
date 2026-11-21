@@ -261,6 +261,134 @@ fn empty_right_panes_keep_focus_border() {
     }
 }
 
+/// Every border-ring cell of a pane: `(col, row)` pairs.
+fn ring_cells(r: ratatui::layout::Rect) -> Vec<(u16, u16)> {
+    let mut cells = Vec::new();
+    for col in r.x..r.x + r.width {
+        cells.push((col, r.y));
+        cells.push((col, r.y + r.height - 1));
+    }
+    for row in r.y..r.y + r.height {
+        cells.push((r.x, row));
+        cells.push((r.x + r.width - 1, row));
+    }
+    cells
+}
+
+/// A pane's border ring plus whether it currently holds focus.
+fn pane_rings(app: &App) -> Vec<(&'static str, ratatui::layout::Rect, bool)> {
+    let focus = app.view_state.focus;
+    vec![
+        (
+            "Hosts",
+            app.layout.left_rect.get(),
+            focus == Focus::Services,
+        ),
+        (
+            "Answers",
+            app.layout.answers_rect.get(),
+            focus == Focus::Answers,
+        ),
+        (
+            "Questions",
+            app.layout.questions_rect.get(),
+            focus == Focus::Questions,
+        ),
+        ("Hex", app.layout.hex_rect.get(), focus == Focus::Hex),
+    ]
+}
+
+/// Cells of a border ring that are plain border: the top row carries
+/// title spans whose colors are content-driven, so it is excluded.
+fn plain_ring_cells(r: ratatui::layout::Rect) -> Vec<(u16, u16)> {
+    ring_cells(r)
+        .into_iter()
+        .filter(|&(col, row)| !(row == r.y && col > r.x && col < r.x + r.width - 1))
+        .collect()
+}
+
+/// A border cell must sit at a rest color (focus white or gray), and
+/// never at the resize glow color unless its pane is listed as glowing.
+fn assert_rest_border_colors(
+    app: &App,
+    buf: &ratatui::buffer::Buffer,
+    glowing: &[&str],
+    context: &str,
+) {
+    use ratatui::style::Color;
+    for (name, rect, focused) in pane_rings(app) {
+        for (col, row) in plain_ring_cells(rect) {
+            let fg = buf.cell((col, row)).map(|c| c.fg);
+            if glowing.contains(&name) {
+                assert_eq!(
+                    fg,
+                    Some(Color::Cyan),
+                    "{context}: {name} border at {col},{row} must keep the hover glow"
+                );
+            } else {
+                let want = if focused { Color::White } else { Color::Gray };
+                assert_eq!(
+                    fg, Some(want),
+                    "{context}: {name} border at {col},{row} must sit at a rest color, not the drag glow"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mouse_up_without_motion_ends_the_resize_glow() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    let down = |column, row| MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::empty(),
+    };
+    let drag = |column, row| MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::empty(),
+    };
+    let up = |column, row| MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::empty(),
+    };
+    // Release away from any seam, with no motion event afterwards: the
+    // very next frame must show the rest colors, not the drag glow.
+    let mut app = two_group_app();
+    app.view_state.focus = Focus::Answers;
+    render_to_buffer(&app, 100, 40);
+    let left = app.layout.left_rect.get();
+    app.handle_mouse(&down(left.x + left.width - 1, left.y + 5));
+    app.handle_mouse(&drag(left.x + left.width - 6, left.y + 5));
+    app.handle_mouse(&up(2, left.y + 1));
+    let buf = render_to_buffer(&app, 100, 40);
+    assert_rest_border_colors(&app, &buf, &[], "release off-seam without motion");
+    // Release on the Questions/Hex seam itself: the pointer rests on a
+    // grabbable seam, so that seam legitimately keeps the hover glow
+    // while the other panes return to their own colors.
+    let mut app = two_group_app();
+    app.view_state.focus = Focus::Answers;
+    render_to_buffer(&app, 100, 40);
+    let answers = app.layout.answers_rect.get();
+    app.handle_mouse(&down(answers.x + 5, app.layout.hex_rect.get().y));
+    app.handle_mouse(&drag(answers.x + 5, app.layout.hex_rect.get().y + 3));
+    render_to_buffer(&app, 100, 40);
+    let hex = app.layout.hex_rect.get();
+    app.handle_mouse(&up(answers.x + 5, hex.y));
+    let buf = render_to_buffer(&app, 100, 40);
+    assert_rest_border_colors(
+        &app,
+        &buf,
+        &["Questions", "Hex"],
+        "release on the lower seam",
+    );
+}
+
 #[test]
 fn synthetic_rows_and_hostnames_render_italic() {
     use ratatui::style::Modifier;

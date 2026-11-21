@@ -573,6 +573,101 @@ fn mouse_down_drag_sequence_moves_seams() {
     assert_shares(&app);
 }
 
+/// Release ends the drag entirely: drag clears and hover is
+/// recomputed from the release point, so a finished drag never
+/// leaves the resize glow stuck (a motion-less terminal never
+/// resyncs it). Release on a seam keeps the legitimate hover.
+#[test]
+fn mouse_up_resets_hover_from_release_point() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    let mut app = two_group_app();
+    let down = |column, row| MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::empty(),
+    };
+    let drag = |column, row| MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::empty(),
+    };
+    let up = |column, row| MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::empty(),
+    };
+    // Grab cell of each seam under the current layout.
+    let grab_cell = |app: &App, mode: DragMode| -> (u16, u16) {
+        let left = app.layout.left_rect.get();
+        let answers = app.layout.answers_rect.get();
+        match mode {
+            DragMode::Vertical => (left.x + left.width - 1, left.y + 5),
+            DragMode::HorizUpper => (answers.x + 5, app.layout.questions_rect.get().y),
+            _ => (answers.x + 5, app.layout.hex_rect.get().y),
+        }
+    };
+    for mode in [
+        DragMode::Vertical,
+        DragMode::HorizUpper,
+        DragMode::HorizLower,
+    ] {
+        app.view_state.answers_pct = 30;
+        app.view_state.questions_pct = 25;
+        render_to_buffer(&app, 100, 40);
+        let (col, row) = grab_cell(&app, mode);
+        // Off-seam release: the glow must go, not wait for a motion
+        // event that button-motion-only terminals never send.
+        app.handle_mouse(&down(col, row));
+        assert_eq!(app.view_state.drag, mode);
+        app.handle_mouse(&drag(
+            if mode == DragMode::Vertical {
+                col - 5
+            } else {
+                col
+            },
+            row + 3,
+        ));
+        // Refresh the layout rects the drag just moved.
+        render_to_buffer(&app, 100, 40);
+        app.handle_mouse(&up(2, left_off_seam_row(&app)));
+        assert_eq!(app.view_state.drag, DragMode::None);
+        assert_eq!(
+            app.view_state.hover.get(),
+            DragMode::None,
+            "{mode:?}: release away from any seam must clear the hover glow"
+        );
+        // On-seam release: the pointer rests on a grabbable seam, so
+        // the hover glow legitimately stays.
+        app.handle_mouse(&down(col, row));
+        app.handle_mouse(&drag(
+            if mode == DragMode::Vertical {
+                col - 5
+            } else {
+                col
+            },
+            row + 3,
+        ));
+        render_to_buffer(&app, 100, 40);
+        let (col, row) = grab_cell(&app, mode);
+        app.handle_mouse(&up(col, row));
+        assert_eq!(app.view_state.drag, DragMode::None);
+        assert_eq!(
+            app.view_state.hover.get(),
+            mode,
+            "{mode:?}: release on the seam must keep the hover glow"
+        );
+    }
+}
+
+/// A point inside the Hosts pane, off every seam grab zone.
+fn left_off_seam_row(app: &App) -> u16 {
+    let left = app.layout.left_rect.get();
+    left.y.saturating_add(1)
+}
+
 #[test]
 fn pane_shares_keep_minimums_at_extremes() {
     use ratatui::layout::Rect;

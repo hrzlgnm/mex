@@ -321,7 +321,15 @@ impl App {
                 self.mouse_moved(mouse.column, mouse.row);
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                // Release ends the drag entirely: recompute the hover
+                // glow from the release point, exactly as a plain
+                // motion there would. Without this the glow sticks
+                // until the next motion event, which button-motion-only
+                // terminals never send.
                 self.view_state.drag = DragMode::None;
+                self.view_state
+                    .hover
+                    .set(self.divider_at(mouse.column, mouse.row));
             }
             MouseEventKind::ScrollDown => self.mouse_wheel(1),
             MouseEventKind::ScrollUp => self.mouse_wheel(-1),
