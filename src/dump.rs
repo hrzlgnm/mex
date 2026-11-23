@@ -305,7 +305,6 @@ fn is_public_host(host: &str) -> bool {
         ".lan",
         ".home",
         ".home.arpa",
-        ".box",
         ".repeater",
     ] {
         if h.ends_with(suf) {
@@ -437,14 +436,10 @@ mod tests {
             redact_txt_value("gid=01518384-aa7a-4445-b1f2-1b0438a16d5a"),
             "gid=*REDACTED*"
         );
-        // Short values, human text, URLs, and keyless pairs pass through.
+        // Short values, human text, and keyless pairs pass through.
         assert_eq!(redact_txt_value("fn=Schreibtisch"), "fn=Schreibtisch");
         assert_eq!(redact_txt_value("rm="), "rm=");
         assert_eq!(redact_txt_value("bare-flag"), "bare-flag");
-        assert_eq!(
-            redact_txt_value("path=http://fritz.box:49000/avmnexusdesc.xml"),
-            "path=http://fritz.box:49000/avmnexusdesc.xml"
-        );
         assert_eq!(
             redact_txt_rdata("id=328FEBD442638273B38340E9AFE1E9CB; fn=Schreibtisch"),
             "id=*REDACTED*; fn=Schreibtisch"
@@ -462,14 +457,14 @@ mod tests {
             redact_txt_value("base_url=https://example.com:443/a?b=c"),
             "base_url=*REDACTED*"
         );
-        // LAN literals, link-local, and home-router names stay visible.
+        // LAN literals, link-local, and home-network names stay visible.
         assert_eq!(
             redact_txt_value("internal_url=http://192.168.178.27:8095"),
             "internal_url=http://192.168.178.27:8095"
         );
         assert_eq!(
             redact_txt_value("path=http://fritz.box:49000/avmnexusdesc.xml"),
-            "path=http://fritz.box:49000/avmnexusdesc.xml"
+            "path=*REDACTED*"
         );
         assert_eq!(
             redact_txt_value("x=http://[fe80::1]:8123/"),
@@ -487,6 +482,14 @@ mod tests {
         assert_eq!(
             redact_txt_value("path=http://printer.local.:9100/x"),
             "path=http://printer.local.:9100/x"
+        );
+        assert_eq!(
+            redact_txt_value("x=http://router.home.arpa/"),
+            "x=http://router.home.arpa/"
+        );
+        assert_eq!(
+            redact_txt_value("external_url=https://nic.box/account"),
+            "external_url=*REDACTED*"
         );
         // Not a URL at all: untouched.
         assert_eq!(
