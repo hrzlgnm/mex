@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.22.2](https://github.com/hrzlgnm/mex/compare/v0.22.1...v0.22.2) (2026-11-23)
+
+
+### Bug Fixes
+
+* close IPv6 gaps in dump redaction ([#355](https://github.com/hrzlgnm/mex/issues/355)) ([5da20b3](https://github.com/hrzlgnm/mex/commit/5da20b3470f62355c16d283ff416354d1fdada03))
+* redact .box URL hosts in dumps ([#356](https://github.com/hrzlgnm/mex/issues/356)) ([99f0993](https://github.com/hrzlgnm/mex/commit/99f09936d5ca8ec26953eb3c86cb69ef5f0f386a))
+
+
+### Dependencies
+
+* lock file maintenance ([#350](https://github.com/hrzlgnm/mex/issues/350)) ([63fc72e](https://github.com/hrzlgnm/mex/commit/63fc72e450c43abca4bbccca9e3f9954927d32d4))
+* update dependency sccache to v0.20.0 ([#352](https://github.com/hrzlgnm/mex/issues/352)) ([19853c9](https://github.com/hrzlgnm/mex/commit/19853c9d109a11531d9df001ffac764c0afadfe5))
+* update rust crate anyhow to v1.0.105 ([#351](https://github.com/hrzlgnm/mex/issues/351)) ([13cf43a](https://github.com/hrzlgnm/mex/commit/13cf43a0513fe9685603cceb53d9bb4806a367bb))
+* update taiki-e/install-action action to v2.90.8 ([#348](https://github.com/hrzlgnm/mex/issues/348)) ([b61bbf8](https://github.com/hrzlgnm/mex/commit/b61bbf84f467b85aced55b77880385d08e8ccae7))
+
+
+### Documentation
+
+* agent worktree commands and SSH key for remote git calls ([#357](https://github.com/hrzlgnm/mex/issues/357)) ([45b74f1](https://github.com/hrzlgnm/mex/commit/45b74f19c8cf556b741c9ac9b43afb51173a2c7e))
+
 ## [0.22.1](https://github.com/hrzlgnm/mex/compare/v0.22.0...v0.22.1) (2026-11-21)
 
 
