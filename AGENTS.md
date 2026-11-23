@@ -138,11 +138,20 @@ Headless run (no TTY) logs to stderr.
 
 ## Workflow
 
-* Agents must work only in a fresh, separate worktree created from `origin/main`;
-  never edit the primary checkout or reuse a stale worktree. Create the worktree
-  (and fetch `origin` first) before making any changes.
+* Run every git command that talks to the remote (`fetch`, `pull`, `push`)
+  after `export GIT_SSH_COMMAND="ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes"`
+  in the same shell command: the SSH agent offers hardware security keys
+  first, and those fail without a human at the device.
+* Before making any change for a new task, run `git fetch origin`, then
+  `git worktree add --no-track -b <branch> ../mex-wt-<topic> origin/main`: a
+  worktree created for this task, never one left from an earlier task, on a
+  new branch cut from `origin/main`. `--no-track` keeps the branch from
+  tracking `main`; publish it with `git push -u origin <branch>`.
+* Do all edits in the task's worktree, leaving the primary checkout as is.
+  Continue an open pull request's branch where `git worktree list` shows it
+  checked out; if nowhere, recreate a worktree with
+  `git worktree add ../mex-wt-<topic> <branch>`.
 * Changes land via pull requests against `main`; never push to `main` directly.
-* Create branches from `origin/main` (`git fetch origin` first).
 * Each branch/PR carries one logical change. Never mix unrelated edits
   (code, CI, docs, deps) in one branch — split them into separate PRs.
 * Commit messages must follow Conventional Commits (`feat:`, `fix:`, `docs:`,
