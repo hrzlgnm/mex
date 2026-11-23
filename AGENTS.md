@@ -138,6 +138,10 @@ Headless run (no TTY) logs to stderr.
 
 ## Workflow
 
+* Run every git command that talks to the remote (`fetch`, `pull`, `push`)
+  after `export GIT_SSH_COMMAND="ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes"`
+  in the same shell command: the SSH agent offers hardware security keys
+  first, and those fail without a human at the device.
 * Before making any change for a new task, run `git fetch origin`, then
   `git worktree add --no-track -b <branch> ../mex-wt-<topic> origin/main`: a
   worktree created for this task, never one left from an earlier task, on a
