@@ -146,7 +146,7 @@ Headless run (no TTY) logs to stderr.
   `git worktree add --no-track -b <branch> ../mex-wt-<topic> origin/main`: a
   worktree created for this task, never one left from an earlier task, on a
   new branch cut from `origin/main`. `--no-track` keeps the branch from
-  tracking `main`, so a bare pull or push targets the branch itself.
+  tracking `main`; publish it with `git push -u origin <branch>`.
 * Do all edits in the task's worktree, leaving the primary checkout as is.
   Continue an open pull request's branch in the worktree created for it, or
   recreate one with `git worktree add ../mex-wt-<topic> <branch>`.
