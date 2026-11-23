@@ -259,26 +259,34 @@ pub fn is_high_entropy_value(v: &str) -> bool {
 }
 
 /// Whether an IP literal is publicly routable (i.e. not private,
-/// loopback, link-local, unique-local, or multicast).
+/// loopback, link-local, unique-local, multicast, or documentation).
+/// IPv4-mapped IPv6 addresses are judged by their IPv4 part.
 fn is_public_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v) => {
-            let o = v.octets();
-            !(o[0] == 10
-                || (o[0] == 172 && (16..32).contains(&o[1]))
-                || (o[0] == 192 && o[1] == 168)
-                || o[0] == 127
-                || (o[0] == 169 && o[1] == 254)
-                || o[0] == 0
-                || o[0] >= 224)
+            let first = v.octets()[0];
+            // 0/8 ("this network") and 240/4 (reserved, broadcast) have
+            // no stable std predicate.
+            !(v.is_private()
+                || v.is_loopback()
+                || v.is_link_local()
+                || v.is_multicast()
+                || first == 0
+                || first >= 240)
         }
         std::net::IpAddr::V6(v) => {
+            if let Some(v4) = v.to_ipv4_mapped() {
+                return is_public_ip(&std::net::IpAddr::V4(v4));
+            }
             let s = v.segments();
-            !(v.is_loopback()
+            // 2001:db8::/32 (documentation) has no stable std predicate.
+            let is_documentation = s[0] == 0x2001 && s[1] == 0x0db8;
+            !(is_documentation
+                || v.is_loopback()
                 || v.is_unspecified()
-                || (s[0] & 0xffc0) == 0xfe80
-                || (s[0] & 0xfe00) == 0xfc00
-                || (s[0] & 0xff00) == 0xff00)
+                || v.is_unicast_link_local()
+                || v.is_unique_local()
+                || v.is_multicast())
         }
     }
 }
@@ -291,7 +299,12 @@ fn is_public_host(host: &str) -> bool {
     if h.is_empty() {
         return false;
     }
-    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+    // `url` keeps IPv6 hosts bracketed in `host_str`.
+    if let Ok(ip) = h
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+    {
         return is_public_ip(&ip);
     }
     if !h.contains('.') {
@@ -305,7 +318,6 @@ fn is_public_host(host: &str) -> bool {
         ".lan",
         ".home",
         ".home.arpa",
-        ".box",
         ".repeater",
     ] {
         if h.ends_with(suf) {
@@ -330,22 +342,27 @@ pub fn is_public_url(v: &str) -> bool {
     };
     is_public_host(host)
 }
-/// Whether a string is a public IPv6 literal. Global unicast device
-/// addresses are stable fingerprints; link-local, unique-local,
-/// loopback and multicast stay visible.
-fn is_public_ip_literal(v: &str) -> bool {
-    match v.trim().parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V6(ip)) => is_public_ip(&std::net::IpAddr::V6(ip)),
-        _ => false,
+
+/// The masked form of a public IPv6 literal, keeping the first and last
+/// hextet (`2003:*REDACTED*:7927`) so prefix and host tail stay useful
+/// for debugging; `None` for anything else. Global unicast addresses are
+/// stable device fingerprints; link-local, unique-local, loopback,
+/// multicast, documentation and plain IPv4 stay visible. An IPv4-mapped
+/// address is masked when its IPv4 part is public. A `%scope` suffix is
+/// ignored.
+fn masked_public_ipv6(addr: &str) -> Option<String> {
+    let unscoped = addr.trim().split('%').next().unwrap_or("");
+    match unscoped.parse::<std::net::IpAddr>() {
+        Ok(ip @ std::net::IpAddr::V6(v6)) if is_public_ip(&ip) => {
+            let s = v6.segments();
+            Some(format!("{:x}:*REDACTED*:{:x}", s[0], s[7]))
+        }
+        _ => None,
     }
 }
 
-/// Redact a bare public IPv6 literal, keeping the first and last
-/// hextet (`2003:*REDACTED*:7927`) so prefix and host tail stay useful
-/// for debugging. Anything else (including IPv4 and non-public IPv6)
-/// passes through.
 /// Mask every public IPv6 literal among the words of `text`
-/// (`redact_ip_literal` per word, ignoring a trailing `,` or `;`), leaving
+/// (`masked_public_ipv6` per word, ignoring a trailing `,` or `;`), leaving
 /// everything else as is. Word-wise, so an address that prefixes another
 /// never rewrites part of the longer one.
 pub fn redact_ip_words(text: &str) -> String {
@@ -353,25 +370,19 @@ pub fn redact_ip_words(text: &str) -> String {
         .map(|word| {
             let addr = word.trim_end_matches([',', ';']);
             let tail = &word[addr.len()..];
-            if addr.parse::<std::net::IpAddr>().is_ok() {
-                format!("{}{tail}", redact_ip_literal(addr))
-            } else {
-                word.to_string()
+            match masked_public_ipv6(addr) {
+                Some(masked) => format!("{masked}{tail}"),
+                None => word.to_string(),
             }
         })
         .collect::<Vec<_>>()
         .join(" ")
 }
 
+/// Redact a bare public IPv6 literal (see `masked_public_ipv6`);
+/// anything else passes through unchanged.
 pub fn redact_ip_literal(rdata: &str) -> String {
-    let trimmed = rdata.trim().split('%').next().unwrap_or("");
-    match trimmed.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V6(ip)) if is_public_ip(&std::net::IpAddr::V6(ip)) => {
-            let s = ip.segments();
-            format!("{:x}:*REDACTED*:{:x}", s[0], s[7])
-        }
-        _ => rdata.to_string(),
-    }
+    masked_public_ipv6(rdata).unwrap_or_else(|| rdata.to_string())
 }
 
 /// Redact a `key=value` pair, keeping the key so dumps stay comparable:
@@ -380,14 +391,15 @@ pub fn redact_ip_literal(rdata: &str) -> String {
 /// (`key=2003:*REDACTED*:7927`). Pairs without `=` or with ordinary
 /// values pass through.
 pub fn redact_txt_value(pair: &str) -> String {
-    match pair.split_once('=') {
-        Some((k, v)) if is_high_entropy_value(v) || is_public_url(v) => {
-            format!("{k}=*REDACTED*")
-        }
-        Some((k, v)) if is_public_ip_literal(v) => {
-            format!("{k}={}", redact_ip_literal(v))
-        }
-        _ => pair.to_string(),
+    let Some((k, v)) = pair.split_once('=') else {
+        return pair.to_string();
+    };
+    if is_high_entropy_value(v) || is_public_url(v) {
+        format!("{k}=*REDACTED*")
+    } else if let Some(masked) = masked_public_ipv6(v) {
+        format!("{k}={masked}")
+    } else {
+        pair.to_string()
     }
 }
 
@@ -437,14 +449,10 @@ mod tests {
             redact_txt_value("gid=01518384-aa7a-4445-b1f2-1b0438a16d5a"),
             "gid=*REDACTED*"
         );
-        // Short values, human text, URLs, and keyless pairs pass through.
+        // Short values, human text, and keyless pairs pass through.
         assert_eq!(redact_txt_value("fn=Schreibtisch"), "fn=Schreibtisch");
         assert_eq!(redact_txt_value("rm="), "rm=");
         assert_eq!(redact_txt_value("bare-flag"), "bare-flag");
-        assert_eq!(
-            redact_txt_value("path=http://fritz.box:49000/avmnexusdesc.xml"),
-            "path=http://fritz.box:49000/avmnexusdesc.xml"
-        );
         assert_eq!(
             redact_txt_rdata("id=328FEBD442638273B38340E9AFE1E9CB; fn=Schreibtisch"),
             "id=*REDACTED*; fn=Schreibtisch"
@@ -462,14 +470,14 @@ mod tests {
             redact_txt_value("base_url=https://example.com:443/a?b=c"),
             "base_url=*REDACTED*"
         );
-        // LAN literals, link-local, and home-router names stay visible.
+        // LAN literals, link-local, and home-network names stay visible.
         assert_eq!(
             redact_txt_value("internal_url=http://192.168.178.27:8095"),
             "internal_url=http://192.168.178.27:8095"
         );
         assert_eq!(
             redact_txt_value("path=http://fritz.box:49000/avmnexusdesc.xml"),
-            "path=http://fritz.box:49000/avmnexusdesc.xml"
+            "path=*REDACTED*"
         );
         assert_eq!(
             redact_txt_value("x=http://[fe80::1]:8123/"),
@@ -487,6 +495,14 @@ mod tests {
         assert_eq!(
             redact_txt_value("path=http://printer.local.:9100/x"),
             "path=http://printer.local.:9100/x"
+        );
+        assert_eq!(
+            redact_txt_value("x=http://router.home.arpa/"),
+            "x=http://router.home.arpa/"
+        );
+        assert_eq!(
+            redact_txt_value("external_url=https://nic.box/account"),
+            "external_url=*REDACTED*"
         );
         // Not a URL at all: untouched.
         assert_eq!(
@@ -514,5 +530,62 @@ mod tests {
         assert_eq!(redact_txt_value("ip6=fd00::1"), "ip6=fd00::1");
         assert_eq!(redact_ip_literal("::1"), "::1");
         assert_eq!(redact_ip_literal("192.168.178.30"), "192.168.178.30");
+    }
+
+    #[test]
+    fn redaction_masks_scoped_public_ipv6_everywhere() {
+        let scoped = "2003:e8:bf10:9500:38e1:a9ff:fe2c:7927%eth0";
+        assert_eq!(
+            redact_txt_value(&format!("ipv6={scoped}")),
+            "ipv6=2003:*REDACTED*:7927"
+        );
+        assert_eq!(redact_ip_literal(scoped), "2003:*REDACTED*:7927");
+        assert_eq!(
+            redact_ip_words(&format!("seen at {scoped}, fe80::1%eth0")),
+            "seen at 2003:*REDACTED*:7927, fe80::1%eth0"
+        );
+    }
+
+    #[test]
+    fn redaction_judges_bracketed_ipv6_url_hosts() {
+        assert_eq!(
+            redact_txt_value("x=http://[2003:e8::1]:8123/"),
+            "x=*REDACTED*"
+        );
+        for pair in [
+            "x=http://[fe80::1]:8123/",
+            "x=http://[fd00::1]/",
+            "x=http://[::1]/",
+        ] {
+            assert_eq!(redact_txt_value(pair), pair);
+        }
+    }
+
+    #[test]
+    fn redaction_keeps_ipv4_url_hosts_at_private_range_edges() {
+        for pair in [
+            "x=http://10.0.0.1/",
+            "x=http://172.31.255.1/",
+            "x=http://169.254.1.1/",
+            "x=http://127.0.0.1:8080/",
+            "x=http://0.0.0.0/",
+            "x=http://255.255.255.255/",
+        ] {
+            assert_eq!(redact_txt_value(pair), pair);
+        }
+        assert_eq!(redact_txt_value("x=http://172.32.0.1/"), "x=*REDACTED*");
+        assert_eq!(redact_txt_value("x=http://8.8.8.8/"), "x=*REDACTED*");
+    }
+
+    #[test]
+    fn redaction_keeps_mapped_private_and_documentation_ipv6() {
+        assert_eq!(
+            redact_ip_literal("::ffff:192.168.1.1"),
+            "::ffff:192.168.1.1"
+        );
+        assert_eq!(redact_ip_literal("2001:db8::1"), "2001:db8::1");
+        assert_eq!(redact_txt_value("ip6=2001:db8::1"), "ip6=2001:db8::1");
+        // A public IPv4 part keeps the mapped address masked as IPv6.
+        assert_eq!(redact_ip_literal("::ffff:8.8.8.8"), "0:*REDACTED*:808");
     }
 }
