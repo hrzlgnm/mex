@@ -81,15 +81,25 @@ pub(super) struct FamilySocket {
 
 impl FamilySocket {
     pub(super) fn open(family: Family, registry: &mio::Registry) -> Option<Self> {
+        let create = match family {
+            Family::V4 => create_v4_socket,
+            Family::V6 => create_v6_socket,
+        };
+        Self::open_with(family, registry, create)
+    }
+
+    /// `open` with the socket creator injected, so tests can fail it.
+    pub(super) fn open_with(
+        family: Family,
+        registry: &mio::Registry,
+        create: impl FnOnce() -> Result<PktInfoUdpSocket>,
+    ) -> Option<Self> {
         let (label, token) = match family {
             Family::V4 => ("v4", V4_TOKEN),
             Family::V6 => ("v6", V6_TOKEN),
         };
         let opened = (|| -> Result<Self> {
-            let pktinfo = match family {
-                Family::V4 => create_v4_socket()?,
-                Family::V6 => create_v6_socket()?,
-            };
+            let pktinfo = create()?;
             let mut readiness = mio::net::UdpSocket::from_std(pktinfo.try_clone_std()?);
             registry.register(&mut readiness, token, mio::Interest::READABLE)?;
             Ok(Self {
@@ -454,7 +464,17 @@ impl Listener {
 
     /// Read and handle one datagram.
     pub(super) fn read_one(&mut self, socket: &PktInfoUdpSocket) -> ReadStep {
-        let (len, info) = match socket.recv(&mut self.buf) {
+        let received = socket.recv(&mut self.buf);
+        self.handle_recv(received)
+    }
+
+    /// Handle one recv result; a received datagram is in
+    /// `self.buf[..len]`, with its ingress interface and addresses.
+    pub(super) fn handle_recv(
+        &mut self,
+        received: std::io::Result<(usize, socket_pktinfo::PktInfo)>,
+    ) -> ReadStep {
+        let (len, info) = match received {
             Ok(read) => read,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return ReadStep::WouldBlock,
             Err(e) => {
