@@ -461,3 +461,121 @@ fn ptr_query() -> QueryRequest {
         qu: false,
     }
 }
+
+#[test]
+fn repeat_pin_failure_still_skips_the_copy() {
+    // The second failure is already on record (not logged again), but
+    // the copy is still skipped: never an unpinned send.
+    let eth0 = Ipv4Addr::new(192, 168, 1, 2);
+    let socket = FakeSocket {
+        failing_pin: Some(Egress::V4(eth0)),
+        ..FakeSocket::default()
+    };
+    let links = [("eth0".to_string(), eth0)];
+    let mut failures = SendFailures::default();
+    for _ in 0..2 {
+        send_on_all_interfaces(
+            &socket,
+            &ptr_query(),
+            Family::V4,
+            &links,
+            &[],
+            &mut failures,
+            &mut SentCopies::default(),
+        );
+    }
+    assert_eq!(
+        *socket.calls.borrow(),
+        ["pin V4(192.168.1.2)", "pin V4(192.168.1.2)"]
+    );
+}
+
+#[test]
+fn repeat_send_failure_is_not_remembered_as_sent() {
+    // Every pass still tries the send; none of the failed copies may be
+    // taken for our own loopback copy later.
+    let socket = FakeSocket::default();
+    socket.failing_send.set(true);
+    let links = [("eth0".to_string(), 2u32)];
+    let mut failures = SendFailures::default();
+    let mut sent = SentCopies::default();
+    for _ in 0..2 {
+        send_on_all_interfaces(
+            &socket,
+            &ptr_query(),
+            Family::V6,
+            &[],
+            &links,
+            &mut failures,
+            &mut sent,
+        );
+    }
+    assert_eq!(
+        *socket.calls.borrow(),
+        [
+            "pin V6(2)",
+            "send [ff02::fb%2]:5353",
+            "pin V6(2)",
+            "send [ff02::fb%2]:5353",
+        ]
+    );
+    let bytes = encode_query(&ptr_query(), "eth0").unwrap();
+    assert!(!sent.take(&bytes, Instant::now()));
+}
+
+#[test]
+fn unencodable_request_sends_nothing_after_the_pin() {
+    let socket = FakeSocket::default();
+    let req = QueryRequest {
+        name: "a..local".to_string(),
+        ..ptr_query()
+    };
+    let mut sent = SentCopies::default();
+    send_on_all_interfaces(
+        &socket,
+        &req,
+        Family::V6,
+        &[],
+        &[("eth0".to_string(), 2u32)],
+        &mut SendFailures::default(),
+        &mut sent,
+    );
+    assert_eq!(*socket.calls.borrow(), ["pin V6(2)"]);
+    assert!(sent.recent.is_empty(), "nothing sent, nothing remembered");
+}
+
+#[test]
+fn wire_name_rejects_empty_and_overlong_labels() {
+    let longest = "a".repeat(63);
+    let too_long = "a".repeat(64);
+    assert!(wire_name("").is_none());
+    assert!(wire_name("a..b.local").is_none());
+    assert!(wire_name(&format!("{too_long}.local")).is_none());
+    assert!(wire_name(&format!("{longest}.local")).is_some());
+}
+
+#[test]
+fn encode_query_rejects_unencodable_name() {
+    let req = QueryRequest {
+        name: "a..local".to_string(),
+        ..ptr_query()
+    };
+    assert!(encode_query(&req, "").is_none());
+}
+
+#[test]
+fn unencodable_known_answer_is_skipped_others_kept() {
+    let ka = |target: &str| KnownAnswer {
+        target: target.to_string(),
+        ttl: 120,
+        iface: String::new(),
+    };
+    let req = QueryRequest {
+        known_answers: vec![ka(""), ka("Good._http._tcp.local")],
+        ..ptr_query()
+    };
+    let ev = roundtrip_query(&req);
+    assert_eq!(ev.questions.len(), 1, "the question survives");
+    assert_eq!(ev.query_kas.len(), 1);
+    assert_eq!(ev.query_kas[0].rdata, "Good._http._tcp.local.");
+}
