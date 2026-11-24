@@ -163,8 +163,11 @@ impl App {
         if key.is_empty() {
             return "(unknown host)".to_string();
         }
-        if key == ENUM_HOST || key == UNATTRIBUTED_HOST {
-            return key.to_string();
+        if key == ENUM_HOST {
+            return ENUM_GROUP_NAME.to_string();
+        }
+        if key == UNATTRIBUTED_HOST {
+            return UNATTRIBUTED_GROUP_NAME.to_string();
         }
         for s in &self.services {
             if Self::host_key(&s.hostname) == key {
