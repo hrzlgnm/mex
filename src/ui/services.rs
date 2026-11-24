@@ -150,7 +150,7 @@ pub(super) fn draw_service_list(
             format!(" Hosts: {} ", app.host_display_name(label))
         }
         Some(DisplayItem::Unattributed) => {
-            format!(" Hosts: {} ", crate::app::UNATTRIBUTED_HOST)
+            format!(" Hosts: {} ", crate::app::UNATTRIBUTED_GROUP_NAME)
         }
         None => " Hosts ".to_string(),
     };

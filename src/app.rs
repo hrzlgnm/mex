@@ -330,11 +330,16 @@ fn rand_range(lo_ms: u64, hi_ms: u64) -> Duration {
     Duration::from_millis(lo_ms + (rand_u32() as u64 % span))
 }
 
-/// Group header for the selectable enumeration row in the Hosts pane.
-pub const ENUM_HOST: &str = "(enumeration)";
-/// Group header for the `(unattributed)` findings row in the Hosts pane,
-/// present only while such findings exist.
-pub const UNATTRIBUTED_HOST: &str = "(unattributed)";
+/// Group key of the selectable enumeration row in the Hosts pane. Ends
+/// in a dot, which no host key does (`host_key` strips trailing dots):
+/// a host named `(enumeration).` must never share this group.
+pub const ENUM_HOST: &str = "(enumeration).";
+/// Group key of the `(unattributed)` findings row in the Hosts pane,
+/// present only while such findings exist; dotted like `ENUM_HOST`.
+pub const UNATTRIBUTED_HOST: &str = "(unattributed).";
+/// The names shown for the two built-in groups.
+pub const ENUM_GROUP_NAME: &str = "(enumeration)";
+pub const UNATTRIBUTED_GROUP_NAME: &str = "(unattributed)";
 
 /// Whether a response carries a non-zero RCODE, which RFC 6762 §18.11
 /// says MUST be silently ignored on receipt.
@@ -939,7 +944,7 @@ impl<'a> DetailTarget<'a> {
                 }
             }
             DetailTarget::Enum(e) => e.pane_ident(),
-            DetailTarget::Unattributed => UNATTRIBUTED_HOST.to_string(),
+            DetailTarget::Unattributed => UNATTRIBUTED_GROUP_NAME.to_string(),
         }
     }
 }

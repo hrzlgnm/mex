@@ -67,7 +67,7 @@ fn enum_answers_file_on_selectable_row() {
     );
     assert!(app.scheduler.known_types().contains("_http._tcp.local"));
     assert_eq!(app.enum_entries[0].answers.len(), 1);
-    assert_eq!(app.group_labels()[0], "(enumeration)");
+    assert_eq!(app.group_labels()[0], ENUM_HOST);
     // Diagnostics carry a per-name row for the enumeration name.
     let rows = app.diagnostics_rows();
     assert!(rows.iter().any(|(k, _)| k.contains("_dns-sd._udp")));
@@ -136,7 +136,7 @@ fn groups_by_hostname_with_unknown_last() {
     assert_eq!(
         labels,
         vec![
-            "(enumeration)".to_string(),
+            ENUM_HOST.to_string(),
             "test.local".to_string(),
             String::new()
         ]
@@ -568,4 +568,110 @@ fn interest_statuses_have_stable_labels() {
         labels,
         ["transmitted", "suppressed", "answered", "abandoned"]
     );
+}
+
+/// A service on a host whose (legal, single-label) name reads like a
+/// built-in group header.
+fn app_with_host_named(host: &str) -> App {
+    let mut app = App::new().unwrap();
+    ingest(&mut app, &ptr_record(120));
+    ingest(
+        &mut app,
+        &raw_record(
+            "Test._http._tcp.local.",
+            33,
+            "SRV",
+            &format!("0 0 80 {host}"),
+            120,
+        ),
+    );
+    app.evict_expired();
+    app
+}
+
+fn host_header_of(app: &App, host: &str) -> String {
+    let key = App::host_key(host);
+    assert!(
+        app.display_items()
+            .iter()
+            .any(|it| matches!(it, DisplayItem::Host { label } if *label == key)),
+        "{host} has its own header"
+    );
+    key
+}
+
+#[test]
+fn a_host_named_like_the_enumeration_group_is_its_own_group() {
+    let mut app = app_with_host_named("(enumeration).");
+    let key = host_header_of(&app, "(enumeration).");
+    assert_ne!(key, ENUM_HOST);
+    assert_eq!(app.group_labels().len(), 2, "enumeration and the host");
+    assert_eq!(app.host_service_count(&key), 1, "the host's own service");
+    assert_eq!(app.host_display_name(&key), "(enumeration)");
+    assert_eq!(diagnostics_value(&app, "hosts"), "1");
+
+    // Folding the host leaves the enumeration rows listed, and back.
+    app.collapsed_hosts.insert(key.clone());
+    assert!(app
+        .display_items()
+        .iter()
+        .any(|it| matches!(it, DisplayItem::Enum { .. })));
+    app.collapsed_hosts.clear();
+    app.collapsed_hosts.insert(ENUM_HOST.to_string());
+    assert!(app
+        .display_items()
+        .iter()
+        .any(|it| matches!(it, DisplayItem::Instance { .. })));
+
+    // Jumping to the host's group lands on its service, not on an
+    // enumeration row.
+    app.collapsed_hosts.clear();
+    app.select_group_first(&key);
+    assert!(matches!(
+        app.display_items().get(app.view_state.selected_display),
+        Some(DisplayItem::Instance { .. })
+    ));
+}
+
+#[test]
+fn a_host_named_like_the_unattributed_group_is_its_own_group() {
+    let mut app = app_with_host_named("(unattributed).");
+    // A finding with no owner brings the real (unattributed) group.
+    ingest(
+        &mut app,
+        &raw_record("fritz.box.", 6, "TYPE6", "rdlength=49", 10),
+    );
+    app.evict_expired();
+    let key = host_header_of(&app, "(unattributed).");
+    assert_ne!(key, UNATTRIBUTED_HOST);
+    assert_eq!(app.group_labels().len(), 3);
+    assert_eq!(app.host_service_count(&key), 1);
+    app.collapsed_hosts.insert(key);
+    assert!(app
+        .display_items()
+        .iter()
+        .any(|it| matches!(it, DisplayItem::Unattributed)));
+}
+
+#[test]
+fn builtin_groups_show_their_names() {
+    let mut app = two_group_app();
+    assert_eq!(app.host_display_name(ENUM_HOST), "(enumeration)");
+    assert_eq!(app.host_display_name(UNATTRIBUTED_HOST), "(unattributed)");
+    ingest(
+        &mut app,
+        &raw_record("fritz.box.", 6, "TYPE6", "rdlength=49", 10),
+    );
+    app.evict_expired();
+    let pos = app
+        .display_items()
+        .iter()
+        .position(|it| matches!(it, DisplayItem::Unattributed))
+        .unwrap();
+    app.view_state.selected_display = pos;
+    app.clamp_selection();
+    assert_eq!(app.display_detail().unwrap().pane_ident(), "(unattributed)");
+    let lines = screen(&app, 120, 40);
+    assert!(lines.iter().any(|l| l.contains("Hosts: (unattributed) ")));
+    assert!(!lines.iter().any(|l| l.contains("(unattributed).")));
 }
