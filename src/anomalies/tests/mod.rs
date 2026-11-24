@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 mod analyze;
+mod conflicts;
 mod flush;
 mod naming;
 mod questions;
