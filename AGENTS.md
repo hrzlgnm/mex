@@ -122,7 +122,7 @@ Headless run (no TTY) logs to stderr.
   with ≥half the original TTL remaining, sent with remaining TTL, scoped to
   the egress interface.
 * QU bit only on the startup enumeration batch; everything else is QM.
-* A/AAAA query names keep wire case; dedup keys are lowercase.
+* A/AAAA query names keep wire case.
 * No queries for dead interests: `evict_expired` prunes `continuous`,
   `requeries`, `enum_known`, `known_types` to live names.
 * Records show the ingress interface (`%iface` for IPv6 link-local,
@@ -167,6 +167,10 @@ Headless run (no TTY) logs to stderr.
 * Prefer editing existing files; no new deps without need
   (`simple-dns` exposes the mDNS QU bit and cache-flush bit natively).
 * Random jitter uses the std-only `rand_u32` helper in `app.rs`.
+* Names fold ASCII only: keys and comparisons use `to_ascii_lowercase` /
+  `eq_ignore_ascii_case` (RFC 6762 §16: `A`-`Z` match `a`-`z`, every other
+  byte compares exactly, so `É` and `é` are two names). `to_lowercase` is for
+  display sort orders.
 
 ## Agent skills
 
