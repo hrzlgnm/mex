@@ -420,7 +420,7 @@ impl App {
     }
 
     pub(super) fn save_state_dump(&self) -> Result<String> {
-        let json_path = self.save_state_dump_to(std::path::Path::new(""))?;
+        let json_path = self.save_state_dump_to(&self.state_dump_dir)?;
         Ok(json_path.to_string_lossy().into_owned())
     }
 

@@ -699,6 +699,9 @@ pub struct App {
     link_stats: browse::LinkStats,
     /// Refused-packet accounting from the listener thread (RFC 6762 §11).
     drop_stats: Arc<browse::DropStats>,
+    /// Where Ctrl+J writes state dumps: the working directory (empty
+    /// path) unless a test points it elsewhere.
+    state_dump_dir: std::path::PathBuf,
 
     rx: mpsc::Receiver<browse::Event>,
     query_tx: browse::QueryTx,
@@ -1102,6 +1105,7 @@ impl App {
             clamped_gen: None,
             link_stats,
             drop_stats,
+            state_dump_dir: std::path::PathBuf::new(),
         })
     }
 

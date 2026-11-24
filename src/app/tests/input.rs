@@ -1170,3 +1170,503 @@ fn plus_folds_and_unfolds_the_enumeration_group() {
         "unfolded again"
     );
 }
+
+fn mouse(
+    kind: crossterm::event::MouseEventKind,
+    column: u16,
+    row: u16,
+) -> crossterm::event::MouseEvent {
+    crossterm::event::MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: crossterm::event::KeyModifiers::empty(),
+    }
+}
+
+/// Fixed pane geometry for click tests that don't render a frame.
+fn place_panes(app: &mut App) {
+    use ratatui::layout::Rect;
+    app.layout.list_offset.set(0);
+    app.layout.left_rect.set(Rect::new(0, 3, 33, 30));
+    app.layout.right_rect.set(Rect::new(33, 3, 67, 30));
+    app.layout.answers_rect.set(Rect::new(33, 3, 67, 10));
+    app.layout.questions_rect.set(Rect::new(33, 13, 67, 10));
+    app.layout.hex_rect.set(Rect::new(33, 23, 67, 10));
+}
+
+fn selected_item(app: &App) -> Option<DisplayItem> {
+    app.display_items()
+        .get(app.view_state.selected_display)
+        .cloned()
+}
+
+#[test]
+fn ctrl_j_saves_a_state_dump_and_reports_where_or_why_not() {
+    use crossterm::event::KeyModifiers;
+    let dir = std::env::temp_dir().join(format!("mex-ctrl-j-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut app = App::new().unwrap();
+    app.state_dump_dir = dir.clone();
+    press_with(&mut app, KeyCode::Char('j'), KeyModifiers::CONTROL);
+    let msg = app.status_msg.as_ref().map(|(m, _)| m.clone()).unwrap();
+    let path = msg.strip_prefix("Dump saved: ").expect(&msg);
+    assert!(std::path::Path::new(path).starts_with(&dir));
+    assert!(std::fs::metadata(path).is_ok(), "the dump file exists");
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    // The directory is gone now: the failure is reported, not fatal.
+    press_with(&mut app, KeyCode::Char('J'), KeyModifiers::CONTROL);
+    let msg = app.status_msg.as_ref().map(|(m, _)| m.clone()).unwrap();
+    assert!(msg.starts_with("Dump failed: "), "{msg}");
+    assert!(app.running);
+}
+
+#[test]
+fn backtab_cycles_panes_backwards() {
+    let mut app = two_group_app();
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        press(&mut app, KeyCode::BackTab);
+        seen.push(app.view_state.focus);
+    }
+    assert_eq!(
+        seen,
+        [
+            Focus::Hex,
+            Focus::Questions,
+            Focus::Answers,
+            Focus::Services
+        ]
+    );
+}
+
+#[test]
+fn ctrl_scroll_moves_the_hex_dump_while_it_has_focus() {
+    use crossterm::event::KeyModifiers;
+    let mut app = two_group_app();
+    app.view_state.focus = Focus::Hex;
+    press_with(&mut app, KeyCode::Down, KeyModifiers::CONTROL);
+    assert_eq!(app.layout.hex_offset.get(), 1);
+    assert_eq!(app.layout.detail_offset.get(), 0, "the Answers table stays");
+}
+
+#[test]
+fn split_percentages_of_an_empty_area_fall_back_to_defaults() {
+    use ratatui::layout::Rect;
+    assert_eq!(App::pct_from_x(10, Rect::default()), 33);
+    assert_eq!(App::pct_from_y(10, Rect::default()), 34);
+}
+
+#[test]
+fn other_mouse_buttons_are_ignored() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let mut app = two_group_app();
+    place_panes(&mut app);
+    let (focus, selected) = (app.view_state.focus, app.view_state.selected_display);
+    app.handle_mouse(&mouse(MouseEventKind::Down(MouseButton::Right), 40, 8));
+    app.handle_mouse(&mouse(MouseEventKind::Up(MouseButton::Middle), 40, 8));
+    assert_eq!(app.view_state.focus, focus);
+    assert_eq!(app.view_state.selected_display, selected);
+}
+
+#[test]
+fn horizontal_wheel_pans_only_the_diagnostics_overlay() {
+    use crossterm::event::MouseEventKind;
+    let mut app = two_group_app();
+    app.handle_mouse(&mouse(MouseEventKind::ScrollRight, 10, 10));
+    assert_eq!(app.layout.diagnostics_hscroll.get(), 0, "overlay closed");
+    press(&mut app, KeyCode::Char('d'));
+    app.handle_mouse(&mouse(MouseEventKind::ScrollRight, 10, 10));
+    app.handle_mouse(&mouse(MouseEventKind::ScrollRight, 10, 10));
+    app.handle_mouse(&mouse(MouseEventKind::ScrollLeft, 10, 10));
+    assert_eq!(app.layout.diagnostics_hscroll.get(), 1);
+}
+
+#[test]
+fn mouse_down_in_the_answers_pane_selects_the_record() {
+    use ratatui::layout::Rect;
+    let mut app = App::new().unwrap();
+    service_with_txt(&mut app, "a=1; b=2");
+    app.view_state.focus = Focus::Services;
+    app.layout.left_rect.set(Rect::new(0, 3, 33, 30));
+    app.layout.right_rect.set(Rect::new(33, 3, 67, 30));
+    app.layout.answers_rect.set(Rect::new(33, 3, 67, 20));
+    app.layout.questions_rect.set(Rect::new(33, 24, 67, 8));
+    app.layout.hex_rect.set(Rect::default());
+    app.layout.detail_offset.set(0);
+    // Info row, PTR, its finding row, then SRV (as in
+    // `mouse_click_answers_selects_record`).
+    left_click(&mut app, 40, 3 + 2 + 3);
+    assert_eq!(app.view_state.focus, Focus::Answers);
+    assert_eq!(app.view_state.detail_selected, 1);
+    // The info row above the records selects nothing.
+    left_click(&mut app, 40, 3 + 2);
+    assert_eq!(app.view_state.detail_selected, 1);
+}
+
+#[test]
+fn clicks_outside_every_pane_and_on_borders_change_nothing() {
+    use ratatui::layout::Rect;
+    let mut app = two_group_app();
+    place_panes(&mut app);
+    let before = (
+        app.view_state.selected_display,
+        app.view_state.detail_selected,
+    );
+    // Below every pane (the status line).
+    left_click(&mut app, 40, 38);
+    assert_eq!(app.view_state.focus, Focus::Services);
+    // Hosts pane: its top border, and a row past the last entry.
+    left_click(&mut app, 5, 3);
+    let past_last = 3 + 1 + app.display_items().len() as u16 + 2;
+    left_click(&mut app, 5, past_last);
+    assert_eq!(app.view_state.focus, Focus::Services);
+    // Answers pane: its column header.
+    left_click(&mut app, 40, 3 + 1);
+    assert_eq!(app.view_state.focus, Focus::Answers);
+    // A pane's bottom border is the resize seam while the pane below
+    // is shown; with that pane hidden it is a plain border.
+    app.layout.questions_rect.set(Rect::default());
+    app.layout.hex_rect.set(Rect::default());
+    left_click(&mut app, 40, 3 + 10 - 1);
+    assert_eq!(app.view_state.focus, Focus::Answers);
+    assert_eq!(app.view_state.drag, DragMode::None, "no seam there");
+    app.layout.questions_rect.set(Rect::new(33, 13, 67, 10));
+    app.layout.answers_rect.set(Rect::default());
+    left_click(&mut app, 40, 13 + 10 - 1);
+    assert_eq!(app.view_state.focus, Focus::Questions);
+    assert_eq!(app.view_state.drag, DragMode::None, "no seam there");
+    assert_eq!(
+        (
+            app.view_state.selected_display,
+            app.view_state.detail_selected
+        ),
+        before
+    );
+}
+
+#[test]
+fn drag_and_motion_are_ignored_while_the_overlay_is_open() {
+    let mut app = two_group_app();
+    render_to_buffer(&app, 120, 40);
+    let pct = app.view_state.left_pct;
+    press(&mut app, KeyCode::Char('d'));
+    app.view_state.drag = DragMode::Vertical;
+    app.handle_mouse(&mouse_drag(60, 10));
+    assert_eq!(app.view_state.left_pct, pct);
+}
+
+#[test]
+fn motion_reported_during_a_drag_keeps_resizing() {
+    use crossterm::event::MouseEventKind;
+    let mut app = two_group_app();
+    render_to_buffer(&app, 120, 40);
+    let (col, row) = seam_grab_cell(&app, DragMode::Vertical);
+    app.handle_mouse(&mouse_down(col, row));
+    assert_eq!(app.view_state.drag, DragMode::Vertical);
+    let pct = app.view_state.left_pct;
+    // Some terminals report the held-button motion as plain Moved.
+    app.handle_mouse(&mouse(MouseEventKind::Moved, col + 12, row));
+    assert!(
+        app.view_state.left_pct > pct,
+        "the split followed the pointer"
+    );
+}
+
+#[test]
+fn clicking_the_header_of_the_selected_hosts_group_folds_onto_it() {
+    let mut app = two_group_app();
+    place_panes(&mut app);
+    // The cursor is on Shell, inside shell.local: folding that group
+    // takes the cursor's row away, so it lands on the clicked header.
+    let header = app
+        .display_items()
+        .iter()
+        .position(|it| matches!(it, DisplayItem::Host { label } if label == "shell.local"))
+        .unwrap();
+    left_click(&mut app, 5, 3 + 1 + header as u16);
+    assert!(app.is_host_collapsed("shell.local"));
+    assert!(
+        selected_item(&app)
+            == Some(DisplayItem::Host {
+                label: "shell.local".to_string()
+            })
+    );
+}
+
+#[test]
+fn question_clicks_hit_the_layout_when_nothing_was_drawn() {
+    let mut app = test_service_app();
+    select_instance(&mut app, "Test");
+    ask(&mut app, "Test._http._tcp.local.", querier(1));
+    ask(&mut app, "Test._http._tcp.local.", querier(2));
+    place_panes(&mut app);
+    assert!(app.layout.questions_rows.borrow().is_none(), "no frame yet");
+    let raws = service_of(&app, "Test").ordered_answers().len();
+    // First table row (below border and column header): question 0.
+    left_click(&mut app, 40, 13 + 2);
+    assert_eq!(app.view_state.focus, Focus::Questions);
+    assert_eq!(app.view_state.detail_selected, raws);
+    // Clicking it again keeps it; a row below every question selects
+    // nothing.
+    left_click(&mut app, 40, 13 + 2);
+    assert_eq!(app.view_state.detail_selected, raws);
+    left_click(&mut app, 40, 13 + 8);
+    assert_eq!(app.view_state.detail_selected, raws);
+}
+
+#[test]
+fn question_clicks_without_a_detail_target_do_nothing() {
+    let mut app = App::new().unwrap();
+    place_panes(&mut app);
+    // Fold the enumeration group: its header holds the cursor and no
+    // target was ever selected.
+    app.collapsed_hosts.insert(ENUM_HOST.to_string());
+    app.view_state.selected_display = 0;
+    app.sticky_enum_key = None;
+    assert!(app.display_detail().is_none());
+    left_click(&mut app, 40, 13 + 2);
+    assert_eq!(app.view_state.focus, Focus::Questions);
+    assert_eq!(app.view_state.detail_selected, 0);
+}
+
+#[test]
+fn arrows_move_the_service_and_record_cursors() {
+    let mut app = two_group_app();
+    let start = app.view_state.selected_display;
+    press(&mut app, KeyCode::Down);
+    let down = app.view_state.selected_display;
+    assert!(down > start);
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.view_state.selected_display, start);
+
+    press(&mut app, KeyCode::Tab); // Answers
+    let first = app.view_state.detail_selected;
+    press(&mut app, KeyCode::Down);
+    assert_eq!(app.view_state.detail_selected, first + 1);
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.view_state.detail_selected, first);
+}
+
+#[test]
+fn unbound_keys_in_the_answers_and_hex_panes_change_nothing() {
+    let mut app = two_group_app();
+    for focus in [Focus::Answers, Focus::Hex] {
+        app.view_state.focus = focus;
+        let before = (
+            app.view_state.detail_selected,
+            app.layout.hex_offset.get(),
+            app.view_state.selected_display,
+        );
+        press(&mut app, KeyCode::Char('x'));
+        let after = (
+            app.view_state.detail_selected,
+            app.layout.hex_offset.get(),
+            app.view_state.selected_display,
+        );
+        assert_eq!(after, before, "{focus:?}");
+        assert!(app.running);
+    }
+}
+
+#[test]
+fn paging_and_stepping_stop_at_the_list_ends() {
+    let mut app = two_group_app();
+    app.layout.list_viewport.set(100);
+    press(&mut app, KeyCode::PageDown);
+    let last = *selectable_positions(&app).last().unwrap();
+    assert_eq!(app.view_state.selected_display, last);
+    press(&mut app, KeyCode::Down);
+    assert_eq!(app.view_state.selected_display, last, "no stop below");
+    press(&mut app, KeyCode::PageUp);
+    let first = selectable_positions(&app)[0];
+    assert_eq!(app.view_state.selected_display, first);
+    press(&mut app, KeyCode::Up);
+    assert_eq!(
+        app.view_state.selected_display, first,
+        "the header is no stop"
+    );
+    app.move_selection(0);
+    assert_eq!(app.view_state.selected_display, first, "no step, no move");
+}
+
+#[test]
+fn a_host_named_like_a_builtin_group_still_lists_each_group_once() {
+    // "(enumeration)." is a legal single-label host name; it keys the
+    // same group label as the enumeration group.
+    let mut app = App::new().unwrap();
+    ingest(&mut app, &ptr_record(120));
+    ingest(
+        &mut app,
+        &raw_record(
+            "Test._http._tcp.local.",
+            33,
+            "SRV",
+            "0 0 80 (enumeration).",
+            120,
+        ),
+    );
+    app.evict_expired();
+    let labels = app.group_labels();
+    let mut unique = labels.clone();
+    unique.dedup();
+    assert_eq!(labels, unique);
+    assert_eq!(labels.iter().filter(|l| l.as_str() == ENUM_HOST).count(), 1);
+}
+
+#[test]
+fn group_jumps_from_headers_stale_rows_and_the_unattributed_entry() {
+    let mut app = two_group_app();
+    // A finding with no owner adds the (unattributed) group last.
+    ingest(
+        &mut app,
+        &raw_record("fritz.box.", 6, "TYPE6", "rdlength=49", 10),
+    );
+    app.evict_expired();
+    assert!(app.group_labels().iter().any(|l| l == UNATTRIBUTED_HOST));
+
+    // From a folded host's header (a stop while folded), `l` enters
+    // the next group.
+    press(&mut app, KeyCode::Char('-'));
+    assert!(app.is_host_collapsed("shell.local"));
+    app.view_state.selected_display = app
+        .display_items()
+        .iter()
+        .position(|it| matches!(it, DisplayItem::Host { label } if label == "shell.local"))
+        .unwrap();
+    press(&mut app, KeyCode::Char('l'));
+    assert!(
+        matches!(selected_item(&app), Some(DisplayItem::Instance { index }) if app.services[index].instance == "Test")
+    );
+
+    // `L` jumps to the last group: the (unattributed) entry.
+    press(&mut app, KeyCode::Char('L'));
+    assert!(selected_item(&app) == Some(DisplayItem::Unattributed));
+    // `h` from there goes back one group.
+    press(&mut app, KeyCode::Char('h'));
+    assert!(
+        matches!(selected_item(&app), Some(DisplayItem::Instance { index }) if app.services[index].instance == "Test")
+    );
+
+    // From an enumeration row, `l` enters the first host group.
+    app.view_state.selected_display = 1;
+    assert!(selected_item(&app) == Some(DisplayItem::Enum { index: 0 }));
+    press(&mut app, KeyCode::Char('l'));
+    assert!(
+        selected_item(&app)
+            == Some(DisplayItem::Host {
+                label: "shell.local".to_string()
+            }),
+        "shell.local is still folded: its header is the stop"
+    );
+
+    // A stale cursor past the list enters from the edge it moves away
+    // from: `l` the first group, `h` the last.
+    app.view_state.selected_display = 999;
+    app.jump_group(1);
+    assert!(selected_item(&app) == Some(DisplayItem::Enum { index: 0 }));
+    app.view_state.selected_display = 999;
+    app.jump_group(-1);
+    assert!(selected_item(&app) == Some(DisplayItem::Unattributed));
+}
+
+#[test]
+fn toggling_on_a_header_folds_it_and_past_the_list_does_nothing() {
+    let mut app = two_group_app();
+    let header = app
+        .display_items()
+        .iter()
+        .position(|it| matches!(it, DisplayItem::Host { label } if label == "test.local"))
+        .unwrap();
+    app.view_state.selected_display = header;
+    app.toggle_collapse();
+    assert!(app.is_host_collapsed("test.local"));
+
+    let folded = app.collapsed_hosts.clone();
+    app.view_state.selected_display = 999;
+    app.toggle_collapse();
+    assert_eq!(app.collapsed_hosts, folded);
+    assert!(app.view_state.selected_display < app.display_items().len());
+}
+
+#[test]
+fn record_cursor_enters_the_focused_table_from_its_edges() {
+    let mut app = test_service_app();
+    select_instance(&mut app, "Test");
+    // No questions yet: the Questions table is empty, keys do nothing.
+    app.view_state.focus = Focus::Questions;
+    let before = app.view_state.detail_selected;
+    press(&mut app, KeyCode::Down);
+    assert_eq!(app.view_state.detail_selected, before);
+
+    ask(&mut app, "Test._http._tcp.local.", querier(1));
+    ask(&mut app, "Test._http._tcp.local.", querier(2));
+    let raws = service_of(&app, "Test").ordered_answers().len();
+    // The cursor still sits on an answer: Up enters the questions at
+    // their last row, Down at their first.
+    app.view_state.detail_selected = 0;
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.view_state.detail_selected, raws + 1);
+    app.view_state.detail_selected = 0;
+    app.detail_anchor = None;
+    press(&mut app, KeyCode::Down);
+    assert_eq!(app.view_state.detail_selected, raws);
+}
+
+#[test]
+fn a_record_cursor_past_the_rows_is_clamped_to_the_last() {
+    let mut app = test_service_app();
+    select_instance(&mut app, "Test");
+    let rows = service_of(&app, "Test").ordered_answers().len();
+    app.view_state.detail_selected = 999;
+    app.detail_anchor = None;
+    app.clamp_selection();
+    assert_eq!(app.view_state.detail_selected, rows - 1);
+}
+
+#[test]
+fn a_lone_unfolded_header_keeps_the_cursor_without_a_stop() {
+    // Nothing selectable at all: the cursor stays on the only row.
+    let mut app = App::new().unwrap();
+    app.enum_entries.clear();
+    app.view_state.selected_display = 0;
+    app.clamp_selection();
+    assert_eq!(app.view_state.selected_display, 0);
+    // Home and End find no stop either.
+    press(&mut app, KeyCode::Home);
+    press(&mut app, KeyCode::End);
+    assert_eq!(app.view_state.selected_display, 0);
+}
+
+#[test]
+fn the_hosts_list_scrolls_back_to_show_the_cursor() {
+    let mut app = two_group_app();
+    // The cursor above the viewport pulls the viewport up to it.
+    select_instance(&mut app, "Test");
+    let test_row = app.view_state.selected_display;
+    app.layout.list_offset.set(test_row + 3);
+    app.clamp_selection();
+    assert_eq!(app.layout.list_offset.get(), test_row);
+    // On the first stop, the header above it comes into view too.
+    let first = selectable_positions(&app)[0];
+    app.view_state.selected_display = first;
+    app.layout.list_offset.set(first);
+    app.clamp_selection();
+    assert_eq!(app.layout.list_offset.get(), first - 1);
+}
+
+#[test]
+fn enter_on_a_folded_header_in_the_answers_pane_touches_no_txt() {
+    let mut app = App::new().unwrap();
+    service_with_txt(&mut app, "a=1; b=2");
+    press(&mut app, KeyCode::Char('-'));
+    assert!(matches!(
+        selected_item(&app),
+        Some(DisplayItem::Host { .. })
+    ));
+    app.view_state.focus = Focus::Answers;
+    assert!(!app.toggle_txt_expanded());
+    press(&mut app, KeyCode::Enter);
+    assert!(app.expanded_txt.is_empty());
+}
