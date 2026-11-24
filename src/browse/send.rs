@@ -280,19 +280,32 @@ pub(super) fn split_instance_labels(name: &str) -> Vec<&str> {
 /// Wire name for an unescaped display name. Labels go in as raw bytes,
 /// so instance names with spaces and punctuation (which presentation
 /// parsers reject) encode fine. `None` means the name cannot go on the
-/// wire (empty or over-long label).
+/// wire: an empty or over-long label, or a name longer than
+/// `MAX_NAME_OCTETS` (labels are built unchecked, so simple-dns would
+/// write it out anyway, as a malformed packet).
 pub(super) fn wire_name(name: &str) -> Option<simple_dns::Name<'_>> {
     let parts = split_instance_labels(name);
     let mut labels = Vec::with_capacity(parts.len());
+    // The root label's zero octet.
+    let mut octets = 1;
     for part in parts {
         let bytes = part.as_bytes();
         if bytes.is_empty() || bytes.len() > 63 {
             return None;
         }
+        // Length octet plus the label itself.
+        octets += 1 + bytes.len();
         labels.push(simple_dns::Label::new_unchecked(bytes));
+    }
+    if octets > MAX_NAME_OCTETS {
+        return None;
     }
     Some(simple_dns::Name::new_with_labels(&labels))
 }
+
+/// Longest name on the wire, counting each label's length octet and the
+/// root's zero octet (RFC 1035 §3.1).
+pub(super) const MAX_NAME_OCTETS: usize = 255;
 
 /// Largest UDP payload we will emit (RFC 6762 §17: packets MUST NOT
 /// exceed 9000 bytes including IP+UDP headers; the 40-byte IPv6 header
@@ -300,7 +313,7 @@ pub(super) fn wire_name(name: &str) -> Option<simple_dns::Name<'_>> {
 pub(super) const MAX_QUERY_BYTES: usize = 9000 - 40 - 8;
 
 /// Encode one query for an egress interface. `None` means the owner name
-/// cannot go on the wire (empty or over-long label); that is logged
+/// cannot go on the wire (see `wire_name`); that is logged
 /// because the scheduler has already counted the query as sent.
 ///
 /// Names compress against byte-identical repeats (differing-case names

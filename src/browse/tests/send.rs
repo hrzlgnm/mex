@@ -579,3 +579,17 @@ fn unencodable_known_answer_is_skipped_others_kept() {
     assert_eq!(ev.query_kas.len(), 1);
     assert_eq!(ev.query_kas[0].rdata, "Good._http._tcp.local.");
 }
+
+#[test]
+fn wire_name_rejects_names_over_255_octets() {
+    // RFC 1035 §3.1: a whole name is at most 255 octets on the wire,
+    // counting each label's length octet and the root's zero octet.
+    // Four 63-octet labels encode to 4 * 64 + 1 = 257 octets.
+    let label = "a".repeat(63);
+    let too_long = [label.as_str(); 4].join(".");
+    assert!(wire_name(&too_long).is_none());
+    // 3 * 64 + (61 + 1) + 1 = 255 octets: the longest valid name.
+    let longest = format!("{label}.{label}.{label}.{}", "a".repeat(61));
+    assert!(wire_name(&longest).is_some());
+    assert!(wire_name(&format!("{longest}a")).is_none(), "256 octets");
+}
