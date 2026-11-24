@@ -593,3 +593,61 @@ fn wire_name_rejects_names_over_255_octets() {
     assert!(wire_name(&longest).is_some());
     assert!(wire_name(&format!("{longest}a")).is_none(), "256 octets");
 }
+
+#[test]
+fn query_codec_failure_is_handled_not_a_panic() {
+    let qname = wire_name("_http._tcp.local").unwrap();
+    assert!(build_query_into(&mut LimitedSink::new(0), &qname, TYPE::PTR, false, &[]).is_none());
+    // The in-memory sink encodes as before.
+    let bytes = build_query(&qname, TYPE::PTR, false, &[]).unwrap();
+    let ev = parse_packet(&bytes, test_source(), std::net::IpAddr::V4(MDNS_V4), "", 0).unwrap();
+    assert_eq!(ev.questions[0].name, "_http._tcp.local.");
+}
+
+fn dense_ptr_query() -> QueryRequest {
+    QueryRequest {
+        known_answers: (0..2000)
+            .map(|i| KnownAnswer {
+                target: format!("instance-{i:05}._http._tcp.local"),
+                ttl: 120,
+                iface: String::new(),
+            })
+            .collect(),
+        ..ptr_query()
+    }
+}
+
+#[test]
+fn encode_failure_ends_the_query_at_either_build() {
+    // The first build fails outright.
+    assert!(encode_query_into(&mut LimitedSink::new(0), &ptr_query(), "").is_none());
+    // The oversized first build fits the budget exactly; the first
+    // known-answer truncation retry then fails. The budget is what the
+    // build writes, not the packet length: the codec writes each
+    // RDLENGTH twice (a placeholder, then the value).
+    let req = dense_ptr_query();
+    let qname = wire_name(&req.name).unwrap();
+    let kas: Vec<_> = req
+        .known_answers
+        .iter()
+        .map(|ka| (wire_name(&ka.target).unwrap(), ka.ttl))
+        .collect();
+    let mut probe = LimitedSink::new(usize::MAX);
+    let first = build_query_into(&mut probe, &qname, req.record_type, req.qu, &kas).unwrap();
+    assert!(first.len() > MAX_QUERY_BYTES, "the retry path is taken");
+    let first_writes = usize::MAX - probe.budget;
+    assert!(encode_query_into(&mut LimitedSink::new(first_writes), &req, "").is_none());
+    // With room to spare, the retries succeed as before.
+    assert!(encode_query_into(&mut LimitedSink::new(usize::MAX), &req, "").is_some());
+}
+
+#[test]
+fn a_reused_in_memory_sink_starts_each_packet_fresh() {
+    // Truncation retries reuse the sink: a packet must not carry the
+    // previous one's length as leading zeros.
+    let qname = wire_name("_http._tcp.local").unwrap();
+    let mut sink = std::io::Cursor::new(Vec::new());
+    let first = build_query_into(&mut sink, &qname, TYPE::PTR, false, &[]).unwrap();
+    let second = build_query_into(&mut sink, &qname, TYPE::PTR, false, &[]).unwrap();
+    assert_eq!(first, second);
+}

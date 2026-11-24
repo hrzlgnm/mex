@@ -255,14 +255,37 @@ pub(super) fn question_row(q: &Question<'_>, ing: Ingress<'_>) -> RawRecord {
 /// names are written expanded with no compression pointers — matching
 /// the old per-record encoding and keeping the slice self-contained.
 pub(super) fn record_wire(rec: &ResourceRecord<'_>) -> Vec<u8> {
+    record_wire_into(&mut std::io::Cursor::new(Vec::new()), rec)
+}
+
+/// `record_wire` through `sink`. Empty when the codec fails, which it
+/// only does when the sink does: the hex pane then shows no bytes
+/// instead of the app going down.
+pub(super) fn record_wire_into(mut sink: &mut dyn WireSink, rec: &ResourceRecord<'_>) -> Vec<u8> {
     let mut pkt = Packet::new_reply(0);
     pkt.answers.push(rec.clone());
-    // The codec only fails on writer I/O errors, and an in-memory
-    // `Vec` never fails to grow by a write.
-    let bytes = pkt
-        .build_bytes_vec()
-        .expect("writing a record into a Vec cannot fail");
-    bytes[12..].to_vec()
+    match pkt.write_to(&mut sink) {
+        Ok(()) => sink.take_bytes().get(12..).unwrap_or_default().to_vec(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Where the encoders write: an in-memory buffer in the app, a failing
+/// one in tests (the codec only fails on writer errors). Taken as a
+/// trait object, so each encoder is compiled once and its success and
+/// error arms count as one function's coverage.
+pub(super) trait WireSink: std::io::Write + std::io::Seek {
+    /// The bytes written so far, leaving the sink empty and ready for
+    /// the next packet.
+    fn take_bytes(&mut self) -> Vec<u8>;
+}
+
+impl WireSink for std::io::Cursor<Vec<u8>> {
+    fn take_bytes(&mut self) -> Vec<u8> {
+        // Rewind too: a write at the old position would pad with zeros.
+        self.set_position(0);
+        std::mem::take(self.get_mut())
+    }
 }
 
 /// Type and RDLENGTH of one resource record, read from the packet
