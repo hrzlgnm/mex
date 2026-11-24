@@ -338,6 +338,12 @@ impl Scheduler {
         &self.overheard
     }
 
+    pub(super) fn overheard_mut(
+        &mut self,
+    ) -> &mut HashMap<(String, u16), (Instant, HashSet<String>, String)> {
+        &mut self.overheard
+    }
+
     pub(super) fn continuous_mut(&mut self) -> &mut HashMap<(String, u16), ContinuousQuery> {
         &mut self.continuous
     }

@@ -344,6 +344,21 @@ impl TransmitState {
 }
 
 impl QueryTx {
+    /// A sender whose listener is gone (its queue closed), with both
+    /// families able to transmit: every `send` fails, as after the
+    /// listener thread stopped.
+    #[cfg(test)]
+    pub(crate) fn disconnected() -> Self {
+        let poll = mio::Poll::new().expect("poll");
+        let waker = Arc::new(mio::Waker::new(poll.registry(), WAKER_TOKEN).expect("waker"));
+        let (tx, _closed) = mpsc::channel();
+        Self {
+            tx: Some(tx),
+            waker,
+            transmit: Arc::new(TransmitState::new(true, true)),
+        }
+    }
+
     /// The shared per-family transmit state.
     pub fn transmit(&self) -> &TransmitState {
         &self.transmit

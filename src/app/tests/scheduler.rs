@@ -184,3 +184,92 @@ fn eviction_keeps_refresh_summaries_of_live_names_by_ascii_case_only() {
     let left: Vec<_> = s.requeries().keys().cloned().collect();
     assert_eq!(left, [key("\u{00C9}CLAIR._HTTP._tcp.local", 33)]);
 }
+
+#[test]
+fn enumeration_goodbye_drops_the_known_answer_but_keeps_the_type() {
+    let mut s = Scheduler::default();
+    let mut rec = raw_record(
+        "_services._dns-sd._udp.local.",
+        12,
+        "PTR",
+        "_ipp._tcp.local.",
+        4500,
+    );
+    s.note_enum_type("_IPP._tcp.local", &rec);
+    assert!(s.enum_known().contains_key("_ipp._tcp.local"));
+    rec.ttl = 0;
+    s.note_enum_type("_ipp._tcp.local", &rec);
+    assert!(s.enum_known().is_empty(), "a goodbye is no known answer");
+    assert!(
+        s.known_types().contains("_ipp._tcp.local"),
+        "the type stays learned"
+    );
+}
+
+#[test]
+fn stale_overheard_question_suppresses_nothing() {
+    let Some(old) = Instant::now().checked_sub(OVERHEARD_WINDOW + Duration::from_secs(1)) else {
+        return; // host clock too young to backdate
+    };
+    let mut s = Scheduler::default();
+    let q = raw_record("_ipp._tcp.local.", 12, "PTR", "", 0);
+    s.note_overheard(&q, &[]);
+    for (seen, _, _) in s.overheard_mut().values_mut() {
+        *seen = old;
+    }
+    assert!(!s.suppressed_by_overheard(&key("_ipp._tcp.local", 12), &[]));
+}
+
+#[test]
+fn overheard_known_answers_only_count_on_their_own_link() {
+    let mut q = raw_record("_ipp._tcp.local.", 12, "PTR", "", 0);
+    q.iface = "eth0".to_string();
+    let ka = raw_record("_ipp._tcp.local.", 12, "PTR", "P._ipp._tcp.local.", 4500);
+    let local = |iface: &str| {
+        vec![browse::KnownAnswer {
+            target: "P._ipp._tcp.local".to_string(),
+            ttl: 4500,
+            iface: iface.to_string(),
+        }]
+    };
+    let k = key("_ipp._tcp.local", 12);
+    let mut s = Scheduler::default();
+    s.note_overheard(&q, std::slice::from_ref(&ka));
+    // The remote querier listed P; we know P only from another link,
+    // so our query would not carry it there: not a duplicate.
+    assert!(!s.suppressed_by_overheard(&k, &local("wlan0")));
+    // Known on the same link: the overheard query stands in for ours.
+    assert!(s.suppressed_by_overheard(&k, &local("eth0")));
+}
+
+#[test]
+fn advancing_or_postponing_keeps_existing_deadlines_honest() {
+    let now = Instant::now();
+    // No stream for the key: advancing creates none.
+    let mut s = Scheduler::default();
+    s.advance_continuous(&key("_ipp._tcp.local", 12), now);
+    assert!(s.continuous().is_empty());
+    // A stream already due later than the refresh floor keeps its time.
+    let k = key("_http._tcp.local", 12);
+    let mut s = seeded(&k.0, k.1, Duration::from_secs(8), now);
+    let later = now + Duration::from_secs(3600);
+    s.continuous_mut().get_mut(&k).unwrap().next_due = later;
+    s.postpone_continuous_for_refresh(&k, now);
+    assert_eq!(s.continuous()[&k].next_due, later);
+}
+
+#[test]
+fn eviction_drops_refresh_summaries_of_dead_interests() {
+    let now = Instant::now();
+    let mut s = Scheduler::default();
+    s.requeries_mut()
+        .insert(key("_HTTP._tcp.local", 12), (now, 1));
+    s.requeries_mut().insert(key("gone.local", 1), (now, 1));
+    s.evict(HashSet::from([key("_http._tcp.local", 12)]));
+    let left: Vec<_> = s.requeries().keys().cloned().collect();
+    assert_eq!(
+        left,
+        [key("_HTTP._tcp.local", 12)],
+        "matched case-insensitively"
+    );
+}
