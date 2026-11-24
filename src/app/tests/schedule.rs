@@ -964,3 +964,52 @@ fn cached_a_row(app: &mut App) -> &mut browse::RawRecord {
         .find(|r| r.rtype == 1)
         .expect("cached A row")
 }
+
+#[test]
+fn refresh_of_a_non_ascii_name_postpones_its_discovery_stream() {
+    // A due SRV refresh for `Éclair` must push back the discovery
+    // stream of the same question, or both RFC 6762 §5.2 timers fire
+    // back to back.
+    let Some(old) = Instant::now().checked_sub(Duration::from_secs(100)) else {
+        return; // host clock too young to backdate
+    };
+    let mut app = App::new().unwrap();
+    ingest(
+        &mut app,
+        &raw_record(
+            "_http._tcp.local.",
+            12,
+            "PTR",
+            "Éclair._http._tcp.local.",
+            4500,
+        ),
+    );
+    let mut srv = raw_record(
+        "Éclair._http._tcp.local.",
+        33,
+        "SRV",
+        "0 0 80 e.local.",
+        120,
+    );
+    srv.received_at = old; // 83%: refresh due
+    ingest(&mut app, &srv);
+    let stream = Scheduler::continuous_key("Éclair._http._tcp.local", 33);
+    let now = Instant::now();
+    app.scheduler.continuous_mut().insert(
+        stream.clone(),
+        ContinuousQuery {
+            next_due: now,
+            interval: Duration::from_secs(8),
+            qname: "Éclair._http._tcp.local".to_string(),
+        },
+    );
+    app.requery_expiring();
+    assert!(
+        app.scheduler.refresh_rows().keys().any(|r| r.1 == 33),
+        "the SRV refresh was sent"
+    );
+    assert!(
+        app.scheduler.continuous()[&stream].next_due >= now + Duration::from_secs(8),
+        "the discovery stream was postponed"
+    );
+}

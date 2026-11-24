@@ -136,3 +136,23 @@ fn response_names_the_question_sent_just_before_it() {
     );
     assert!(stale.response_trigger(&answer).is_none());
 }
+
+#[test]
+fn refresh_postpones_a_stream_whose_name_differs_in_non_ascii_case() {
+    // Refresh keys keep wire case; stream keys are fully lowercased
+    // (RFC 6763 §7). `É` and `é` name the same interest.
+    let now = Instant::now();
+    let stream = Scheduler::continuous_key("Éclair._http._tcp.local", 33);
+    let mut s = seeded(&stream.0, stream.1, Duration::from_secs(8), now);
+    s.postpone_continuous_for_refresh(&key("Éclair._http._tcp.local", 33), now);
+    assert_eq!(
+        s.continuous()[&stream].next_due,
+        now + Duration::from_secs(8),
+        "the existing stream is floored at now + its interval"
+    );
+    assert_eq!(
+        s.continuous().len(),
+        1,
+        "no second stream for the same name"
+    );
+}

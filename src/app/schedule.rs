@@ -222,19 +222,18 @@ impl Scheduler {
     /// Postpone the exponential stream after a refresh (real or suppressed)
     /// so the two §5.2 timers don't emit back-to-back duplicates.
     pub(super) fn postpone_continuous_for_refresh(&mut self, key: &(String, u16), now: Instant) {
-        let mut postponed = false;
-        for (ckey, entry) in self.continuous.iter_mut() {
-            if ckey.1 == key.1 && ckey.0.eq_ignore_ascii_case(&key.0) {
+        // Refresh keys keep wire case; streams are keyed by the full
+        // lowercase fold (not ASCII-only: `É` and `é` are one name).
+        use std::collections::hash_map::Entry;
+        match self.continuous.entry(Self::continuous_key(&key.0, key.1)) {
+            Entry::Occupied(mut e) => {
+                let entry = e.get_mut();
                 let floor = now + entry.interval.max(Duration::from_secs(1));
                 if entry.next_due < floor {
                     entry.next_due = floor;
                 }
-                postponed = true;
             }
-        }
-        if !postponed {
-            let ckey = Self::continuous_key(&key.0, key.1);
-            if let std::collections::hash_map::Entry::Vacant(e) = self.continuous.entry(ckey) {
+            Entry::Vacant(e) => {
                 e.insert(ContinuousQuery {
                     next_due: now + Duration::from_secs(1),
                     interval: Duration::from_secs(1),
