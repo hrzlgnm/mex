@@ -257,10 +257,12 @@ pub(super) fn question_row(q: &Question<'_>, ing: Ingress<'_>) -> RawRecord {
 pub(super) fn record_wire(rec: &ResourceRecord<'_>) -> Vec<u8> {
     let mut pkt = Packet::new_reply(0);
     pkt.answers.push(rec.clone());
-    match pkt.build_bytes_vec() {
-        Ok(bytes) => bytes.get(12..).unwrap_or_default().to_vec(),
-        Err(_) => Vec::new(),
-    }
+    // The codec only fails on writer I/O errors, and an in-memory
+    // `Vec` never fails to grow by a write.
+    let bytes = pkt
+        .build_bytes_vec()
+        .expect("writing a record into a Vec cannot fail");
+    bytes[12..].to_vec()
 }
 
 /// Type and RDLENGTH of one resource record, read from the packet
@@ -348,18 +350,11 @@ pub fn record_fields(wire: &[u8], rtype: u16) -> Vec<RecordField> {
     let Some(owner_end) = wire_name_end(wire, 0) else {
         return whole_record_field(wire);
     };
-    let Some(type_end) = owner_end.checked_add(2) else {
-        return whole_record_field(wire);
-    };
-    let Some(class_end) = type_end.checked_add(2) else {
-        return whole_record_field(wire);
-    };
-    let Some(ttl_end) = class_end.checked_add(4) else {
-        return whole_record_field(wire);
-    };
-    let Some(length_end) = ttl_end.checked_add(2) else {
-        return whole_record_field(wire);
-    };
+    // `owner_end` is within `wire`, so these sums cannot overflow.
+    let type_end = owner_end + 2;
+    let class_end = type_end + 2;
+    let ttl_end = class_end + 4;
+    let length_end = ttl_end + 2;
     let Some(header) = wire.get(owner_end..length_end) else {
         return whole_record_field(wire);
     };
@@ -422,11 +417,6 @@ pub fn question_fields(wire: &[u8], name: &str, rtype_str: &str) -> Option<Vec<R
     if packet.has_flags(PacketFlag::RESPONSE) {
         return None;
     }
-    let question_count = u16::from_be_bytes(wire.get(4..6)?.try_into().ok()?) as usize;
-    if question_count != packet.questions.len() {
-        return None;
-    }
-
     let mut selected_index = None;
     for (index, question) in packet.questions.iter().enumerate() {
         if display_name(&question.qname).trim_end_matches('.') == name.trim_end_matches('.')
@@ -438,22 +428,20 @@ pub fn question_fields(wire: &[u8], name: &str, rtype_str: &str) -> Option<Vec<R
     }
     let selected_index = selected_index?;
 
+    // The parse succeeded, so every question up to the selected one is
+    // whole: skip the earlier ones (name, type, class).
     let mut offset = 12;
-    for (index, _) in packet.questions.iter().enumerate() {
-        let name_end = packet_name_end(wire, offset)?;
-        let type_end = name_end.checked_add(2)?;
-        let class_end = type_end.checked_add(2)?;
-        wire.get(offset..class_end)?;
-        if index == selected_index {
-            return Some(vec![
-                record_field("QNAME", offset, name_end),
-                record_field("QTYPE", name_end, type_end),
-                record_field("QCLASS / QU", type_end, class_end),
-            ]);
-        }
-        offset = class_end;
+    for _ in 0..selected_index {
+        offset = packet_name_end(wire, offset)? + 4;
     }
-    None
+    let name_end = packet_name_end(wire, offset)?;
+    let type_end = name_end + 2;
+    let class_end = type_end + 2;
+    Some(vec![
+        record_field("QNAME", offset, name_end),
+        record_field("QTYPE", name_end, type_end),
+        record_field("QCLASS / QU", type_end, class_end),
+    ])
 }
 
 pub(super) fn record_field(label: &str, start: usize, end: usize) -> RecordField {

@@ -752,3 +752,223 @@ fn inconsistent_record_wire_is_one_whole_field() {
     whole(&[3, b'a', b'b']);
     assert!(record_fields(&[], 5).is_empty(), "nothing to show");
 }
+
+fn parse_response(msg: &Packet<'_>) -> Event {
+    parse_packet(
+        &msg.build_bytes_vec().unwrap(),
+        test_source(),
+        std::net::IpAddr::V4(MDNS_V4),
+        "br0",
+        3,
+    )
+    .unwrap()
+}
+
+#[test]
+fn cname_and_ns_targets_render_and_flag_invalid_utf8() {
+    let owner = || simple_dns::Name::new_unchecked("alias.local.");
+    let mut msg = Packet::new_reply(0);
+    msg.answers.push(ResourceRecord::new(
+        owner(),
+        CLASS::IN,
+        120,
+        RData::CNAME(simple_dns::Name::new_unchecked("host.local.").into()),
+    ));
+    msg.answers.push(ResourceRecord::new(
+        owner(),
+        CLASS::IN,
+        120,
+        RData::NS(simple_dns::Name::new_unchecked("ns.local.").into()),
+    ));
+    let ev = parse_response(&msg);
+    let rows: Vec<_> = ev
+        .answers
+        .iter()
+        .map(|r| (r.rtype_str.as_str(), r.rdata.as_str(), r.invalid_utf8))
+        .collect();
+    assert_eq!(
+        rows,
+        [("CNAME", "host.local.", false), ("NS", "ns.local.", false)]
+    );
+
+    let mut bad = Packet::new_reply(0);
+    bad.answers.push(ResourceRecord::new(
+        owner(),
+        CLASS::IN,
+        120,
+        RData::CNAME(name_with_invalid_label().into()),
+    ));
+    bad.answers.push(ResourceRecord::new(
+        owner(),
+        CLASS::IN,
+        120,
+        RData::NS(name_with_invalid_label().into()),
+    ));
+    let ev = parse_response(&bad);
+    assert!(ev.answers.iter().all(|r| r.invalid_utf8));
+    assert_eq!(ev.answers[0].rdata, "\u{fffd}.local.");
+}
+
+/// A packet with `flags`, holding an OPT pseudo-record and then a PTR
+/// record (`svc.local.` → `inst.local.`), both in the answer section.
+fn opt_then_ptr_in_answers(flags: u16) -> Vec<u8> {
+    let mut wire = Vec::new();
+    for field in [0u16, flags, 0, 2, 0, 0] {
+        wire.extend_from_slice(&field.to_be_bytes());
+    }
+    // OPT: root owner, type 41, UDP size 1232, TTL 0, no options.
+    wire.push(0);
+    wire.extend_from_slice(&OPT_TYPE.to_be_bytes());
+    wire.extend_from_slice(&1232u16.to_be_bytes());
+    wire.extend_from_slice(&0u32.to_be_bytes());
+    wire.extend_from_slice(&0u16.to_be_bytes());
+    // PTR svc.local. -> inst.local.
+    wire.extend_from_slice(b"\x03svc\x05local\x00");
+    wire.extend_from_slice(&12u16.to_be_bytes());
+    wire.extend_from_slice(&1u16.to_be_bytes());
+    wire.extend_from_slice(&120u32.to_be_bytes());
+    let target = b"\x04inst\x05local\x00";
+    wire.extend_from_slice(&(target.len() as u16).to_be_bytes());
+    wire.extend_from_slice(target);
+    wire
+}
+
+#[test]
+fn opt_in_the_answer_section_is_never_a_row() {
+    // Only the first Additional OPT moves into the header; one in the
+    // answer section stays a record and must be skipped, in responses
+    // and in a query's known answers alike.
+    let parse = |flags| {
+        parse_packet(
+            &opt_then_ptr_in_answers(flags),
+            test_source(),
+            std::net::IpAddr::V4(MDNS_V4),
+            "",
+            0,
+        )
+        .unwrap()
+    };
+    let response = parse(0x8400);
+    assert_eq!(response.answers.len(), 1);
+    assert_eq!(response.answers[0].rdata, "inst.local.");
+    let query = parse(0);
+    assert_eq!(query.query_kas.len(), 1);
+    assert_eq!(query.query_kas[0].rdata, "inst.local.");
+}
+
+#[test]
+fn aaaa_rdata_gets_an_ipv6_address_field() {
+    let rec = ResourceRecord::new(
+        simple_dns::Name::new_unchecked("host.local."),
+        CLASS::IN,
+        120,
+        RData::AAAA(simple_dns::rdata::AAAA {
+            address: u128::from(Ipv6Addr::LOCALHOST),
+        }),
+    );
+    let wire = record_wire(&rec);
+    let field = record_fields(&wire, 28).pop().unwrap();
+    assert_eq!(field.label, "IPv6 address");
+    assert_eq!(field.end - field.start, 16);
+    assert_eq!(field.end, wire.len());
+}
+
+#[test]
+fn question_fields_refuse_a_response() {
+    let mut msg = Packet::new_reply(0);
+    msg.questions.push(Question::new(
+        simple_dns::Name::new_unchecked("_http._tcp.local."),
+        QTYPE::TYPE(TYPE::PTR),
+        QCLASS::CLASS(CLASS::IN),
+        false,
+    ));
+    let wire = msg.build_bytes_vec().unwrap();
+    assert!(question_fields(&wire, "_http._tcp.local", "PTR").is_none());
+}
+
+#[test]
+fn question_fields_find_a_later_question() {
+    let mut q = Packet::new_query(0);
+    for name in ["a.local.", "bb.local."] {
+        q.questions.push(Question::new(
+            simple_dns::Name::new_unchecked(name),
+            QTYPE::TYPE(TYPE::A),
+            QCLASS::CLASS(CLASS::IN),
+            false,
+        ));
+    }
+    let wire = q.build_bytes_vec().unwrap();
+    // 12-byte header, then "a.local." (9 bytes) and its type and class.
+    let fields = question_fields(&wire, "bb.local", "A").unwrap();
+    let spans: Vec<_> = fields.iter().map(|f| (f.start, f.end)).collect();
+    assert_eq!(spans, [(25, 35), (35, 37), (37, 39)]);
+}
+
+#[test]
+fn bad_name_encodings_end_the_walk() {
+    // Label types 0x40 and 0x80 are reserved (RFC 6891 §5 retired 0x40).
+    assert_eq!(wire_name_end(&[0x40], 0), None);
+    assert_eq!(packet_name_end(&[0x80], 0), None);
+    // Standalone records never carry compression pointers.
+    assert_eq!(wire_name_end(&[0xc0, 0x00], 0), None);
+    // A pointer must point backwards, inside the packet.
+    let wire = [1, b'a', 0, 0xc0, 0x00];
+    assert_eq!(packet_name_end(&wire, 3), Some(5));
+    assert_eq!(packet_name_end(&[1, b'a', 0, 0xc0, 0x03], 3), None, "self");
+    assert_eq!(packet_name_end(&[1, b'a', 0, 0xc0, 0x09], 3), None, "ahead");
+}
+
+#[test]
+fn txt_strings_overrunning_the_rdata_get_no_fields() {
+    let rec = ResourceRecord::new(
+        simple_dns::Name::new_unchecked("i.local."),
+        CLASS::IN,
+        120,
+        RData::TXT(
+            simple_dns::rdata::TXT::new()
+                .with_string("a=1")
+                .unwrap()
+                .with_string("b")
+                .unwrap(),
+        ),
+    );
+    let wire = record_wire(&rec);
+    let labels = |w: &[u8]| -> Vec<String> {
+        record_fields(w, 16)
+            .into_iter()
+            .map(|f| f.label)
+            .filter(|l| l.starts_with("TXT string"))
+            .collect()
+    };
+    assert_eq!(labels(&wire), ["TXT string 1", "TXT string 2"]);
+    // The second string claims more bytes than the RDATA holds.
+    let mut overrun = wire.clone();
+    let last_len_at = wire.len() - 2;
+    overrun[last_len_at] = 9;
+    assert!(labels(&overrun).is_empty());
+    // A range past the bytes present yields nothing, not a panic.
+    assert!(txt_string_fields(&[], 0, 1).is_empty());
+}
+
+#[test]
+fn rdata_label_edge_forms() {
+    // A TXT key without `=` is a boolean attribute (RFC 6763 §6.4).
+    let txt = simple_dns::rdata::TXT::new()
+        .with_string("flag")
+        .unwrap()
+        .with_string("k=v")
+        .unwrap();
+    assert_eq!(rdata_label(&RData::TXT(txt)), "flag; k=v");
+    // NSEC with an empty bitmap shows just the next name.
+    let nsec = simple_dns::rdata::NSEC {
+        next_name: simple_dns::Name::new_unchecked("host.local."),
+        type_bit_maps: Vec::new(),
+    };
+    assert_eq!(rdata_label(&RData::NSEC(nsec)), "host.local.");
+    // Types outside the in-scope set have no label.
+    let mx = simple_dns::rdata::MX {
+        preference: 10,
+        exchange: simple_dns::Name::new_unchecked("mail.local."),
+    };
+    assert_eq!(rdata_label(&RData::MX(mx)), "");
+}
