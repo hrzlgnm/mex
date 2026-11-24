@@ -17,6 +17,8 @@ fn unusable_interfaces_are_skipped() {
             index: Some(2),
             oper_status: status,
             is_p2p: p2p,
+            #[cfg(windows)]
+            adapter_name: String::new(),
         }
     }
     use if_addrs::IfOperStatus as St;
