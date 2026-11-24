@@ -509,3 +509,44 @@ fn run_refreshes_interfaces_when_due() {
     listener.run();
     assert!(listener.next_refresh >= started + IFACE_REFRESH);
 }
+
+#[test]
+fn query_send_fails_once_the_listener_is_gone() {
+    // The listener dropped its queue (it stopped): `send` reports the
+    // request as not accepted instead of pretending it was queued.
+    let poll = mio::Poll::new().unwrap();
+    let waker = Arc::new(mio::Waker::new(poll.registry(), WAKER_TOKEN).unwrap());
+    let (tx, rx) = mpsc::channel();
+    drop(rx);
+    let query_tx = QueryTx {
+        tx: Some(tx),
+        waker,
+        transmit: Arc::new(TransmitState::new(true, true)),
+    };
+    assert!(!query_tx.send(QueryRequest {
+        name: "_http._tcp.local".to_string(),
+        record_type: TYPE::PTR,
+        known_answers: Vec::new(),
+        qu: false,
+    }));
+}
+
+#[test]
+fn drop_counts_survive_a_poisoned_last_source_lock() {
+    // A panic while holding a last-source lock must not take the
+    // listener down with it: counting goes on, the last source is
+    // simply unknown from then on.
+    let drops = Arc::new(DropStats::default());
+    let poisoner = drops.clone();
+    let _ = thread::spawn(move || {
+        let _last = poisoner.last.lock().unwrap();
+        let _malformed = poisoner.malformed_last.lock().unwrap();
+        panic!("poison both locks");
+    })
+    .join();
+    drops.note(test_source());
+    drops.note_malformed(test_source());
+    assert_eq!((drops.total(), drops.malformed_total()), (1, 1));
+    assert!(drops.last().is_none());
+    assert!(drops.malformed_last().is_none());
+}
