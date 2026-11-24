@@ -972,3 +972,19 @@ fn rdata_label_edge_forms() {
     };
     assert_eq!(rdata_label(&RData::MX(mx)), "");
 }
+
+#[test]
+fn record_sections_have_stable_labels() {
+    use RecordSection::*;
+    let labels = [Answer, Authority, Additional, KnownAnswer, Question].map(RecordSection::as_str);
+    assert_eq!(
+        labels,
+        [
+            "answer",
+            "authority",
+            "additional",
+            "known-answer",
+            "question"
+        ]
+    );
+}
