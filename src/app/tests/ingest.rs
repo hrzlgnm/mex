@@ -1038,3 +1038,135 @@ fn enumeration_goodbyes_withdraw_the_row_or_file_a_new_one() {
         ]
     );
 }
+
+#[test]
+fn ptr_targets_compare_by_labels_or_rdata_never_mixed() {
+    let with_labels = raw_record("_http._tcp.local.", 12, "PTR", "A._http._tcp.local.", 120);
+    let mut upper = with_labels.clone();
+    upper.ptr_target_labels = Some(vec![
+        b"a".to_vec(),
+        b"_HTTP".to_vec(),
+        b"_tcp".to_vec(),
+        b"local".to_vec(),
+    ]);
+    assert!(same_ptr_target(&with_labels, &upper), "labels ignore case");
+    let mut no_labels = with_labels.clone();
+    no_labels.ptr_target_labels = None;
+    let mut no_labels_upper = no_labels.clone();
+    no_labels_upper.rdata = "a._HTTP._tcp.local.".to_string();
+    assert!(
+        same_ptr_target(&no_labels, &no_labels_upper),
+        "rdata ignores case"
+    );
+    assert!(
+        !same_ptr_target(&with_labels, &no_labels),
+        "mixed forms differ"
+    );
+}
+
+#[test]
+fn five_label_owner_without_sub_is_no_subtype() {
+    let rec = raw_record(
+        "printer.ipp._ipp._tcp.local.",
+        12,
+        "PTR",
+        "P._ipp._tcp.local.",
+        120,
+    );
+    assert!(subtype_owner_parts(&rec).is_none());
+}
+
+#[test]
+fn raw_event_history_keeps_the_newest_2000() {
+    let mut app = App::new().unwrap();
+    let (tx, rx) = mpsc::channel();
+    app.rx = rx;
+    for ttl in 0..2001 {
+        tx.send(event_for(&ptr_record(ttl))).unwrap();
+    }
+    app.drain_events();
+    assert_eq!(app.raw_events.len(), 2000);
+    assert_eq!(app.raw_events[0].answers[0].ttl, 1, "the oldest went");
+}
+
+#[test]
+fn rate_windows_drop_entries_past_the_window_on_idle_ticks() {
+    let Some(old) = Instant::now().checked_sub(DIAGNOSTICS_WINDOW + Duration::from_secs(1)) else {
+        return; // host clock too young to backdate past the window
+    };
+    let mut app = App::new().unwrap();
+    // No live traffic: a packet arriving mid-test would add a fresh entry.
+    let (_tx, rx) = mpsc::channel();
+    app.rx = rx;
+    app.diagnostics.packet_times.push_back(old);
+    app.diagnostics.suppressed_times.push_back(old);
+    app.drain_events();
+    assert!(app.diagnostics.packet_times.is_empty());
+    assert!(app.diagnostics.suppressed_times.is_empty());
+}
+
+#[test]
+fn srv_without_target_claims_no_pending_addresses() {
+    // RFC 2782: target "." means "no service here". Such an SRV, and a
+    // service with no hostname yet, never pick up a host's addresses.
+    let mut app = App::new().unwrap();
+    let mut lonely = ServiceEntry {
+        instance: "Lonely".to_string(),
+        service_type: "_http._tcp.local".to_string(),
+        hostname: String::new(),
+        port: 0,
+        subtypes: Vec::new(),
+        answers: Vec::new(),
+        questions: Vec::new(),
+        questions_dropped: 0,
+        last_seen: Instant::now(),
+        is_active: true,
+        last_event: None,
+    };
+    lonely.answers.push(raw_record(
+        "Lonely._http._tcp.local.",
+        33,
+        "SRV",
+        "0 0 0 .",
+        120,
+    ));
+    app.services.push(lonely);
+    ingest_packet(
+        &mut app,
+        event_for(&raw_record("test.local.", 1, "A", "192.168.1.10", 120)),
+    );
+    ingest_packet(&mut app, event_for(&ptr_record(120)));
+    ingest_packet(&mut app, event_for(&srv_record(120)));
+    let lonely = service_of(&app, "Lonely");
+    assert!(lonely.answers.iter().all(|r| r.rtype != 1));
+    assert!(service_of(&app, "Test")
+        .answers
+        .iter()
+        .any(|r| r.rtype == 1));
+}
+
+#[test]
+fn enumeration_rows_long_past_ttl_are_pruned_txt_kept_expanded() {
+    let Some(old) = Instant::now().checked_sub(Duration::from_secs(200)) else {
+        return; // host clock too young to backdate
+    };
+    let mut app = App::new().unwrap();
+    let mut stale = raw_record(ENUM_SERVICE, 12, "PTR", "_http._tcp.local.", 10);
+    stale.received_at = old;
+    let txt = raw_record(ENUM_SERVICE, 16, "TXT", "note=1", 4500);
+    app.expanded_txt.insert(App::txt_key(&txt));
+    app.enum_entries[0].answers = vec![stale, txt.clone()];
+    let gen = app.state_gen;
+    app.evict_expired();
+    let left: Vec<_> = app.enum_entries[0]
+        .answers
+        .iter()
+        .map(|r| r.rtype)
+        .collect();
+    assert_eq!(left, [16], "the stale PTR went, the live TXT stayed");
+    assert_ne!(app.state_gen, gen, "the view was told");
+    assert!(
+        app.is_txt_expanded(&txt),
+        "a live enum TXT keeps its expansion"
+    );
+}

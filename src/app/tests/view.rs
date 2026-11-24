@@ -494,3 +494,78 @@ fn txt_children_render_upright() {
         cell.fg
     );
 }
+
+fn bare_service(instance: &str, hostname: &str, port: u16) -> ServiceEntry {
+    ServiceEntry {
+        instance: instance.to_string(),
+        service_type: "_http._tcp.local".to_string(),
+        hostname: hostname.to_string(),
+        port,
+        subtypes: Vec::new(),
+        answers: Vec::new(),
+        questions: Vec::new(),
+        questions_dropped: 0,
+        last_seen: Instant::now(),
+        is_active: true,
+        last_event: None,
+    }
+}
+
+#[test]
+fn pane_ident_shows_what_is_known_of_the_host() {
+    let ident = |svc: &ServiceEntry| DetailTarget::Service(svc).pane_ident();
+    assert_eq!(ident(&bare_service("Web", "", 0)), "Web");
+    assert_eq!(
+        ident(&bare_service("Web", "host.local.", 0)),
+        "Web @ host.local"
+    );
+    assert_eq!(
+        ident(&bare_service("Web", "host.local.", 80)),
+        "Web @ host.local:80"
+    );
+    assert_eq!(DetailTarget::Unattributed.questions_len(), 0);
+}
+
+#[test]
+fn duplicate_answers_show_once_latest_wins() {
+    let older = ptr_record(120);
+    let mut newer = ptr_record(4500);
+    newer.received_at = Instant::now();
+    let mut svc = bare_service("Test", "test.local.", 80);
+    svc.answers = vec![older.clone(), newer.clone()];
+    let rows = svc.ordered_answers();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].ttl, 4500);
+
+    let entry = EnumEntry {
+        name: ENUM_SERVICE.to_string(),
+        answers: vec![older, newer],
+        questions: Vec::new(),
+        questions_dropped: 0,
+        last_seen: Instant::now(),
+        last_event: None,
+    };
+    let rows = entry.ordered_answers();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].ttl, 4500);
+}
+
+#[test]
+fn ages_and_sizes_pick_their_unit() {
+    assert_eq!(fmt_age(59), "59s");
+    assert_eq!(fmt_age(61), "1m01s");
+    assert_eq!(fmt_age(3_660), "1h01m");
+    assert_eq!(fmt_bytes(1023), "1023 B");
+    assert_eq!(fmt_bytes(1536), "1.5 KiB");
+    assert_eq!(fmt_bytes(3 * 1_048_576), "3.0 MiB");
+}
+
+#[test]
+fn interest_statuses_have_stable_labels() {
+    use InterestStatus::*;
+    let labels = [Transmitted, Suppressed, Answered, Abandoned].map(InterestStatus::as_str);
+    assert_eq!(
+        labels,
+        ["transmitted", "suppressed", "answered", "abandoned"]
+    );
+}
