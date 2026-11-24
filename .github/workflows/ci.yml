@@ -135,7 +135,7 @@ jobs:
         uses: ./.github/actions/setup-rust-cache
         with:
           components: rustfmt, clippy
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: aarch64-apple-darwin,x86_64-apple-darwin,x86_64-pc-windows-msvc
           save-cache: ${{ github.ref == 'refs/heads/main' }}
 
       - name: ⚡ Setup sccache
@@ -154,6 +154,13 @@ jobs:
       - name: 🍏 Clippy (macOS targets)
         shell: bash
         run: cargo clippy --all-targets --target aarch64-apple-darwin --target x86_64-apple-darwin -- -D warnings
+
+      # Type-checks the Windows cfg code, tests included: the Windows
+      # build job only builds the release binary, so the test build was
+      # never compiled there. Nothing links, so no MSVC toolchain is needed.
+      - name: 🪟 Clippy (Windows target)
+        shell: bash
+        run: cargo clippy --all-targets --target x86_64-pc-windows-msvc -- -D warnings
 
   test:
     name: "🧪 Test"
