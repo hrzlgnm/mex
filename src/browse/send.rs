@@ -283,9 +283,6 @@ pub(super) fn split_instance_labels(name: &str) -> Vec<&str> {
 /// wire (empty or over-long label).
 pub(super) fn wire_name(name: &str) -> Option<simple_dns::Name<'_>> {
     let parts = split_instance_labels(name);
-    if parts.is_empty() {
-        return None;
-    }
     let mut labels = Vec::with_capacity(parts.len());
     for part in parts {
         let bytes = part.as_bytes();
@@ -338,14 +335,14 @@ pub(super) fn encode_query(req: &QueryRequest, egress_iface: &str) -> Option<Vec
         kas.push((rdata, ka_ttl));
     }
 
-    let mut bytes = build_query(&qname, req.record_type, req.qu, &kas)?;
+    let mut bytes = build_query(&qname, req.record_type, req.qu, &kas);
     if bytes.len() > MAX_QUERY_BYTES {
         let total = kas.len();
         let mut n = total;
         while n > 0 {
             n /= 2;
             kas.truncate(n);
-            bytes = build_query(&qname, req.record_type, req.qu, &kas)?;
+            bytes = build_query(&qname, req.record_type, req.qu, &kas);
             if bytes.len() <= MAX_QUERY_BYTES {
                 break;
             }
@@ -361,13 +358,13 @@ pub(super) fn encode_query(req: &QueryRequest, egress_iface: &str) -> Option<Vec
 }
 
 /// One query packet: question plus the given known answers, names
-/// compressed. `None` only on codec failure (logged by the caller).
+/// compressed.
 pub(super) fn build_query(
     qname: &simple_dns::Name<'_>,
     record_type: TYPE,
     qu: bool,
     kas: &[(simple_dns::Name<'_>, u32)],
-) -> Option<Vec<u8>> {
+) -> Vec<u8> {
     let mut pkt = Packet::new_query(0);
     pkt.questions.push(simple_dns::Question::new(
         qname.clone(),
@@ -383,19 +380,16 @@ pub(super) fn build_query(
             RData::PTR(rdata.clone().into()),
         ));
     }
-    match pkt.build_bytes_vec_compressed() {
-        Ok(bytes) => Some(bytes),
-        Err(e) => {
-            log::warn!("mex: cannot encode query for {qname}: {e}");
-            None
-        }
-    }
+    // The codec only fails on writer I/O errors, and an in-memory
+    // `Vec` never fails to grow by a write.
+    pkt.build_bytes_vec_compressed()
+        .expect("writing a query into a Vec cannot fail")
 }
 
 pub(crate) fn inferred_question_packet(name: &str, rtype: u16, qu: bool) -> Option<Vec<u8>> {
     let qname = wire_name(name)?;
     let record_type = record_type_from_u16(rtype)?;
-    build_query(&qname, record_type, qu, &[])
+    Some(build_query(&qname, record_type, qu, &[]))
 }
 
 /// Encode and send one query copy, returning its bytes with the send
