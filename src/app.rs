@@ -561,7 +561,7 @@ impl Sighting {
 
 /// Lowercased `instance.service_type`, the identity address denials use.
 fn service_key(instance: &str, service_type: &str) -> String {
-    format!("{instance}.{service_type}").to_lowercase()
+    format!("{instance}.{service_type}").to_ascii_lowercase()
 }
 
 /// Cumulative v2 traffic/query counters for the diagnostics overlay. Derived
@@ -1251,7 +1251,7 @@ impl App {
         let mut services_by_host: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, svc) in self.services.iter().enumerate() {
             let mut hosts = HashSet::new();
-            let selected = svc.hostname.trim_end_matches('.').to_lowercase();
+            let selected = svc.hostname.trim_end_matches('.').to_ascii_lowercase();
             if !selected.is_empty() {
                 hosts.insert(selected);
             }
@@ -1260,7 +1260,7 @@ impl App {
                     continue;
                 }
                 if let Some(target) = srv_target(&rec.rdata) {
-                    hosts.insert(target.to_lowercase());
+                    hosts.insert(target.to_ascii_lowercase());
                 }
             }
             for host in hosts {
@@ -1434,28 +1434,34 @@ impl App {
         let mut live: HashSet<(String, u16)> = HashSet::new();
         live.insert((ENUM_SERVICE.to_string(), 12));
         for entry in &self.enum_entries {
-            live.insert((entry.name.to_lowercase(), 12));
+            live.insert((entry.name.to_ascii_lowercase(), 12));
             for rec in &entry.answers {
-                live.insert((rec.name.trim_end_matches('.').to_lowercase(), rec.rtype));
+                live.insert((
+                    rec.name.trim_end_matches('.').to_ascii_lowercase(),
+                    rec.rtype,
+                ));
             }
         }
         for svc in &self.services {
-            live.insert((svc.service_type.to_lowercase(), 12));
-            let full = format!("{}.{}", svc.instance, svc.service_type).to_lowercase();
+            live.insert((svc.service_type.to_ascii_lowercase(), 12));
+            let full = format!("{}.{}", svc.instance, svc.service_type).to_ascii_lowercase();
             live.insert((full.clone(), 33));
             live.insert((full, 16));
             if !svc.hostname.is_empty() {
-                let host = svc.hostname.trim_end_matches('.').to_lowercase();
+                let host = svc.hostname.trim_end_matches('.').to_ascii_lowercase();
                 live.insert((host.clone(), 1));
                 live.insert((host, 28));
             }
             for rec in &svc.answers {
-                live.insert((rec.name.trim_end_matches('.').to_lowercase(), rec.rtype));
+                live.insert((
+                    rec.name.trim_end_matches('.').to_ascii_lowercase(),
+                    rec.rtype,
+                ));
             }
         }
         for p in &self.pending_instances {
-            live.insert((p.service_type.to_lowercase(), 12));
-            let full = format!("{}.{}", p.instance, p.service_type).to_lowercase();
+            live.insert((p.service_type.to_ascii_lowercase(), 12));
+            let full = format!("{}.{}", p.instance, p.service_type).to_ascii_lowercase();
             live.insert((full.clone(), 33));
             live.insert((full, 16));
         }

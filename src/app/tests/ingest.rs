@@ -1170,3 +1170,48 @@ fn enumeration_rows_long_past_ttl_are_pruned_txt_kept_expanded() {
         "a live enum TXT keeps its expansion"
     );
 }
+
+#[test]
+fn names_fold_ascii_case_only_per_rfc_6762_section_16() {
+    // A-Z match a-z; every other byte compares exactly, so `É`
+    // (U+00C9) and `é` (U+00E9) name different instances and hosts.
+    let mut app = App::new().unwrap();
+    for (instance, host) in [
+        ("\u{00C9}clair", "\u{00C9}vent.local."),
+        ("\u{00E9}clair", "\u{00E9}vent.local."),
+    ] {
+        let full = format!("{instance}._http._tcp.local.");
+        ingest(
+            &mut app,
+            &raw_record("_http._tcp.local.", 12, "PTR", &full, 120),
+        );
+        ingest(
+            &mut app,
+            &raw_record(&full, 33, "SRV", &format!("0 0 80 {host}"), 120),
+        );
+    }
+    // Another ASCII case of the first name is the same instance.
+    ingest(
+        &mut app,
+        &raw_record("\u{00C9}CLAIR._HTTP._tcp.local.", 16, "TXT", "a=1", 120),
+    );
+    app.evict_expired();
+    let mut instances: Vec<&str> = app.services.iter().map(|s| s.instance.as_str()).collect();
+    instances.sort();
+    assert_eq!(instances, ["\u{00C9}clair", "\u{00E9}clair"]);
+    let upper = app
+        .services
+        .iter()
+        .find(|s| s.instance == "\u{00C9}clair")
+        .unwrap();
+    assert!(
+        upper.answers.iter().any(|r| r.rtype == 16),
+        "TXT filed on \u{00C9}clair"
+    );
+    let groups: Vec<String> = app
+        .group_labels()
+        .into_iter()
+        .filter(|l| l.ends_with("vent.local"))
+        .collect();
+    assert_eq!(groups.len(), 2, "two hosts: {groups:?}");
+}

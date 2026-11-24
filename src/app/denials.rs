@@ -110,8 +110,8 @@ impl AddressDenials {
             .iter()
             .filter(|r| r.rtype == 33 && r.ttl > 0)
             .filter_map(|r| {
-                let target = srv_target(&r.rdata)?.to_lowercase();
-                Some((r.name.trim_end_matches('.').to_lowercase(), target))
+                let target = srv_target(&r.rdata)?.to_ascii_lowercase();
+                Some((r.name.trim_end_matches('.').to_ascii_lowercase(), target))
             })
             .collect();
         // This packet's SRVs name instances too (they are filed next).
@@ -121,16 +121,16 @@ impl AddressDenials {
         for r in ev.answers.iter().filter(|r| r.ttl > 0) {
             match r.rtype {
                 12 if !is_enum_name(r.name.trim_end_matches('.')) => {
-                    instances.insert(r.rdata.trim_end_matches('.').to_lowercase());
+                    instances.insert(r.rdata.trim_end_matches('.').to_ascii_lowercase());
                 }
                 16 => {
-                    instances.insert(r.name.trim_end_matches('.').to_lowercase());
+                    instances.insert(r.name.trim_end_matches('.').to_ascii_lowercase());
                 }
                 _ => {}
             }
         }
         for nsec in ev.answers.iter().filter(|r| r.rtype == 47) {
-            let owner = nsec.name.trim_end_matches('.').to_lowercase();
+            let owner = nsec.name.trim_end_matches('.').to_ascii_lowercase();
             let (address, other) = browse::nsec_address_types(&nsec.rdata);
             let denial =
                 |service: &str, rtype: u16, host: Option<&str>, form: DenialForm| AddressDenial {
@@ -225,7 +225,7 @@ impl AddressDenials {
     /// Whether a live denial keeps this address row off `service`.
     pub(super) fn denies(&self, service: &str, rec: &browse::RawRecord) -> bool {
         matches!(rec.rtype, 1 | 28) && {
-            let host = rec.name.trim_end_matches('.').to_lowercase();
+            let host = rec.name.trim_end_matches('.').to_ascii_lowercase();
             self.covers(service, rec.rtype, &host)
         }
     }
@@ -256,7 +256,7 @@ impl AddressDenials {
     /// Keep an address no service may show, so its host header still
     /// lists it (deduplicated like rows: type, address, source).
     pub(super) fn withhold(&mut self, rec: &browse::RawRecord) {
-        let host = rec.name.trim_end_matches('.').to_lowercase();
+        let host = rec.name.trim_end_matches('.').to_ascii_lowercase();
         let rows = self.withheld.entry(host).or_default();
         rows.retain(|r| !same_address_row(r, rec));
         if rec.ttl > 0 {
@@ -266,7 +266,7 @@ impl AddressDenials {
 
     /// Drop a withheld copy of `rec` (same type, address, source).
     pub(super) fn forget_withheld(&mut self, rec: &browse::RawRecord) {
-        let host = rec.name.trim_end_matches('.').to_lowercase();
+        let host = rec.name.trim_end_matches('.').to_ascii_lowercase();
         if let Some(rows) = self.withheld.get_mut(&host) {
             rows.retain(|r| !same_address_row(r, rec));
             if rows.is_empty() {
@@ -316,7 +316,7 @@ impl App {
             };
             let mut withheld = Vec::new();
             svc.answers.retain(|r| {
-                let owner = r.name.trim_end_matches('.').to_lowercase();
+                let owner = r.name.trim_end_matches('.').to_ascii_lowercase();
                 let denied = denial.applies_to(r.rtype, &owner);
                 if denied {
                     withheld.push(r.clone());

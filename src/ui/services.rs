@@ -143,7 +143,7 @@ pub(super) fn draw_service_list(
             let key = app.services()[*index]
                 .hostname
                 .trim_end_matches('.')
-                .to_lowercase();
+                .to_ascii_lowercase();
             format!(" Hosts: {} ", app.host_display_name(&key))
         }
         Some(DisplayItem::Host { label }) => {

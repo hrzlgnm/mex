@@ -138,13 +138,13 @@ fn response_names_the_question_sent_just_before_it() {
 }
 
 #[test]
-fn refresh_postpones_a_stream_whose_name_differs_in_non_ascii_case() {
-    // Refresh keys keep wire case; stream keys are fully lowercased
-    // (RFC 6763 §7). `É` and `é` name the same interest.
+fn refresh_postpones_the_stream_of_the_same_name_only() {
+    // RFC 6762 §16: A-Z fold, other bytes compare exactly. A refresh in
+    // another ASCII case postpones the stream of its name...
     let now = Instant::now();
-    let stream = Scheduler::continuous_key("Éclair._http._tcp.local", 33);
+    let stream = Scheduler::continuous_key("\u{00C9}clair._http._tcp.local", 33);
     let mut s = seeded(&stream.0, stream.1, Duration::from_secs(8), now);
-    s.postpone_continuous_for_refresh(&key("Éclair._http._tcp.local", 33), now);
+    s.postpone_continuous_for_refresh(&key("\u{00C9}CLAIR._HTTP._tcp.local", 33), now);
     assert_eq!(
         s.continuous()[&stream].next_due,
         now + Duration::from_secs(8),
@@ -154,5 +154,14 @@ fn refresh_postpones_a_stream_whose_name_differs_in_non_ascii_case() {
         s.continuous().len(),
         1,
         "no second stream for the same name"
+    );
+    // ...while `é` (U+00E9) is another name: its own stream starts,
+    // and the `É` stream keeps its time.
+    let later = now + Duration::from_secs(30);
+    s.postpone_continuous_for_refresh(&key("\u{00E9}clair._http._tcp.local", 33), later);
+    assert_eq!(s.continuous().len(), 2);
+    assert_eq!(
+        s.continuous()[&stream].next_due,
+        now + Duration::from_secs(8)
     );
 }

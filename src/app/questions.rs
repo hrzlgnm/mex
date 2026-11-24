@@ -9,10 +9,10 @@ impl App {
     /// Enumeration questions file on their selectable enumeration row.
     pub(super) fn route_question(&mut self, q: &browse::RawRecord, ev: &browse::Event) {
         self.scheduler.note_observed(q, ev.source);
-        let name = q.name.trim_end_matches('.').to_lowercase();
+        let name = q.name.trim_end_matches('.').to_ascii_lowercase();
         if is_enum_name(&name) {
             for entry in &mut self.enum_entries {
-                if entry.name.to_lowercase() == name {
+                if entry.name.to_ascii_lowercase() == name {
                     Self::file_question_counted(
                         &mut entry.questions,
                         &mut entry.questions_dropped,
@@ -33,12 +33,14 @@ impl App {
                 "{}.{}",
                 self.services[i].instance, self.services[i].service_type
             )
-            .to_lowercase();
+            .to_ascii_lowercase();
             let host = self.services[i]
                 .hostname
                 .trim_end_matches('.')
-                .to_lowercase();
-            if full == name || host == name || self.services[i].service_type.to_lowercase() == name
+                .to_ascii_lowercase();
+            if full == name
+                || host == name
+                || self.services[i].service_type.to_ascii_lowercase() == name
             {
                 let svc = &mut self.services[i];
                 Self::file_question_counted(
@@ -88,9 +90,9 @@ impl App {
     ) -> bool {
         // DNS names compare case-insensitively (RFC 4343); the row keeps
         // the latest asking's case for display.
-        let key = name.to_lowercase();
+        let key = name.to_ascii_lowercase();
         match rows.iter().position(|(n, t, src, _, _)| {
-            n.to_lowercase() == key && t == &rtype_str && src == &source
+            n.to_ascii_lowercase() == key && t == &rtype_str && src == &source
         }) {
             Some(pos) => {
                 rows[pos] = (name, rtype_str, source, at, bytes);
@@ -137,7 +139,7 @@ impl App {
         // (`display_name` adds the root dot); match on the dot-less key.
         let bare = name.trim_end_matches('.');
         let display = format!("{bare}.");
-        let key = bare.to_lowercase();
+        let key = bare.to_ascii_lowercase();
         // Only the types we ever transmit (`record_type_from_u16`) can
         // reach this path.
         let Some(label) = browse::record_type_from_u16(rtype).and(browse::rtype_name(rtype)) else {
@@ -150,7 +152,7 @@ impl App {
         let at = Instant::now();
         if is_enum_name(&key) {
             for entry in &mut self.enum_entries {
-                if entry.name.to_lowercase() == key {
+                if entry.name.to_ascii_lowercase() == key {
                     Self::file_question_counted(
                         &mut entry.questions,
                         &mut entry.questions_dropped,
@@ -170,12 +172,15 @@ impl App {
                 "{}.{}",
                 self.services[i].instance, self.services[i].service_type
             )
-            .to_lowercase();
+            .to_ascii_lowercase();
             let host = self.services[i]
                 .hostname
                 .trim_end_matches('.')
-                .to_lowercase();
-            if full == key || host == key || self.services[i].service_type.to_lowercase() == key {
+                .to_ascii_lowercase();
+            if full == key
+                || host == key
+                || self.services[i].service_type.to_ascii_lowercase() == key
+            {
                 let svc = &mut self.services[i];
                 Self::file_question_counted(
                     &mut svc.questions,
@@ -189,8 +194,8 @@ impl App {
             }
         }
         for p in &mut self.pending_instances {
-            let full = format!("{}.{}", p.instance, p.service_type).to_lowercase();
-            if full == key || p.service_type.to_lowercase() == key {
+            let full = format!("{}.{}", p.instance, p.service_type).to_ascii_lowercase();
+            if full == key || p.service_type.to_ascii_lowercase() == key {
                 Self::file_question_counted(
                     &mut p.questions,
                     &mut p.questions_dropped,

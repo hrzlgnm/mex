@@ -32,7 +32,7 @@ impl App {
     ///
     /// Empty when nothing matches.
     pub(super) fn sighting_owners(&self, sighting: &Sighting) -> Vec<String> {
-        let name = sighting.rec.name.trim_end_matches('.').to_lowercase();
+        let name = sighting.rec.name.trim_end_matches('.').to_ascii_lowercase();
         let question = sighting.kind == SightingKind::Question;
         if is_enum_name(&name) {
             return vec![anomalies::ENUMERATION_SERVICE.to_string()];
@@ -44,8 +44,8 @@ impl App {
             }
         };
         for svc in &self.services {
-            let full = format!("{}.{}", svc.instance, svc.service_type).to_lowercase();
-            if full == name || (question && svc.service_type.to_lowercase() == name) {
+            let full = format!("{}.{}", svc.instance, svc.service_type).to_ascii_lowercase();
+            if full == name || (question && svc.service_type.to_ascii_lowercase() == name) {
                 add(anomalies::service_id(&svc.instance, &svc.service_type));
             }
             if Self::service_hosts(svc).contains(&name) {
@@ -53,8 +53,8 @@ impl App {
             }
         }
         for p in &self.pending_instances {
-            let full = format!("{}.{}", p.instance, p.service_type).to_lowercase();
-            if full == name || (question && p.service_type.to_lowercase() == name) {
+            let full = format!("{}.{}", p.instance, p.service_type).to_ascii_lowercase();
+            if full == name || (question && p.service_type.to_ascii_lowercase() == name) {
                 add(anomalies::service_id(&p.instance, &p.service_type));
             }
         }

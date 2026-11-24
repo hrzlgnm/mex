@@ -62,7 +62,7 @@ impl Scheduler {
     /// Learn a service type from an enumeration answer and track it as a
     /// known answer (RFC 6762 §7.1) until it expires or says goodbye.
     pub(super) fn note_enum_type(&mut self, target: &str, rec: &browse::RawRecord) {
-        let key = target.to_lowercase();
+        let key = target.to_ascii_lowercase();
         self.known_types.insert(key.clone());
         if rec.ttl > 0 {
             self.enum_known
@@ -116,19 +116,21 @@ impl Scheduler {
         &self.enum_known
     }
 
-    /// Map key for `continuous` and `requeries`: lowercased name per
-    /// RFC 6763 §7 / RFC 1035 §2.3.1 (service types and subtypes compare
-    /// case-insensitively; host names too). The query itself keeps wire
-    /// case via `qname` / the desired-map value.
+    /// Map key for `continuous` and `requeries`: the name with ASCII
+    /// letters lowercased. mDNS names compare case-insensitively for
+    /// A-Z only; every other byte, UTF-8 multibyte characters included,
+    /// compares exactly (RFC 6762 §16, RFC 4343 §3), so `É` and `é` stay
+    /// distinct names. The query itself keeps wire case via `qname` /
+    /// the desired-map value.
     pub(super) fn continuous_key(name: &str, rtype: u16) -> (String, u16) {
-        (name.to_lowercase(), rtype)
+        (name.to_ascii_lowercase(), rtype)
     }
 
-    /// Provenance map key: dot-trimmed lowercased name plus type, so
-    /// wire case and trailing dots collapse the way the scheduler keys
-    /// do (RFC 6763 §7).
+    /// Provenance map key: dot-trimmed, ASCII-lowercased name plus type,
+    /// so wire case and trailing dots collapse the way the scheduler keys
+    /// do (RFC 6762 §16: only A-Z fold).
     pub(super) fn provenance_key(name: &str, rtype: u16) -> (String, u16) {
-        (name.trim_end_matches('.').to_lowercase(), rtype)
+        (name.trim_end_matches('.').to_ascii_lowercase(), rtype)
     }
 
     /// Record an observed remote question with its packet timestamp,
@@ -190,7 +192,7 @@ impl Scheduler {
         key: &(String, u16),
         local_ka: &[browse::KnownAnswer],
     ) -> bool {
-        let lookup = (key.0.trim_end_matches('.').to_lowercase(), key.1);
+        let lookup = (key.0.trim_end_matches('.').to_ascii_lowercase(), key.1);
         let (seen, remote, iface) = match self.overheard.get(&lookup) {
             Some(v) => v.clone(),
             None => return false,
@@ -201,7 +203,7 @@ impl Scheduler {
         let mut local = HashSet::new();
         for ka in local_ka {
             if ka.iface.is_empty() || iface.is_empty() || ka.iface == iface {
-                local.insert(ka.target.trim_end_matches('.').to_lowercase());
+                local.insert(ka.target.trim_end_matches('.').to_ascii_lowercase());
             }
         }
         if remote.iter().all(|r| local.contains(r)) {
@@ -222,8 +224,8 @@ impl Scheduler {
     /// Postpone the exponential stream after a refresh (real or suppressed)
     /// so the two §5.2 timers don't emit back-to-back duplicates.
     pub(super) fn postpone_continuous_for_refresh(&mut self, key: &(String, u16), now: Instant) {
-        // Refresh keys keep wire case; streams are keyed by the full
-        // lowercase fold (not ASCII-only: `É` and `é` are one name).
+        // Refresh keys keep wire case; streams are keyed by
+        // `continuous_key`, so look the stream up by that key.
         use std::collections::hash_map::Entry;
         match self.continuous.entry(Self::continuous_key(&key.0, key.1)) {
             Entry::Occupied(mut e) => {
@@ -273,11 +275,11 @@ impl Scheduler {
     /// Remember a remote QM question and the known answers it carried
     /// (RFC 6762 §7.3), to suppress our own duplicate once.
     pub(super) fn note_overheard(&mut self, q: &browse::RawRecord, kas: &[browse::RawRecord]) {
-        let key = (q.name.trim_end_matches('.').to_lowercase(), q.rtype);
+        let key = (q.name.trim_end_matches('.').to_ascii_lowercase(), q.rtype);
         let mut remote = HashSet::new();
         for ka in kas {
             if ka.rtype == q.rtype && ka.name.eq_ignore_ascii_case(&q.name) {
-                remote.insert(ka.rdata.trim_end_matches('.').to_lowercase());
+                remote.insert(ka.rdata.trim_end_matches('.').to_ascii_lowercase());
             }
         }
         self.overheard
@@ -292,7 +294,7 @@ impl Scheduler {
             live.insert((t.clone(), 12));
         }
         self.requeries
-            .retain(|k, _| live.contains(&(k.0.to_lowercase(), k.1)));
+            .retain(|k, _| live.contains(&(k.0.to_ascii_lowercase(), k.1)));
         self.continuous.retain(|k, _| live.contains(k));
         // Provenance outlives short schedule gaps but not dead
         // interests: keep entries with a live schedule key or a recent
@@ -654,8 +656,8 @@ impl App {
     /// pending instances.
     pub(super) fn has_live_answer(&self, key: &(String, u16)) -> bool {
         let live_row = |rec: &browse::RawRecord| {
-            // Canonical key comparison (not ASCII-only): `É` and `é`
-            // must hit the same interest.
+            // Canonical key comparison: wire case of A-Z folds, other
+            // bytes compare exactly (RFC 6762 §16).
             Scheduler::provenance_key(&rec.name, rec.rtype).0 == key.0
                 && rec.ttl > 0
                 && Self::remaining_ttl(rec) > 0
@@ -732,9 +734,8 @@ impl App {
     /// from one with nothing left (abandoned).
     pub(super) fn interest_view(&self, key: &(String, u16)) -> InterestView {
         // Canonicalize once: map keys keep wire case or are lowercased
-        // depending on the map, and eq_ignore_ascii_case only folds
-        // a-z, so compare through `provenance_key` everywhere (`É`
-        // and `é` must hit the same interest).
+        // depending on the map, so compare through `provenance_key`
+        // everywhere (A-Z fold, other bytes exact: RFC 6762 §16).
         let key = Scheduler::provenance_key(&key.0, key.1);
         let state = self.scheduler.query_history.get(&key).cloned();
         let (attempt, refresh_due) = self
@@ -844,7 +845,7 @@ impl App {
                 // only other services (or other demand) keep asking.
                 let host = svc.hostname.trim_end_matches('.').to_string();
                 let key = service_key(&svc.instance, &svc.service_type);
-                let host_key = host.to_lowercase();
+                let host_key = host.to_ascii_lowercase();
                 for rtype in [1, 28] {
                     if !self.address_denials.covers(&key, rtype, &host_key) {
                         want(host.clone(), rtype);
@@ -980,12 +981,12 @@ impl App {
             for svc in &self.services {
                 self.scheduler
                     .known_types
-                    .insert(svc.service_type.to_lowercase());
+                    .insert(svc.service_type.to_ascii_lowercase());
             }
             for p in &self.pending_instances {
                 self.scheduler
                     .known_types
-                    .insert(p.service_type.to_lowercase());
+                    .insert(p.service_type.to_ascii_lowercase());
             }
             for t in self.scheduler.enum_known.keys() {
                 self.scheduler.known_types.insert(t.clone());
@@ -1061,7 +1062,7 @@ impl App {
             if !r.flush_bit
                 || r.ttl == 0
                 || r.rtype != key.1
-                || r.name.trim_end_matches('.').to_lowercase() != key.0
+                || r.name.trim_end_matches('.').to_ascii_lowercase() != key.0
             {
                 return false;
             }
