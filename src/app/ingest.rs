@@ -115,7 +115,7 @@ impl App {
         // same (type, rdata, source) identity `handle_addr` updates by,
         // so a responder only withdraws its own announcement.
         if matches!(rec.rtype, 1 | 28) {
-            let host = rec.name.trim_end_matches('.').to_lowercase();
+            let host = rec.name.trim_end_matches('.').to_ascii_lowercase();
             if let Some(records) = self.pending_addrs.get_mut(&host) {
                 for pending in records.iter_mut().filter(|p| {
                     p.rtype == rec.rtype
@@ -127,17 +127,17 @@ impl App {
                 }
             }
         }
-        let mut names = vec![rec.name.trim_end_matches('.').to_lowercase()];
+        let mut names = vec![rec.name.trim_end_matches('.').to_ascii_lowercase()];
         if rec.rtype == 12 {
-            names.push(rec.rdata.trim_end_matches('.').to_lowercase());
+            names.push(rec.rdata.trim_end_matches('.').to_ascii_lowercase());
         }
         // One hostname backs many services: file the goodbye on every
         // match (notably TTL 0 A/AAAA) instead of stopping at the first.
         let mut hits = Vec::new();
         for (i, svc) in self.services.iter().enumerate() {
-            let full = format!("{}.{}", svc.instance, svc.service_type).to_lowercase();
-            let host = svc.hostname.trim_end_matches('.').to_lowercase();
-            let inst = svc.instance.to_lowercase();
+            let full = format!("{}.{}", svc.instance, svc.service_type).to_ascii_lowercase();
+            let host = svc.hostname.trim_end_matches('.').to_ascii_lowercase();
+            let inst = svc.instance.to_ascii_lowercase();
             let alternate = svc.answers.iter().any(|r| {
                 if r.rtype != 33 {
                     return false;
@@ -152,7 +152,7 @@ impl App {
                     .unwrap_or("")
                     .trim()
                     .trim_end_matches('.')
-                    .to_lowercase();
+                    .to_ascii_lowercase();
                 names.contains(&target)
             });
             if names.iter().any(|n| *n == full || *n == host || *n == inst) || alternate {
@@ -376,8 +376,8 @@ impl App {
             // for this instance) still moves the service, and an expired
             // current host gives way to whatever is live.
             let current_host = self.services[idx].hostname.clone();
-            let current_norm = current_host.trim_end_matches('.').to_lowercase();
-            let new_norm = new_host.trim_end_matches('.').to_lowercase();
+            let current_norm = current_host.trim_end_matches('.').to_ascii_lowercase();
+            let new_norm = new_host.trim_end_matches('.').to_ascii_lowercase();
             let update = if current_host.is_empty() || current_norm == new_norm {
                 true
             } else {
@@ -392,7 +392,7 @@ impl App {
                         .unwrap_or("")
                         .trim()
                         .trim_end_matches('.')
-                        .to_lowercase();
+                        .to_ascii_lowercase();
                     target == current_norm && r.ttl > r.received_at.elapsed().as_secs() as u32
                 });
                 let target_known = self.services[idx].answers.iter().any(|r| {
@@ -406,7 +406,7 @@ impl App {
                         .unwrap_or("")
                         .trim()
                         .trim_end_matches('.')
-                        .to_lowercase();
+                        .to_ascii_lowercase();
                     target == new_norm && r.ttl > r.received_at.elapsed().as_secs() as u32
                 });
                 !current_live || !target_known
@@ -426,14 +426,14 @@ impl App {
         let host_key = self.services[idx]
             .hostname
             .trim_end_matches('.')
-            .to_lowercase();
+            .to_ascii_lowercase();
         if !host_key.is_empty() {
             let mut backfill = Vec::new();
             for (si, svc) in self.services.iter().enumerate() {
                 if si == idx {
                     continue;
                 }
-                if svc.hostname.trim_end_matches('.').to_lowercase() != host_key {
+                if svc.hostname.trim_end_matches('.').to_ascii_lowercase() != host_key {
                     continue;
                 }
                 for r in &svc.answers {
@@ -442,7 +442,7 @@ impl App {
                     // must not leak onto this host. Names compare
                     // case-insensitively (RFC 6763 §7).
                     if (r.rtype == 1 || r.rtype == 28)
-                        && r.name.trim_end_matches('.').to_lowercase() == host_key
+                        && r.name.trim_end_matches('.').to_ascii_lowercase() == host_key
                         && r.ttl > r.received_at.elapsed().as_secs() as u32
                     {
                         backfill.push(r.clone());
@@ -548,14 +548,14 @@ impl App {
     }
 
     pub(super) fn handle_addr(&mut self, rec: &browse::RawRecord, ev: &browse::Event) {
-        let host = rec.name.trim_end_matches('.').to_lowercase();
+        let host = rec.name.trim_end_matches('.').to_ascii_lowercase();
         // One hostname backs many services (several SRVs, one host):
         // file on every match, not just the first. A service may also be
         // reachable under alternate SRV targets, so route addresses for any
         // live target of the service, not only the selected hostname.
         let mut hits = Vec::new();
         for (i, svc) in self.services.iter().enumerate() {
-            let selected = svc.hostname.trim_end_matches('.').to_lowercase() == host;
+            let selected = svc.hostname.trim_end_matches('.').to_ascii_lowercase() == host;
             let alternate = svc.answers.iter().any(|r| {
                 r.rtype == 33
                     && r.ttl > r.received_at.elapsed().as_secs() as u32
@@ -590,7 +590,7 @@ impl App {
     /// record (e.g. HINFO) files on every service of that host, like
     /// addresses, not just the first.
     pub(super) fn handle_other(&mut self, rec: &browse::RawRecord, ev: &browse::Event) {
-        let name = rec.name.trim_end_matches('.').to_lowercase();
+        let name = rec.name.trim_end_matches('.').to_ascii_lowercase();
         let hits: Vec<usize> = self
             .services
             .iter()
@@ -599,8 +599,8 @@ impl App {
                 // Instance name, selected hostname, or any live SRV target
                 // (alternate targets own host records too, as for
                 // addresses).
-                format!("{}.{}", svc.instance, svc.service_type).to_lowercase() == name
-                    || svc.hostname.trim_end_matches('.').to_lowercase() == name
+                format!("{}.{}", svc.instance, svc.service_type).to_ascii_lowercase() == name
+                    || svc.hostname.trim_end_matches('.').to_ascii_lowercase() == name
                     || Self::service_hosts(svc).contains(&name)
             })
             .map(|(i, _)| i)
@@ -613,7 +613,7 @@ impl App {
         // instance, which hands its rows over on promotion.
         if rec.rtype == 47 {
             for p in &mut self.pending_instances {
-                let full = format!("{}.{}", p.instance, p.service_type).to_lowercase();
+                let full = format!("{}.{}", p.instance, p.service_type).to_ascii_lowercase();
                 if full != name {
                     continue;
                 }
@@ -769,15 +769,15 @@ impl App {
     /// phone stopping its share), so match that too. DNS names are
     /// case-insensitive.
     pub(super) fn mark_goodbye(&mut self, rec: &browse::RawRecord) {
-        let mut candidates = vec![rec.name.trim_end_matches('.').to_lowercase()];
+        let mut candidates = vec![rec.name.trim_end_matches('.').to_ascii_lowercase()];
         if rec.rtype == 12 {
-            candidates.push(rec.rdata.trim_end_matches('.').to_lowercase());
+            candidates.push(rec.rdata.trim_end_matches('.').to_ascii_lowercase());
         }
         for svc in &mut self.services {
-            let full = format!("{}.{}", svc.instance, svc.service_type).to_lowercase();
+            let full = format!("{}.{}", svc.instance, svc.service_type).to_ascii_lowercase();
             if candidates
                 .iter()
-                .any(|n| n == &full || n == &svc.instance.to_lowercase())
+                .any(|n| n == &full || n == &svc.instance.to_ascii_lowercase())
             {
                 // Another live copy of the withdrawn record (another
                 // source, or the same source on another link, #264) keeps

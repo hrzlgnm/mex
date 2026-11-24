@@ -89,7 +89,7 @@ impl App {
                         && rec.received_at.elapsed().as_secs() <= u64::from(rec.ttl)
                 }) {
                     if let Some(host) = rec.rdata.split_whitespace().last() {
-                        targets.insert(host.trim_end_matches('.').to_lowercase());
+                        targets.insert(host.trim_end_matches('.').to_ascii_lowercase());
                     }
                 }
                 targets.into_iter().flat_map(move |hostname| {

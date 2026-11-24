@@ -56,7 +56,7 @@ pub(super) fn check_unresolved_srv_target(
         .filter(|rec| rec.rtype == 33 && is_live(rec, evidence.now))
     {
         if let Some(host) = srv.rdata.split_whitespace().last() {
-            if host != "." && targets.insert(host.trim_end_matches('.').to_lowercase()) {
+            if host != "." && targets.insert(host.trim_end_matches('.').to_ascii_lowercase()) {
                 check_unresolved_target(svc, service_id, host, evidence, out);
             }
         }
@@ -85,7 +85,7 @@ pub(super) fn check_unresolved_target(
     }) else {
         return;
     };
-    let host_key = host.to_lowercase();
+    let host_key = host.to_ascii_lowercase();
     // Resolved if the host has a live address in a family this service
     // doesn't deny: a sibling's AAAA says nothing about an IPv4-only one.
     let denied = denied_for_host(&svc.denied_address_types, host);
@@ -146,7 +146,7 @@ pub(super) fn check_unresolved_path(
     if denied.contains(&1) && denied.contains(&28) {
         return;
     }
-    let host_key = host.to_lowercase();
+    let host_key = host.to_ascii_lowercase();
     let host_key = host_key.as_str();
     let on_path = |record: &RawRecord| interface.is_empty() || record.iface == interface;
     // RFC 6762 §18.11: responses with a non-zero RCODE MUST be silently

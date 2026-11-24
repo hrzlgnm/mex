@@ -136,3 +136,51 @@ fn response_names_the_question_sent_just_before_it() {
     );
     assert!(stale.response_trigger(&answer).is_none());
 }
+
+#[test]
+fn refresh_postpones_the_stream_of_the_same_name_only() {
+    // RFC 6762 §16: A-Z fold, other bytes compare exactly. A refresh in
+    // another ASCII case postpones the stream of its name...
+    let now = Instant::now();
+    let stream = Scheduler::continuous_key("\u{00C9}clair._http._tcp.local", 33);
+    let mut s = seeded(&stream.0, stream.1, Duration::from_secs(8), now);
+    s.postpone_continuous_for_refresh(&key("\u{00C9}CLAIR._HTTP._tcp.local", 33), now);
+    assert_eq!(
+        s.continuous()[&stream].next_due,
+        now + Duration::from_secs(8),
+        "the existing stream is floored at now + its interval"
+    );
+    assert_eq!(
+        s.continuous().len(),
+        1,
+        "no second stream for the same name"
+    );
+    // ...while `é` (U+00E9) is another name: its own stream starts,
+    // and the `É` stream keeps its time.
+    let later = now + Duration::from_secs(30);
+    s.postpone_continuous_for_refresh(&key("\u{00E9}clair._http._tcp.local", 33), later);
+    assert_eq!(s.continuous().len(), 2);
+    assert_eq!(
+        s.continuous()[&stream].next_due,
+        now + Duration::from_secs(8)
+    );
+}
+
+#[test]
+fn eviction_keeps_refresh_summaries_of_live_names_by_ascii_case_only() {
+    // Requery keys keep wire case; live names are ASCII-lowercased.
+    // `ÉCLAIR` is the live `Éclair`, while `éclair` (U+00E9) is another,
+    // dead name (RFC 6762 §16).
+    let now = Instant::now();
+    let mut s = Scheduler::default();
+    s.requeries_mut()
+        .insert(key("\u{00C9}CLAIR._HTTP._tcp.local", 33), (now, 1));
+    s.requeries_mut()
+        .insert(key("\u{00E9}clair._http._tcp.local", 33), (now, 1));
+    s.evict(HashSet::from([Scheduler::continuous_key(
+        "\u{00C9}clair._http._tcp.local",
+        33,
+    )]));
+    let left: Vec<_> = s.requeries().keys().cloned().collect();
+    assert_eq!(left, [key("\u{00C9}CLAIR._HTTP._tcp.local", 33)]);
+}

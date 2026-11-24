@@ -70,7 +70,7 @@ pub fn service_id(instance: &str, service_type: &str) -> String {
 /// many services, so host-owned evidence is recorded once, under the
 /// host, and every service on it shows it in a `host` block.
 pub fn host_id(hostname: &str) -> String {
-    hostname.trim_end_matches('.').to_lowercase()
+    hostname.trim_end_matches('.').to_ascii_lowercase()
 }
 
 /// Severity of an anomaly: errors are clear RFC violations, warnings are
@@ -452,7 +452,7 @@ pub fn analyze_observations(
     for svc in &snap.services {
         for rec in svc.answers {
             if matches!(rec.rtype, 1 | 28) {
-                let key = rec.name.trim_end_matches('.').to_lowercase();
+                let key = rec.name.trim_end_matches('.').to_ascii_lowercase();
                 if rec.ttl > 0 {
                     host_addr_latest
                         .entry((key.clone(), rec.rtype))

@@ -463,7 +463,10 @@ pub(super) fn check_ttl_stable(
             continue;
         }
         bases
-            .entry((rec.name.trim_end_matches('.').to_lowercase(), rec.rtype))
+            .entry((
+                rec.name.trim_end_matches('.').to_ascii_lowercase(),
+                rec.rtype,
+            ))
             .or_default()
             .insert(rec.ttl);
     }

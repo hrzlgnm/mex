@@ -220,7 +220,7 @@ impl App {
                     .unwrap_or("")
                     .trim()
                     .trim_end_matches('.')
-                    .to_lowercase();
+                    .to_ascii_lowercase();
                 if !t.is_empty() && !targets.contains(&t) {
                     targets.push(t);
                 }
@@ -233,7 +233,7 @@ impl App {
                 if rec.ttl <= rec.received_at.elapsed().as_secs() as u32 {
                     continue;
                 }
-                let owner = rec.name.trim_end_matches('.').to_lowercase();
+                let owner = rec.name.trim_end_matches('.').to_ascii_lowercase();
                 if !targets.contains(&owner) {
                     continue;
                 }

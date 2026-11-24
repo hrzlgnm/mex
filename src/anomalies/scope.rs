@@ -38,7 +38,7 @@ pub(crate) fn collapse_questions(found: &[Anomaly]) -> Vec<(&Anomaly, Vec<&str>)
                 .as_deref()
                 .unwrap_or_default()
                 .trim_end_matches('.')
-                .to_lowercase(),
+                .to_ascii_lowercase(),
             a.rtype,
             a.source.as_deref(),
             a.message.as_str(),
@@ -66,7 +66,7 @@ where
     for a in items {
         if let (Some(name), Some(rtype)) = (&a.record_name, a.rtype) {
             *counts
-                .entry((name.trim_end_matches('.').to_lowercase(), rtype))
+                .entry((name.trim_end_matches('.').to_ascii_lowercase(), rtype))
                 .or_insert(0) += 1;
         }
     }
@@ -94,7 +94,7 @@ pub(crate) fn visible_scope(a: &Anomaly, identity_count: &HashMap<(String, u16),
             .as_deref()
             .unwrap_or("")
             .trim_end_matches('.')
-            .to_lowercase(),
+            .to_ascii_lowercase(),
         a.rtype.unwrap_or(0),
     );
     match (&a.rdata, identity_count.get(&key)) {
