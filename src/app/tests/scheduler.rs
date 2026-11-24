@@ -165,3 +165,22 @@ fn refresh_postpones_the_stream_of_the_same_name_only() {
         now + Duration::from_secs(8)
     );
 }
+
+#[test]
+fn eviction_keeps_refresh_summaries_of_live_names_by_ascii_case_only() {
+    // Requery keys keep wire case; live names are ASCII-lowercased.
+    // `ÉCLAIR` is the live `Éclair`, while `éclair` (U+00E9) is another,
+    // dead name (RFC 6762 §16).
+    let now = Instant::now();
+    let mut s = Scheduler::default();
+    s.requeries_mut()
+        .insert(key("\u{00C9}CLAIR._HTTP._tcp.local", 33), (now, 1));
+    s.requeries_mut()
+        .insert(key("\u{00E9}clair._http._tcp.local", 33), (now, 1));
+    s.evict(HashSet::from([Scheduler::continuous_key(
+        "\u{00C9}clair._http._tcp.local",
+        33,
+    )]));
+    let left: Vec<_> = s.requeries().keys().cloned().collect();
+    assert_eq!(left, [key("\u{00C9}CLAIR._HTTP._tcp.local", 33)]);
+}
