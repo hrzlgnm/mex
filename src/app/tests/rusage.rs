@@ -1,6 +1,8 @@
 // Copyright 2026 hrzlgnm
 // SPDX-License-Identifier: MIT
 
+// Only the Unix-only tests use the app types.
+#[cfg(unix)]
 use super::*;
 use crate::app::rusage::{self, ResourceUsage};
 
