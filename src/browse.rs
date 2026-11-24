@@ -42,6 +42,7 @@ pub(crate) use wire::rtype_label;
 pub(crate) use wire::rtype_name;
 pub(crate) use wire::strip_local_suffix;
 pub(crate) use wire::wire_rdata_len;
+use wire::WireSink;
 #[cfg(test)]
 use wire::*;
 

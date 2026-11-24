@@ -593,3 +593,13 @@ fn wire_name_rejects_names_over_255_octets() {
     assert!(wire_name(&longest).is_some());
     assert!(wire_name(&format!("{longest}a")).is_none(), "256 octets");
 }
+
+#[test]
+fn query_codec_failure_is_handled_not_a_panic() {
+    let qname = wire_name("_http._tcp.local").unwrap();
+    assert!(build_query_into(FailingSink, &qname, TYPE::PTR, false, &[]).is_none());
+    // The in-memory sink encodes as before.
+    let bytes = build_query(&qname, TYPE::PTR, false, &[]).unwrap();
+    let ev = parse_packet(&bytes, test_source(), std::net::IpAddr::V4(MDNS_V4), "", 0).unwrap();
+    assert_eq!(ev.questions[0].name, "_http._tcp.local.");
+}

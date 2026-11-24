@@ -988,3 +988,10 @@ fn record_sections_have_stable_labels() {
         ]
     );
 }
+
+#[test]
+fn record_codec_failure_yields_an_empty_wire_not_a_panic() {
+    let rec = known_answer("svc._http._tcp.local.", "Inst.svc._http._tcp.local.", 120);
+    assert!(record_wire_into(FailingSink, &rec).is_empty());
+    assert!(!record_wire(&rec).is_empty(), "the in-memory sink encodes");
+}

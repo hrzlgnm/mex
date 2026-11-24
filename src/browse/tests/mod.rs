@@ -38,3 +38,29 @@ impl QuerySocket for FakeSocket {
         Ok(())
     }
 }
+
+/// A wire sink whose every write fails, as a full or broken buffer
+/// would: drives the encoders' error handling.
+struct FailingSink;
+
+impl std::io::Write for FailingSink {
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::ErrorKind::WriteZero.into())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl std::io::Seek for FailingSink {
+    fn seek(&mut self, _pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        Ok(0)
+    }
+}
+
+impl WireSink for FailingSink {
+    fn into_bytes(self) -> Vec<u8> {
+        Vec::new()
+    }
+}

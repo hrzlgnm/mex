@@ -313,8 +313,8 @@ pub(super) const MAX_NAME_OCTETS: usize = 255;
 pub(super) const MAX_QUERY_BYTES: usize = 9000 - 40 - 8;
 
 /// Encode one query for an egress interface. `None` means the owner name
-/// cannot go on the wire (see `wire_name`); that is logged
-/// because the scheduler has already counted the query as sent.
+/// cannot go on the wire (see `wire_name`) or the codec failed; that is
+/// logged because the scheduler has already counted the query as sent.
 ///
 /// Names compress against byte-identical repeats (differing-case names
 /// are written in full, so wire case is preserved), which keeps dense
@@ -348,14 +348,14 @@ pub(super) fn encode_query(req: &QueryRequest, egress_iface: &str) -> Option<Vec
         kas.push((rdata, ka_ttl));
     }
 
-    let mut bytes = build_query(&qname, req.record_type, req.qu, &kas);
+    let mut bytes = build_query(&qname, req.record_type, req.qu, &kas)?;
     if bytes.len() > MAX_QUERY_BYTES {
         let total = kas.len();
         let mut n = total;
         while n > 0 {
             n /= 2;
             kas.truncate(n);
-            bytes = build_query(&qname, req.record_type, req.qu, &kas);
+            bytes = build_query(&qname, req.record_type, req.qu, &kas)?;
             if bytes.len() <= MAX_QUERY_BYTES {
                 break;
             }
@@ -371,13 +371,31 @@ pub(super) fn encode_query(req: &QueryRequest, egress_iface: &str) -> Option<Vec
 }
 
 /// One query packet: question plus the given known answers, names
-/// compressed.
+/// compressed. `None` only on codec failure (logged).
 pub(super) fn build_query(
     qname: &simple_dns::Name<'_>,
     record_type: TYPE,
     qu: bool,
     kas: &[(simple_dns::Name<'_>, u32)],
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
+    build_query_into(
+        std::io::Cursor::new(Vec::new()),
+        qname,
+        record_type,
+        qu,
+        kas,
+    )
+}
+
+/// `build_query` through `sink`; the codec only fails when the sink
+/// does.
+pub(super) fn build_query_into(
+    mut sink: impl WireSink,
+    qname: &simple_dns::Name<'_>,
+    record_type: TYPE,
+    qu: bool,
+    kas: &[(simple_dns::Name<'_>, u32)],
+) -> Option<Vec<u8>> {
     let mut pkt = Packet::new_query(0);
     pkt.questions.push(simple_dns::Question::new(
         qname.clone(),
@@ -393,16 +411,19 @@ pub(super) fn build_query(
             RData::PTR(rdata.clone().into()),
         ));
     }
-    // The codec only fails on writer I/O errors, and an in-memory
-    // `Vec` never fails to grow by a write.
-    pkt.build_bytes_vec_compressed()
-        .expect("writing a query into a Vec cannot fail")
+    match pkt.write_compressed_to(&mut sink) {
+        Ok(()) => Some(sink.into_bytes()),
+        Err(e) => {
+            log::warn!("mex: cannot encode query for {qname}: {e}");
+            None
+        }
+    }
 }
 
 pub(crate) fn inferred_question_packet(name: &str, rtype: u16, qu: bool) -> Option<Vec<u8>> {
     let qname = wire_name(name)?;
     let record_type = record_type_from_u16(rtype)?;
-    Some(build_query(&qname, record_type, qu, &[]))
+    build_query(&qname, record_type, qu, &[])
 }
 
 /// Encode and send one query copy, returning its bytes with the send
