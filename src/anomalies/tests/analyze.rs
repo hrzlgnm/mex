@@ -70,3 +70,53 @@ fn goodbye_and_expired_never_flagged() {
     );
     assert!(!found.iter().any(|a| a.kind == AnomalyKind::TtlHigh));
 }
+
+#[test]
+fn kinds_display_and_order_by_their_label() {
+    use AnomalyKind::*;
+    assert_eq!(SharedFlush.to_string(), SharedFlush.as_str());
+    assert_eq!(format!("{ConflictingAnswers}"), "conflicting-answers");
+    // Ordered by label, so sorted findings group by kind name.
+    assert!(ConflictingAnswers < SharedFlush);
+    assert_eq!(
+        ConflictingAnswers.partial_cmp(&ConflictingAnswers),
+        Some(std::cmp::Ordering::Equal)
+    );
+}
+
+#[test]
+fn goodbye_sightings_and_enumeration_rows_are_not_checked() {
+    // A flushed shared PTR is an error while live; once it says goodbye
+    // (TTL 0) it is no longer held against its owner.
+    let ptr = |ttl| {
+        rec(
+            "_services._dns-sd._udp.local.",
+            12,
+            "PTR",
+            "_fog._tcp.local.",
+            ttl,
+            true,
+        )
+    };
+    let flagged = |enum_answer: &RawRecord, sighting: &RawRecord| {
+        let snap = Snapshot {
+            services: Vec::new(),
+            enum_answers: vec![enum_answer],
+            pending_hosts: HashSet::new(),
+            questions: Vec::new(),
+            sightings: vec![("X._http._tcp.local".to_string(), sighting)],
+            host_addresses: Vec::new(),
+            device_names: HashMap::new(),
+        };
+        let mut owners: Vec<String> = analyze(&snap)
+            .into_iter()
+            .filter(|a| a.kind == AnomalyKind::SharedFlush)
+            .map(|a| a.service)
+            .collect();
+        owners.sort();
+        owners
+    };
+    let (live, gone) = (ptr(4500), ptr(0));
+    assert_eq!(flagged(&live, &live), ["X._http._tcp.local", "enumeration"]);
+    assert!(flagged(&gone, &gone).is_empty());
+}
