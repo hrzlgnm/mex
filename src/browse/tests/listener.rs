@@ -252,3 +252,260 @@ fn malformed_packets_are_counted_with_source() {
     assert_eq!(drops.total(), 0);
     assert!(drops.last().is_none());
 }
+
+/// Ingress index of the one link `bare_listener` knows.
+const TEST_LINK: u32 = 42;
+
+/// A listener with no sockets that knows one link (`eth-test`,
+/// 192.168.178.0/24, matching `test_source()`), for driving datagram
+/// handling without network traffic.
+fn bare_listener(
+    selection: Option<HashSet<String>>,
+) -> (Listener, mpsc::Receiver<Event>, Arc<DropStats>) {
+    let poll = mio::Poll::new().unwrap();
+    let waker = Arc::new(mio::Waker::new(poll.registry(), WAKER_TOKEN).unwrap());
+    let drops = Arc::new(DropStats::default());
+    let (tx, rx) = mpsc::channel();
+    let (_query_tx, query_rx) = mpsc::channel();
+    let mut listener = Listener::new(
+        poll,
+        None,
+        None,
+        tx,
+        query_rx,
+        SharedWithApp {
+            drops: drops.clone(),
+            transmit: Arc::new(TransmitState::new(true, true)),
+            waker,
+        },
+        selection,
+    );
+    listener.ifnames.insert(TEST_LINK, "eth-test".to_string());
+    listener.subnets.insert(
+        TEST_LINK,
+        vec![(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 178, 1)),
+            IpAddr::V4(Ipv4Addr::new(255, 255, 255, 0)),
+        )],
+    );
+    (listener, rx, drops)
+}
+
+/// Hand `bytes` to the listener as if the socket had just received them.
+fn deliver(
+    listener: &mut Listener,
+    bytes: &[u8],
+    src: SocketAddr,
+    dst: IpAddr,
+    ifindex: u32,
+) -> ReadStep {
+    listener.buf[..bytes.len()].copy_from_slice(bytes);
+    listener.handle_recv(Ok((
+        bytes.len(),
+        socket_pktinfo::PktInfo {
+            if_index: u64::from(ifindex),
+            addr_src: src,
+            addr_dst: dst,
+        },
+    )))
+}
+
+/// A well-formed one-question mDNS query.
+fn query_bytes() -> Vec<u8> {
+    let mut q = Packet::new_query(0);
+    q.questions.push(Question::new(
+        simple_dns::Name::new_unchecked("_http._tcp.local."),
+        QTYPE::TYPE(TYPE::PTR),
+        QCLASS::CLASS(CLASS::IN),
+        false,
+    ));
+    q.build_bytes_vec().unwrap()
+}
+
+fn multicast_v4() -> IpAddr {
+    IpAddr::V4(MDNS_V4)
+}
+
+#[test]
+fn malformed_datagram_is_counted_not_forwarded() {
+    let (mut listener, events, drops) = bare_listener(None);
+    let step = deliver(
+        &mut listener,
+        &[0xde, 0xad, 0xbe],
+        test_source(),
+        multicast_v4(),
+        TEST_LINK,
+    );
+    assert!(matches!(step, ReadStep::Handled));
+    assert_eq!(drops.malformed_total(), 1);
+    assert_eq!(drops.malformed_last().unwrap().0, test_source());
+    assert!(events.try_recv().is_err(), "no event for junk");
+    assert_eq!(drops.total(), 0, "not an off-link drop");
+}
+
+#[test]
+fn recv_error_ends_the_drain_like_would_block() {
+    // One failing read neither stops the listener nor spins: the drain
+    // ends, readiness re-arms and the next datagram announces itself.
+    let (mut listener, events, drops) = bare_listener(None);
+    for kind in [
+        std::io::ErrorKind::ConnectionRefused,
+        std::io::ErrorKind::WouldBlock,
+    ] {
+        assert!(matches!(
+            listener.handle_recv(Err(kind.into())),
+            ReadStep::WouldBlock
+        ));
+    }
+    assert!(events.try_recv().is_err());
+    assert_eq!((drops.total(), drops.malformed_total()), (0, 0));
+}
+
+#[test]
+fn off_link_unicast_is_refused_and_counted() {
+    // RFC 6762 §11: a unicast-destination packet must come from a
+    // local subnet of its ingress link.
+    let (mut listener, events, drops) = bare_listener(None);
+    let unicast = IpAddr::V4(Ipv4Addr::new(192, 168, 178, 5));
+    let spoofer: SocketAddr = "10.9.9.9:5353".parse().unwrap();
+    let step = deliver(&mut listener, &query_bytes(), spoofer, unicast, TEST_LINK);
+    assert!(matches!(step, ReadStep::Handled));
+    assert_eq!(drops.total(), 1);
+    assert_eq!(drops.last().unwrap().0, spoofer);
+    assert!(events.try_recv().is_err(), "refused, not forwarded");
+
+    // The same packet from an on-link source is delivered.
+    let step = deliver(
+        &mut listener,
+        &query_bytes(),
+        test_source(),
+        unicast,
+        TEST_LINK,
+    );
+    assert!(matches!(step, ReadStep::Handled));
+    assert_eq!(events.try_recv().unwrap().source, test_source());
+    assert_eq!(drops.total(), 1, "on-link source not counted");
+}
+
+#[test]
+fn off_selection_ingress_is_dropped_silently() {
+    // An explicit `-i` selection drops ingress from other links,
+    // without counting it as off-link or malformed.
+    let selection = HashSet::from(["other".to_string()]);
+    let (mut listener, events, drops) = bare_listener(Some(selection));
+    let step = deliver(
+        &mut listener,
+        &query_bytes(),
+        test_source(),
+        multicast_v4(),
+        TEST_LINK,
+    );
+    assert!(matches!(step, ReadStep::Handled));
+    assert!(events.try_recv().is_err());
+    assert_eq!((drops.total(), drops.malformed_total()), (0, 0));
+}
+
+#[test]
+fn unknown_ingress_link_is_backfilled_once_and_still_delivered() {
+    // An index no host reports: the backfill scan finds nothing and
+    // remembers the index, so later packets don't rescan.
+    let (mut listener, events, _drops) = bare_listener(None);
+    let unmapped = 0x7fff_fff0;
+    let step = deliver(
+        &mut listener,
+        &query_bytes(),
+        test_source(),
+        multicast_v4(),
+        unmapped,
+    );
+    assert!(matches!(step, ReadStep::Handled));
+    assert!(listener.unknown.contains(&unmapped));
+    assert!(!listener.ifnames.contains_key(&unmapped));
+    // Multicast destination, no selection: delivered without a name.
+    let ev = events.try_recv().unwrap();
+    assert_eq!(ev.questions[0].iface, "");
+
+    // A link the host does report but the cached maps miss: the scan
+    // fills its name in before the packet is filed. Hosts with no
+    // addressed link (isolated sandboxes) have nothing to backfill.
+    let (host_links, _) = link_maps();
+    let Some((&idx, name)) = host_links.iter().next() else {
+        eprintln!("skipping backfill hit: host reports no addressed link");
+        return;
+    };
+    // Force the miss even if the host link shares `TEST_LINK`'s index.
+    listener.ifnames.remove(&idx);
+    listener.subnets.remove(&idx);
+    deliver(
+        &mut listener,
+        &query_bytes(),
+        test_source(),
+        multicast_v4(),
+        idx,
+    );
+    assert_eq!(listener.ifnames.get(&idx), Some(name));
+    assert_eq!(events.try_recv().unwrap().questions[0].iface, *name);
+}
+
+#[test]
+fn own_query_copy_is_dropped_on_loopback() {
+    let (mut listener, events, drops) = bare_listener(None);
+    let bytes = query_bytes();
+    listener.sent_copies.record(&bytes, Instant::now());
+    let step = deliver(
+        &mut listener,
+        &bytes,
+        test_source(),
+        multicast_v4(),
+        TEST_LINK,
+    );
+    assert!(matches!(step, ReadStep::Handled));
+    assert!(events.try_recv().is_err(), "our own copy is not a querier");
+    assert_eq!((drops.total(), drops.malformed_total()), (0, 0));
+    // One drop per sent copy: a second identical packet is remote.
+    deliver(
+        &mut listener,
+        &bytes,
+        test_source(),
+        multicast_v4(),
+        TEST_LINK,
+    );
+    assert!(events.try_recv().is_ok());
+}
+
+#[test]
+fn closed_event_receiver_stops_the_drain() {
+    let (mut listener, events, _drops) = bare_listener(None);
+    drop(events);
+    let step = deliver(
+        &mut listener,
+        &query_bytes(),
+        test_source(),
+        multicast_v4(),
+        TEST_LINK,
+    );
+    assert!(matches!(step, ReadStep::Closed));
+}
+
+#[test]
+fn failed_socket_open_yields_no_socket() {
+    let poll = mio::Poll::new().unwrap();
+    let opened = FamilySocket::open_with(Family::V4, poll.registry(), || {
+        Err(anyhow::anyhow!("no socket for you"))
+    });
+    assert!(opened.is_none());
+}
+
+#[test]
+fn run_refreshes_interfaces_when_due() {
+    // A due refresh runs at the top of the loop pass and reschedules;
+    // the dropped query sender then stops the loop.
+    let (mut listener, _events, _drops) = bare_listener(Some(HashSet::new()));
+    let (query_tx, query_rx) = mpsc::channel();
+    drop(query_tx);
+    listener.query_rx = query_rx;
+    let started = Instant::now();
+    listener.next_refresh = started;
+    listener.run();
+    assert!(listener.next_refresh >= started + IFACE_REFRESH);
+}
