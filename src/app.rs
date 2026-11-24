@@ -597,16 +597,63 @@ impl DiagnosticsCounters {
     /// new one evicts the quietest, so the busiest talkers stay exact.
     pub(super) fn count_source(&mut self, src: std::net::SocketAddr) {
         if !self.source_rx.contains_key(&src) && self.source_rx.len() >= SOURCE_RX_CAP {
-            if let Some(quietest) = self
+            // At the cap the map is not empty, so a quietest source exists.
+            let quietest = self
                 .source_rx
                 .iter()
                 .min_by_key(|(_, count)| **count)
-                .map(|(addr, _)| *addr)
-            {
-                self.source_rx.remove(&quietest);
-            }
+                .map(|(addr, _)| *addr);
+            self.source_rx.retain(|addr, _| Some(*addr) != quietest);
         }
         *self.source_rx.entry(src).or_insert(0) += 1;
+    }
+}
+
+/// What a terminal event asks of the TUI loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalAction {
+    /// Applied to the app state; keep going.
+    Handled,
+    /// Ctrl+Z: suspend the terminal (Unix only).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Suspend,
+}
+
+/// When the TUI redraws: only when something changed (input, new
+/// packets, a log popup) or the wall-clock second ticked over (TTL
+/// countdowns, ages, uptime, popup expiry). The 80 ms tick itself stays
+/// for query scheduling; idle ticks skip the costly frame.
+#[derive(Debug)]
+struct RedrawGate {
+    dirty: bool,
+    drawn_sec: Option<u64>,
+}
+
+impl Default for RedrawGate {
+    /// The first pass always draws.
+    fn default() -> Self {
+        Self {
+            dirty: true,
+            drawn_sec: None,
+        }
+    }
+}
+
+impl RedrawGate {
+    /// Something shown may have changed.
+    fn mark(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Whether a frame is due at wall-clock second `sec`.
+    fn due(&self, sec: u64) -> bool {
+        self.dirty || self.drawn_sec != Some(sec)
+    }
+
+    /// A frame was drawn at `sec`.
+    fn drawn(&mut self, sec: u64) {
+        self.dirty = false;
+        self.drawn_sec = Some(sec);
     }
 }
 
@@ -1069,65 +1116,47 @@ impl App {
     }
 
     fn run_tui(&mut self, terminal: &mut ui::Terminal) -> Result<()> {
-        // Redraw only when something changed: input, new packets, a log
-        // popup, or the wall-clock second ticking over (TTL countdowns,
-        // ages, uptime, popup expiry). The 80ms tick itself stays for
-        // query scheduling; idle ticks skip the costly frame.
-        let mut dirty = true;
-        let mut drawn_sec = None;
+        let mut redraw = RedrawGate::default();
         while self.running {
-            let packets_before = self.packet_count;
-            self.drain_events();
-            self.send_queries();
-            self.evict_expired();
-            dirty |= self.packet_count != packets_before;
+            if self.tick() {
+                redraw.mark();
+            }
 
             // Surface retained log write failures (terminal-safe: the
             // popup, not stderr, so the TUI is not corrupted).
             if let Some(msg) = crate::take_log_error() {
-                self.status_msg = Some((msg, Instant::now()));
-                dirty = true;
+                self.show_status(msg);
+                redraw.mark();
             }
 
             let sec = self.start_time.elapsed().as_secs();
-            if dirty || drawn_sec != Some(sec) {
+            if redraw.due(sec) {
                 terminal.draw(|f| ui::draw(f, self))?;
-                dirty = false;
-                drawn_sec = Some(sec);
+                redraw.drawn(sec);
             }
 
             if event::poll(Duration::from_millis(80))? {
                 // Any input may change what is shown (keys, mouse hover,
                 // resize): draw on the next pass.
-                dirty = true;
+                redraw.mark();
                 // Drain everything pending so mouse drags stay smooth at
                 // 12fps instead of handling one event per frame.
                 loop {
-                    match event::read()? {
-                        Event::Key(key) => {
-                            if key.kind == KeyEventKind::Press {
-                                // Unix suspend precedes all key handling (even
-                                // the diagnostics overlay): raw mode delivers
-                                // Ctrl+Z as a key event, not SIGTSTP.
-                                #[cfg(unix)]
-                                if Self::is_suspend_key(&key) {
-                                    if !ui::suspend(terminal)? {
-                                        self.running = false;
-                                        return Ok(());
-                                    }
-                                    // Break out to redraw immediately: the
-                                    // inner loop would block on `read()` until
-                                    // the next input event, leaving the
-                                    // freshly cleared screen blank.
-                                    break;
-                                }
-                                self.handle_key(&key);
-                            }
+                    let action = self.handle_terminal_event(event::read()?);
+                    // Only Unix asks to suspend (Ctrl+Z).
+                    #[cfg(unix)]
+                    if action == TerminalAction::Suspend {
+                        if !ui::suspend(terminal)? {
+                            self.running = false;
+                            return Ok(());
                         }
-                        Event::Mouse(mouse) => self.handle_mouse(&mouse),
-                        Event::Resize(_, _) => self.touch(),
-                        _ => {}
+                        // Break out to redraw immediately: the inner loop
+                        // would block on `read()` until the next input
+                        // event, leaving the freshly cleared screen blank.
+                        break;
                     }
+                    #[cfg(not(unix))]
+                    let _ = action;
                     if !event::poll(Duration::ZERO)? {
                         break;
                     }
@@ -1140,16 +1169,10 @@ impl App {
     fn run_headless(&mut self) -> Result<()> {
         log::info!("mex: started (no TUI available, listening on port 5353)");
         while self.running {
-            self.drain_events();
-            self.send_queries();
-            if self.packet_count > 0 && self.packet_count.is_multiple_of(10) {
-                log::info!(
-                    "mex: {} packets, {} services seen",
-                    self.packet_count,
-                    self.services.len()
-                );
+            self.tick();
+            if let Some(line) = self.headless_progress() {
+                log::info!("{line}");
             }
-            self.evict_expired();
             // Surface retained log write failures (stderr is safe here:
             // no TUI to corrupt).
             if let Some(msg) = crate::take_log_error() {
@@ -1160,6 +1183,53 @@ impl App {
             std::thread::sleep(Duration::from_millis(50));
         }
         Ok(())
+    }
+
+    /// One pass of background work shared by both run loops: file new
+    /// packets, send due queries, expire records. Returns whether new
+    /// packets arrived (the TUI then redraws).
+    fn tick(&mut self) -> bool {
+        let packets_before = self.packet_count;
+        self.drain_events();
+        self.send_queries();
+        self.evict_expired();
+        self.packet_count != packets_before
+    }
+
+    /// Show `msg` in the status line (log write failures in the TUI).
+    fn show_status(&mut self, msg: String) {
+        self.status_msg = Some((msg, Instant::now()));
+    }
+
+    /// Progress line for the headless log: every 10th packet.
+    fn headless_progress(&self) -> Option<String> {
+        (self.packet_count > 0 && self.packet_count.is_multiple_of(10)).then(|| {
+            format!(
+                "mex: {} packets, {} services seen",
+                self.packet_count,
+                self.services.len()
+            )
+        })
+    }
+
+    /// Apply one terminal event. Only key presses count (releases and
+    /// repeats are ignored). Unix suspend precedes all key handling
+    /// (even the diagnostics overlay): raw mode delivers Ctrl+Z as a
+    /// key event, not SIGTSTP, so the loop must suspend the terminal.
+    fn handle_terminal_event(&mut self, event: Event) -> TerminalAction {
+        match event {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                #[cfg(unix)]
+                if Self::is_suspend_key(&key) {
+                    return TerminalAction::Suspend;
+                }
+                self.handle_key(&key);
+            }
+            Event::Mouse(mouse) => self.handle_mouse(&mouse),
+            Event::Resize(_, _) => self.touch(),
+            _ => {}
+        }
+        TerminalAction::Handled
     }
 
     fn flush_pending_addrs(&mut self) {
