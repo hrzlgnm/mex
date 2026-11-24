@@ -1017,3 +1017,262 @@ fn refresh_of_a_non_ascii_name_postpones_its_discovery_stream() {
         "the discovery stream was postponed"
     );
 }
+
+#[test]
+fn known_ptrs_cover_the_type_once_per_link_and_its_pending_instances() {
+    let mut app = App::new().unwrap();
+    // A confirmed _http instance, announced by two sources on one link.
+    ingest(&mut app, &ptr_record(120));
+    ingest(&mut app, &srv_record(120));
+    let mut again = ptr_record(120);
+    again.source = "192.168.1.9:5353".parse().unwrap();
+    ingest(&mut app, &again);
+    // Another type's service, and a pending _http instance (no SRV yet).
+    ingest(
+        &mut app,
+        &raw_record("_ssh._tcp.local.", 12, "PTR", "Shell._ssh._tcp.local.", 120),
+    );
+    ingest(
+        &mut app,
+        &raw_record(
+            "Shell._ssh._tcp.local.",
+            33,
+            "SRV",
+            "0 0 22 shell.local.",
+            120,
+        ),
+    );
+    ingest(
+        &mut app,
+        &raw_record(
+            "_http._tcp.local.",
+            12,
+            "PTR",
+            "Later._http._tcp.local.",
+            120,
+        ),
+    );
+    // A pending instance of another type is no _http answer either.
+    ingest(
+        &mut app,
+        &raw_record(
+            "_ipp._tcp.local.",
+            12,
+            "PTR",
+            "Printer._ipp._tcp.local.",
+            120,
+        ),
+    );
+    for pending in ["Later", "Printer"] {
+        assert!(
+            app.pending_instances.iter().any(|p| p.instance == pending),
+            "{pending} is pending"
+        );
+    }
+    let mut targets: Vec<String> = app
+        .known_ptrs("_http._tcp.local")
+        .into_iter()
+        .map(|ka| ka.target)
+        .collect();
+    targets.sort();
+    assert_eq!(
+        targets,
+        ["Later._http._tcp.local", "Test._http._tcp.local"],
+        "one per target and link; no _ssh answers"
+    );
+}
+
+#[test]
+fn enumeration_answers_past_half_their_ttl_are_no_known_answers() {
+    let Some(old) = Instant::now().checked_sub(Duration::from_secs(70)) else {
+        return; // host clock too young to backdate
+    };
+    let mut app = App::new().unwrap();
+    let mut rec = raw_record(
+        "_services._dns-sd._udp.local.",
+        12,
+        "PTR",
+        "_http._tcp.local.",
+        120,
+    );
+    rec.received_at = old;
+    app.scheduler.note_enum_type("_http._tcp.local", &rec);
+    assert!(app.known_enum_answers().is_empty(), "50 of 120 s left");
+}
+
+#[test]
+fn goodbyes_and_unrefreshable_types_get_no_refresh() {
+    let Some(old) = Instant::now().checked_sub(Duration::from_secs(9)) else {
+        return; // host clock too young to backdate
+    };
+    let mut app = test_service_app();
+    // Inside the 80% window (9 of 10 s), but HINFO is not refreshed,
+    // and a goodbye (TTL 0) is never refreshed.
+    let mut hinfo = raw_record("Test._http._tcp.local.", 13, "HINFO", "x y", 10);
+    hinfo.received_at = old;
+    let goodbye = raw_record(
+        "_services._dns-sd._udp.local.",
+        12,
+        "PTR",
+        "_x._tcp.local.",
+        0,
+    );
+    app.services[0].answers.push(hinfo);
+    app.enum_entries[0].answers.push(goodbye.clone());
+    app.update_refreshes(true);
+    assert!(!app.scheduler.refresh_rows().keys().any(|r| r.1 == 13));
+    assert!(!app
+        .scheduler
+        .refresh_rows()
+        .keys()
+        .any(|r| r.0 == "_services._dns-sd._udp.local"));
+    // A goodbye promises no refresh either.
+    let key = Scheduler::provenance_key("_services._dns-sd._udp.local", 12);
+    app.enum_entries[0].answers = vec![goodbye];
+    assert_eq!(app.next_refresh_due(&key), None);
+}
+
+#[test]
+fn pending_instance_answers_are_live_answers() {
+    let mut app = App::new().unwrap();
+    ingest(&mut app, &ptr_record(120));
+    assert!(app.services.is_empty() && !app.pending_instances.is_empty());
+    assert!(app.has_live_answer(&Scheduler::provenance_key("_http._tcp.local.", 12)));
+}
+
+#[test]
+fn suffix_strip_needs_a_longer_name_and_a_matching_tail() {
+    assert_eq!(
+        App::strip_suffix_ci("_http._tcp.local", "_http._tcp.local"),
+        None
+    );
+    assert_eq!(App::strip_suffix_ci("a.local", "_http._tcp.local"), None);
+    assert_eq!(
+        App::strip_suffix_ci("A._ssh._tcp.local", "_http._tcp.local"),
+        None
+    );
+    // Same length tail, dot-separated prefix: only the tail differs.
+    assert_eq!(
+        App::strip_suffix_ci("A._ipp1._tcp.local", "_http._tcp.local"),
+        None
+    );
+    assert_eq!(
+        App::strip_suffix_ci("A._HTTP._tcp.local", "_http._tcp.local"),
+        Some("A")
+    );
+}
+
+#[test]
+fn a_service_without_a_hostname_asks_for_no_addresses() {
+    let mut app = App::new().unwrap();
+    app.services.push(ServiceEntry {
+        instance: "Lonely".to_string(),
+        service_type: "_http._tcp.local".to_string(),
+        hostname: String::new(),
+        port: 0,
+        subtypes: Vec::new(),
+        answers: Vec::new(),
+        questions: Vec::new(),
+        questions_dropped: 0,
+        last_seen: Instant::now(),
+        is_active: true,
+        last_event: None,
+    });
+    let desired = app.desired_continuous();
+    assert!(desired.contains_key(&("lonely._http._tcp.local".to_string(), 33)));
+    assert!(!desired.keys().any(|(_, t)| *t == 1 || *t == 28));
+}
+
+#[test]
+fn due_non_ptr_interest_goes_out_without_known_answers() {
+    let mut app = App::new().unwrap();
+    ingest(&mut app, &ptr_record(120)); // pending: SRV/TXT wanted
+    let srv = ("test._http._tcp.local".to_string(), 33);
+    app.poll_continuous(); // creates the streams
+    app.scheduler
+        .continuous_mut()
+        .get_mut(&srv)
+        .unwrap()
+        .next_due = Instant::now() - Duration::from_millis(1);
+    let ka_before = app.diagnostics.ka_sent;
+    let sent_before = app.diagnostics.q_sent_continuous;
+    for entry in app.scheduler.continuous_mut().values_mut() {
+        if entry.qname != "Test._http._tcp.local" {
+            entry.next_due = Instant::now() + Duration::from_secs(3600);
+        }
+    }
+    app.poll_continuous();
+    assert_eq!(app.diagnostics.q_sent_continuous, sent_before + 1);
+    assert_eq!(
+        app.diagnostics.ka_sent, ka_before,
+        "SRV carries no known answers"
+    );
+    let state = app
+        .scheduler
+        .history(&Scheduler::provenance_key(&srv.0, 33));
+    assert!(state.is_some_and(|s| s.transmitted.is_some()));
+}
+
+#[test]
+fn queries_the_listener_never_got_are_not_recorded_as_sent() {
+    let mut app = due_query_setup();
+    app.query_tx = browse::QueryTx::disconnected();
+    // Both a continuous query and a refresh are due for _http.
+    app.send_queries();
+    let state = app
+        .scheduler
+        .history(&Scheduler::provenance_key("_http._tcp.local", 12));
+    assert!(state.is_none_or(|s| s.transmitted.is_none()));
+    assert!(app.running, "a closed listener is logged, not fatal");
+
+    // A continuous query alone (no refresh due) is not recorded either.
+    let mut app = App::new().unwrap();
+    app.query_tx = browse::QueryTx::disconnected();
+    app.poll_continuous(); // creates the enumeration stream
+    for entry in app.scheduler.continuous_mut().values_mut() {
+        entry.next_due = Instant::now() - Duration::from_millis(1);
+    }
+    let sent_before = app.diagnostics.q_sent_continuous;
+    app.poll_continuous();
+    assert!(
+        app.diagnostics.q_sent_continuous > sent_before,
+        "it was due"
+    );
+    let state = app.scheduler.history(&Scheduler::provenance_key(
+        "_services._dns-sd._udp.local",
+        12,
+    ));
+    assert!(state.is_none_or(|s| s.transmitted.is_none()));
+}
+
+#[test]
+fn enumeration_types_are_browsed_even_after_the_type_cache_was_pruned() {
+    let mut app = App::new().unwrap();
+    let rec = raw_record(
+        "_services._dns-sd._udp.local.",
+        12,
+        "PTR",
+        "_ipp._tcp.local.",
+        4500,
+    );
+    app.scheduler.note_enum_type("_ipp._tcp.local", &rec);
+    app.scheduler.known_types_mut().clear();
+    app.send_queries();
+    assert!(app.scheduler.known_types().contains("_ipp._tcp.local"));
+    assert!(app
+        .scheduler
+        .continuous()
+        .contains_key(&("_ipp._tcp.local".to_string(), 12)));
+}
+
+#[test]
+fn local_addresses_are_refreshed_every_ten_seconds() {
+    let Some(old) = Instant::now().checked_sub(LOCAL_IPS_REFRESH + Duration::from_secs(1)) else {
+        return; // host clock too young to backdate
+    };
+    let mut app = App::new().unwrap();
+    app.passive = true; // the refresh runs in passive mode too
+    app.last_ip_refresh = old;
+    app.send_queries();
+    assert!(app.last_ip_refresh.elapsed() < LOCAL_IPS_REFRESH);
+}
