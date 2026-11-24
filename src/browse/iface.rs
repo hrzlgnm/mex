@@ -32,13 +32,21 @@ pub struct LinkStats {
 /// selection (which overrides the policy). Unselected usable links are
 /// reported as skipped so the snapshot still enumerates every link.
 pub fn link_stats(selection: Option<&HashSet<String>>) -> LinkStats {
+    link_stats_in(&if_addrs::get_if_addrs().unwrap_or_default(), selection)
+}
+
+/// `link_stats` over a given if-addrs listing.
+pub(super) fn link_stats_in(
+    ifaces: &[if_addrs::Interface],
+    selection: Option<&HashSet<String>>,
+) -> LinkStats {
     let mut stats = LinkStats::default();
     let mut seen_v4 = HashSet::new();
     let mut seen_v6 = HashSet::new();
     let mut seen_skipped = HashSet::new();
     let mut seen_inactive = HashSet::new();
-    for iface in if_addrs::get_if_addrs().unwrap_or_default() {
-        let usable = usable_interface(&iface);
+    for iface in ifaces {
+        let usable = usable_interface(iface);
         if !join_candidate(&iface.name, usable, selection) {
             // Not joined: policy skip, selection exclusion (usable links
             // only), or unusable. A selected-but-down link lands in
@@ -52,7 +60,7 @@ pub fn link_stats(selection: Option<&HashSet<String>>) -> LinkStats {
             }
             continue;
         }
-        match iface.addr {
+        match &iface.addr {
             if_addrs::IfAddr::V4(v4) => {
                 if seen_v4.insert(iface.name.clone()) {
                     stats.v4.push((iface.name.clone(), v4.ip));
@@ -159,11 +167,12 @@ pub(super) fn skipped_interface(name: &str) -> bool {
 /// validation universe for an explicit selection. Down links validate
 /// fine and are picked up by the periodic rejoin once they come up.
 pub fn available_interfaces() -> HashSet<String> {
-    if_addrs::get_if_addrs()
-        .unwrap_or_default()
-        .iter()
-        .map(|i| i.name.clone())
-        .collect()
+    available_interfaces_in(&if_addrs::get_if_addrs().unwrap_or_default())
+}
+
+/// `available_interfaces` over a given if-addrs listing.
+pub(super) fn available_interfaces_in(ifaces: &[if_addrs::Interface]) -> HashSet<String> {
+    ifaces.iter().map(|i| i.name.clone()).collect()
 }
 
 /// Validate an explicit `-i/--interfaces` selection: every name must
@@ -216,16 +225,24 @@ pub(super) fn join_candidate(
 }
 
 pub(super) fn v4_interfaces(selection: Option<&HashSet<String>>) -> Vec<(String, Ipv4Addr)> {
+    v4_interfaces_in(&if_addrs::get_if_addrs().unwrap_or_default(), selection)
+}
+
+/// `v4_interfaces` over a given if-addrs listing.
+pub(super) fn v4_interfaces_in(
+    ifaces: &[if_addrs::Interface],
+    selection: Option<&HashSet<String>>,
+) -> Vec<(String, Ipv4Addr)> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    for iface in if_addrs::get_if_addrs().unwrap_or_default() {
-        if !join_candidate(&iface.name, usable_interface(&iface), selection) {
+    for iface in ifaces {
+        if !join_candidate(&iface.name, usable_interface(iface), selection) {
             continue;
         }
-        if let if_addrs::IfAddr::V4(v4) = iface.addr {
+        if let if_addrs::IfAddr::V4(v4) = &iface.addr {
             // Join once per interface: extra addresses share the group.
             if seen.insert(iface.name.clone()) {
-                out.push((iface.name, v4.ip));
+                out.push((iface.name.clone(), v4.ip));
             }
         }
     }
@@ -233,16 +250,24 @@ pub(super) fn v4_interfaces(selection: Option<&HashSet<String>>) -> Vec<(String,
 }
 
 pub(super) fn v6_interfaces(selection: Option<&HashSet<String>>) -> Vec<(String, u32)> {
+    v6_interfaces_in(&if_addrs::get_if_addrs().unwrap_or_default(), selection)
+}
+
+/// `v6_interfaces` over a given if-addrs listing.
+pub(super) fn v6_interfaces_in(
+    ifaces: &[if_addrs::Interface],
+    selection: Option<&HashSet<String>>,
+) -> Vec<(String, u32)> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    for iface in if_addrs::get_if_addrs().unwrap_or_default() {
-        if !join_candidate(&iface.name, usable_interface(&iface), selection) {
+    for iface in ifaces {
+        if !join_candidate(&iface.name, usable_interface(iface), selection) {
             continue;
         }
-        if let if_addrs::IfAddr::V6(v6) = iface.addr {
+        if let if_addrs::IfAddr::V6(v6) = &iface.addr {
             // Join once per interface: extra addresses share the group.
             if v6.ip.to_string().starts_with('f') && seen.insert(iface.name.clone()) {
-                out.push((iface.name, iface.index.unwrap_or(0)));
+                out.push((iface.name.clone(), iface.index.unwrap_or(0)));
             }
         }
     }

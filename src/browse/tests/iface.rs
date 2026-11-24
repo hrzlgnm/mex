@@ -234,3 +234,113 @@ fn validate_selection_rejects_unknown_with_available_list() {
     assert!(msg.contains("'nope'"), "got: {msg}");
     assert!(msg.contains("br0, eth0"), "got: {msg}");
 }
+
+/// One if-addrs entry: `name` up (or down), not point-to-point, with
+/// one address and its index.
+fn iface(name: &str, addr: &str, index: u32, up: bool) -> if_addrs::Interface {
+    let ip: IpAddr = addr.parse().unwrap();
+    if_addrs::Interface {
+        name: name.to_string(),
+        addr: match ip {
+            IpAddr::V4(ip) => if_addrs::IfAddr::V4(if_addrs::Ifv4Addr {
+                ip,
+                netmask: Ipv4Addr::new(255, 255, 255, 0),
+                prefixlen: 24,
+                broadcast: None,
+            }),
+            IpAddr::V6(ip) => if_addrs::IfAddr::V6(if_addrs::Ifv6Addr {
+                ip,
+                netmask: Ipv6Addr::from(u128::MAX << 64),
+                prefixlen: 64,
+                broadcast: None,
+            }),
+        },
+        index: Some(index),
+        oper_status: if up {
+            if_addrs::IfOperStatus::Up
+        } else {
+            if_addrs::IfOperStatus::Down
+        },
+        is_p2p: false,
+        #[cfg(windows)]
+        adapter_name: String::new(),
+    }
+}
+
+fn p2p(mut link: if_addrs::Interface) -> if_addrs::Interface {
+    link.is_p2p = true;
+    link
+}
+
+/// A host with every kind of link the classification tells apart.
+fn host_links() -> Vec<if_addrs::Interface> {
+    vec![
+        // Two v4 and two link-local v6 addresses: joined once each.
+        iface("eth0", "192.168.1.2", 2, true),
+        iface("eth0", "192.168.1.3", 2, true),
+        iface("eth0", "fe80::1", 2, true),
+        iface("eth0", "fe80::2", 2, true),
+        iface("eth0", "2001:db8::1", 2, true),
+        // A link with only a global v6 address is not a v6 target.
+        iface("eth2", "2001:db8::2", 6, true),
+        // Down, and point-to-point: no multicast to join.
+        iface("eth1", "10.0.0.2", 3, false),
+        iface("eth1", "10.0.0.3", 3, false),
+        p2p(iface("wg0", "10.9.0.1", 4, true)),
+        // Skipped by policy unless selected.
+        iface("lo", "127.0.0.1", 1, true),
+        iface("docker0", "172.17.0.1", 5, true),
+    ]
+}
+
+#[test]
+fn link_stats_classify_every_kind_of_link() {
+    let stats = link_stats_in(&host_links(), None);
+    assert_eq!(
+        stats.v4,
+        [("eth0".to_string(), Ipv4Addr::new(192, 168, 1, 2))]
+    );
+    assert_eq!(stats.v6, [("eth0".to_string(), 2)]);
+    assert_eq!(stats.skipped, ["docker0", "lo"]);
+    assert_eq!(stats.inactive, ["eth1", "wg0"], "each named once");
+}
+
+#[test]
+fn link_stats_selection_overrides_policy_but_not_usability() {
+    let sel = HashSet::from(["lo".to_string(), "eth1".to_string()]);
+    let stats = link_stats_in(&host_links(), Some(&sel));
+    assert_eq!(stats.v4, [("lo".to_string(), Ipv4Addr::LOCALHOST)]);
+    assert!(stats.v6.is_empty());
+    // Unselected usable links are skipped; the selected but down link
+    // waits in inactive for the rejoin refresh.
+    assert_eq!(stats.skipped, ["docker0", "eth0", "eth2"]);
+    assert_eq!(stats.inactive, ["eth1", "wg0"]);
+}
+
+#[test]
+fn join_lists_take_one_address_per_usable_link() {
+    let links = host_links();
+    assert_eq!(
+        v4_interfaces_in(&links, None),
+        [("eth0".to_string(), Ipv4Addr::new(192, 168, 1, 2))]
+    );
+    assert_eq!(v6_interfaces_in(&links, None), [("eth0".to_string(), 2)]);
+    let sel = HashSet::from(["eth1".to_string()]);
+    assert!(
+        v4_interfaces_in(&links, Some(&sel)).is_empty(),
+        "eth1 is down"
+    );
+}
+
+#[test]
+fn available_interfaces_name_every_link_in_any_state() {
+    // The selection universe: down, point-to-point and policy-skipped
+    // links validate too, each name once.
+    let names: HashSet<String> = ["eth0", "eth1", "eth2", "wg0", "lo", "docker0"]
+        .map(String::from)
+        .into();
+    assert_eq!(available_interfaces_in(&host_links()), names);
+    // The host listing: a single enumeration, so no race with link
+    // changes between two scans.
+    assert!(available_interfaces().iter().all(|n| !n.is_empty()));
+}
