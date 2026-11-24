@@ -1,5 +1,49 @@
 # Changelog
 
+## [0.22.3](https://github.com/hrzlgnm/mex/compare/v0.22.2...v0.22.3) (2026-11-24)
+
+
+### Bug Fixes
+
+* build the tests on Windows ([#370](https://github.com/hrzlgnm/mex/issues/370)) ([4932b5d](https://github.com/hrzlgnm/mex/commit/4932b5d789c737899934cc575e4f989ea8c4cda6))
+* fold only ASCII letters when comparing names (RFC 6762 §16) ([#377](https://github.com/hrzlgnm/mex/issues/377)) ([2921547](https://github.com/hrzlgnm/mex/commit/2921547f32f56138f04fca8f54cfb61196fdd2c3))
+* keep hosts named like a built-in group in their own group ([#375](https://github.com/hrzlgnm/mex/issues/375)) ([2f52a13](https://github.com/hrzlgnm/mex/commit/2f52a132c8c66b8e9fa5b4b5c37c0d1489f17aa1))
+* refuse query names over 255 octets ([#364](https://github.com/hrzlgnm/mex/issues/364)) ([ca9352a](https://github.com/hrzlgnm/mex/commit/ca9352a4c93495c9d6e7d95b95de6e5345017367))
+
+
+### Dependencies
+
+* update anchore/scan-action action to v7.4.3 ([#358](https://github.com/hrzlgnm/mex/issues/358)) ([5f93343](https://github.com/hrzlgnm/mex/commit/5f933437718b55a6a547bc0bbccaded5a38dd004))
+* update ghcr.io/hrzlgnm/mdns-browser-arch-aur-builder:v1 docker digest to 9b1f812 ([#360](https://github.com/hrzlgnm/mex/issues/360)) ([7217152](https://github.com/hrzlgnm/mex/commit/72171522f15d2a57503a9b8f374f7d9f2813f2d2))
+
+
+### Documentation
+
+* names fold ASCII only (RFC 6762 §16) ([#379](https://github.com/hrzlgnm/mex/issues/379)) ([aecee9a](https://github.com/hrzlgnm/mex/commit/aecee9a96e27f234baea4e04b84b39c98a03853e))
+
+
+### Code Refactoring
+
+* handle codec errors in encoders instead of panicking ([#369](https://github.com/hrzlgnm/mex/issues/369)) ([2b9163a](https://github.com/hrzlgnm/mex/commit/2b9163a91a30d23aa4c5e4e8ce329d7849aa7411))
+
+
+### Tests
+
+* cover listener error and malformed datagram paths ([#362](https://github.com/hrzlgnm/mex/issues/362)) ([a629280](https://github.com/hrzlgnm/mex/commit/a629280b675d206dec61b7c92d14be1a7005ab70))
+* cover remaining anomalies paths ([#373](https://github.com/hrzlgnm/mex/issues/373)) ([1cf1075](https://github.com/hrzlgnm/mex/commit/1cf1075fb98b2b68349b31569c85bfa976f89990))
+* cover remaining app paths ([#368](https://github.com/hrzlgnm/mex/issues/368)) ([e8268fe](https://github.com/hrzlgnm/mex/commit/e8268fead1e8f2e1e5fb785d6b59daab671eb790))
+* cover remaining browse paths ([#367](https://github.com/hrzlgnm/mex/issues/367)) ([e4b7793](https://github.com/hrzlgnm/mex/commit/e4b779381acf190ccc22087314347d5a8ffaff34))
+* cover remaining iface paths ([#366](https://github.com/hrzlgnm/mex/issues/366)) ([9790085](https://github.com/hrzlgnm/mex/commit/9790085b5cb393c2c21dcbf93246728c74bb6ed5))
+* cover remaining input paths ([#374](https://github.com/hrzlgnm/mex/issues/374)) ([23080a3](https://github.com/hrzlgnm/mex/commit/23080a397dbf91e0c532ec284bee6ee054d689c0))
+* cover remaining schedule paths ([#376](https://github.com/hrzlgnm/mex/issues/376)) ([2ea94fa](https://github.com/hrzlgnm/mex/commit/2ea94fa9e98c62a9bbd99e98656d07ec7370d8ba))
+* cover remaining send paths ([#363](https://github.com/hrzlgnm/mex/issues/363)) ([d43e7ed](https://github.com/hrzlgnm/mex/commit/d43e7ed2edb677238291e628c4acf1327e0bf801))
+* cover remaining wire paths ([#365](https://github.com/hrzlgnm/mex/issues/365)) ([1621d53](https://github.com/hrzlgnm/mex/commit/1621d536adca364691170f23c11abb05dee0ce09))
+
+
+### Continuous Integration
+
+* lint the Windows target, tests included ([#371](https://github.com/hrzlgnm/mex/issues/371)) ([98c18d6](https://github.com/hrzlgnm/mex/commit/98c18d66ae04e40a1a6798796f6ae5e83b48f9b4))
+
 ## [0.22.2](https://github.com/hrzlgnm/mex/compare/v0.22.1...v0.22.2) (2026-11-23)
 
 
