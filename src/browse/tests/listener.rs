@@ -425,10 +425,17 @@ fn unknown_ingress_link_is_backfilled_once_and_still_delivered() {
     let ev = events.try_recv().unwrap();
     assert_eq!(ev.questions[0].iface, "");
 
-    // A link the host does report (loopback at least) but the cached
-    // maps miss: the scan fills its name in before the packet is filed.
+    // A link the host does report but the cached maps miss: the scan
+    // fills its name in before the packet is filed. Hosts with no
+    // addressed link (isolated sandboxes) have nothing to backfill.
     let (host_links, _) = link_maps();
-    let (&idx, name) = host_links.iter().next().expect("host has a link");
+    let Some((&idx, name)) = host_links.iter().next() else {
+        eprintln!("skipping backfill hit: host reports no addressed link");
+        return;
+    };
+    // Force the miss even if the host link shares `TEST_LINK`'s index.
+    listener.ifnames.remove(&idx);
+    listener.subnets.remove(&idx);
     deliver(
         &mut listener,
         &query_bytes(),
