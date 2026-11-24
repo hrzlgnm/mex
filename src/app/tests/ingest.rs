@@ -1095,6 +1095,9 @@ fn rate_windows_drop_entries_past_the_window_on_idle_ticks() {
         return; // host clock too young to backdate past the window
     };
     let mut app = App::new().unwrap();
+    // No live traffic: a packet arriving mid-test would add a fresh entry.
+    let (_tx, rx) = mpsc::channel();
+    app.rx = rx;
     app.diagnostics.packet_times.push_back(old);
     app.diagnostics.suppressed_times.push_back(old);
     app.drain_events();

@@ -1168,9 +1168,10 @@ impl App {
 
     fn run_headless(&mut self) -> Result<()> {
         log::info!("mex: started (no TUI available, listening on port 5353)");
+        let mut logged_tens = 0;
         while self.running {
             self.tick();
-            if let Some(line) = self.headless_progress() {
+            if let Some(line) = self.headless_progress(&mut logged_tens) {
                 log::info!("{line}");
             }
             // Surface retained log write failures (stderr is safe here:
@@ -1201,15 +1202,20 @@ impl App {
         self.status_msg = Some((msg, Instant::now()));
     }
 
-    /// Progress line for the headless log: every 10th packet.
-    fn headless_progress(&self) -> Option<String> {
-        (self.packet_count > 0 && self.packet_count.is_multiple_of(10)).then(|| {
-            format!(
-                "mex: {} packets, {} services seen",
-                self.packet_count,
-                self.services.len()
-            )
-        })
+    /// Progress line for the headless log, once per ten packets:
+    /// `logged_tens` holds the tens already reported, so idle ticks stay
+    /// quiet and a batch jumping past a multiple of ten still reports.
+    fn headless_progress(&self, logged_tens: &mut u64) -> Option<String> {
+        let tens = self.packet_count / 10;
+        if tens <= *logged_tens {
+            return None;
+        }
+        *logged_tens = tens;
+        Some(format!(
+            "mex: {} packets, {} services seen",
+            self.packet_count,
+            self.services.len()
+        ))
     }
 
     /// Apply one terminal event. Only key presses count (releases and

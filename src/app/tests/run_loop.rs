@@ -101,18 +101,30 @@ fn redraw_waits_for_a_change_or_the_next_second() {
 }
 
 #[test]
-fn headless_progress_every_tenth_packet() {
+fn headless_progress_once_per_ten_packets() {
+    // The headless loop ticks every 50 ms: a count resting on a
+    // multiple of ten logs once, and a batch jumping past one still
+    // logs.
     let mut app = App::new().unwrap();
-    assert_eq!(app.headless_progress(), None, "no packets yet");
+    let mut logged = 0;
+    assert_eq!(app.headless_progress(&mut logged), None, "no packets yet");
     app.packet_count = 9;
-    assert_eq!(app.headless_progress(), None);
+    assert_eq!(app.headless_progress(&mut logged), None);
     app.packet_count = 10;
     assert_eq!(
-        app.headless_progress().as_deref(),
+        app.headless_progress(&mut logged).as_deref(),
         Some("mex: 10 packets, 0 services seen")
     );
-    app.packet_count = 11;
-    assert_eq!(app.headless_progress(), None);
+    assert_eq!(app.headless_progress(&mut logged), None, "idle tick");
+    app.packet_count = 19;
+    assert_eq!(app.headless_progress(&mut logged), None);
+    app.packet_count = 23;
+    assert_eq!(
+        app.headless_progress(&mut logged).as_deref(),
+        Some("mex: 23 packets, 0 services seen"),
+        "a batch jumped past 20"
+    );
+    assert_eq!(app.headless_progress(&mut logged), None);
 }
 
 #[test]
