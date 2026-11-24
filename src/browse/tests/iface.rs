@@ -333,9 +333,14 @@ fn join_lists_take_one_address_per_usable_link() {
 }
 
 #[test]
-fn available_interfaces_names_every_host_link() {
-    // The selection universe: every link if-addrs reports, in any state.
-    let (names, _) = link_maps();
-    let available = available_interfaces();
-    assert!(names.values().all(|n| available.contains(n)));
+fn available_interfaces_name_every_link_in_any_state() {
+    // The selection universe: down, point-to-point and policy-skipped
+    // links validate too, each name once.
+    let names: HashSet<String> = ["eth0", "eth1", "eth2", "wg0", "lo", "docker0"]
+        .map(String::from)
+        .into();
+    assert_eq!(available_interfaces_in(&host_links()), names);
+    // The host listing: a single enumeration, so no race with link
+    // changes between two scans.
+    assert!(available_interfaces().iter().all(|n| !n.is_empty()));
 }

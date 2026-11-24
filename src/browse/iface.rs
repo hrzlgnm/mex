@@ -167,11 +167,12 @@ pub(super) fn skipped_interface(name: &str) -> bool {
 /// validation universe for an explicit selection. Down links validate
 /// fine and are picked up by the periodic rejoin once they come up.
 pub fn available_interfaces() -> HashSet<String> {
-    if_addrs::get_if_addrs()
-        .unwrap_or_default()
-        .iter()
-        .map(|i| i.name.clone())
-        .collect()
+    available_interfaces_in(&if_addrs::get_if_addrs().unwrap_or_default())
+}
+
+/// `available_interfaces` over a given if-addrs listing.
+pub(super) fn available_interfaces_in(ifaces: &[if_addrs::Interface]) -> HashSet<String> {
+    ifaces.iter().map(|i| i.name.clone()).collect()
 }
 
 /// Validate an explicit `-i/--interfaces` selection: every name must
