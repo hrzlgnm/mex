@@ -1204,22 +1204,53 @@ fn selected_item(app: &App) -> Option<DisplayItem> {
 #[test]
 fn ctrl_j_saves_a_state_dump_and_reports_where_or_why_not() {
     use crossterm::event::KeyModifiers;
-    let dir = std::env::temp_dir().join(format!("mex-ctrl-j-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = ScratchDir::new("mex-ctrl-j");
     let mut app = App::new().unwrap();
-    app.state_dump_dir = dir.clone();
+    app.state_dump_dir = dir.path.clone();
     press_with(&mut app, KeyCode::Char('j'), KeyModifiers::CONTROL);
     let msg = app.status_msg.as_ref().map(|(m, _)| m.clone()).unwrap();
     let path = msg.strip_prefix("Dump saved: ").expect(&msg);
-    assert!(std::path::Path::new(path).starts_with(&dir));
+    assert!(std::path::Path::new(path).starts_with(&dir.path));
     assert!(std::fs::metadata(path).is_ok(), "the dump file exists");
-    std::fs::remove_dir_all(&dir).unwrap();
 
-    // The directory is gone now: the failure is reported, not fatal.
+    // A directory that does not exist: the failure is reported, not
+    // fatal.
+    app.state_dump_dir = dir.path.join("missing");
     press_with(&mut app, KeyCode::Char('J'), KeyModifiers::CONTROL);
     let msg = app.status_msg.as_ref().map(|(m, _)| m.clone()).unwrap();
     assert!(msg.starts_with("Dump failed: "), "{msg}");
     assert!(app.running);
+}
+
+/// A directory created exclusively for one test (never an existing
+/// one), removed with everything in it when dropped, also when the
+/// test fails.
+struct ScratchDir {
+    path: std::path::PathBuf,
+}
+
+impl ScratchDir {
+    fn new(prefix: &str) -> Self {
+        let base = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        for attempt in 0u32.. {
+            let path = base.join(format!("{prefix}-{}-{nanos}-{attempt}", std::process::id()));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Self { path },
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("cannot create {}: {e}", path.display()),
+            }
+        }
+        unreachable!("u32 attempts exhausted")
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }
 
 #[test]
