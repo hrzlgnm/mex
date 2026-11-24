@@ -325,6 +325,16 @@ pub(super) const MAX_QUERY_BYTES: usize = 9000 - 40 - 8;
 /// the 65507-byte kernel limit). Full multipacket known-answer
 /// suppression (RFC 6762 §7.2, TC-bit follow-ups) is future work.
 pub(super) fn encode_query(req: &QueryRequest, egress_iface: &str) -> Option<Vec<u8>> {
+    encode_query_into(&mut std::io::Cursor::new(Vec::new()), req, egress_iface)
+}
+
+/// `encode_query` through `sink`, which every build (including the
+/// known-answer truncation retries) writes to.
+pub(super) fn encode_query_into(
+    sink: &mut dyn WireSink,
+    req: &QueryRequest,
+    egress_iface: &str,
+) -> Option<Vec<u8>> {
     let qname = match wire_name(&req.name) {
         Some(n) => n,
         None => {
@@ -348,14 +358,14 @@ pub(super) fn encode_query(req: &QueryRequest, egress_iface: &str) -> Option<Vec
         kas.push((rdata, ka_ttl));
     }
 
-    let mut bytes = build_query(&qname, req.record_type, req.qu, &kas)?;
+    let mut bytes = build_query_into(sink, &qname, req.record_type, req.qu, &kas)?;
     if bytes.len() > MAX_QUERY_BYTES {
         let total = kas.len();
         let mut n = total;
         while n > 0 {
             n /= 2;
             kas.truncate(n);
-            bytes = build_query(&qname, req.record_type, req.qu, &kas)?;
+            bytes = build_query_into(sink, &qname, req.record_type, req.qu, &kas)?;
             if bytes.len() <= MAX_QUERY_BYTES {
                 break;
             }
@@ -379,7 +389,7 @@ pub(super) fn build_query(
     kas: &[(simple_dns::Name<'_>, u32)],
 ) -> Option<Vec<u8>> {
     build_query_into(
-        std::io::Cursor::new(Vec::new()),
+        &mut std::io::Cursor::new(Vec::new()),
         qname,
         record_type,
         qu,
@@ -390,7 +400,7 @@ pub(super) fn build_query(
 /// `build_query` through `sink`; the codec only fails when the sink
 /// does.
 pub(super) fn build_query_into(
-    mut sink: impl WireSink,
+    mut sink: &mut dyn WireSink,
     qname: &simple_dns::Name<'_>,
     record_type: TYPE,
     qu: bool,
@@ -412,7 +422,7 @@ pub(super) fn build_query_into(
         ));
     }
     match pkt.write_compressed_to(&mut sink) {
-        Ok(()) => Some(sink.into_bytes()),
+        Ok(()) => Some(sink.take_bytes()),
         Err(e) => {
             log::warn!("mex: cannot encode query for {qname}: {e}");
             None

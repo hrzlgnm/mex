@@ -39,13 +39,31 @@ impl QuerySocket for FakeSocket {
     }
 }
 
-/// A wire sink whose every write fails, as a full or broken buffer
-/// would: drives the encoders' error handling.
-struct FailingSink;
+/// A wire sink that accepts `budget` bytes in all, then fails every
+/// write, as a full or broken buffer would: drives the encoders' error
+/// handling, also on a later packet through the same sink.
+struct LimitedSink {
+    buf: std::io::Cursor<Vec<u8>>,
+    budget: usize,
+}
 
-impl std::io::Write for FailingSink {
-    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-        Err(std::io::ErrorKind::WriteZero.into())
+impl LimitedSink {
+    fn new(budget: usize) -> Self {
+        Self {
+            buf: std::io::Cursor::new(Vec::new()),
+            budget,
+        }
+    }
+}
+
+impl std::io::Write for LimitedSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.budget == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        let n = bytes.len().min(self.budget);
+        self.budget -= n;
+        self.buf.write(&bytes[..n])
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -53,14 +71,14 @@ impl std::io::Write for FailingSink {
     }
 }
 
-impl std::io::Seek for FailingSink {
-    fn seek(&mut self, _pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        Ok(0)
+impl std::io::Seek for LimitedSink {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.buf.seek(pos)
     }
 }
 
-impl WireSink for FailingSink {
-    fn into_bytes(self) -> Vec<u8> {
-        Vec::new()
+impl WireSink for LimitedSink {
+    fn take_bytes(&mut self) -> Vec<u8> {
+        self.buf.take_bytes()
     }
 }
