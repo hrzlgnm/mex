@@ -36,12 +36,12 @@ fn tick_reports_whether_packets_arrived() {
 fn only_key_presses_act() {
     let mut app = App::new().unwrap();
     for kind in [KeyEventKind::Release, KeyEventKind::Repeat] {
-        let gen = app.state_gen;
+        let generation = app.state_gen;
         let action =
             app.handle_terminal_event(key(KeyCode::Char('q'), KeyModifiers::empty(), kind));
         assert_eq!(action, TerminalAction::Handled);
         assert!(app.running, "{kind:?} of q does not quit");
-        assert_eq!(app.state_gen, gen, "{kind:?} changes nothing");
+        assert_eq!(app.state_gen, generation, "{kind:?} changes nothing");
     }
     assert_eq!(
         app.handle_terminal_event(press(KeyCode::Char('q'))),
@@ -54,14 +54,14 @@ fn only_key_presses_act() {
 #[test]
 fn ctrl_z_asks_the_loop_to_suspend_before_key_handling() {
     let mut app = App::new().unwrap();
-    let gen = app.state_gen;
+    let generation = app.state_gen;
     let ctrl_z = key(
         KeyCode::Char('z'),
         KeyModifiers::CONTROL,
         KeyEventKind::Press,
     );
     assert_eq!(app.handle_terminal_event(ctrl_z), TerminalAction::Suspend);
-    assert_eq!(app.state_gen, gen, "not passed on as a key");
+    assert_eq!(app.state_gen, generation, "not passed on as a key");
     assert!(app.running);
 }
 
@@ -69,7 +69,7 @@ fn ctrl_z_asks_the_loop_to_suspend_before_key_handling() {
 fn mouse_and_resize_touch_the_view_other_events_do_not() {
     use crossterm::event::{MouseEvent, MouseEventKind};
     let mut app = App::new().unwrap();
-    let mut gen = app.state_gen;
+    let mut generation = app.state_gen;
     let mouse = Event::Mouse(MouseEvent {
         kind: MouseEventKind::Moved,
         column: 0,
@@ -78,14 +78,14 @@ fn mouse_and_resize_touch_the_view_other_events_do_not() {
     });
     for event in [mouse, Event::Resize(80, 24)] {
         assert_eq!(app.handle_terminal_event(event), TerminalAction::Handled);
-        assert_ne!(app.state_gen, gen, "touched");
-        gen = app.state_gen;
+        assert_ne!(app.state_gen, generation, "touched");
+        generation = app.state_gen;
     }
     assert_eq!(
         app.handle_terminal_event(Event::FocusGained),
         TerminalAction::Handled
     );
-    assert_eq!(app.state_gen, gen, "focus changes nothing shown");
+    assert_eq!(app.state_gen, generation, "focus changes nothing shown");
 }
 
 #[test]

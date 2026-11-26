@@ -1156,7 +1156,7 @@ fn enumeration_rows_long_past_ttl_are_pruned_txt_kept_expanded() {
     let txt = raw_record(ENUM_SERVICE, 16, "TXT", "note=1", 4500);
     app.expanded_txt.insert(App::txt_key(&txt));
     app.enum_entries[0].answers = vec![stale, txt.clone()];
-    let gen = app.state_gen;
+    let generation = app.state_gen;
     app.evict_expired();
     let left: Vec<_> = app.enum_entries[0]
         .answers
@@ -1164,7 +1164,7 @@ fn enumeration_rows_long_past_ttl_are_pruned_txt_kept_expanded() {
         .map(|r| r.rtype)
         .collect();
     assert_eq!(left, [16], "the stale PTR went, the live TXT stayed");
-    assert_ne!(app.state_gen, gen, "the view was told");
+    assert_ne!(app.state_gen, generation, "the view was told");
     assert!(
         app.is_txt_expanded(&txt),
         "a live enum TXT keeps its expansion"
