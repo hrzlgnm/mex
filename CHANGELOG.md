@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.22.4](https://github.com/hrzlgnm/mex/compare/v0.22.3...v0.22.4) (2026-11-26)
+
+
+### Bug Fixes
+
+* keep dotted instance labels when SRV/TXT precede the PTR ([#385](https://github.com/hrzlgnm/mex/issues/385)) ([7ede50e](https://github.com/hrzlgnm/mex/commit/7ede50e3486b7dda4531aef8c22d3ad02e3b786d))
+* key names in presentation form so dotted instance labels never collide ([#388](https://github.com/hrzlgnm/mex/issues/388)) ([8b10790](https://github.com/hrzlgnm/mex/commit/8b10790736f67dcaa42532abca42d1bb3ee1d904))
+* land late PTRs on their confirmed service, not a pending copy ([#387](https://github.com/hrzlgnm/mex/issues/387)) ([3712661](https://github.com/hrzlgnm/mex/commit/371266171505956141c2c09894d471bfec49dbcb))
+
+
+### Dependencies
+
+* lock file maintenance ([#391](https://github.com/hrzlgnm/mex/issues/391)) ([fb55141](https://github.com/hrzlgnm/mex/commit/fb55141273ce783da7669cb37b539cc94c48fa20))
+* update dependency cargo-auditable to v0.7.8 ([#383](https://github.com/hrzlgnm/mex/issues/383)) ([79ddad5](https://github.com/hrzlgnm/mex/commit/79ddad5312334da2337cadfe7e6d789aff4d777a))
+* update dependency sccache to v0.20.1 ([#380](https://github.com/hrzlgnm/mex/issues/380)) ([45896bb](https://github.com/hrzlgnm/mex/commit/45896bbdde3d48368c8229e7d16af4db2874ddd4))
+* update rust crate clap to v4.6.10 ([#381](https://github.com/hrzlgnm/mex/issues/381)) ([814b1af](https://github.com/hrzlgnm/mex/commit/814b1afe2495794359ed9808606b1000c861b99c))
+* update taiki-e/install-action action to v2.90.10 ([#384](https://github.com/hrzlgnm/mex/issues/384)) ([bf835d0](https://github.com/hrzlgnm/mex/commit/bf835d05d758dcce349358a5c62611e5190dc204))
+* update taiki-e/install-action action to v2.90.11 ([#390](https://github.com/hrzlgnm/mex/issues/390)) ([ed79933](https://github.com/hrzlgnm/mex/commit/ed79933f7fd96b20881f9fd0e35f96f227cb0c52))
+
 ## [0.22.3](https://github.com/hrzlgnm/mex/compare/v0.22.2...v0.22.3) (2026-11-24)
 
 
