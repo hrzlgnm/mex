@@ -16,6 +16,14 @@ pub(super) fn own_hosts(target: &crate::app::DetailTarget<'_>) -> HashSet<String
     }
 }
 
+/// Width of the SECT column (`auth`).
+const SECT_WIDTH: u16 = 4;
+
+/// Inner pane width, SOURCE excluded, that SECT needs: TYPE, TTL, FLUSH
+/// and SECT at full width, RDATA's minimum, and one space between each
+/// of the six columns.
+const SECT_PANE_MIN: u16 = 8 + 12 + 6 + SECT_WIDTH + 20 + 5;
+
 pub(super) fn draw_records_tab(
     frame: &mut Frame,
     area: ratatui::layout::Rect,
@@ -50,12 +58,6 @@ pub(super) fn draw_records_tab(
     }));
     let book = app.address_book();
     let own = own_hosts(&target);
-    let (rows, raw_positions) = detail_table_rows(app, &target, &layout, &book, &own);
-    app.layout()
-        .answers_rows
-        .replace(Some(layout.iter().map(|l| l.owning_record()).collect()));
-    let total_rows = rows.len();
-
     // Size SOURCE to the longest label (record rows and finding rows,
     // device names included) so IPv6 fits, clamped to keep RDATA usable
     // on narrow terminals.
@@ -82,14 +84,29 @@ pub(super) fn draw_records_tab(
         .clamp(14, 60) as u16;
 
     // TYPE fits `▸ TXT` / `TYPE13` plus the level marker.
-    let widths = [
+    let mut widths = vec![
         Constraint::Length(8),
         Constraint::Length(12),
         Constraint::Length(6),
-        Constraint::Length(4),
         Constraint::Length(src_w),
         Constraint::Min(20),
     ];
+    // SECT (#399) only shows when every column keeps its full width:
+    // a narrow pane drops it rather than squeezing TTL and FLUSH into
+    // misleading stubs like `75m0`.
+    let show_sect = area.width.saturating_sub(2) >= SECT_PANE_MIN + src_w;
+    if show_sect {
+        widths.insert(3, Constraint::Length(SECT_WIDTH));
+    }
+    let (rows, raw_positions) = detail_table_rows(app, &target, &layout, &book, &own, show_sect);
+    app.layout()
+        .answers_rows
+        .replace(Some(layout.iter().map(|l| l.owning_record()).collect()));
+    let total_rows = rows.len();
+    let mut header = vec!["TYPE", "TTL", "FLUSH", "SOURCE", "RDATA"];
+    if show_sect {
+        header.insert(3, "SECT");
+    }
 
     let block_title = if app.view_state().detail_free_scroll {
         format!("Answers: {} ↕", target.pane_ident())
@@ -105,7 +122,7 @@ pub(super) fn draw_records_tab(
 
     let table = Table::new(rows, widths)
         .header(
-            Row::new(vec!["TYPE", "TTL", "FLUSH", "SECT", "SOURCE", "RDATA"]).style(
+            Row::new(header).style(
                 Style::default()
                     .add_modifier(Modifier::BOLD)
                     .fg(Color::Cyan),
@@ -227,9 +244,13 @@ pub(super) fn detail_table_rows<'a>(
     layout: &[crate::app::AnswerLine],
     book: &AddressBook,
     own: &HashSet<String>,
+    show_sect: bool,
 ) -> (Vec<Row<'a>>, Vec<usize>) {
     use crate::app::AnswerLine;
     let mut rows = Vec::new();
+    // Columns: TYPE, TTL, FLUSH, [SECT,] SOURCE, RDATA.
+    let columns: u16 = if show_sect { 6 } else { 5 };
+    let source_col = usize::from(columns) - 2;
 
     let info_style = Style::default()
         .fg(Color::Green)
@@ -284,26 +305,22 @@ pub(super) fn detail_table_rows<'a>(
     }
     for line in layout {
         match line {
-            AnswerLine::Info { label, text } => rows.push(
-                Row::new(vec![
-                    Cell::from(*label),
-                    Cell::from(""),
-                    Cell::from(""),
-                    Cell::from(""),
-                    Cell::from(""),
-                    Cell::from(text.clone()),
-                ])
-                .style(info_style),
+            AnswerLine::Info { label, text } => {
+                let mut cells: Vec<Cell> = (0..columns).map(|_| Cell::from("")).collect();
+                cells[0] = Cell::from(*label);
+                cells[source_col + 1] = Cell::from(text.clone());
+                rows.push(Row::new(cells).style(info_style));
+            }
+            AnswerLine::Block(label) => rows.push(
+                Row::new(vec![Cell::from(label.clone()).column_span(columns)]).style(block_style),
             ),
-            AnswerLine::Block(label) => rows
-                .push(Row::new(vec![Cell::from(label.clone()).column_span(6)]).style(block_style)),
             AnswerLine::Finding { anomaly, record } => {
                 rows.push(finding_row(
                     anomaly,
                     &identity_count,
                     book,
-                    4,
-                    5,
+                    source_col,
+                    source_col + 1,
                     record.is_some(),
                 ));
             }
@@ -317,7 +334,7 @@ pub(super) fn detail_table_rows<'a>(
                         Span::raw(" "),
                         Span::raw(pair.clone()),
                     ]))
-                    .column_span(6)])
+                    .column_span(columns)])
                     .style(pair_style),
                 );
             }
@@ -361,17 +378,19 @@ pub(super) fn detail_table_rows<'a>(
                 } else {
                     rec.rtype_str.as_str()
                 };
-                rows.push(
-                    Row::new(vec![
-                        marked_cell(type_label.to_string(), type_mark, Style::default()),
-                        marked_cell(ttl_str, ttl_mark, ttl_style),
-                        Cell::from(flush),
-                        Cell::from(rec.section.short_label()),
-                        Cell::from(record_source_label(rec, book, own)),
-                        Cell::from(crate::browse::display_rdata(rec.rtype, &rec.rdata)),
-                    ])
-                    .style(style),
-                );
+                let mut cells = vec![
+                    marked_cell(type_label.to_string(), type_mark, Style::default()),
+                    marked_cell(ttl_str, ttl_mark, ttl_style),
+                    Cell::from(flush),
+                ];
+                if show_sect {
+                    cells.push(Cell::from(rec.section.short_label()));
+                }
+                cells.push(Cell::from(record_source_label(rec, book, own)));
+                cells.push(Cell::from(crate::browse::display_rdata(
+                    rec.rtype, &rec.rdata,
+                )));
+                rows.push(Row::new(cells).style(style));
             }
         }
     }

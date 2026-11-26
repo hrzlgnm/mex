@@ -162,3 +162,56 @@ fn expanded_txt_pairs_span_the_whole_row() {
         "{lines:#?}"
     );
 }
+
+/// The header line of the Answers pane drawn at `width` columns, and
+/// the pane's inner width.
+fn header_at(app: &App, width: u16) -> (String, u16) {
+    let buf = render_to_buffer(app, width, 40);
+    let area = app.layout.answers_rect.get();
+    let text = rect_text(&buf, area);
+    let header = text
+        .lines()
+        .find(|l| l.contains("TYPE"))
+        .unwrap_or_else(|| panic!("{text}"))
+        .to_string();
+    (header, area.width - 2)
+}
+
+#[test]
+fn narrow_pane_drops_sect_and_keeps_ttl_whole() {
+    let app = app_with_sections(
+        browse::RecordSection::Answer,
+        browse::RecordSection::Additional,
+    );
+    let buf = render_to_buffer(&app, 80, 24);
+    let lines: Vec<String> = rect_text(&buf, app.layout.answers_rect.get())
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let h = header(&lines);
+    assert!(!h.contains("SECT"), "{lines:#?}");
+    let srv = row(&lines, "0 0 80 test.local.");
+    assert!(srv.contains("2m00s") || srv.contains("1m59s"), "{lines:#?}");
+    assert!(srv.contains("flush"), "{lines:#?}");
+    assert!(!srv.contains(" ans "), "{lines:#?}");
+    assert_eq!(col(srv, "192.168.1."), col(h, "SOURCE"), "{lines:#?}");
+}
+
+#[test]
+fn sect_shows_exactly_when_every_column_fits() {
+    let app = app_with_sections(
+        browse::RecordSection::Answer,
+        browse::RecordSection::Additional,
+    );
+    // TYPE 8, TTL 12, FLUSH 6, SECT 4, RDATA min 20, five gaps, and
+    // SOURCE sized to `192.168.1.2:5353`.
+    let need = 8 + 12 + 6 + 4 + 20 + 5 + "192.168.1.2:5353".len() as u16;
+    let (mut below, mut at_or_above) = (false, false);
+    for width in 60..=200 {
+        let (h, inner) = header_at(&app, width);
+        assert_eq!(h.contains("SECT"), inner >= need, "width {width}: {h}");
+        below |= inner < need;
+        at_or_above |= inner >= need;
+    }
+    assert!(below && at_or_above, "scan crosses the threshold");
+}
