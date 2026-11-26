@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.23.0](https://github.com/hrzlgnm/mex/compare/v0.22.4...v0.23.0) (2026-11-26)
+
+
+### Features
+
+* send a self question now with r in the Questions pane ([#395](https://github.com/hrzlgnm/mex/issues/395)) ([6136db7](https://github.com/hrzlgnm/mex/commit/6136db7e44c1dc04f6967b2a94bae351eecd040d))
+
+
+### Code Refactoring
+
+* record own queries with an OwnQuery type that cannot be Observed ([#397](https://github.com/hrzlgnm/mex/issues/397)) ([d83393b](https://github.com/hrzlgnm/mex/commit/d83393b06e2abbac49175d245d2b1fe02ec3da01))
+
+
+### Tests
+
+* rename gen locals to generation ([#392](https://github.com/hrzlgnm/mex/issues/392)) ([8b787bd](https://github.com/hrzlgnm/mex/commit/8b787bd2c122f42e98a2bdd1c3c7fc4180a318ad))
+
 ## [0.22.4](https://github.com/hrzlgnm/mex/compare/v0.22.3...v0.22.4) (2026-11-26)
 
 
