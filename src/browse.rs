@@ -118,6 +118,19 @@ impl RecordSection {
             RecordSection::Question => "question",
         }
     }
+
+    /// Short label for the Answers pane's SECT column (#399). Known
+    /// answers and questions never reach that pane; they still get a
+    /// label rather than a panic.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            RecordSection::Answer => "ans",
+            RecordSection::Authority => "auth",
+            RecordSection::Additional => "add",
+            RecordSection::KnownAnswer => "ka",
+            RecordSection::Question => "q",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

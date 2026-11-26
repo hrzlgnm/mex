@@ -86,6 +86,7 @@ pub(super) fn draw_records_tab(
         Constraint::Length(8),
         Constraint::Length(12),
         Constraint::Length(6),
+        Constraint::Length(4),
         Constraint::Length(src_w),
         Constraint::Min(20),
     ];
@@ -104,7 +105,7 @@ pub(super) fn draw_records_tab(
 
     let table = Table::new(rows, widths)
         .header(
-            Row::new(vec!["TYPE", "TTL", "FLUSH", "SOURCE", "RDATA"]).style(
+            Row::new(vec!["TYPE", "TTL", "FLUSH", "SECT", "SOURCE", "RDATA"]).style(
                 Style::default()
                     .add_modifier(Modifier::BOLD)
                     .fg(Color::Cyan),
@@ -289,19 +290,20 @@ pub(super) fn detail_table_rows<'a>(
                     Cell::from(""),
                     Cell::from(""),
                     Cell::from(""),
+                    Cell::from(""),
                     Cell::from(text.clone()),
                 ])
                 .style(info_style),
             ),
             AnswerLine::Block(label) => rows
-                .push(Row::new(vec![Cell::from(label.clone()).column_span(5)]).style(block_style)),
+                .push(Row::new(vec![Cell::from(label.clone()).column_span(6)]).style(block_style)),
             AnswerLine::Finding { anomaly, record } => {
                 rows.push(finding_row(
                     anomaly,
                     &identity_count,
                     book,
-                    3,
                     4,
+                    5,
                     record.is_some(),
                 ));
             }
@@ -315,7 +317,7 @@ pub(super) fn detail_table_rows<'a>(
                         Span::raw(" "),
                         Span::raw(pair.clone()),
                     ]))
-                    .column_span(5)])
+                    .column_span(6)])
                     .style(pair_style),
                 );
             }
@@ -364,6 +366,7 @@ pub(super) fn detail_table_rows<'a>(
                         marked_cell(type_label.to_string(), type_mark, Style::default()),
                         marked_cell(ttl_str, ttl_mark, ttl_style),
                         Cell::from(flush),
+                        Cell::from(rec.section.short_label()),
                         Cell::from(record_source_label(rec, book, own)),
                         Cell::from(crate::browse::display_rdata(rec.rtype, &rec.rdata)),
                     ])
