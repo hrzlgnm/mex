@@ -1220,7 +1220,7 @@ fn names_fold_ascii_case_only_per_rfc_6762_section_16() {
 /// holds a dot. Its display name `Á.a._test._tcp.local.` can't tell the
 /// label boundary; the wire labels can.
 fn dotted_instance_record(rtype: u16, rtype_str: &str, rdata: &str) -> browse::RawRecord {
-    let mut rec = raw_record("Á.a._test._tcp.local.", rtype, rtype_str, rdata, 120);
+    let mut rec = raw_record("Á\\.a._test._tcp.local.", rtype, rtype_str, rdata, 120);
     rec.owner_labels = ["Á.a", "_test", "_tcp", "local"]
         .iter()
         .map(|label| label.as_bytes().to_vec())
@@ -1351,7 +1351,7 @@ fn late_ptr_for_dotted_instance_lands_on_confirmed_service() {
         "_test._tcp.local.",
         12,
         "PTR",
-        "Á.a._test._tcp.local.",
+        "Á\\.a._test._tcp.local.",
         4500,
     );
     ptr.ptr_target_labels = Some(

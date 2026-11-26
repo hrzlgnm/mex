@@ -8,9 +8,11 @@ use super::*;
 pub(super) fn finding_scope(a: &Anomaly) -> String {
     match (&a.record_name, a.rtype_str.as_deref()) {
         (Some(name), Some(rtype)) if a.kind.is_question() => {
-            format!("QRY {rtype} {name}")
+            format!("QRY {rtype} {}", crate::browse::unescape_name(name))
         }
-        (Some(name), Some(rtype)) => format!("{rtype} {name}"),
+        (Some(name), Some(rtype)) => {
+            format!("{rtype} {}", crate::browse::unescape_name(name))
+        }
         _ => String::new(),
     }
 }
@@ -104,6 +106,7 @@ pub(crate) fn visible_scope(a: &Anomaly, identity_count: &HashMap<(String, u16),
                     .trim_end_matches('.')
                     .eq_ignore_ascii_case(a.service.trim_end_matches('.')) =>
         {
+            let rdata = crate::browse::display_rdata(a.rtype.unwrap_or(0), rdata);
             format!("{base} = {rdata}")
         }
         _ => base,

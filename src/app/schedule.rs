@@ -818,7 +818,11 @@ impl App {
         if !tail.eq_ignore_ascii_case(suffix) {
             return None;
         }
-        prefix.strip_suffix('.')
+        // Names are in presentation form: an escaped dot (`\.`) sits
+        // inside a label, so the suffix doesn't start a label there.
+        prefix
+            .strip_suffix('.')
+            .filter(|head| !browse::escapes_next(head))
     }
 
     /// Desired continuous-browse queries: enumeration plus every live PTR /
@@ -837,13 +841,13 @@ impl App {
         }
         for p in &self.pending_instances {
             want(p.service_type.clone(), 12);
-            let full = format!("{}.{}", p.instance, p.service_type);
+            let full = crate::browse::instance_name(&p.instance, &p.service_type);
             want(full.clone(), 33);
             want(full, 16);
         }
         for svc in &self.services {
             want(svc.service_type.clone(), 12);
-            let full = format!("{}.{}", svc.instance, svc.service_type);
+            let full = crate::browse::instance_name(&svc.instance, &svc.service_type);
             want(full.clone(), 33);
             want(full, 16);
             if !svc.hostname.is_empty() {

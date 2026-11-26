@@ -365,7 +365,7 @@ pub(super) fn detail_table_rows<'a>(
                         marked_cell(ttl_str, ttl_mark, ttl_style),
                         Cell::from(flush),
                         Cell::from(record_source_label(rec, book, own)),
-                        Cell::from(rec.rdata.clone()),
+                        Cell::from(crate::browse::display_rdata(rec.rtype, &rec.rdata)),
                     ])
                     .style(style),
                 );

@@ -119,7 +119,7 @@ pub(super) fn draw_questions_tab(
                 last_txt,
                 due_txt,
                 question_source_label(source, &book),
-                name.clone(),
+                crate::browse::unescape_name(name),
             ],
             style,
         ));

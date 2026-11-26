@@ -365,10 +365,9 @@ fn same_ptr_target(a: &browse::RawRecord, b: &browse::RawRecord) -> bool {
 
 fn subtype_owner_parts(rec: &browse::RawRecord) -> Option<(Vec<u8>, String)> {
     let fallback_labels = if rec.owner_labels.is_empty() {
-        rec.name
-            .trim_end_matches('.')
-            .split('.')
-            .map(|label| label.as_bytes().to_vec())
+        browse::presentation_labels(&rec.name)
+            .into_iter()
+            .map(String::into_bytes)
             .collect::<Vec<_>>()
     } else {
         Vec::new()
@@ -387,7 +386,7 @@ fn subtype_owner_parts(rec: &browse::RawRecord) -> Option<(Vec<u8>, String)> {
 
     let service_type = [service, protocol, local]
         .iter()
-        .map(|label| String::from_utf8_lossy(label).into_owned())
+        .map(|label| browse::escape_label(&String::from_utf8_lossy(label)))
         .collect::<Vec<_>>()
         .join(".");
     Some((subtype.clone(), service_type))
@@ -561,7 +560,7 @@ impl Sighting {
 
 /// Lowercased `instance.service_type`, the identity address denials use.
 fn service_key(instance: &str, service_type: &str) -> String {
-    format!("{instance}.{service_type}").to_ascii_lowercase()
+    crate::browse::instance_name(instance, service_type).to_ascii_lowercase()
 }
 
 /// Cumulative v2 traffic/query counters for the diagnostics overlay. Derived
@@ -1444,7 +1443,8 @@ impl App {
         }
         for svc in &self.services {
             live.insert((svc.service_type.to_ascii_lowercase(), 12));
-            let full = format!("{}.{}", svc.instance, svc.service_type).to_ascii_lowercase();
+            let full =
+                crate::browse::instance_name(&svc.instance, &svc.service_type).to_ascii_lowercase();
             live.insert((full.clone(), 33));
             live.insert((full, 16));
             if !svc.hostname.is_empty() {
@@ -1461,7 +1461,8 @@ impl App {
         }
         for p in &self.pending_instances {
             live.insert((p.service_type.to_ascii_lowercase(), 12));
-            let full = format!("{}.{}", p.instance, p.service_type).to_ascii_lowercase();
+            let full =
+                crate::browse::instance_name(&p.instance, &p.service_type).to_ascii_lowercase();
             live.insert((full.clone(), 33));
             live.insert((full, 16));
         }

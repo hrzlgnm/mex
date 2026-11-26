@@ -654,7 +654,7 @@ impl App {
                 }
                 Some((
                     rec.wire.clone(),
-                    format!(" {} {} ", rec.rtype_str, rec.name),
+                    format!(" {} {} ", rec.rtype_str, browse::unescape_name(&rec.name)),
                 ))
             }
             DetailEntry::Question {
@@ -663,7 +663,7 @@ impl App {
                 raw,
                 source,
             } => {
-                let title = format!(" QRY {rtype_str} {name} ");
+                let title = format!(" QRY {rtype_str} {} ", browse::unescape_name(name));
                 if *source == SELF_SOURCE {
                     return Some((raw.to_vec(), format!("{title}(inferred) ")));
                 }
