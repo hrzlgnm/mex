@@ -266,7 +266,7 @@ impl Scheduler {
         &mut self,
         name: &str,
         rtype: u16,
-        origin: QueryOrigin,
+        origin: OwnQuery,
         at: Instant,
         interfaces: String,
     ) {
@@ -275,21 +275,17 @@ impl Scheduler {
             .entry(Self::provenance_key(name, rtype))
             .or_default();
         match origin {
-            QueryOrigin::Transmitted => {
+            OwnQuery::Transmitted => {
                 entry.transmitted = Some(at);
                 entry.transmitted_interfaces = interfaces;
             }
             // A manual send is a transmit too (spacing, demand, links).
-            QueryOrigin::Manual => {
+            OwnQuery::Manual => {
                 entry.transmitted = Some(at);
                 entry.transmitted_interfaces = interfaces;
                 entry.manual = Some(at);
             }
-            QueryOrigin::Suppressed => entry.suppressed = Some(at),
-            QueryOrigin::Observed => {
-                // Observed questions carry their own packet timestamp
-                // and source; use `note_observed` instead.
-            }
+            OwnQuery::Suppressed => entry.suppressed = Some(at),
         }
     }
 
@@ -646,7 +642,7 @@ impl App {
             log::debug!("mex: suppressed refresh query for {} (overheard)", key.0);
             self.diagnostics.suppressed_refresh += 1;
             self.diagnostics.suppressed_times.push_back(now);
-            self.note_query(&key.0, key.1, QueryOrigin::Suppressed, now);
+            self.note_query(&key.0, key.1, OwnQuery::Suppressed, now);
         } else {
             self.diagnostics.q_sent_refresh += 1;
             self.diagnostics.ka_sent += ka.len() as u64;
@@ -656,7 +652,7 @@ impl App {
                 known_answers: ka,
                 qu: false,
             }) {
-                self.note_query(&key.0, key.1, QueryOrigin::Transmitted, now);
+                self.note_query(&key.0, key.1, OwnQuery::Transmitted, now);
             } else {
                 log::warn!(
                     "mex: dropped refresh query for {} (listener channels closed)",
@@ -756,7 +752,7 @@ impl App {
         log::debug!("mex: sending manual query for {name} {rtype_str}");
         self.diagnostics.q_sent_manual += 1;
         self.diagnostics.ka_sent += ka_count;
-        self.note_query(&name, rtype, QueryOrigin::Manual, now);
+        self.note_query(&name, rtype, OwnQuery::Manual, now);
         // Our query answers whatever an overheard identical question
         // asked: it must not later stand in for a scheduled send (§7.3).
         self.scheduler.forget_overheard(&name, rtype);
@@ -768,7 +764,7 @@ impl App {
 
     /// Record a query event for an interest: we transmitted it or §7.3
     /// suppression stood in for it, stamped at action time.
-    pub(super) fn note_query(&mut self, name: &str, rtype: u16, origin: QueryOrigin, at: Instant) {
+    pub(super) fn note_query(&mut self, name: &str, rtype: u16, origin: OwnQuery, at: Instant) {
         let mut query_interfaces: Vec<String> = self
             .link_stats
             .v4
@@ -1068,7 +1064,7 @@ impl App {
                 let now = Instant::now();
                 self.diagnostics.suppressed_continuous += 1;
                 self.diagnostics.suppressed_times.push_back(now);
-                self.note_query(&key.0, key.1, QueryOrigin::Suppressed, now);
+                self.note_query(&key.0, key.1, OwnQuery::Suppressed, now);
                 self.route_own_question(&key.0, key.1, false);
                 self.scheduler.advance_continuous(&key, now);
                 continue;
@@ -1094,7 +1090,7 @@ impl App {
                 known_answers: ka,
                 qu,
             }) {
-                self.note_query(&send_name, key.1, QueryOrigin::Transmitted, now);
+                self.note_query(&send_name, key.1, OwnQuery::Transmitted, now);
             } else {
                 log::warn!(
                     "mex: dropped continuous query for {} (listener channels closed)",

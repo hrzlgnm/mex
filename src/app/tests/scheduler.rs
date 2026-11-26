@@ -112,7 +112,7 @@ fn response_names_the_question_sent_just_before_it() {
     s.note_query(
         "printer.local",
         28,
-        QueryOrigin::Transmitted,
+        OwnQuery::Transmitted,
         sent,
         "eth0".into(),
     );
@@ -130,7 +130,7 @@ fn response_names_the_question_sent_just_before_it() {
     stale.note_query(
         "printer.local",
         28,
-        QueryOrigin::Transmitted,
+        OwnQuery::Transmitted,
         late,
         "eth0".into(),
     );
