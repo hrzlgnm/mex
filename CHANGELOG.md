@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.24.0](https://github.com/hrzlgnm/mex/compare/v0.23.0...v0.24.0) (2026-11-26)
+
+
+### Features
+
+* show each record's DNS section in the Answers pane ([#400](https://github.com/hrzlgnm/mex/issues/400)) ([e708d80](https://github.com/hrzlgnm/mex/commit/e708d80f921210d1800035a9d039337d36590aab))
+
+
+### Bug Fixes
+
+* replace a service row when only the owner name's case changed ([#403](https://github.com/hrzlgnm/mex/issues/403)) ([9a532fd](https://github.com/hrzlgnm/mex/commit/9a532fdda7917fcf5ef090a6a5f7eb7c817af4ef))
+
 ## [0.23.0](https://github.com/hrzlgnm/mex/compare/v0.22.4...v0.23.0) (2026-11-26)
 
 

@@ -3,7 +3,7 @@
 
 [package]
 name = "mex"
-version = "0.23.0"
+version = "0.24.0"
 edition = "2021"
 license = "MIT"
 description = "Terminal UI to browse and debug mDNS/DNS-SD on the local link — live services, records, queries, raw packets, and anomaly detection"
