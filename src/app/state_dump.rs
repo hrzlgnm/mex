@@ -340,7 +340,7 @@ impl App {
                 .pending_instances
                 .iter()
                 .map(|p| dump::RawGroup {
-                    name: format!("{}.{}", p.instance, p.service_type),
+                    name: crate::browse::instance_name(&p.instance, &p.service_type),
                     answers: p
                         .answers
                         .iter()

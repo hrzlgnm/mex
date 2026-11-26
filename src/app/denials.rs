@@ -28,7 +28,7 @@ impl DenialForm {
 /// AAAA): rows of that type stay off this service while it is live.
 #[derive(Debug, Clone)]
 pub(super) struct AddressDenial {
-    /// Lowercased `instance.service_type` (`service_key`).
+    /// Lowercased service name in presentation form (`service_key`).
     service: String,
     rtype: u16,
     /// The hostname it applies to (RFC form); `None` for every host of
@@ -54,7 +54,7 @@ impl AddressDenial {
         self.service == service && self.applies_to(rtype, host) && self.is_live()
     }
 
-    /// Lowercased `instance.service_type` this denial keeps rows off.
+    /// Lowercased service name (`service_key`) this denial keeps rows off.
     pub(super) fn service(&self) -> &str {
         &self.service
     }

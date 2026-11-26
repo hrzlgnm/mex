@@ -44,7 +44,8 @@ impl App {
             }
         };
         for svc in &self.services {
-            let full = format!("{}.{}", svc.instance, svc.service_type).to_ascii_lowercase();
+            let full =
+                crate::browse::instance_name(&svc.instance, &svc.service_type).to_ascii_lowercase();
             if full == name || (question && svc.service_type.to_ascii_lowercase() == name) {
                 add(anomalies::service_id(&svc.instance, &svc.service_type));
             }
@@ -53,7 +54,8 @@ impl App {
             }
         }
         for p in &self.pending_instances {
-            let full = format!("{}.{}", p.instance, p.service_type).to_ascii_lowercase();
+            let full =
+                crate::browse::instance_name(&p.instance, &p.service_type).to_ascii_lowercase();
             if full == name || (question && p.service_type.to_ascii_lowercase() == name) {
                 add(anomalies::service_id(&p.instance, &p.service_type));
             }

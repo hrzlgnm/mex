@@ -135,9 +135,10 @@ impl App {
         // match (notably TTL 0 A/AAAA) instead of stopping at the first.
         let mut hits = Vec::new();
         for (i, svc) in self.services.iter().enumerate() {
-            let full = format!("{}.{}", svc.instance, svc.service_type).to_ascii_lowercase();
+            let full =
+                crate::browse::instance_name(&svc.instance, &svc.service_type).to_ascii_lowercase();
             let host = svc.hostname.trim_end_matches('.').to_ascii_lowercase();
-            let inst = svc.instance.to_ascii_lowercase();
+            let inst = browse::escape_label(&svc.instance).to_ascii_lowercase();
             let alternate = svc.answers.iter().any(|r| {
                 if r.rtype != 33 {
                     return false;
@@ -242,7 +243,8 @@ impl App {
         }
 
         if let Some((subtype, svc_type)) = subtype_owner_parts(rec) {
-            let instance = Self::strip_suffix_ci(target, &svc_type).unwrap_or(target);
+            let (instance, svc_type) = Self::ptr_instance(rec, target, &svc_type);
+            let instance = &instance;
             // Late subtype PTRs (arriving after the SRV already promoted
             // the service, the normal passive-mode order) land on the live
             // service directly; otherwise they wait in pending for the SRV
@@ -275,7 +277,8 @@ impl App {
             return;
         }
 
-        let instance = Self::strip_suffix_ci(target, st).unwrap_or(target);
+        let (instance, st) = Self::ptr_instance(rec, target, st);
+        let (instance, st) = (instance.as_str(), st.as_str());
         // A PTR for an already-confirmed service (SRV first, the passive
         // order) lands on that service only, like late TXT and subtype
         // PTRs. A pending copy here would be refreshed by every later PTR
@@ -294,11 +297,53 @@ impl App {
         self.pending_instances[pi].answers.push(rec.clone());
     }
 
+    /// (instance, service type) a PTR target names under the browsed
+    /// `svc_type`. Instances are kept as plain label text; the target is in
+    /// presentation form. One label before `svc_type` is the instance. More
+    /// labels there name an instance of a deeper type, so the target splits
+    /// like an SRV owner, first wire label as the instance: read as one
+    /// label, `a.b` would be the dotted instance `a\.b` (#386). A target
+    /// outside `svc_type` stays its instance, as it always has.
+    pub(super) fn ptr_instance(
+        rec: &browse::RawRecord,
+        target: &str,
+        svc_type: &str,
+    ) -> (String, String) {
+        let Some(prefix) = Self::strip_suffix_ci(target, svc_type) else {
+            return (browse::unescape_name(target), svc_type.to_string());
+        };
+        let mut labels = browse::presentation_labels(prefix);
+        if labels.len() == 1 {
+            return (labels.remove(0), svc_type.to_string());
+        }
+        let labels = match rec.ptr_target_labels.as_deref() {
+            Some(wire) => wire
+                .iter()
+                .map(|label| String::from_utf8_lossy(label).into_owned())
+                .collect(),
+            None => browse::presentation_labels(target),
+        };
+        // Wire labels that disagree with the target name (never from the
+        // parser) leave the target whole, as for a target outside the type.
+        let (instance, service_type) = match labels.as_slice() {
+            [instance, service_type @ ..] if !service_type.is_empty() => (instance, service_type),
+            _ => return (browse::unescape_name(target), svc_type.to_string()),
+        };
+        let service_type = service_type
+            .iter()
+            .map(|label| browse::escape_label(label))
+            .collect::<Vec<_>>()
+            .join(".");
+        (instance.clone(), service_type)
+    }
+
     /// Split an SRV/TXT owner into (instance, service type). The wire
     /// labels are exact: the instance is the first label (RFC 6763 §4.1),
-    /// even when it holds dots (`Á.a._test._tcp.local`), whose display
-    /// name alone can't tell the label boundary. Without wire labels, fall
-    /// back to known service types, then to the first display dot.
+    /// even when it holds dots (`Á.a._test._tcp.local`). The instance is
+    /// the plain label text; the type is in presentation form, like the
+    /// record names it is matched against. Without wire labels, the
+    /// presentation-form owner name splits at its first unescaped dot,
+    /// unless a known service type matches first.
     pub(super) fn split_owner(&self, rec: &browse::RawRecord) -> Option<(String, String)> {
         if let [instance, service_type @ ..] = rec.owner_labels.as_slice() {
             if service_type.is_empty() {
@@ -306,15 +351,20 @@ impl App {
             }
             let service_type = service_type
                 .iter()
-                .map(|label| String::from_utf8_lossy(label))
+                .map(|label| browse::escape_label(&String::from_utf8_lossy(label)))
                 .collect::<Vec<_>>()
                 .join(".");
             return Some((String::from_utf8_lossy(instance).into_owned(), service_type));
         }
         let name = rec.name.trim_end_matches('.');
         self.split_instance_type(name).or_else(|| {
-            let (instance, service_type) = name.split_once('.')?;
-            Some((instance.to_string(), service_type.to_string()))
+            let mut labels = browse::presentation_labels(name).into_iter();
+            let instance = labels.next()?;
+            let service_type = labels
+                .map(|label| browse::escape_label(&label))
+                .collect::<Vec<_>>()
+                .join(".");
+            (!service_type.is_empty()).then_some((instance, service_type))
         })
     }
 
@@ -348,7 +398,13 @@ impl App {
             let Some(instance) = prefix.strip_suffix('.') else {
                 return;
             };
-            if instance.is_empty() {
+            // An escaped dot (`\.`) is inside the instance label, and the
+            // instance is one label: `a.b` before a known type is no
+            // instance of it (that would be the dotted `a\.b`, #386).
+            if instance.is_empty()
+                || browse::escapes_next(instance)
+                || browse::presentation_labels(instance).len() != 1
+            {
                 return;
             }
             let replace = match &best {
@@ -356,7 +412,7 @@ impl App {
                 None => true,
             };
             if replace {
-                best = Some((instance.to_string(), tail.to_string()));
+                best = Some((browse::unescape_name(instance), tail.to_string()));
             }
         };
         for s in &self.services {
@@ -609,7 +665,8 @@ impl App {
                 // Instance name, selected hostname, or any live SRV target
                 // (alternate targets own host records too, as for
                 // addresses).
-                format!("{}.{}", svc.instance, svc.service_type).to_ascii_lowercase() == name
+                crate::browse::instance_name(&svc.instance, &svc.service_type).to_ascii_lowercase()
+                    == name
                     || svc.hostname.trim_end_matches('.').to_ascii_lowercase() == name
                     || Self::service_hosts(svc).contains(&name)
             })
@@ -623,7 +680,8 @@ impl App {
         // instance, which hands its rows over on promotion.
         if rec.rtype == 47 {
             for p in &mut self.pending_instances {
-                let full = format!("{}.{}", p.instance, p.service_type).to_ascii_lowercase();
+                let full =
+                    crate::browse::instance_name(&p.instance, &p.service_type).to_ascii_lowercase();
                 if full != name {
                     continue;
                 }
@@ -784,11 +842,11 @@ impl App {
             candidates.push(rec.rdata.trim_end_matches('.').to_ascii_lowercase());
         }
         for svc in &mut self.services {
-            let full = format!("{}.{}", svc.instance, svc.service_type).to_ascii_lowercase();
-            if candidates
-                .iter()
-                .any(|n| n == &full || n == &svc.instance.to_ascii_lowercase())
-            {
+            let full =
+                crate::browse::instance_name(&svc.instance, &svc.service_type).to_ascii_lowercase();
+            if candidates.iter().any(|n| {
+                n == &full || *n == browse::escape_label(&svc.instance).to_ascii_lowercase()
+            }) {
                 // Another live copy of the withdrawn record (another
                 // source, or the same source on another link, #264) keeps
                 // the service up: only this copy's row goes `bye`.

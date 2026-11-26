@@ -6,6 +6,7 @@ use super::*;
 /// Short display form for a service type: `_http._tcp.local.` → `http.tcp`.
 /// Only used for rendering; grouping and collapse keys keep the full name.
 pub(super) fn short_service_type(label: &str) -> String {
+    let label = crate::browse::unescape_name(label);
     let trimmed = label.trim_end_matches('.');
     let base = crate::browse::strip_local_suffix(trimmed).unwrap_or(trimmed);
     let joined: Vec<&str> = base

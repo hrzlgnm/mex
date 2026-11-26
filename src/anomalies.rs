@@ -25,7 +25,8 @@ pub(crate) use scope::collapse_questions;
 pub(crate) use scope::identity_counts;
 pub(crate) use scope::visible_scope;
 
-/// Service identity carried by findings: `instance.service_type`, or
+/// Service identity carried by findings: the service's presentation-form
+/// name (`browse::instance_name`, instance label escaped), or
 /// `enumeration` for enumeration-row answers. Single definition shared
 /// by the analyzer and the pane filters so the two cannot drift.
 pub const ENUMERATION_SERVICE: &str = "enumeration";
@@ -60,9 +61,11 @@ pub(crate) fn is_mdns_question_type(rtype: u16) -> bool {
     is_mdns_common_type(rtype) || rtype == 255
 }
 
-/// Service identity for a confirmed or pending instance.
+/// Service identity for a confirmed or pending instance: its
+/// presentation-form name (`browse::instance_name`), so a dot inside
+/// the instance label never merges two instances (#386).
 pub fn service_id(instance: &str, service_type: &str) -> String {
-    format!("{instance}.{service_type}")
+    crate::browse::instance_name(instance, service_type)
 }
 
 /// Finding owner for a record or question owned by a hostname (an SRV
@@ -184,8 +187,8 @@ pub struct Anomaly {
     /// Stable machine-readable identifier (`unresolved-srv-target`, `unicast-style-response`, ...).
     pub kind: AnomalyKind,
     pub severity: Severity,
-    /// Owning service as `instance.service_type`, or `enumeration` for
-    /// enumeration-row answers.
+    /// Owning service as its presentation-form name (`service_id`), or
+    /// `enumeration` for enumeration-row answers.
     pub service: String,
     pub record_name: Option<String>,
     pub rtype: Option<u16>,
@@ -247,7 +250,7 @@ pub struct Snapshot<'a> {
     pub pending_hosts: HashSet<String>,
     /// Observed questions flattened across services, pending instances,
     /// and enumeration rows. The owning service id rides along
-    /// (`instance.service_type`, or `enumeration`).
+    /// (`service_id`, or `enumeration`).
     pub questions: Vec<QuestionView<'a>>,
     /// Out-of-scope records kept only as evidence (never answer rows),
     /// with their attributed service id (or `unattributed`).
@@ -517,7 +520,7 @@ pub fn analyze_observations(
                 .unwrap_or_else(|| is_subtype_target(target));
             let target_display = target_labels
                 .map(display_type_target)
-                .unwrap_or_else(|| target.to_string());
+                .unwrap_or_else(|| crate::browse::unescape_name(target));
             if let Some(reason) = type_problem {
                 out.push(Anomaly {
                     kind: AnomalyKind::TypeFormat,

@@ -995,3 +995,64 @@ fn record_codec_failure_yields_an_empty_wire_not_a_panic() {
     assert!(record_wire_into(&mut LimitedSink::new(0), &rec).is_empty());
     assert!(!record_wire(&rec).is_empty(), "the in-memory sink encodes");
 }
+
+#[test]
+fn presentation_name_helpers_round_trip() {
+    assert_eq!(escape_label("a.b\\c"), "a\\.b\\\\c");
+    assert_eq!(escape_label("Küche"), "Küche");
+    assert_eq!(
+        presentation_labels("a\\.b\\\\c._x._tcp.local."),
+        ["a.b\\c", "_x", "_tcp", "local"]
+    );
+    assert_eq!(presentation_labels("a.b"), ["a", "b"]);
+    // An escaped trailing dot belongs to the label; an escaped
+    // backslash before the root dot does not hide the root.
+    assert_eq!(presentation_labels("a\\."), ["a."]);
+    assert_eq!(unescape_name("a\\."), "a.");
+    assert_eq!(unescape_name("a\\\\."), "a\\.");
+    assert_eq!(unescape_name("a\\.b._x._tcp.local."), "a.b._x._tcp.local.");
+    assert_eq!(unescape_name("plain.local"), "plain.local");
+    assert!(escapes_next("a\\"));
+    assert!(!escapes_next("a\\\\"));
+    assert!(!escapes_next("a"));
+    assert_eq!(instance_name("a.b", "_x._tcp.local"), "a\\.b._x._tcp.local");
+    // Only rdata that holds a name is unescaped for views.
+    assert_eq!(
+        display_rdata(12, "a\\.b._x._tcp.local."),
+        "a.b._x._tcp.local."
+    );
+    assert_eq!(
+        display_rdata(33, "0 0 80 h\\.x.local."),
+        "0 0 80 h.x.local."
+    );
+    assert_eq!(display_rdata(16, "k=a\\.b"), "k=a\\.b");
+}
+
+#[test]
+fn dotted_instance_label_parses_to_presentation_form() {
+    let owner = || {
+        simple_dns::Name::new_with_labels(&[
+            simple_dns::Label::new_unchecked(b"a.b"),
+            simple_dns::Label::new_unchecked(b"_x"),
+            simple_dns::Label::new_unchecked(b"_tcp"),
+            simple_dns::Label::new_unchecked(b"local"),
+        ])
+    };
+    let mut msg = Packet::new_reply(0);
+    msg.answers.push(ResourceRecord::new(
+        simple_dns::Name::new_unchecked("_x._tcp.local."),
+        CLASS::IN,
+        120,
+        RData::PTR(owner().into()),
+    ));
+    msg.answers.push(ResourceRecord::new(
+        owner(),
+        CLASS::IN,
+        120,
+        RData::TXT(simple_dns::rdata::TXT::new()),
+    ));
+    let ev = parse_response(&msg);
+    assert_eq!(ev.answers[0].rdata, "a\\.b._x._tcp.local.");
+    assert_eq!(ev.answers[1].name, "a\\.b._x._tcp.local.");
+    assert_eq!(ev.answers[1].owner_labels[0], b"a.b");
+}

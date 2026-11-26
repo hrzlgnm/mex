@@ -244,51 +244,22 @@ pub(super) fn known_answers_for_iface<'a>(
         .collect()
 }
 
-/// Split an unescaped display name into wire labels. Records are stored
-/// unescaped for display, so a dot inside a DNS-SD instance label
-/// (RFC 6763 §4.1.1 allows arbitrary text) is indistinguishable from a
-/// separator: everything left of the LAST `<_service>._tcp|_udp` is one
-/// instance label. Last-match matters: an instance label containing
-/// `._tcp.`-like text (e.g. `foo._tcp.bar._http._tcp.local`) still
-/// resolves to the real service suffix. Subtype owners
-/// (`<sub>._sub.<_service>…`), service types, and host names split on
-/// every dot.
-///
-/// Limits: a host or service name that itself ends in a
-/// `<_service>._tcp|_udp`-shaped suffix (e.g. a host literally named
-/// `x._tcp.example.com`) would split at the wrong label — but such
-/// names never appear as query owners in this browser (queries are only
-/// built for live interests), and re-encoding still yields a valid
-/// name, just not the intended split.
-pub(super) fn split_instance_labels(name: &str) -> Vec<&str> {
-    let name = name.trim_end_matches('.');
-    let parts: Vec<&str> = name.split('.').collect();
-    let Some(proto) = parts.iter().rposition(|l| is_proto_label(l.as_bytes())) else {
-        return parts;
-    };
-    if proto < 2 || !parts[proto - 1].starts_with('_') || is_sub_label(parts[proto - 2].as_bytes())
-    {
-        return parts;
-    }
-    let service = proto - 1;
-    let instance_len = parts[..service].iter().map(|l| l.len() + 1).sum::<usize>() - 1;
-    let mut labels = vec![&name[..instance_len]];
-    labels.extend_from_slice(&parts[service..]);
-    labels
-}
-
-/// Wire name for an unescaped display name. Labels go in as raw bytes,
-/// so instance names with spaces and punctuation (which presentation
-/// parsers reject) encode fine. `None` means the name cannot go on the
-/// wire: an empty or over-long label, or a name longer than
+/// Wire name for a name as mex keys it: presentation form
+/// (`display_name`, `instance_name`), split on unescaped dots with each
+/// escape dropped, so `\.` stays inside its label (#386). Every owner
+/// mex queries for comes from a parsed name or an `instance_name`, so
+/// the split is exact: `a\.b._x._tcp.local` and `a.b._x._tcp.local`
+/// are two names. Labels go in as raw bytes, so instance names with
+/// spaces and punctuation encode fine. `None` means the name cannot go
+/// on the wire: an empty or over-long label, or a name longer than
 /// `MAX_NAME_OCTETS` (labels are built unchecked, so simple-dns would
 /// write it out anyway, as a malformed packet).
-pub(super) fn wire_name(name: &str) -> Option<simple_dns::Name<'_>> {
-    let parts = split_instance_labels(name);
+pub(super) fn wire_name(name: &str) -> Option<simple_dns::Name<'static>> {
+    let parts = presentation_labels(name);
     let mut labels = Vec::with_capacity(parts.len());
     // The root label's zero octet.
     let mut octets = 1;
-    for part in parts {
+    for part in &parts {
         let bytes = part.as_bytes();
         if bytes.is_empty() || bytes.len() > 63 {
             return None;
@@ -300,7 +271,7 @@ pub(super) fn wire_name(name: &str) -> Option<simple_dns::Name<'_>> {
     if octets > MAX_NAME_OCTETS {
         return None;
     }
-    Some(simple_dns::Name::new_with_labels(&labels))
+    Some(simple_dns::Name::new_with_labels(&labels).into_owned())
 }
 
 /// Longest name on the wire, counting each label's length octet and the

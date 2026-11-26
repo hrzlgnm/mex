@@ -181,8 +181,8 @@ impl App {
         anomalies::analyze_observations(&snap, &self.raw_events, &address_queries)
     }
 
-    /// Per-service anomaly counts keyed by `instance.service_type`
-    /// service id. Used for host-list markers and the Answers table
+    /// Per-service anomaly counts keyed by service id (`anomalies::service_id`).
+    /// Used for host-list markers and the Answers table
     /// without recomputing per row. Informational notes never count.
     #[cfg(test)]
     pub fn anomaly_counts(&self) -> HashMap<String, usize> {

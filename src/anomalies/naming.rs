@@ -24,7 +24,7 @@ pub(super) fn check_type_format(svc: &ServiceView, service_id: &str, out: &mut V
             rtype_str: None,
             rdata: None,
             source: None,
-            message: format!("bad type {st}: {reason}"),
+            message: format!("bad type {}: {reason}", crate::browse::unescape_name(st)),
             rfc: "RFC 6763 §7",
             requirement: "MUST",
             response: None,
@@ -38,7 +38,8 @@ pub(super) fn check_type_format(svc: &ServiceView, service_id: &str, out: &mut V
 /// one verdict and one message. Accepts `subtype._sub._service._tcp`
 /// (RFC 6763 §7.1) as well as plain service types.
 pub(super) fn service_type_problem(st: &str) -> Option<String> {
-    let parts: Vec<&[u8]> = st.split('.').map(str::as_bytes).collect();
+    let labels = crate::browse::presentation_labels(st);
+    let parts: Vec<&[u8]> = labels.iter().map(String::as_bytes).collect();
     service_type_labels_problem(&parts)
 }
 
@@ -95,7 +96,8 @@ pub(super) fn service_label_problem(label: &[u8]) -> Option<String> {
 /// Valid subtypes pass service-type validation but still don't belong in
 /// `_services._dns-sd._udp.local` (RFC 6763 §9 lists base types).
 pub(super) fn is_subtype_target(st: &str) -> bool {
-    let parts: Vec<&[u8]> = st.split('.').map(str::as_bytes).collect();
+    let labels = crate::browse::presentation_labels(st);
+    let parts: Vec<&[u8]> = labels.iter().map(String::as_bytes).collect();
     is_subtype_labels(&parts)
 }
 
@@ -242,10 +244,14 @@ pub(super) fn expected_base(rtype: u16, name: &str) -> u32 {
 /// Basic DNS-name shape: dot-separated non-empty labels of at most 63
 /// bytes, 255 bytes overall. Internationalized names pass through.
 pub(super) fn dns_name_problem(name: &str) -> Option<String> {
-    if name.len() > 255 {
+    // `name` is in presentation form: measure the labels as they go on
+    // the wire, without their escapes.
+    let labels = crate::browse::presentation_labels(name);
+    let text_len = labels.iter().map(String::len).sum::<usize>() + labels.len().saturating_sub(1);
+    if text_len > 255 {
         return Some("name exceeds 255 bytes".to_string());
     }
-    for label in name.split('.') {
+    for label in &labels {
         if label.is_empty() {
             return Some("name has an empty label".to_string());
         }

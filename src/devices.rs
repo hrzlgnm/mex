@@ -36,7 +36,11 @@ impl DeviceName {
     /// `~`-prefixed when inferred.
     pub fn display(&self) -> String {
         let name = self.names.first().map(String::as_str).unwrap_or_default();
-        let short = name.split('.').next().unwrap_or(name);
+        // Names are in presentation form: the first label, escapes dropped.
+        let short = crate::browse::presentation_labels(name)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
         if self.inferred {
             format!("~{short}")
         } else {

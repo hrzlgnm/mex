@@ -58,35 +58,59 @@ fn utf8_instance_names_survive_the_wire_round_trip() {
     assert_eq!(ev.questions[0].name, format!("{name}."));
 }
 
+/// Labels of `wire_name(name)`, as text.
+fn wire_labels_of(name: &str) -> Vec<String> {
+    wire_name(name)
+        .expect("encodable")
+        .get_labels()
+        .iter()
+        .map(|label| String::from_utf8_lossy(label.as_ref()).into_owned())
+        .collect()
+}
+
 #[test]
-fn split_instance_labels_keep_instance_dots_in_one_label() {
+fn wire_name_keeps_escaped_dots_inside_their_label() {
     assert_eq!(
-        split_instance_labels("amzn.dmgr:ABC._amzn-wplay._tcp.local"),
+        wire_labels_of("amzn\\.dmgr:ABC._amzn-wplay._tcp.local"),
         ["amzn.dmgr:ABC", "_amzn-wplay", "_tcp", "local"]
     );
-    // Subtype owners, enumeration, service types, and host names
-    // split on every dot.
     assert_eq!(
-        split_instance_labels("_printer._sub._http._tcp.local."),
+        wire_labels_of("foo\\._tcp\\.bar._http._tcp.local."),
+        ["foo._tcp.bar", "_http", "_tcp", "local"]
+    );
+    assert_eq!(
+        wire_labels_of("back\\\\slash._x._tcp.local"),
+        ["back\\slash", "_x", "_tcp", "local"]
+    );
+    // Without an escape, every dot separates (#386): instance `a` of
+    // `b._x._tcp.local` is not instance `a.b` of `_x._tcp.local`.
+    assert_eq!(
+        wire_labels_of("a.b._x._tcp.local"),
+        ["a", "b", "_x", "_tcp", "local"]
+    );
+    assert_eq!(
+        wire_labels_of("_printer._sub._http._tcp.local."),
         ["_printer", "_sub", "_http", "_tcp", "local"]
     );
     assert_eq!(
-        split_instance_labels("_services._dns-sd._udp.local"),
-        ["_services", "_dns-sd", "_udp", "local"]
-    );
-    assert_eq!(
-        split_instance_labels("_http._tcp.local"),
-        ["_http", "_tcp", "local"]
-    );
-    assert_eq!(
-        split_instance_labels("FritzBoxRepeater.fritz.box"),
+        wire_labels_of("FritzBoxRepeater.fritz.box"),
         ["FritzBoxRepeater", "fritz", "box"]
     );
-    // Last-match wins: `._tcp.`-like text inside the instance label
-    // still resolves to the real service suffix.
+}
+
+#[test]
+fn dotted_instance_query_round_trips_in_presentation_form() {
+    let name = "Á\\.a._test._tcp.local";
+    let ev = roundtrip_query(&QueryRequest {
+        name: name.to_string(),
+        record_type: TYPE::SRV,
+        known_answers: Vec::new(),
+        qu: false,
+    });
+    assert_eq!(ev.questions[0].name, format!("{name}."));
     assert_eq!(
-        split_instance_labels("foo._tcp.bar._http._tcp.local"),
-        ["foo._tcp.bar", "_http", "_tcp", "local"]
+        ev.questions[0].owner_labels,
+        [&b"\xc3\x81.a"[..], b"_test", b"_tcp", b"local"]
     );
 }
 

@@ -29,9 +29,9 @@ impl App {
             return;
         }
         for i in 0..self.services.len() {
-            let full = format!(
-                "{}.{}",
-                self.services[i].instance, self.services[i].service_type
+            let full = crate::browse::instance_name(
+                &self.services[i].instance,
+                &self.services[i].service_type,
             )
             .to_ascii_lowercase();
             let host = self.services[i]
@@ -168,9 +168,9 @@ impl App {
             return;
         }
         for i in 0..self.services.len() {
-            let full = format!(
-                "{}.{}",
-                self.services[i].instance, self.services[i].service_type
+            let full = crate::browse::instance_name(
+                &self.services[i].instance,
+                &self.services[i].service_type,
             )
             .to_ascii_lowercase();
             let host = self.services[i]
@@ -194,7 +194,8 @@ impl App {
             }
         }
         for p in &mut self.pending_instances {
-            let full = format!("{}.{}", p.instance, p.service_type).to_ascii_lowercase();
+            let full =
+                crate::browse::instance_name(&p.instance, &p.service_type).to_ascii_lowercase();
             if full == key || p.service_type.to_ascii_lowercase() == key {
                 Self::file_question_counted(
                     &mut p.questions,

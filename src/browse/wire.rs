@@ -30,25 +30,107 @@ pub(super) fn rdata_has_invalid_utf8(rdata: &RData) -> bool {
     }
 }
 
-/// Display form of a parsed DNS name: labels joined as UTF-8 (lossy),
-/// with a trailing dot. Non-UTF-8 bytes render as U+FFFD (RFC 6762 §16
-/// names are UTF-8); this matches the in-flight instance-name fix and
-/// replaces the old latin-1 byte-as-char rendering. Labels go on the
-/// wire as raw bytes, so this deliberately does not interpret escapes:
-/// a dot inside a DNS-SD instance label (RFC 6763 §4.1.1) renders as a
-/// plain separator, the same ambiguous-but-stable form the old codec
-/// produced after unescaping presentation format. `split_instance_labels`
-/// below recovers the label split for re-encoding.
+/// Presentation form of a parsed DNS name (RFC 1035 §5.1): labels as
+/// UTF-8 (lossy), each escaped by `escape_label`, joined by dots, with
+/// a trailing dot. Non-UTF-8 bytes render as U+FFFD (RFC 6762 §16 names
+/// are UTF-8). A dot inside a DNS-SD instance label (RFC 6763 §4.1.1)
+/// stays `\.`, so the name keeps its label boundaries: it is the
+/// identity every record, question and query owner is keyed by (#386).
+/// Views show `unescape_name` of it; names without a dot or backslash
+/// inside a label read the same either way.
 pub(super) fn display_name(name: &simple_dns::Name<'_>) -> String {
     let mut out = String::new();
     for (i, label) in name.get_labels().iter().enumerate() {
         if i > 0 {
             out.push('.');
         }
-        out.push_str(&String::from_utf8_lossy(label.as_ref()));
+        out.push_str(&escape_label(&String::from_utf8_lossy(label.as_ref())));
     }
     out.push('.');
     out
+}
+
+/// One label in presentation form (RFC 1035 §5.1, RFC 6763 §4.3): `\`
+/// and `.` take a backslash, so a dot inside the label never reads as
+/// a separator. Everything else stays as is (UTF-8 is not escaped).
+pub(crate) fn escape_label(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    for c in label.chars() {
+        if matches!(c, '.' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Labels of a presentation-form name: split on unescaped dots, each
+/// escape dropped (`\X` is `X`). A trailing root dot adds no label.
+pub(crate) fn presentation_labels(name: &str) -> Vec<String> {
+    split_presentation(name).0
+}
+
+/// `presentation_labels` plus whether the name ends in the root (an
+/// unescaped trailing dot).
+fn split_presentation(name: &str) -> (Vec<String>, bool) {
+    let mut labels = Vec::new();
+    let mut label = String::new();
+    let mut rooted = false;
+    let mut chars = name.chars();
+    while let Some(c) = chars.next() {
+        rooted = c == '.';
+        match c {
+            '\\' => label.extend(chars.next()),
+            '.' => labels.push(std::mem::take(&mut label)),
+            _ => label.push(c),
+        }
+    }
+    if !rooted {
+        labels.push(label);
+    }
+    (labels, rooted)
+}
+
+/// Display form of a presentation-form name: escapes dropped, labels
+/// joined by plain dots (the trailing root dot kept when present). For
+/// views only: it is ambiguous where a label holds a dot.
+pub(crate) fn unescape_name(name: &str) -> String {
+    if !name.contains('\\') {
+        return name.to_string();
+    }
+    let (labels, rooted) = split_presentation(name);
+    let mut out = labels.join(".");
+    if rooted {
+        out.push('.');
+    }
+    out
+}
+
+/// View text of a record's rdata: the name it holds (PTR, CNAME and NS
+/// targets, the SRV target, the NSEC next name) without escapes, like
+/// `unescape_name`; any other rdata (TXT text) exactly as stored.
+pub(crate) fn display_rdata(rtype: u16, rdata: &str) -> String {
+    match rtype {
+        2 | 5 | 12 | 33 | 47 => unescape_name(rdata),
+        _ => rdata.to_string(),
+    }
+}
+
+/// Whether `head`, the text of a presentation-form name before one of
+/// its dots, ends in an unpaired backslash: then that dot is escaped
+/// (inside a label), not a separator.
+pub(crate) fn escapes_next(head: &str) -> bool {
+    head.bytes().rev().take_while(|&b| b == b'\\').count() % 2 == 1
+}
+
+/// Presentation-form name of a service instance: its instance label
+/// escaped (`escape_label`) and joined to its service type, which is
+/// already in presentation form. Wire case; fold ASCII to compare. Two
+/// instances share it only if they share both the instance label and
+/// the type, so `a.b` of `_x._tcp.local` and `a` of `b._x._tcp.local`
+/// stay apart (#386).
+pub(crate) fn instance_name(instance: &str, service_type: &str) -> String {
+    format!("{}.{service_type}", escape_label(instance))
 }
 
 pub(crate) fn parse_packet(
@@ -586,8 +668,8 @@ pub(crate) fn is_sub_label(label: &[u8]) -> bool {
 /// offset is a char boundary, so slicing there cannot panic.
 pub(super) fn local_suffix_offset(trimmed: &str) -> Option<usize> {
     let off = trimmed.len().checked_sub(".local".len())?;
-    trimmed.as_bytes()[off..]
-        .eq_ignore_ascii_case(b".local")
+    // In presentation form `foo\.local` is one label, not under `.local`.
+    (trimmed.as_bytes()[off..].eq_ignore_ascii_case(b".local") && !escapes_next(&trimmed[..off]))
         .then_some(off)
 }
 

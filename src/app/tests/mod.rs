@@ -22,6 +22,7 @@ mod run_loop;
 mod rusage;
 mod schedule;
 mod scheduler;
+mod service_identity;
 mod srv_target;
 mod state_dump;
 mod transmit_state;
@@ -31,21 +32,20 @@ fn test_source() -> SocketAddr {
     "192.168.1.2:5353".parse().unwrap()
 }
 
+/// Wire labels of a name as the parser keys it (presentation form):
+/// `\.` stays inside its label, as in `Á\.a._test._tcp.local.`.
+fn wire_labels(name: &str) -> Vec<Vec<u8>> {
+    browse::presentation_labels(name)
+        .into_iter()
+        .map(String::into_bytes)
+        .collect()
+}
+
 fn raw_record(name: &str, rtype: u16, rtype_str: &str, rdata: &str, ttl: u32) -> browse::RawRecord {
     browse::RawRecord {
         name: name.to_string(),
-        owner_labels: name
-            .trim_end_matches('.')
-            .split('.')
-            .map(|label| label.as_bytes().to_vec())
-            .collect(),
-        ptr_target_labels: (rtype == 12).then(|| {
-            rdata
-                .trim_end_matches('.')
-                .split('.')
-                .map(|label| label.as_bytes().to_vec())
-                .collect()
-        }),
+        owner_labels: wire_labels(name),
+        ptr_target_labels: (rtype == 12).then(|| wire_labels(rdata)),
         rtype,
         rtype_str: rtype_str.to_string(),
         flush_bit: false,
@@ -303,11 +303,7 @@ fn query_event(
 ) -> browse::Event {
     let q = browse::RawRecord {
         name: name.to_string(),
-        owner_labels: name
-            .trim_end_matches('.')
-            .split('.')
-            .map(|label| label.as_bytes().to_vec())
-            .collect(),
+        owner_labels: wire_labels(name),
         ptr_target_labels: None,
         rtype,
         rtype_str: rtype_str.to_string(),
