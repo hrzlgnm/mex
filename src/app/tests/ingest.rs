@@ -1264,3 +1264,17 @@ fn owner_without_wire_labels_falls_back_to_display_split() {
     rec.owner_labels = vec![b"local".to_vec()];
     assert_eq!(app.split_owner(&rec), None);
 }
+
+#[test]
+fn single_label_srv_and_txt_owners_are_ignored() {
+    // A one-label owner names no instance: neither a service nor a
+    // pending entry may appear for it.
+    let mut app = App::new().unwrap();
+    ingest(
+        &mut app,
+        &raw_record("local.", 33, "SRV", "0 0 80 host.local.", 120),
+    );
+    ingest(&mut app, &raw_record("local.", 16, "TXT", "k=v", 120));
+    assert!(app.services.is_empty());
+    assert!(app.pending_instances.is_empty());
+}
