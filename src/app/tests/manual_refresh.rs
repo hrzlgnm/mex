@@ -567,3 +567,24 @@ fn r_leaves_a_browse_stream_that_is_already_due_later_alone() {
     assert_eq!(app.diagnostics.q_sent_manual, 1);
     assert_eq!(app.scheduler.continuous()[&key].next_due, later);
 }
+
+#[test]
+fn a_self_row_for_a_type_mex_never_queries_is_never_sent() {
+    // Self rows are only filed for queried types; this guards against a
+    // future path filing one for anything else (here NSEC, and a type
+    // with no name at all).
+    for rtype_str in ["NSEC", "TYPE65"] {
+        let mut app = app_with_self_ptr_row();
+        app.services[0].questions.push((
+            "test.local.".to_string(),
+            rtype_str.to_string(),
+            SELF_SOURCE,
+            Instant::now(),
+            Vec::new(),
+        ));
+        cursor_to_question(&mut app, |_, t, s| t == rtype_str && s == SELF_SOURCE);
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.diagnostics.q_sent_manual, 0, "{rtype_str}");
+        assert_no_popup(&app);
+    }
+}
