@@ -781,9 +781,11 @@ impl App {
         }
         // Replace the stale copy of the same record (name, type, rdata,
         // source, link): per link, so one source heard on two links keeps
-        // a row on each (#264).
+        // a row on each (#264). Owner names fold ASCII case (RFC 6762
+        // §16), so a copy in another wire case replaces the row (#402);
+        // rdata compares exactly (TXT data is case-sensitive).
         if let Some(pos) = s.answers.iter().position(|r| {
-            r.name == rec.name
+            r.name.eq_ignore_ascii_case(&rec.name)
                 && r.rtype == rec.rtype
                 && r.rdata == rec.rdata
                 && r.source == rec.source

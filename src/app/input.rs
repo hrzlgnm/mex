@@ -1075,7 +1075,9 @@ impl App {
                 source,
                 ifindex,
             } => raws.iter().position(|r| {
-                &r.name == name
+                // Same row identity as `push_record`: the owner name
+                // folds ASCII case, so a replacing copy keeps the cursor.
+                r.name.eq_ignore_ascii_case(name)
                     && r.rtype == *rtype
                     && &r.rdata == rdata
                     && r.source == *source

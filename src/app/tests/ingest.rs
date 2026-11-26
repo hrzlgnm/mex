@@ -1385,3 +1385,53 @@ fn ptr_before_srv_still_parks_in_pending_until_promotion() {
     assert!(app.pending_instances.is_empty());
     assert_eq!(live_ptr_rows(&app).len(), 1);
 }
+
+#[test]
+fn service_records_coalesce_owner_name_case_variants() {
+    // DNS names fold ASCII case (RFC 6762 §16): a newer copy in another
+    // wire case replaces the row instead of filing a second one (#402).
+    let mut app = test_service_app();
+    let mut upper = srv_record(120);
+    upper.name = "TEST._HTTP._tcp.local.".to_string();
+    upper.owner_labels = wire_labels(&upper.name);
+    upper.section = browse::RecordSection::Additional;
+    ingest(&mut app, &upper);
+    let srvs: Vec<_> = app.services[0]
+        .answers
+        .iter()
+        .filter(|r| r.rtype == 33)
+        .collect();
+    assert_eq!(srvs.len(), 1, "{srvs:#?}");
+    assert_eq!(srvs[0].name, "TEST._HTTP._tcp.local.", "latest copy wins");
+    assert_eq!(srvs[0].section, browse::RecordSection::Additional);
+}
+
+#[test]
+fn service_records_keep_non_ascii_case_variants_apart() {
+    // Only A-Z fold: `É` (U+00C9) and `é` (U+00E9) owner names under one
+    // instance stay two rows.
+    let mut app = test_service_app();
+    for name in ["\u{00C9}x.test.local.", "\u{00E9}x.test.local."] {
+        app.push_record(0, &raw_record(name, 16, "TXT", "a=1", 120));
+    }
+    let txts = app.services[0]
+        .answers
+        .iter()
+        .filter(|r| r.rtype == 16)
+        .count();
+    assert_eq!(txts, 2);
+}
+
+#[test]
+fn service_records_keep_rdata_case() {
+    // TXT data is case-sensitive: only the owner name folds.
+    let mut app = test_service_app();
+    ingest(&mut app, &txt_record("a=1"));
+    ingest(&mut app, &txt_record("A=1"));
+    let txts = app.services[0]
+        .answers
+        .iter()
+        .filter(|r| r.rtype == 16)
+        .count();
+    assert_eq!(txts, 2);
+}
