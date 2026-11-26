@@ -292,6 +292,30 @@ impl App {
         }
     }
 
+    /// Split an SRV/TXT owner into (instance, service type). The wire
+    /// labels are exact: the instance is the first label (RFC 6763 §4.1),
+    /// even when it holds dots (`Á.a._test._tcp.local`), whose display
+    /// name alone can't tell the label boundary. Without wire labels, fall
+    /// back to known service types, then to the first display dot.
+    pub(super) fn split_owner(&self, rec: &browse::RawRecord) -> Option<(String, String)> {
+        if let [instance, service_type @ ..] = rec.owner_labels.as_slice() {
+            if service_type.is_empty() {
+                return None;
+            }
+            let service_type = service_type
+                .iter()
+                .map(|label| String::from_utf8_lossy(label))
+                .collect::<Vec<_>>()
+                .join(".");
+            return Some((String::from_utf8_lossy(instance).into_owned(), service_type));
+        }
+        let name = rec.name.trim_end_matches('.');
+        self.split_instance_type(name).or_else(|| {
+            let (instance, service_type) = name.split_once('.')?;
+            Some((instance.to_string(), service_type.to_string()))
+        })
+    }
+
     /// Split a full instance name ("inst._svc._tcp.local") into (instance,
     /// service type). Instance names may legally contain dots (e.g. Fire TV
     /// style "amzn.dmgr:...:..."), so splitting on the first dot misparses
@@ -346,16 +370,8 @@ impl App {
     }
 
     pub(super) fn handle_srv(&mut self, rec: &browse::RawRecord, ev: &browse::Event) {
-        let name = rec.name.trim_end_matches('.');
-        let (instance, service_type) = match self.split_instance_type(name) {
-            Some(split) => split,
-            None => {
-                let parts: Vec<&str> = name.splitn(2, '.').collect();
-                if parts.len() < 2 {
-                    return;
-                }
-                (parts[0].to_string(), parts[1].to_string())
-            }
+        let Some((instance, service_type)) = self.split_owner(rec) else {
+            return;
         };
         let idx = self.ensure_svc(&instance, &service_type);
 
@@ -520,16 +536,8 @@ impl App {
     }
 
     pub(super) fn handle_txt(&mut self, rec: &browse::RawRecord, ev: &browse::Event) {
-        let name = rec.name.trim_end_matches('.');
-        let (instance, service_type) = match self.split_instance_type(name) {
-            Some(split) => split,
-            None => {
-                let parts: Vec<&str> = name.splitn(2, '.').collect();
-                if parts.len() < 2 {
-                    return;
-                }
-                (parts[0].to_string(), parts[1].to_string())
-            }
+        let Some((instance, service_type)) = self.split_owner(rec) else {
+            return;
         };
         // Late TXT (arriving after the SRV already promoted the service,
         // the normal passive-mode order) lands on the live service

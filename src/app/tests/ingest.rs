@@ -1215,3 +1215,66 @@ fn names_fold_ascii_case_only_per_rfc_6762_section_16() {
         .collect();
     assert_eq!(groups.len(), 2, "two hosts: {groups:?}");
 }
+
+/// `avahi-publish-service Á.a _test._tcp 443`: one instance label that
+/// holds a dot. Its display name `Á.a._test._tcp.local.` can't tell the
+/// label boundary; the wire labels can.
+fn dotted_instance_record(rtype: u16, rtype_str: &str, rdata: &str) -> browse::RawRecord {
+    let mut rec = raw_record("Á.a._test._tcp.local.", rtype, rtype_str, rdata, 120);
+    rec.owner_labels = ["Á.a", "_test", "_tcp", "local"]
+        .iter()
+        .map(|label| label.as_bytes().to_vec())
+        .collect();
+    rec
+}
+
+#[test]
+fn srv_before_ptr_keeps_dotted_instance_label() {
+    let mut app = App::new().unwrap();
+    let mut srv = dotted_instance_record(33, "SRV", "0 0 443 host.local.");
+    srv.flush_bit = true;
+    ingest(&mut app, &srv);
+    assert_eq!(app.services.len(), 1);
+    assert_eq!(app.services[0].instance, "Á.a");
+    assert_eq!(app.services[0].service_type, "_test._tcp.local");
+    assert!(findings_of(&app, anomalies::AnomalyKind::TypeFormat).is_empty());
+}
+
+#[test]
+fn txt_before_ptr_keeps_dotted_instance_label() {
+    let mut app = App::new().unwrap();
+    ingest(
+        &mut app,
+        &dotted_instance_record(16, "TXT", "uga=http://uga.bung"),
+    );
+    assert_eq!(app.pending_instances.len(), 1);
+    assert_eq!(app.pending_instances[0].instance, "Á.a");
+    assert_eq!(app.pending_instances[0].service_type, "_test._tcp.local");
+}
+
+#[test]
+fn owner_without_wire_labels_falls_back_to_display_split() {
+    let app = App::new().unwrap();
+    let mut rec = raw_record("Test._http._tcp.local.", 33, "SRV", "0 0 80 t.local.", 120);
+    rec.owner_labels.clear();
+    assert_eq!(
+        app.split_owner(&rec),
+        Some(("Test".to_string(), "_http._tcp.local".to_string()))
+    );
+    rec.owner_labels = vec![b"local".to_vec()];
+    assert_eq!(app.split_owner(&rec), None);
+}
+
+#[test]
+fn single_label_srv_and_txt_owners_are_ignored() {
+    // A one-label owner names no instance: neither a service nor a
+    // pending entry may appear for it.
+    let mut app = App::new().unwrap();
+    ingest(
+        &mut app,
+        &raw_record("local.", 33, "SRV", "0 0 80 host.local.", 120),
+    );
+    ingest(&mut app, &raw_record("local.", 16, "TXT", "k=v", 120));
+    assert!(app.services.is_empty());
+    assert!(app.pending_instances.is_empty());
+}
