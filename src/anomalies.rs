@@ -25,7 +25,8 @@ pub(crate) use scope::collapse_questions;
 pub(crate) use scope::identity_counts;
 pub(crate) use scope::visible_scope;
 
-/// Service identity carried by findings: `instance.service_type`, or
+/// Service identity carried by findings: the service's presentation-form
+/// name (`browse::instance_name`, instance label escaped), or
 /// `enumeration` for enumeration-row answers. Single definition shared
 /// by the analyzer and the pane filters so the two cannot drift.
 pub const ENUMERATION_SERVICE: &str = "enumeration";
@@ -186,8 +187,8 @@ pub struct Anomaly {
     /// Stable machine-readable identifier (`unresolved-srv-target`, `unicast-style-response`, ...).
     pub kind: AnomalyKind,
     pub severity: Severity,
-    /// Owning service as `instance.service_type`, or `enumeration` for
-    /// enumeration-row answers.
+    /// Owning service as its presentation-form name (`service_id`), or
+    /// `enumeration` for enumeration-row answers.
     pub service: String,
     pub record_name: Option<String>,
     pub rtype: Option<u16>,
@@ -249,7 +250,7 @@ pub struct Snapshot<'a> {
     pub pending_hosts: HashSet<String>,
     /// Observed questions flattened across services, pending instances,
     /// and enumeration rows. The owning service id rides along
-    /// (`instance.service_type`, or `enumeration`).
+    /// (`service_id`, or `enumeration`).
     pub questions: Vec<QuestionView<'a>>,
     /// Out-of-scope records kept only as evidence (never answer rows),
     /// with their attributed service id (or `unattributed`).

@@ -184,9 +184,9 @@ impl App {
     /// removed (`printer.local.` → `printer`). Case-insensitive; names
     /// that merely contain `local` elsewhere are untouched.
     pub(super) fn short_hostname(name: &str) -> String {
-        browse::strip_local_suffix(name)
-            .unwrap_or_else(|| name.trim_end_matches('.'))
-            .to_string()
+        browse::unescape_name(
+            browse::strip_local_suffix(name).unwrap_or_else(|| name.trim_end_matches('.')),
+        )
     }
 
     /// Live addresses (A/AAAA rdata) aggregated across all services on the

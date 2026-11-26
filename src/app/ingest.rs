@@ -243,10 +243,8 @@ impl App {
         }
 
         if let Some((subtype, svc_type)) = subtype_owner_parts(rec) {
-            // Instances are kept as plain label text; the PTR target is in
-            // presentation form.
-            let instance =
-                &browse::unescape_name(Self::strip_suffix_ci(target, &svc_type).unwrap_or(target));
+            let (instance, svc_type) = Self::ptr_instance(rec, target, &svc_type);
+            let instance = &instance;
             // Late subtype PTRs (arriving after the SRV already promoted
             // the service, the normal passive-mode order) land on the live
             // service directly; otherwise they wait in pending for the SRV
@@ -279,7 +277,8 @@ impl App {
             return;
         }
 
-        let instance = &browse::unescape_name(Self::strip_suffix_ci(target, st).unwrap_or(target));
+        let (instance, st) = Self::ptr_instance(rec, target, st);
+        let (instance, st) = (instance.as_str(), st.as_str());
         // A PTR for an already-confirmed service (SRV first, the passive
         // order) lands on that service only, like late TXT and subtype
         // PTRs. A pending copy here would be refreshed by every later PTR
@@ -296,6 +295,46 @@ impl App {
         }
         let pi = self.ensure_pending(instance, st);
         self.pending_instances[pi].answers.push(rec.clone());
+    }
+
+    /// (instance, service type) a PTR target names under the browsed
+    /// `svc_type`. Instances are kept as plain label text; the target is in
+    /// presentation form. One label before `svc_type` is the instance. More
+    /// labels there name an instance of a deeper type, so the target splits
+    /// like an SRV owner, first wire label as the instance: read as one
+    /// label, `a.b` would be the dotted instance `a\.b` (#386). A target
+    /// outside `svc_type` stays its instance, as it always has.
+    pub(super) fn ptr_instance(
+        rec: &browse::RawRecord,
+        target: &str,
+        svc_type: &str,
+    ) -> (String, String) {
+        let Some(prefix) = Self::strip_suffix_ci(target, svc_type) else {
+            return (browse::unescape_name(target), svc_type.to_string());
+        };
+        let mut labels = browse::presentation_labels(prefix);
+        if labels.len() == 1 {
+            return (labels.remove(0), svc_type.to_string());
+        }
+        let labels = match rec.ptr_target_labels.as_deref() {
+            Some(wire) => wire
+                .iter()
+                .map(|label| String::from_utf8_lossy(label).into_owned())
+                .collect(),
+            None => browse::presentation_labels(target),
+        };
+        // Wire labels that disagree with the target name (never from the
+        // parser) leave the target whole, as for a target outside the type.
+        let (instance, service_type) = match labels.as_slice() {
+            [instance, service_type @ ..] if !service_type.is_empty() => (instance, service_type),
+            _ => return (browse::unescape_name(target), svc_type.to_string()),
+        };
+        let service_type = service_type
+            .iter()
+            .map(|label| browse::escape_label(label))
+            .collect::<Vec<_>>()
+            .join(".");
+        (instance.clone(), service_type)
     }
 
     /// Split an SRV/TXT owner into (instance, service type). The wire
@@ -359,8 +398,13 @@ impl App {
             let Some(instance) = prefix.strip_suffix('.') else {
                 return;
             };
-            // An escaped dot (`\.`) is inside the instance label.
-            if instance.is_empty() || browse::escapes_next(instance) {
+            // An escaped dot (`\.`) is inside the instance label, and the
+            // instance is one label: `a.b` before a known type is no
+            // instance of it (that would be the dotted `a\.b`, #386).
+            if instance.is_empty()
+                || browse::escapes_next(instance)
+                || browse::presentation_labels(instance).len() != 1
+            {
                 return;
             }
             let replace = match &best {

@@ -558,7 +558,8 @@ impl Sighting {
     }
 }
 
-/// Lowercased `instance.service_type`, the identity address denials use.
+/// Lowercased presentation-form service name (`browse::instance_name`,
+/// instance label escaped), the identity address denials use.
 fn service_key(instance: &str, service_type: &str) -> String {
     crate::browse::instance_name(instance, service_type).to_ascii_lowercase()
 }

@@ -256,3 +256,127 @@ fn known_type_split_keeps_an_escaped_dot_in_the_instance() {
     // The dot before the known type is escaped: no label starts there.
     assert_eq!(app.split_instance_type("a\\._x._tcp.local"), None);
 }
+
+#[test]
+fn ptr_to_a_deeper_target_files_on_the_instance_its_labels_name() {
+    // `_x._tcp.local` browsing to instance `a` of `b._x._tcp.local`
+    // (labels a, b, _x, _tcp, local): the prefix `a.b` is two labels,
+    // so it never names the dotted instance `a\.b`.
+    let mut app = colliding_app();
+    ingest(
+        &mut app,
+        &raw_record("_x._tcp.local.", 12, "PTR", PLAIN, 4500),
+    );
+    assert!(app.pending_instances.is_empty());
+    assert!(rows_of(dotted(&app), 12).is_empty(), "not a.b's PTR");
+    assert_eq!(rows_of(plain(&app), 12).len(), 1);
+}
+
+#[test]
+fn ptr_to_a_deeper_target_parks_under_its_own_type() {
+    let mut app = App::new().unwrap();
+    ingest(
+        &mut app,
+        &raw_record("_x._tcp.local.", 12, "PTR", PLAIN, 4500),
+    );
+    let pending: Vec<_> = app
+        .pending_instances
+        .iter()
+        .map(|p| (p.instance.as_str(), p.service_type.as_str()))
+        .collect();
+    assert_eq!(pending, [("a", "b._x._tcp.local")]);
+}
+
+#[test]
+fn subtype_ptr_to_a_deeper_target_files_on_the_instance_its_labels_name() {
+    let mut app = colliding_app();
+    ingest(
+        &mut app,
+        &raw_record("_s._sub._x._tcp.local.", 12, "PTR", PLAIN, 4500),
+    );
+    assert!(app.pending_instances.is_empty());
+    assert!(dotted(&app).subtypes.is_empty(), "not a.b's subtype");
+    assert_eq!(plain(&app).subtypes, [b"_s".to_vec()]);
+}
+
+#[test]
+fn ptr_target_outside_its_type_stays_the_instance_of_that_type() {
+    let mut app = App::new().unwrap();
+    ingest(
+        &mut app,
+        &raw_record("_x._tcp.local.", 12, "PTR", "foo._y._tcp.local.", 4500),
+    );
+    let pending: Vec<_> = app
+        .pending_instances
+        .iter()
+        .map(|p| (p.instance.as_str(), p.service_type.as_str()))
+        .collect();
+    assert_eq!(pending, [("foo._y._tcp.local", "_x._tcp.local")]);
+}
+
+#[test]
+fn deeper_ptr_target_without_wire_labels_splits_its_name() {
+    let mut ptr = raw_record("_x._tcp.local.", 12, "PTR", PLAIN, 4500);
+    ptr.ptr_target_labels = None;
+    assert_eq!(
+        App::ptr_instance(&ptr, PLAIN.trim_end_matches('.'), "_x._tcp.local"),
+        ("a".to_string(), "b._x._tcp.local".to_string())
+    );
+}
+
+#[test]
+fn ptr_target_with_disagreeing_wire_labels_stays_whole() {
+    // Never from the parser: one wire label for a three-label prefix.
+    let mut ptr = raw_record("_x._tcp.local.", 12, "PTR", PLAIN, 4500);
+    ptr.ptr_target_labels = Some(vec![b"a".to_vec()]);
+    assert_eq!(
+        App::ptr_instance(&ptr, PLAIN.trim_end_matches('.'), "_x._tcp.local"),
+        ("a.b._x._tcp.local".to_string(), "_x._tcp.local".to_string())
+    );
+}
+
+#[test]
+fn known_type_split_rejects_a_multi_label_instance() {
+    let mut app = App::new().unwrap();
+    app.scheduler
+        .known_types_mut()
+        .insert("_x._tcp.local".to_string());
+    assert_eq!(app.split_instance_type("a.b._x._tcp.local"), None);
+}
+
+#[test]
+fn srv_target_checks_measure_wire_labels_not_escapes() {
+    // 63 bytes on the wire (valid), 64 characters once its backslash is
+    // escaped.
+    let label = format!("{}\\\\", "h".repeat(62));
+    let mut app = App::new().unwrap();
+    ingest(
+        &mut app,
+        &raw_record(DOTTED, 33, "SRV", &format!("0 0 80 {label}.local."), 120),
+    );
+    // One label `foo.local`, not a name under `.local`.
+    ingest(
+        &mut app,
+        &raw_record(PLAIN, 33, "SRV", "0 0 81 foo\\.local.", 120),
+    );
+    let found = findings_of(&app, anomalies::AnomalyKind::SrvTarget);
+    let messages: Vec<_> = found
+        .iter()
+        .map(|a| (a.service.as_str(), a.message.as_str()))
+        .collect();
+    assert_eq!(
+        messages,
+        [("a.b._x._tcp.local", "target needs unicast DNS")],
+        "{found:?}"
+    );
+}
+
+#[test]
+fn host_views_show_names_without_escapes() {
+    assert_eq!(App::short_hostname("a\\.b.local."), "a.b");
+    let device = crate::devices::DeviceName {
+        names: vec!["a\\.b.local".to_string()],
+        inferred: false,
+    };
+    assert_eq!(device.display(), "a.b");
+}

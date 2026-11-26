@@ -668,8 +668,8 @@ pub(crate) fn is_sub_label(label: &[u8]) -> bool {
 /// offset is a char boundary, so slicing there cannot panic.
 pub(super) fn local_suffix_offset(trimmed: &str) -> Option<usize> {
     let off = trimmed.len().checked_sub(".local".len())?;
-    trimmed.as_bytes()[off..]
-        .eq_ignore_ascii_case(b".local")
+    // In presentation form `foo\.local` is one label, not under `.local`.
+    (trimmed.as_bytes()[off..].eq_ignore_ascii_case(b".local") && !escapes_next(&trimmed[..off]))
         .then_some(off)
 }
 
