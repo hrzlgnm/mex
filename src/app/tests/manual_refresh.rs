@@ -203,16 +203,17 @@ fn r_postpones_a_due_browse_query_and_keeps_the_refresh_timer() {
         },
     );
     let refresh_before = app.interest_summary("_http._tcp.local", 12);
-    let continuous_sent = app.diagnostics.q_sent_continuous;
-    let refresh_sent = app.diagnostics.q_sent_refresh;
     press(&mut app, KeyCode::Char('r'));
     assert_eq!(app.diagnostics.q_sent_manual, 1);
+    let manual_at = app.interest_summary("_http._tcp.local", 12).last_manual_at;
+    // Other streams (enumeration, SRV, ...) may fire here on a slow
+    // runner; only this question's own sends matter.
     app.send_queries();
     assert_eq!(
-        app.diagnostics.q_sent_continuous, continuous_sent,
+        last_transmitted(&app),
+        manual_at,
         "no back-to-back duplicate of the manual query"
     );
-    assert_eq!(app.diagnostics.q_sent_refresh, refresh_sent);
     let entry = &app.scheduler.continuous()[&("_http._tcp.local".to_string(), 12)];
     assert_eq!(entry.interval, Duration::from_secs(8), "backoff unchanged");
     let refresh_after = app.interest_summary("_http._tcp.local", 12);
@@ -457,10 +458,17 @@ fn r_consumes_an_overheard_question_so_the_next_send_is_not_suppressed() {
             qname: key.0.clone(),
         },
     );
-    let continuous_sent = app.diagnostics.q_sent_continuous;
+    let manual_at = app.interest_summary("_http._tcp.local", 12).last_manual_at;
     app.send_queries();
-    assert_eq!(app.diagnostics.suppressed_continuous, 0);
-    assert_eq!(app.diagnostics.q_sent_continuous, continuous_sent + 1);
+    let s = app.interest_summary("_http._tcp.local", 12);
+    assert_eq!(
+        s.last_suppressed_at, None,
+        "not suppressed by the stale question"
+    );
+    assert!(
+        s.last_transmitted_at > manual_at,
+        "the browse query went out"
+    );
 }
 
 #[test]
