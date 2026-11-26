@@ -156,8 +156,15 @@ fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             app.services().len(),
             uptime_str,
             if app.is_passive() { " │ passive" } else { "" },
-            // `r` acts only in the Questions pane (#394).
-            if app.view_state().focus == Focus::Questions {
+            // `r` acts only on a `self` question in the Questions pane
+            // (#394): hint it only there.
+            if app.view_state().focus == Focus::Questions
+                && matches!(
+                    app.selected_detail_entry(),
+                    Some(crate::app::DetailEntry::Question { source, .. })
+                        if *source == crate::app::SELF_SOURCE
+                )
+            {
                 " [r] send"
             } else {
                 ""

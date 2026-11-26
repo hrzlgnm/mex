@@ -358,13 +358,26 @@ fn manual_sends_show_in_diagnostics_and_the_state_dump() {
 }
 
 #[test]
-fn header_hints_r_only_while_questions_is_focused() {
+fn header_hints_r_only_while_a_self_question_is_selected() {
     let header = |app: &App| {
         let buf = render_to_buffer(app, 200, 40);
         rect_text(&buf, ratatui::layout::Rect::new(0, 0, 200, 3))
     };
     let mut app = app_with_self_ptr_row();
+    app.ingest_event(&query_event(
+        "_http._tcp.local.",
+        12,
+        "PTR",
+        false,
+        Vec::new(),
+        remote_source(),
+    ));
+    cursor_to_self_ptr(&mut app);
     assert!(header(&app).contains("[r] send"), "{}", header(&app));
+    // Same pane, but a foreign question: `r` would do nothing.
+    cursor_to_question(&mut app, |_, _, s| s == remote_source());
+    assert!(!header(&app).contains("[r] send"), "{}", header(&app));
+    cursor_to_self_ptr(&mut app);
     press(&mut app, KeyCode::Tab);
     assert!(!header(&app).contains("[r] send"), "{}", header(&app));
 }
