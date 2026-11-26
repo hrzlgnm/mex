@@ -1278,3 +1278,110 @@ fn single_label_srv_and_txt_owners_are_ignored() {
     assert!(app.services.is_empty());
     assert!(app.pending_instances.is_empty());
 }
+
+/// The diagnostics "pending inst / addrs" value's instance half.
+fn pending_instance_count(app: &App) -> String {
+    let rows = app.diagnostics_rows();
+    let (_, value) = rows
+        .iter()
+        .find(|(k, _)| k.contains("pending inst"))
+        .expect("pending inst row");
+    value.split(" / ").next().unwrap().trim().to_string()
+}
+
+#[test]
+fn late_ptr_lands_on_confirmed_service_without_pending_copy() {
+    let mut app = App::new().unwrap();
+    ingest(&mut app, &srv_record(120));
+    ingest(&mut app, &ptr_record(4500));
+    assert_eq!(app.services.len(), 1);
+    assert!(app.pending_instances.is_empty());
+    assert_eq!(live_ptr_rows(&app).len(), 1);
+    assert_eq!(pending_instance_count(&app), "0");
+}
+
+#[test]
+fn repeated_late_ptrs_refresh_the_service_row_only() {
+    let mut app = App::new().unwrap();
+    ingest(&mut app, &srv_record(120));
+    for _ in 0..3 {
+        ingest(&mut app, &ptr_record(4500));
+    }
+    assert!(app.pending_instances.is_empty());
+    assert_eq!(live_ptr_rows(&app).len(), 1);
+}
+
+#[test]
+fn late_ptr_after_goodbye_reactivates_without_pending_copy() {
+    let mut app = App::new().unwrap();
+    ingest(&mut app, &srv_record(120));
+    ingest(&mut app, &ptr_record(4500));
+    ingest(&mut app, &ptr_record(0));
+    assert!(!app.services[0].is_active);
+    ingest(&mut app, &ptr_record(4500));
+    assert!(app.services[0].is_active);
+    assert!(app.pending_instances.is_empty());
+}
+
+#[test]
+fn late_ptr_with_other_wire_case_matches_confirmed_service() {
+    let mut app = App::new().unwrap();
+    ingest(&mut app, &srv_record(120));
+    ingest(
+        &mut app,
+        &raw_record(
+            "_HTTP._tcp.local.",
+            12,
+            "PTR",
+            "TEST._HTTP._tcp.local.",
+            4500,
+        ),
+    );
+    assert_eq!(app.services.len(), 1);
+    assert!(app.pending_instances.is_empty());
+}
+
+#[test]
+fn late_ptr_for_dotted_instance_lands_on_confirmed_service() {
+    let mut app = App::new().unwrap();
+    let mut srv = dotted_instance_record(33, "SRV", "0 0 443 host.local.");
+    srv.flush_bit = true;
+    ingest(&mut app, &srv);
+    let mut ptr = raw_record(
+        "_test._tcp.local.",
+        12,
+        "PTR",
+        "Á.a._test._tcp.local.",
+        4500,
+    );
+    ptr.ptr_target_labels = Some(
+        ["Á.a", "_test", "_tcp", "local"]
+            .iter()
+            .map(|label| label.as_bytes().to_vec())
+            .collect(),
+    );
+    ingest(&mut app, &ptr);
+    assert_eq!(app.services.len(), 1);
+    assert!(app.pending_instances.is_empty());
+}
+
+#[test]
+fn own_question_after_late_ptr_is_filed_once_on_the_service() {
+    let mut app = App::new().unwrap();
+    ingest(&mut app, &srv_record(120));
+    ingest(&mut app, &ptr_record(4500));
+    app.route_own_question("Test._http._tcp.local.", 16, false);
+    assert_eq!(app.services[0].questions.len(), 1);
+    assert!(app.pending_instances.is_empty());
+}
+
+#[test]
+fn ptr_before_srv_still_parks_in_pending_until_promotion() {
+    let mut app = App::new().unwrap();
+    ingest(&mut app, &ptr_record(4500));
+    assert_eq!(app.pending_instances.len(), 1);
+    assert_eq!(pending_instance_count(&app), "1");
+    ingest(&mut app, &srv_record(120));
+    assert!(app.pending_instances.is_empty());
+    assert_eq!(live_ptr_rows(&app).len(), 1);
+}

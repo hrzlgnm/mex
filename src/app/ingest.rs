@@ -276,20 +276,22 @@ impl App {
         }
 
         let instance = Self::strip_suffix_ci(target, st).unwrap_or(target);
-        let pi = self.ensure_pending(instance, st);
-        self.pending_instances[pi].answers.push(rec.clone());
-        // A live PTR for an already-confirmed service must reactivate it
-        // here: after a goodbye the service is inactive, and without this
-        // forward the PTR would sit in pending until (and unless) a fresh
-        // SRV arrives, leaving a returned service stuck offline.
-        // push_record only reactivates on live PTR, so SRV/TXT answers
-        // still cannot resurrect a withdrawn service.
+        // A PTR for an already-confirmed service (SRV first, the passive
+        // order) lands on that service only, like late TXT and subtype
+        // PTRs. A pending copy here would be refreshed by every later PTR
+        // and only absorbed by the next SRV. It must still reactivate the
+        // service: after a goodbye the service is inactive, and push_record
+        // reactivates on a live PTR (SRV/TXT answers still cannot resurrect
+        // a withdrawn service).
         if let Some(idx) = self.services.iter().position(|s| {
             s.instance.eq_ignore_ascii_case(instance) && s.service_type.eq_ignore_ascii_case(st)
         }) {
             self.services[idx].last_event = Some(ev.clone());
             self.push_record(idx, rec);
+            return;
         }
+        let pi = self.ensure_pending(instance, st);
+        self.pending_instances[pi].answers.push(rec.clone());
     }
 
     /// Split an SRV/TXT owner into (instance, service type). The wire
