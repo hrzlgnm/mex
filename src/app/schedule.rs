@@ -711,12 +711,15 @@ impl App {
             return Err(format!("{rtype_str} is never queried"));
         };
         // An NSEC-denied address type drives no query interest for this
-        // service, even while its old self row is still listed.
+        // service, even while its old self row is still listed. Host
+        // scoped like the scheduler: a denial for an old SRV target
+        // never blocks the new one.
         if let Some(DetailTarget::Service(svc)) = self.display_detail() {
-            let denied = self
+            let key = service_key(&svc.instance, &svc.service_type);
+            if self
                 .address_denials
-                .denied_types(&service_key(&svc.instance, &svc.service_type));
-            if denied.iter().any(|(t, _)| *t == rtype) {
+                .covers(&key, rtype, &name.to_ascii_lowercase())
+            {
                 return Err(format!("{name} {rtype_str} is denied by NSEC"));
             }
         }

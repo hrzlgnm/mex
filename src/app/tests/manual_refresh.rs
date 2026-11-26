@@ -479,3 +479,83 @@ fn r_on_an_nsec_denied_address_type_sends_nothing() {
         "the service drives no AAAA interest"
     );
 }
+
+#[test]
+fn a_denial_for_the_old_host_does_not_block_the_new_target() {
+    let mut app = knulp_app();
+    // RFC form: _dacp says knulp.local has only A, so no AAAA.
+    app.ingest_event(&packet(vec![
+        srv_on_knulp(DACP),
+        raw_record("knulp.local.", 47, "NSEC", "knulp.local. A", 120),
+    ]));
+    assert_eq!(
+        app.address_denials
+            .denied_types(&service_key("iTunes_Ctrl", "_dacp._tcp.local")),
+        vec![(28, Some("knulp.local".to_string()))]
+    );
+    // _dacp moves to another host, which does have an AAAA interest.
+    let mut srv = raw_record(DACP, 33, "SRV", "0 0 3689 other.local.", 120);
+    srv.flush_bit = true;
+    ingest(&mut app, &srv);
+    // The host-scoped denial outlives the retarget (TTL only).
+    assert!(!app
+        .address_denials
+        .denied_types(&service_key("iTunes_Ctrl", "_dacp._tcp.local"))
+        .is_empty());
+    app.route_own_question("other.local", 28, false);
+    select_instance(&mut app, "iTunes_Ctrl");
+    render_to_buffer(&app, 120, 40);
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Tab);
+    cursor_to_question(&mut app, |n, t, s| {
+        n == "other.local." && t == "AAAA" && s == SELF_SOURCE
+    });
+    press(&mut app, KeyCode::Char('r'));
+    assert_eq!(
+        app.diagnostics.q_sent_manual, 1,
+        "only knulp's AAAA is denied"
+    );
+    let row = self_row_line(&app, "other.local.");
+    assert!(row.contains("0s manual"), "{row}");
+}
+
+#[test]
+fn r_on_an_empty_questions_pane_sends_nothing() {
+    let mut app = App::new().unwrap();
+    ingest(&mut app, &ptr_record(120));
+    ingest(&mut app, &srv_record(120));
+    select_instance(&mut app, "Test");
+    render_to_buffer(&app, 120, 40);
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(app.view_state.focus, Focus::Questions);
+    assert!(
+        !matches!(
+            app.selected_detail_entry(),
+            Some(DetailEntry::Question { .. })
+        ),
+        "no question rows"
+    );
+    press(&mut app, KeyCode::Char('r'));
+    assert_eq!(app.diagnostics.q_sent_manual, 0);
+    assert_no_popup(&app);
+}
+
+#[test]
+fn r_leaves_a_browse_stream_that_is_already_due_later_alone() {
+    let mut app = app_with_self_ptr_row();
+    cursor_to_self_ptr(&mut app);
+    let key = ("_http._tcp.local".to_string(), 12);
+    let later = Instant::now() + Duration::from_secs(600);
+    app.scheduler.continuous_mut().insert(
+        key.clone(),
+        ContinuousQuery {
+            next_due: later,
+            interval: Duration::from_secs(8),
+            qname: key.0.clone(),
+        },
+    );
+    press(&mut app, KeyCode::Char('r'));
+    assert_eq!(app.diagnostics.q_sent_manual, 1);
+    assert_eq!(app.scheduler.continuous()[&key].next_due, later);
+}
