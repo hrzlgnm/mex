@@ -135,6 +135,11 @@ Headless run (no TTY) logs to stderr.
   sent, discovery doesn't back off, refresh attempts aren't used (records
   still expire at 100% TTL). On resume `continuous` is cleared, so
   discovery restarts with the startup schedule (jitter, startup QU).
+* Manual refresh (`r` on a `self` Questions row): one QM query now, with
+  the scheduled known answers. Not §7.3-suppressed, uses no refresh
+  attempt, moves no backoff, starts no stream (only postpones an existing
+  one); held back within 1 s of any send of that question, in passive mode
+  and while transmission is on hold.
 
 ## Workflow
 

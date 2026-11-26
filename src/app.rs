@@ -399,6 +399,9 @@ fn srv_target(rdata: &str) -> Option<&str> {
 
 /// Maximum interval between continuous queries (RFC 6762 §5.2 steady state).
 const MAX_CONTINUOUS_INTERVAL: Duration = Duration::from_secs(3600);
+/// Minimum gap between a manual query and any earlier send of the same
+/// question (#394; RFC 6762 §5.2 spacing).
+const MANUAL_REFRESH_SPACING: Duration = Duration::from_secs(1);
 /// Local address refresh is unrelated to querying; keep it on its own timer.
 const LOCAL_IPS_REFRESH: Duration = Duration::from_secs(10);
 const PENDING_ADDR_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
@@ -585,6 +588,8 @@ pub struct DiagnosticsCounters {
     pub source_rx: HashMap<std::net::SocketAddr, u64>,
     pub q_sent_continuous: u64,
     pub q_sent_refresh: u64,
+    /// Queries sent by hand (`r` on a `self` question row).
+    pub q_sent_manual: u64,
     pub qu_sent: u64,
     pub ka_sent: u64,
     pub suppressed_continuous: u64,

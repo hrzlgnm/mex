@@ -245,6 +245,21 @@ impl Scheduler {
         }
     }
 
+    /// Postpone an existing exponential stream after a manual query
+    /// (#394), like a refresh does, but never start one: a manual query
+    /// creates no schedule.
+    pub(super) fn postpone_continuous_for_manual(&mut self, key: &(String, u16), now: Instant) {
+        if let Some(entry) = self
+            .continuous
+            .get_mut(&Self::continuous_key(&key.0, key.1))
+        {
+            let floor = now + entry.interval.max(Duration::from_secs(1));
+            if entry.next_due < floor {
+                entry.next_due = floor;
+            }
+        }
+    }
+
     /// Record our own transmit or suppression for an interest, with the
     /// links a transmit went out on.
     pub(super) fn note_query(
@@ -633,6 +648,77 @@ impl App {
         // duplicates (RFC 6762 §5.2 spacing).
         self.scheduler.postpone_continuous_for_refresh(key, now);
         true
+    }
+
+    /// Send the `self` question under the Questions cursor once, now
+    /// (#394), and say what happened for the status line. A one-off
+    /// nudge: it uses no refresh attempt and moves no backoff.
+    pub(super) fn manual_refresh_selected(&mut self) -> String {
+        if self.passive {
+            return "Refresh: passive mode sends no queries".to_string();
+        }
+        // Like the schedules' hold: nothing queued, nothing counted.
+        if !self.query_tx.transmit().any() {
+            return "Refresh: queries on hold (no link can transmit)".to_string();
+        }
+        let Some(DetailEntry::Question {
+            name,
+            rtype_str,
+            source,
+            ..
+        }) = self.selected_detail_entry()
+        else {
+            return "Refresh: select a question row".to_string();
+        };
+        if *source != SELF_SOURCE {
+            return "Refresh: only self questions can be sent".to_string();
+        }
+        let name = name.trim_end_matches('.').to_string();
+        let rtype_str = rtype_str.to_string();
+        let Some(rtype) = browse::rtype_from_str(&rtype_str) else {
+            return format!("Refresh: {rtype_str} is never queried");
+        };
+        let Some(rt) = browse::record_type_from_u16(rtype) else {
+            return format!("Refresh: {rtype_str} is never queried");
+        };
+        let now = Instant::now();
+        // RFC 6762 §5.2 spacing: never the same question twice within a
+        // second, so key repeat cannot flood the link and a press cannot
+        // land on top of a scheduled send.
+        let last = self
+            .scheduler
+            .history(&Scheduler::provenance_key(&name, rtype))
+            .and_then(|h| h.transmitted);
+        if last.is_some_and(|t| now.saturating_duration_since(t) < MANUAL_REFRESH_SPACING) {
+            return format!("Refresh: {name} {rtype_str} was sent less than 1s ago");
+        }
+        let ka = if rt == TYPE::PTR {
+            if is_enum_name(&name) {
+                self.known_enum_answers()
+            } else {
+                self.known_ptrs(&name.to_ascii_lowercase())
+            }
+        } else {
+            Vec::new()
+        };
+        let ka_count = ka.len() as u64;
+        if !self.query_tx.send(browse::QueryRequest {
+            name: name.clone(),
+            record_type: rt,
+            known_answers: ka,
+            qu: false,
+        }) {
+            log::warn!("mex: dropped manual query for {name} (listener channels closed)");
+            return format!("Refresh failed: {name} {rtype_str} (listener closed)");
+        }
+        log::debug!("mex: sending manual query for {name} {rtype_str}");
+        self.diagnostics.q_sent_manual += 1;
+        self.diagnostics.ka_sent += ka_count;
+        self.note_query(&name, rtype, QueryOrigin::Transmitted, now);
+        self.route_own_question(&name, rtype, false);
+        self.scheduler
+            .postpone_continuous_for_manual(&(name.clone(), rtype), now);
+        format!("Refresh sent: {name} {rtype_str}")
     }
 
     /// Record a query event for an interest: we transmitted it or §7.3

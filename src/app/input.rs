@@ -645,6 +645,11 @@ impl App {
                 KeyCode::End => self.move_detail_edge(false),
                 KeyCode::PageUp | KeyCode::Char('b') => self.page_detail(-1),
                 KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => self.page_detail(1),
+                // Ask the selected `self` question now (#394).
+                KeyCode::Char('r') => {
+                    let msg = self.manual_refresh_selected();
+                    self.status_msg = Some((msg, Instant::now()));
+                }
                 _ => {}
             },
             // The hex pane has no cursor; its keys scroll the dump, which

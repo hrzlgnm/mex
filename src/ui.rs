@@ -151,11 +151,17 @@ fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 .fg(Color::Cyan),
         ),
         Span::raw(format!(
-            "│ {} pkts │ {} svcs │ uptime {}{}  [q] quit [tab] pane [j/k] move [enter] fold [*] all [d] diagnostics",
+            "│ {} pkts │ {} svcs │ uptime {}{}  [q] quit [tab] pane [j/k] move [enter] fold [*] all [d] diagnostics{}",
             app.packet_count(),
             app.services().len(),
             uptime_str,
             if app.is_passive() { " │ passive" } else { "" },
+            // `r` acts only in the Questions pane (#394).
+            if app.view_state().focus == Focus::Questions {
+                " [r] send"
+            } else {
+                ""
+            },
         )),
     ]);
 
