@@ -60,12 +60,20 @@ pub(super) fn draw_questions_tab(
                     // Our own send or §7.3 suppression: never "observed".
                     // Compare the original instants (not rounded ages) so
                     // the newer event wins even within the same second.
+                    // A transmit stamped by a manual send (#394) reads
+                    // `manual` until a later scheduled send replaces it.
+                    let transmit_origin = if s.last_manual_at.is_some()
+                        && s.last_manual_at == s.last_transmitted_at
+                    {
+                        crate::app::QueryOrigin::Manual
+                    } else {
+                        crate::app::QueryOrigin::Transmitted
+                    };
                     let selected = match (s.last_transmitted_at, s.last_suppressed_at) {
                         (Some(t), Some(u)) if u > t => {
                             Some((crate::app::QueryOrigin::Suppressed, u))
                         }
-                        (Some(t), Some(_)) => Some((crate::app::QueryOrigin::Transmitted, t)),
-                        (Some(t), None) => Some((crate::app::QueryOrigin::Transmitted, t)),
+                        (Some(t), _) => Some((transmit_origin, t)),
                         (None, Some(u)) => Some((crate::app::QueryOrigin::Suppressed, u)),
                         (None, None) => None,
                     };

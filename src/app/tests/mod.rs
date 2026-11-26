@@ -13,6 +13,7 @@ mod finding_targets;
 mod hex;
 mod ingest;
 mod input;
+mod manual_refresh;
 mod out_of_scope;
 mod per_link_copies;
 mod per_nic_answers;

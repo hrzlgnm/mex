@@ -645,6 +645,14 @@ impl App {
                 KeyCode::End => self.move_detail_edge(false),
                 KeyCode::PageUp | KeyCode::Char('b') => self.page_detail(-1),
                 KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => self.page_detail(1),
+                // Ask the selected `self` question now (#394).
+                KeyCode::Char('r')
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.manual_refresh_selected()
+                }
                 _ => {}
             },
             // The hex pane has no cursor; its keys scroll the dump, which

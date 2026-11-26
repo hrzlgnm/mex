@@ -162,6 +162,7 @@ impl App {
         diagnostics.insert("flush_seen".to_string(), diag.flush_seen);
         diagnostics.insert("q_sent_continuous".to_string(), diag.q_sent_continuous);
         diagnostics.insert("q_sent_refresh".to_string(), diag.q_sent_refresh);
+        diagnostics.insert("q_sent_manual".to_string(), diag.q_sent_manual);
         diagnostics.insert("qu_sent".to_string(), diag.qu_sent);
         diagnostics.insert("ka_sent".to_string(), diag.ka_sent);
         diagnostics.insert(

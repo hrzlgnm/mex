@@ -301,10 +301,13 @@ impl App {
 
         // Query engine.
         section(&mut rows, "Queries");
-        let sent = self.diagnostics.q_sent_continuous + self.diagnostics.q_sent_refresh;
+        // Scheduled sends only: suppression applies to due queries, never
+        // to manual ones (#394).
+        let scheduled = self.diagnostics.q_sent_continuous + self.diagnostics.q_sent_refresh;
+        let sent = scheduled + self.diagnostics.q_sent_manual;
         let supp = self.diagnostics.suppressed_continuous + self.diagnostics.suppressed_refresh;
-        let supp_pct = if sent + supp > 0 {
-            supp as f64 * 100.0 / (sent + supp) as f64
+        let supp_pct = if scheduled + supp > 0 {
+            supp as f64 * 100.0 / (scheduled + supp) as f64
         } else {
             0.0
         };
@@ -312,9 +315,10 @@ impl App {
             &mut rows,
             "sent",
             format!(
-                "{sent} ({} continuous · {} refresh · {} QU)",
+                "{sent} ({} continuous · {} refresh · {} manual · {} QU)",
                 self.diagnostics.q_sent_continuous,
                 self.diagnostics.q_sent_refresh,
+                self.diagnostics.q_sent_manual,
                 self.diagnostics.qu_sent
             ),
         );

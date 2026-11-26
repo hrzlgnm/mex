@@ -155,6 +155,7 @@ browsed as before.
 | `PageUp` / `PageDown`, `b` / `f`, `Space` | page (viewport scroll in Hex) |
 | `Enter` | fold / unfold host (Hosts) or TXT record (Answers) |
 | `+` / `-` | fold / unfold host (Hosts) |
+| `r` | send the `self` question under the cursor now (Questions; its LAST then reads `manual`; QM, at most once per second per question, never in passive mode) |
 | `*` | collapse all host groups / unfold all |
 | `Ctrl+↑/↓`, `Ctrl+k`, `Shift+↑/↓`, `J` / `K` | scroll Answers viewport freely (Hex viewport when Hex focused) |
 | `Ctrl+J` | dump mex state to JSON, `<timestamp>-mex-<version>.json` (experimental; redaction is heuristic, review before sharing) |
