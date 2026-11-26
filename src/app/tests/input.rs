@@ -1701,3 +1701,36 @@ fn enter_on_a_folded_header_in_the_answers_pane_touches_no_txt() {
     press(&mut app, KeyCode::Enter);
     assert!(app.expanded_txt.is_empty());
 }
+
+#[test]
+fn detail_cursor_follows_a_record_whose_owner_case_changed() {
+    // A newer copy in another wire case replaces the row (#402); the
+    // record cursor stays on it.
+    let mut app = App::new().unwrap();
+    service_with_txt(&mut app, "a=1; b=2");
+    // Park on the SRV: a lost anchor parks on the last row (TXT), so
+    // the cursor only stays put when the anchor still matches.
+    let idx = app
+        .display_service()
+        .unwrap()
+        .ordered_answers()
+        .iter()
+        .position(|r| r.rtype == 33)
+        .unwrap();
+    app.view_state.detail_selected = idx;
+    app.detail_anchor = app
+        .display_detail()
+        .and_then(|d| App::identity_at_detail(&d, idx));
+    let mut upper = srv_record(120);
+    upper.name = "TEST._HTTP._TCP.LOCAL.".to_string();
+    upper.owner_labels = wire_labels(&upper.name);
+    ingest(&mut app, &upper);
+    app.sync_detail_cursor();
+    match app.selected_detail_entry() {
+        Some(DetailEntry::Record(r)) => {
+            assert_eq!(r.rtype, 33, "{r:?}");
+            assert_eq!(r.name, "TEST._HTTP._TCP.LOCAL.");
+        }
+        _ => panic!("cursor on a record"),
+    }
+}
