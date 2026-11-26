@@ -279,6 +279,12 @@ impl Scheduler {
                 entry.transmitted = Some(at);
                 entry.transmitted_interfaces = interfaces;
             }
+            // A manual send is a transmit too (spacing, demand, links).
+            QueryOrigin::Manual => {
+                entry.transmitted = Some(at);
+                entry.transmitted_interfaces = interfaces;
+                entry.manual = Some(at);
+            }
             QueryOrigin::Suppressed => entry.suppressed = Some(at),
             QueryOrigin::Observed => {
                 // Observed questions carry their own packet timestamp
@@ -339,6 +345,12 @@ impl Scheduler {
             .map(|(n, _)| n.clone())
             .collect();
         self.known_types.retain(|t| live_types.contains(t));
+    }
+
+    /// Drop the overheard copy of a question our own manual query just
+    /// asked (#394): it must not stand in for a later scheduled send.
+    pub(super) fn forget_overheard(&mut self, name: &str, rtype: u16) {
+        self.overheard.remove(&Self::provenance_key(name, rtype));
     }
 }
 
@@ -402,6 +414,7 @@ impl App {
                 .is_some_and(|s| s.transmitted.is_some() || s.suppressed.is_some()),
             last_transmitted_at: view.at(QueryOrigin::Transmitted),
             last_suppressed_at: view.at(QueryOrigin::Suppressed),
+            last_manual_at: view.at(QueryOrigin::Manual),
         }
     }
 
@@ -545,6 +558,16 @@ impl App {
             pending
                 .iter()
                 .filter(|(_, rows)| rows.iter().any(|(_, _, due)| *due))
+                // A manual query (#394) under a second old already asked
+                // this: hold the refresh (attempt kept, still due) until
+                // the RFC 6762 §5.2 spacing has passed.
+                .filter(|(key, _)| {
+                    !self
+                        .scheduler
+                        .history(&Scheduler::provenance_key(&key.0, key.1))
+                        .and_then(|h| h.manual)
+                        .is_some_and(|t| now.saturating_duration_since(t) < MANUAL_REFRESH_SPACING)
+                })
                 .map(|(key, _)| key.clone())
                 .collect()
         } else {
@@ -651,15 +674,22 @@ impl App {
     }
 
     /// Send the `self` question under the Questions cursor once, now
-    /// (#394), and say what happened for the status line. A one-off
-    /// nudge: it uses no refresh attempt and moves no backoff.
-    pub(super) fn manual_refresh_selected(&mut self) -> String {
+    /// (#394). A one-off nudge: it uses no refresh attempt and moves no
+    /// backoff. No popup: a send shows as `manual` in the row's LAST;
+    /// a press that sends nothing is only logged.
+    pub(super) fn manual_refresh_selected(&mut self) {
+        if let Err(why) = self.try_manual_refresh() {
+            log::debug!("mex: manual query not sent: {why}");
+        }
+    }
+
+    fn try_manual_refresh(&mut self) -> Result<(), String> {
         if self.passive {
-            return "Refresh: passive mode sends no queries".to_string();
+            return Err("passive mode sends no queries".to_string());
         }
         // Like the schedules' hold: nothing queued, nothing counted.
         if !self.query_tx.transmit().any() {
-            return "Refresh: queries on hold (no link can transmit)".to_string();
+            return Err("queries on hold (no link can transmit)".to_string());
         }
         let Some(DetailEntry::Question {
             name,
@@ -668,19 +698,28 @@ impl App {
             ..
         }) = self.selected_detail_entry()
         else {
-            return "Refresh: select a question row".to_string();
+            return Err("no question row selected".to_string());
         };
         if *source != SELF_SOURCE {
-            return "Refresh: only self questions can be sent".to_string();
+            return Err(format!("{name} {rtype_str} is a foreign question"));
         }
         let name = name.trim_end_matches('.').to_string();
         let rtype_str = rtype_str.to_string();
-        let Some(rtype) = browse::rtype_from_str(&rtype_str) else {
-            return format!("Refresh: {rtype_str} is never queried");
+        let Some((rtype, rt)) = browse::rtype_from_str(&rtype_str)
+            .and_then(|code| browse::record_type_from_u16(code).map(|rt| (code, rt)))
+        else {
+            return Err(format!("{rtype_str} is never queried"));
         };
-        let Some(rt) = browse::record_type_from_u16(rtype) else {
-            return format!("Refresh: {rtype_str} is never queried");
-        };
+        // An NSEC-denied address type drives no query interest for this
+        // service, even while its old self row is still listed.
+        if let Some(DetailTarget::Service(svc)) = self.display_detail() {
+            let denied = self
+                .address_denials
+                .denied_types(&service_key(&svc.instance, &svc.service_type));
+            if denied.iter().any(|(t, _)| *t == rtype) {
+                return Err(format!("{name} {rtype_str} is denied by NSEC"));
+            }
+        }
         let now = Instant::now();
         // RFC 6762 §5.2 spacing: never the same question twice within a
         // second, so key repeat cannot flood the link and a press cannot
@@ -690,7 +729,7 @@ impl App {
             .history(&Scheduler::provenance_key(&name, rtype))
             .and_then(|h| h.transmitted);
         if last.is_some_and(|t| now.saturating_duration_since(t) < MANUAL_REFRESH_SPACING) {
-            return format!("Refresh: {name} {rtype_str} was sent less than 1s ago");
+            return Err(format!("{name} {rtype_str} was sent less than 1s ago"));
         }
         let ka = if rt == TYPE::PTR {
             if is_enum_name(&name) {
@@ -709,16 +748,19 @@ impl App {
             qu: false,
         }) {
             log::warn!("mex: dropped manual query for {name} (listener channels closed)");
-            return format!("Refresh failed: {name} {rtype_str} (listener closed)");
+            return Ok(());
         }
         log::debug!("mex: sending manual query for {name} {rtype_str}");
         self.diagnostics.q_sent_manual += 1;
         self.diagnostics.ka_sent += ka_count;
-        self.note_query(&name, rtype, QueryOrigin::Transmitted, now);
+        self.note_query(&name, rtype, QueryOrigin::Manual, now);
+        // Our query answers whatever an overheard identical question
+        // asked: it must not later stand in for a scheduled send (§7.3).
+        self.scheduler.forget_overheard(&name, rtype);
         self.route_own_question(&name, rtype, false);
         self.scheduler
             .postpone_continuous_for_manual(&(name.clone(), rtype), now);
-        format!("Refresh sent: {name} {rtype_str}")
+        Ok(())
     }
 
     /// Record a query event for an interest: we transmitted it or §7.3

@@ -56,11 +56,19 @@ fn backdate_transmit(app: &mut App, by: Duration) {
     state.transmitted = state.transmitted.map(|t| t - by);
 }
 
-fn status(app: &App) -> String {
-    app.status_msg
-        .as_ref()
-        .map(|(m, _)| m.clone())
-        .unwrap_or_default()
+/// `r` never pops up a status message: its feedback is the row.
+fn assert_no_popup(app: &App) {
+    assert!(app.status_msg.is_none(), "{:?}", app.status_msg);
+}
+
+/// The Questions pane line of the `self` row for `name`.
+fn self_row_line(app: &App, name: &str) -> String {
+    let buf = render_to_buffer(app, 120, 40);
+    rect_text(&buf, app.layout.questions_rect.get())
+        .lines()
+        .find(|l| l.contains(name) && l.contains("self"))
+        .unwrap_or_else(|| panic!("no self row for {name}"))
+        .to_string()
 }
 
 fn last_transmitted(app: &App) -> Option<Instant> {
@@ -79,7 +87,12 @@ fn r_on_self_row_sends_that_question_now() {
         last_transmitted(&app) > before,
         "LAST moves to the manual send"
     );
-    assert_eq!(status(&app), "Refresh sent: _http._tcp.local PTR");
+    assert_no_popup(&app);
+    let row = self_row_line(&app, "_http._tcp.local.");
+    assert!(
+        row.contains("0s manual"),
+        "LAST names the manual send: {row}"
+    );
 }
 
 #[test]
@@ -98,7 +111,7 @@ fn r_on_foreign_row_sends_nothing() {
     press(&mut app, KeyCode::Char('r'));
     assert_eq!(app.diagnostics.q_sent_manual, 0);
     assert_eq!(last_transmitted(&app), before);
-    assert_eq!(status(&app), "Refresh: only self questions can be sent");
+    assert_no_popup(&app);
 }
 
 #[test]
@@ -122,15 +135,12 @@ fn r_while_transmission_held_sends_nothing() {
     press(&mut app, KeyCode::Char('r'));
     assert_eq!(app.diagnostics.q_sent_manual, 0);
     assert_eq!(last_transmitted(&app), before);
-    assert_eq!(
-        status(&app),
-        "Refresh: queries on hold (no link can transmit)"
-    );
+    assert_no_popup(&app);
 }
 
 #[test]
 fn r_in_passive_mode_sends_nothing() {
-    // Passive mode files no self rows; any question row says why.
+    // Passive mode files no self rows; a foreign row stays inert too.
     let mut app = App::new_with(true, None).unwrap();
     ingest(&mut app, &ptr_record(120));
     ingest(&mut app, &srv_record(120));
@@ -149,7 +159,7 @@ fn r_in_passive_mode_sends_nothing() {
     cursor_to_question(&mut app, |_, _, s| s == remote_source());
     press(&mut app, KeyCode::Char('r'));
     assert_eq!(app.diagnostics.q_sent_manual, 0);
-    assert_eq!(status(&app), "Refresh: passive mode sends no queries");
+    assert_no_popup(&app);
 }
 
 #[test]
@@ -159,10 +169,7 @@ fn r_sends_at_most_once_per_second_per_question() {
     press(&mut app, KeyCode::Char('r'));
     press(&mut app, KeyCode::Char('r'));
     assert_eq!(app.diagnostics.q_sent_manual, 1, "key repeat is held back");
-    assert_eq!(
-        status(&app),
-        "Refresh: _http._tcp.local PTR was sent less than 1s ago"
-    );
+    assert_no_popup(&app);
     backdate_transmit(&mut app, Duration::from_millis(1001));
     press(&mut app, KeyCode::Char('r'));
     assert_eq!(app.diagnostics.q_sent_manual, 2);
@@ -253,7 +260,7 @@ fn r_is_not_suppressed_by_an_overheard_identical_question() {
 }
 
 #[test]
-fn r_with_the_listener_gone_reports_failure_and_counts_nothing() {
+fn r_with_the_listener_gone_counts_nothing() {
     let mut app = app_with_self_ptr_row();
     cursor_to_self_ptr(&mut app);
     let before = last_transmitted(&app);
@@ -261,10 +268,9 @@ fn r_with_the_listener_gone_reports_failure_and_counts_nothing() {
     press(&mut app, KeyCode::Char('r'));
     assert_eq!(app.diagnostics.q_sent_manual, 0);
     assert_eq!(last_transmitted(&app), before);
-    assert_eq!(
-        status(&app),
-        "Refresh failed: _http._tcp.local PTR (listener closed)"
-    );
+    assert_no_popup(&app);
+    let row = self_row_line(&app, "_http._tcp.local.");
+    assert!(!row.contains("manual"), "{row}");
 }
 
 #[test]
@@ -287,11 +293,6 @@ fn cursor_stays_on_the_row_after_r() {
         }
         _ => panic!("cursor left the self PTR row"),
     }
-    assert!(
-        status(&app).contains("less than 1s ago"),
-        "{}",
-        status(&app)
-    );
 }
 
 #[test]
@@ -329,10 +330,8 @@ fn r_on_the_enumeration_self_row_sends_the_enumeration_query() {
     let ka_before = app.diagnostics.ka_sent;
     press(&mut app, KeyCode::Char('r'));
     assert_eq!(app.diagnostics.q_sent_manual, 1);
-    assert_eq!(
-        status(&app),
-        "Refresh sent: _services._dns-sd._udp.local PTR"
-    );
+    let row = self_row_line(&app, "_services._dns-sd._udp.local.");
+    assert!(row.contains("0s manual"), "{row}");
     assert_eq!(
         app.diagnostics.ka_sent - ka_before,
         1,
@@ -348,7 +347,14 @@ fn manual_sends_show_in_diagnostics_and_the_state_dump() {
     let rows = app.diagnostics_rows();
     let sent = &rows.iter().find(|(k, _)| k == "sent").expect("sent row").1;
     assert!(sent.contains("· 1 manual ·"), "{sent}");
-    assert_eq!(app.state_dump().diagnostics["q_sent_manual"], 1);
+    let dump = app.state_dump();
+    assert_eq!(dump.diagnostics["q_sent_manual"], 1);
+    let interest = dump
+        .interests
+        .iter()
+        .find(|i| i.name == "_http._tcp.local" && i.rtype == 12)
+        .expect("PTR interest dumped");
+    assert_eq!(interest.last_origin.as_deref(), Some("manual"));
 }
 
 #[test]
@@ -361,4 +367,102 @@ fn header_hints_r_only_while_questions_is_focused() {
     assert!(header(&app).contains("[r] send"), "{}", header(&app));
     press(&mut app, KeyCode::Tab);
     assert!(!header(&app).contains("[r] send"), "{}", header(&app));
+}
+
+#[test]
+fn a_later_scheduled_send_shows_transmitted_again() {
+    let mut app = app_with_self_ptr_row();
+    cursor_to_self_ptr(&mut app);
+    press(&mut app, KeyCode::Char('r'));
+    let later = Instant::now() + Duration::from_millis(5);
+    app.note_query("_http._tcp.local", 12, QueryOrigin::Transmitted, later);
+    let row = self_row_line(&app, "_http._tcp.local.");
+    assert!(row.contains("transmitted"), "{row}");
+    assert!(!row.contains("manual"), "{row}");
+}
+
+#[test]
+fn ctrl_r_and_alt_r_send_nothing() {
+    use crossterm::event::KeyModifiers;
+    let mut app = app_with_self_ptr_row();
+    cursor_to_self_ptr(&mut app);
+    press_with(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+    press_with(&mut app, KeyCode::Char('r'), KeyModifiers::ALT);
+    assert_eq!(app.diagnostics.q_sent_manual, 0);
+}
+
+#[test]
+fn a_due_refresh_waits_out_the_spacing_after_r() {
+    let mut app = app_with_self_ptr_row();
+    cursor_to_self_ptr(&mut app);
+    // The PTR row's next refresh attempt is due right now.
+    for state in app.scheduler.refresh_rows_mut().values_mut() {
+        state.next_due = Instant::now() - Duration::from_millis(1);
+    }
+    let refresh_sent = app.diagnostics.q_sent_refresh;
+    press(&mut app, KeyCode::Char('r'));
+    assert_eq!(app.diagnostics.q_sent_manual, 1);
+    app.send_queries();
+    assert_eq!(
+        app.diagnostics.q_sent_refresh, refresh_sent,
+        "no refresh right on top of the manual query"
+    );
+    // Once the second has passed, the refresh goes out and keeps its
+    // attempt.
+    let state = app
+        .scheduler
+        .query_history_mut()
+        .get_mut(&("_http._tcp.local".to_string(), 12))
+        .unwrap();
+    state.transmitted = state.transmitted.map(|t| t - Duration::from_millis(1100));
+    state.manual = state.manual.map(|t| t - Duration::from_millis(1100));
+    app.send_queries();
+    assert_eq!(app.diagnostics.q_sent_refresh, refresh_sent + 1);
+}
+
+#[test]
+fn r_consumes_an_overheard_question_so_the_next_send_is_not_suppressed() {
+    let mut app = app_with_self_ptr_row();
+    app.ingest_event(&query_event(
+        "_http._tcp.local.",
+        12,
+        "PTR",
+        false,
+        Vec::new(),
+        remote_source(),
+    ));
+    cursor_to_self_ptr(&mut app);
+    press(&mut app, KeyCode::Char('r'));
+    // The discovery stream comes due while the overheard question is
+    // still inside its window.
+    let key = ("_http._tcp.local".to_string(), 12);
+    app.scheduler.continuous_mut().insert(
+        key.clone(),
+        ContinuousQuery {
+            next_due: Instant::now() - Duration::from_millis(1),
+            interval: Duration::from_secs(8),
+            qname: key.0.clone(),
+        },
+    );
+    let continuous_sent = app.diagnostics.q_sent_continuous;
+    app.send_queries();
+    assert_eq!(app.diagnostics.suppressed_continuous, 0);
+    assert_eq!(app.diagnostics.q_sent_continuous, continuous_sent + 1);
+}
+
+#[test]
+fn r_on_an_nsec_denied_address_type_sends_nothing() {
+    let mut app = knulp_app();
+    app.route_own_question("knulp.local", 28, false);
+    ingest(&mut app, &legacy_aaaa_denial());
+    select_instance(&mut app, "iTunes_Ctrl");
+    render_to_buffer(&app, 120, 40);
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Tab);
+    cursor_to_question(&mut app, |_, t, s| t == "AAAA" && s == SELF_SOURCE);
+    press(&mut app, KeyCode::Char('r'));
+    assert_eq!(
+        app.diagnostics.q_sent_manual, 0,
+        "the service drives no AAAA interest"
+    );
 }

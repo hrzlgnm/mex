@@ -141,10 +141,12 @@ struct PendingService {
 type QuestionRow = (String, String, std::net::SocketAddr, Instant, Vec<u8>);
 
 /// What the latest query activity for an interest was: we transmitted
-/// it, §7.3 suppression stood in for it, or a remote querier asked it.
+/// it on schedule, the user sent it by hand (`r`, #394), §7.3
+/// suppression stood in for it, or a remote querier asked it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum QueryOrigin {
     Transmitted,
+    Manual,
     Suppressed,
     Observed,
 }
@@ -153,6 +155,7 @@ impl QueryOrigin {
     pub fn as_str(self) -> &'static str {
         match self {
             QueryOrigin::Transmitted => "transmitted",
+            QueryOrigin::Manual => "manual",
             QueryOrigin::Suppressed => "suppressed",
             QueryOrigin::Observed => "observed",
         }
@@ -231,6 +234,7 @@ impl InterestView {
         let s = self.state.as_ref()?;
         match origin {
             QueryOrigin::Transmitted => s.transmitted,
+            QueryOrigin::Manual => s.manual,
             QueryOrigin::Suppressed => s.suppressed,
             QueryOrigin::Observed => s.observed.as_ref().map(|o| o.at),
         }
@@ -259,6 +263,10 @@ pub struct InterestSummary {
     pub last_transmitted_at: Option<Instant>,
     /// Instant of our last §7.3-suppressed query for this interest, if any.
     pub last_suppressed_at: Option<Instant>,
+    /// Instant of our last manual (`r`) query, if any. A manual send is
+    /// also a transmit: when it equals `last_transmitted_at`, the
+    /// latest transmit was the manual one.
+    pub last_manual_at: Option<Instant>,
 }
 
 /// Per-interest query provenance: when we last transmitted, last stood
@@ -270,8 +278,11 @@ pub struct InterestSummary {
 /// else's question.
 #[derive(Clone, Debug, Default)]
 struct InterestQueryState {
+    /// Latest transmit, scheduled or manual.
     transmitted: Option<Instant>,
     transmitted_interfaces: String,
+    /// Latest manual transmit (#394); also stamped into `transmitted`.
+    manual: Option<Instant>,
     suppressed: Option<Instant>,
     observed: Option<ObservedQuery>,
 }
@@ -281,6 +292,9 @@ impl InterestQueryState {
     fn last(&self) -> Option<(QueryOrigin, Instant)> {
         [
             (QueryOrigin::Transmitted, self.transmitted),
+            // After Transmitted: on the tie a manual send leaves (both
+            // stamped), `max_by_key` keeps the later entry, Manual.
+            (QueryOrigin::Manual, self.manual),
             (QueryOrigin::Suppressed, self.suppressed),
             (QueryOrigin::Observed, self.observed.as_ref().map(|o| o.at)),
         ]

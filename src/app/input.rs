@@ -646,9 +646,12 @@ impl App {
                 KeyCode::PageUp | KeyCode::Char('b') => self.page_detail(-1),
                 KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char(' ') => self.page_detail(1),
                 // Ask the selected `self` question now (#394).
-                KeyCode::Char('r') => {
-                    let msg = self.manual_refresh_selected();
-                    self.status_msg = Some((msg, Instant::now()));
+                KeyCode::Char('r')
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.manual_refresh_selected()
                 }
                 _ => {}
             },
