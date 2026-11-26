@@ -389,7 +389,7 @@ fn a_later_scheduled_send_shows_transmitted_again() {
     cursor_to_self_ptr(&mut app);
     press(&mut app, KeyCode::Char('r'));
     let later = Instant::now() + Duration::from_millis(5);
-    app.note_query("_http._tcp.local", 12, QueryOrigin::Transmitted, later);
+    app.note_query("_http._tcp.local", 12, OwnQuery::Transmitted, later);
     let row = self_row_line(&app, "_http._tcp.local.");
     assert!(row.contains("transmitted"), "{row}");
     assert!(!row.contains("manual"), "{row}");

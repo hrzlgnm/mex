@@ -559,7 +559,7 @@ fn query_provenance_prunes_dead_interests() {
     app.note_query(
         "_http._tcp.local",
         12,
-        QueryOrigin::Transmitted,
+        OwnQuery::Transmitted,
         Instant::now(),
     );
     // Stale provenance with no live schedule is dropped.
@@ -937,7 +937,7 @@ fn query_interfaces_survive_link_changes_and_exclude_inactive_selection() {
     );
     app.link_stats.v4 = vec![("br0".into(), "192.168.1.2".parse().unwrap())];
     app.link_stats.v6.clear();
-    app.note_query("test.local", 1, QueryOrigin::Transmitted, Instant::now());
+    app.note_query("test.local", 1, OwnQuery::Transmitted, Instant::now());
     app.link_stats.v4.clear();
     app.interfaces = None;
     assert_eq!(

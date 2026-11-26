@@ -162,6 +162,17 @@ impl QueryOrigin {
     }
 }
 
+/// One of our own query events, as `note_query` records it: a scheduled
+/// transmit, a manual (`r`) transmit, or a §7.3 suppression. Observed
+/// remote questions are not ours and go through `note_observed`, so
+/// they cannot be passed here (#396).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum OwnQuery {
+    Transmitted,
+    Manual,
+    Suppressed,
+}
+
 /// Which schedule owns an interest's next query: the TTL refresh
 /// stream, the continuous browse stream, or neither (terminal). Read
 /// from the live `requeries`/`continuous` maps, never stored.
