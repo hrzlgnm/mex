@@ -62,6 +62,10 @@ Headless run (no TTY) logs to stderr.
   paths. Tests live in `src/browse/tests/`, one file per child module
   plus `transmit`.
 * `src/app.rs` — browser state, query scheduling, ingest/expire, selection.
+  Messages with a non-zero OPCODE (RFC 6762 §18.3, `Event::is_ignored`)
+  and responses with a non-zero RCODE (§18.11) stop at ingest but stay in
+  the packet log; non-zero-OPCODE ones are also dropped before the
+  analyzer and counted in diagnostics.
   Out-of-scope records, known answers and questions go to `sightings`
   (never rows, never query drivers; capped, expired by TTL/time), with
   owners resolved at analysis time: instance names to their service,

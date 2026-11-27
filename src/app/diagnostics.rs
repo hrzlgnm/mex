@@ -420,6 +420,7 @@ impl App {
         );
         kv(&mut rows, "refused off-link", self.offlink_row());
         kv(&mut rows, "malformed packets", self.malformed_row());
+        kv(&mut rows, "ignored opcode", self.opcode_ignored_row());
         let mut iface_rows: Vec<(&String, &u64)> = self.diagnostics.iface_rx.iter().collect();
         iface_rows.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
         for (iface, count) in iface_rows.iter().take(8) {
@@ -602,6 +603,19 @@ impl App {
     pub(super) fn malformed_row(&self) -> String {
         let total = self.drop_stats.malformed_total();
         match self.drop_stats.malformed_last() {
+            Some((src, at)) => format!(
+                "{total} total · last {src} {} ago",
+                fmt_age(at.elapsed().as_secs())
+            ),
+            None => format!("{total} total"),
+        }
+    }
+
+    /// Messages with a non-zero OPCODE, silently ignored (RFC 6762 §18.3)
+    /// but counted, so a device sending them stays identifiable.
+    pub(super) fn opcode_ignored_row(&self) -> String {
+        let total = self.diagnostics.opcode_ignored;
+        match self.diagnostics.opcode_ignored_last {
             Some((src, at)) => format!(
                 "{total} total · last {src} {} ago",
                 fmt_age(at.elapsed().as_secs())

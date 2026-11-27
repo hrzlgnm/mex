@@ -907,3 +907,35 @@ fn a_probe_answer_still_counts_as_the_last_multicast() {
         flood[0].message
     );
 }
+
+/// `events` re-stamped with a header whose OPCODE is `opcode`, QR set
+/// for responses.
+fn with_opcode(events: Vec<Event>, opcode: u8) -> Vec<Event> {
+    events
+        .into_iter()
+        .map(|mut ev| {
+            let qr = if ev.questions.is_empty() { 0x84 } else { 0 };
+            ev.raw_bytes = vec![0, 0, qr | (opcode << 3), 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            ev
+        })
+        .collect()
+}
+
+/// RFC 6762 §18.3 (#427): a message with a non-zero OPCODE is ignored,
+/// so neither a question nor a record flood counts it.
+#[test]
+fn nonzero_opcode_floods_are_ignored() {
+    let q = question(NAME, 33, "SRV", querier(), "");
+    let askings = askings(querier(), "", &[0, 250, 500, 750, 1000]);
+    let found = analyze_questions(vec![row(SERVICE, &q)], &with_opcode(askings.clone(), 5));
+    assert!(rate_findings(&found).is_empty(), "{found:#?}");
+    let found = analyze_questions(vec![row(SERVICE, &q)], &with_opcode(askings, 0));
+    assert_eq!(rate_findings(&found).len(), 1, "{found:#?}");
+
+    let a = host_a(responder(), "");
+    let copies = sends(base(), &a, &[0, 250, 500, 750, 1000]);
+    let found = analyze_answers(&[cached(&a)], &with_opcode(copies.clone(), 5));
+    assert!(multicast_findings(&found).is_empty(), "{found:#?}");
+    let found = analyze_answers(&[cached(&a)], &with_opcode(copies, 0));
+    assert_eq!(multicast_findings(&found).len(), 1, "{found:#?}");
+}

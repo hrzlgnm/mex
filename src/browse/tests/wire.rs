@@ -1251,3 +1251,28 @@ fn a_query_s_additional_records_are_kept_apart_not_filed() {
         ]
     );
 }
+
+#[test]
+fn a_message_s_opcode_is_exposed_on_the_event() {
+    // RFC 6762 §18.3 (#427): a non-zero OPCODE marks the message ignored,
+    // query and response alike; OPCODE 0 never does.
+    let parse = |flags: u16| {
+        let mut raw = Vec::new();
+        for field in [0u16, flags, 1, 0, 0, 0] {
+            raw.extend_from_slice(&field.to_be_bytes());
+        }
+        raw.extend_from_slice(b"\x03svc\x05local\x00");
+        raw.extend_from_slice(&[0, 12, 0, 1]);
+        parse_packet(&raw, test_source(), std::net::IpAddr::V4(MDNS_V4), "enx", 2)
+            .expect("packet parses")
+    };
+    for (flags, opcode) in [(0x0000, 0), (0x2800, 5), (0x2000, 4), (0x7800, 15)] {
+        for qr in [0, 0x8000] {
+            let ev = parse(flags | qr);
+            assert_eq!(ev.opcode(), opcode, "flags {:#06x}", flags | qr);
+            assert_eq!(ev.is_ignored(), opcode != 0);
+        }
+    }
+    // AA and RD next to it don't leak into the OPCODE.
+    assert_eq!(parse(0x8500).opcode(), 0);
+}

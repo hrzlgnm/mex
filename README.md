@@ -279,6 +279,15 @@ remaining one) gets no TTL checks. EDNS0 OPT pseudo-records are not records and
 are ignored. At most 256 sightings are kept; the diagnostics overlay counts
 evictions.
 
+A message with a non-zero OPCODE (a DNS UPDATE or NOTIFY sent to the mDNS
+group) has no mDNS meaning and is silently ignored ([RFC 6762
+§18.3](https://www.rfc-editor.org/rfc/rfc6762#section-18.3), MUST): it
+stays in the packet log for the hex pane, but files no rows, sightings or
+questions, moves no query scheduling and counts in no finding. The
+diagnostics overlay and state dumps count such messages (`ignored opcode`,
+`opcode_ignored_packets`). A response with a non-zero RCODE is likewise
+kept off the panes ([§18.11](https://www.rfc-editor.org/rfc/rfc6762#section-18.11)).
+
 Reverse-mapping PTRs (`*.in-addr.arpa`, `*.ip6.arpa`) are exempt from
 the shared-record rules: they are unique records. Omitting the flush
 bit on A/AAAA records and publishing TXT records at 120 s are

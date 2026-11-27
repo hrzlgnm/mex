@@ -17,6 +17,18 @@ impl App {
             );
             return;
         }
+        // RFC 6762 §18.3: likewise for a non-zero OPCODE, query or
+        // response; counted so the overlay shows something sends them.
+        if ev.is_ignored() {
+            log::debug!(
+                "mex: ignoring message from {} with OPCODE {}",
+                ev.source,
+                ev.opcode()
+            );
+            self.diagnostics.opcode_ignored += 1;
+            self.diagnostics.opcode_ignored_last = Some((ev.source, Instant::now()));
+            return;
+        }
         log::trace!(
             "mex: ingesting packet from {} ({} answer(s), {} question(s))",
             ev.source,

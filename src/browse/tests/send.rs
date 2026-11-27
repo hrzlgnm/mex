@@ -691,3 +691,19 @@ fn own_queries_keep_the_aa_bit_clear() {
     let inferred = inferred_question_packet("_http._tcp.local", 12, false).unwrap();
     assert_eq!(inferred[2] & 0x04, 0);
 }
+
+#[test]
+fn own_queries_keep_opcode_zero() {
+    // RFC 6762 §18.3: mex must never send what it ignores (#427).
+    let mut req = ptr_query();
+    assert_eq!(roundtrip_query(&req).opcode(), 0);
+    req.qu = true;
+    req.known_answers = vec![KnownAnswer {
+        target: "Inst._http._tcp.local.".into(),
+        ttl: 4500,
+        iface: String::new(),
+    }];
+    assert_eq!(roundtrip_query(&req).opcode(), 0);
+    let inferred = inferred_question_packet("_http._tcp.local", 12, false).unwrap();
+    assert_eq!(inferred[2] & 0x78, 0);
+}

@@ -275,6 +275,20 @@ impl Event {
             .get(2)
             .is_some_and(|flags| flags & 0x80 == 0 && flags & 0x04 != 0)
     }
+
+    /// The header's OPCODE (bits 3–6 of the flags byte); 0 is a standard
+    /// query or response.
+    pub fn opcode(&self) -> u8 {
+        self.raw_bytes.get(2).map_or(0, |flags| (flags >> 3) & 0x0f)
+    }
+
+    /// Whether mDNS gives this message no meaning: RFC 6762 §18.3 says a
+    /// message with a non-zero OPCODE MUST be silently ignored, query and
+    /// response alike. It stays in the packet log, but never reaches
+    /// state, scheduling or the analyzer (#427).
+    pub fn is_ignored(&self) -> bool {
+        self.opcode() != 0
+    }
 }
 
 #[derive(Debug, Clone)]
