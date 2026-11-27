@@ -48,17 +48,25 @@ pub(super) fn repeats(mut times: Vec<Instant>) -> Option<Repeats> {
 }
 
 /// Seconds with at most two decimals, trailing zeros dropped: `1`, `0.25`.
+/// Truncated, never rounded up: a 999 ms gap reads `0.99`, not `1`,
+/// which would look like it kept the one-second floor.
 pub(super) fn fmt_secs(d: Duration) -> String {
-    let s = format!("{:.2}", d.as_secs_f64());
+    let centis = d.as_millis() / 10;
+    let s = format!("{}.{:02}", centis / 100, centis % 100);
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
-/// Identity of one asking: the name folded ASCII-only (RFC 6762 §16),
-/// the type, and the querier as findings name it (address plus link).
-type AskingKey = (String, u16, String);
+/// Identity of one question as a Questions row knows it: the name folded
+/// ASCII-only (RFC 6762 §16), the type, and the querier address. Rows
+/// carry no ingress link, so links are told apart below it.
+type AskingKey = (String, u16, SocketAddr);
 
-fn asking_key(name: &str, rtype: u16, source_label: String) -> AskingKey {
-    (name.to_ascii_lowercase(), rtype, source_label)
+/// An ingress link: interface name and index, so two unnamed links stay
+/// two.
+type Link = (String, u32);
+
+fn asking_key(name: &str, rtype: u16, source: SocketAddr) -> AskingKey {
+    (name.to_ascii_lowercase(), rtype, source)
 }
 
 /// A continuous querier, the only kind RFC 6762 §5.2 binds: it asks
@@ -84,7 +92,9 @@ pub(super) fn check_query_rate(
     if questions.is_empty() {
         return;
     }
-    let mut times: HashMap<AskingKey, Vec<Instant>> = HashMap::new();
+    // Each question's askings, per link: one querier asking once on each
+    // of two links is not a repeat.
+    let mut times: HashMap<AskingKey, HashMap<Link, Vec<Instant>>> = HashMap::new();
     for ev in events.iter().filter(|ev| !ev.is_probe()) {
         let mut in_packet = HashSet::new();
         for q in ev
@@ -92,9 +102,15 @@ pub(super) fn check_query_rate(
             .iter()
             .filter(|q| is_continuous_querier(&q.source))
         {
-            let key = asking_key(&q.name, q.rtype, q.source_label());
-            if in_packet.insert(key.clone()) {
-                times.entry(key).or_default().push(ev.received_at);
+            let key = asking_key(&q.name, q.rtype, q.source);
+            let link = (q.iface.clone(), q.ifindex);
+            if in_packet.insert((key.clone(), link.clone())) {
+                times
+                    .entry(key)
+                    .or_default()
+                    .entry(link)
+                    .or_default()
+                    .push(ev.received_at);
             }
         }
     }
@@ -103,10 +119,17 @@ pub(super) fn check_query_rate(
         .iter()
         .filter(|q| is_continuous_querier(&q.source))
     {
-        let key = asking_key(q.name, q.rtype, q.source_label.clone());
-        let verdict = verdicts
-            .entry(key.clone())
-            .or_insert_with(|| times.get(&key).and_then(|t| repeats(t.clone())));
+        let key = asking_key(q.name, q.rtype, q.source);
+        // The row stands for every link the querier asked on: its worst
+        // link (the shortest gap) decides.
+        let verdict = verdicts.entry(key.clone()).or_insert_with(|| {
+            times.get(&key).and_then(|links| {
+                links
+                    .values()
+                    .filter_map(|t| repeats(t.clone()))
+                    .min_by_key(|r| r.min_gap)
+            })
+        });
         let Some(rep) = verdict else {
             continue;
         };

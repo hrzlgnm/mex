@@ -69,7 +69,8 @@ fn askings(source: SocketAddr, iface: &str, offsets: &[u64]) -> Vec<Event> {
         .collect()
 }
 
-/// The snapshot's Questions row for `q` under `service`.
+/// The snapshot's Questions row for `q` under `service`, as the app
+/// builds it: rows carry no ingress link, so the label is the address.
 fn row<'a>(service: &str, q: &'a RawRecord) -> QuestionView<'a> {
     QuestionView {
         service: service.to_string(),
@@ -77,7 +78,7 @@ fn row<'a>(service: &str, q: &'a RawRecord) -> QuestionView<'a> {
         rtype: q.rtype,
         rtype_str: &q.rtype_str,
         source: q.source,
-        source_label: q.source_label(),
+        source_label: q.source.to_string(),
     }
 }
 
@@ -149,12 +150,59 @@ fn different_queriers_asking_close_together_stay_quiet() {
 
 #[test]
 fn one_querier_on_two_links_stays_quiet() {
-    let on_eth = question(NAME, 33, "SRV", querier(), "eth0");
-    let on_wlan = question(NAME, 33, "SRV", querier(), "wlan0");
+    // One Questions row (rows carry no link), asked once on each link.
+    let q = question(NAME, 33, "SRV", querier(), "eth0");
     let mut events = askings(querier(), "eth0", &[0]);
     events.extend(askings(querier(), "wlan0", &[250]));
-    let found = analyze_questions(vec![row(SERVICE, &on_eth), row(SERVICE, &on_wlan)], &events);
+    let found = analyze_questions(vec![row(SERVICE, &q)], &events);
     assert!(rate_findings(&found).is_empty(), "{found:#?}");
+    // Two unnamed links stay apart too, by interface index.
+    let mut first = askings(querier(), "", &[0]);
+    let mut second = askings(querier(), "", &[250]);
+    first[0].questions[0].ifindex = 3;
+    second[0].questions[0].ifindex = 4;
+    first.extend(second);
+    let found = analyze_questions(vec![row(SERVICE, &q)], &first);
+    assert!(rate_findings(&found).is_empty(), "{found:#?}");
+}
+
+#[test]
+fn querier_repeating_on_a_named_link_is_flagged_on_its_row() {
+    // Packets know their link; the Questions row doesn't. The repeats on
+    // eth0 still land on the querier's row.
+    let q = question(NAME, 33, "SRV", querier(), "eth0");
+    let events = askings(querier(), "eth0", &[0, 300]);
+    let found = analyze_questions(vec![row(SERVICE, &q)], &events);
+    let rate = rate_findings(&found);
+    assert_eq!(rate.len(), 1, "{found:#?}");
+    assert_eq!(rate[0].source.as_deref(), Some("192.168.1.70:5353"));
+}
+
+#[test]
+fn a_gap_just_under_a_second_never_reads_as_one() {
+    let q = question(NAME, 33, "SRV", querier(), "");
+    let events = askings(querier(), "", &[0, 999]);
+    let found = analyze_questions(vec![row(SERVICE, &q)], &events);
+    let rate = rate_findings(&found);
+    assert_eq!(rate.len(), 1, "{found:#?}");
+    assert!(
+        rate[0].message.contains("as little as 0.99 s apart"),
+        "{}",
+        rate[0].message
+    );
+}
+
+#[test]
+fn an_opt_only_authority_section_is_no_probe() {
+    // OPT belongs in the additional section; a query carrying only an
+    // OPT in its authority section proposes nothing, so it isn't a probe.
+    let q = question(NAME, 33, "SRV", querier(), "");
+    let mut events = askings(querier(), "", &[0, 250]);
+    for ev in &mut events {
+        ev.query_authority = vec![rec("", 41, "OPT", "", 0, false)];
+    }
+    let found = analyze_questions(vec![row(SERVICE, &q)], &events);
+    assert_eq!(rate_findings(&found).len(), 1, "{found:#?}");
 }
 
 #[test]

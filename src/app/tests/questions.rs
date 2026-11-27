@@ -377,17 +377,19 @@ fn querier_repeating_a_question_gets_a_rate_finding_on_its_row() {
     service_with_txt(&mut app, "a=1; b=2");
     let chatty: SocketAddr = "192.168.1.70:5353".parse().unwrap();
     for _ in 0..4 {
-        ingest_packet(
-            &mut app,
-            query_event(
-                "Test._http._tcp.local.",
-                33,
-                "SRV",
-                false,
-                Vec::new(),
-                chatty,
-            ),
+        let mut ev = query_event(
+            "Test._http._tcp.local.",
+            33,
+            "SRV",
+            false,
+            Vec::new(),
+            chatty,
         );
+        // On a named link, as live traffic is: the Questions row itself
+        // keeps no link, and must still get the finding.
+        ev.questions[0].iface = "eth0".to_string();
+        ev.questions[0].ifindex = 2;
+        ingest_packet(&mut app, ev);
     }
     let found = app.anomalies();
     let target = app.display_detail().unwrap();

@@ -247,9 +247,13 @@ pub struct Event {
 impl Event {
     /// Whether this is a probe query (RFC 6762 §8.1): it carries the
     /// records it proposes in the authority section. A question alone,
-    /// even ANY, doesn't make a probe here.
+    /// even ANY, doesn't make a probe here, and neither does a stray OPT
+    /// pseudo-record (its place is the additional section): it proposes
+    /// nothing.
     pub fn is_probe(&self) -> bool {
-        !self.query_authority.is_empty()
+        self.query_authority
+            .iter()
+            .any(|r| r.rtype != wire::OPT_TYPE)
     }
 }
 
