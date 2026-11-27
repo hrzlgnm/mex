@@ -124,6 +124,7 @@ fn packet_diagnostics_counts_goodbyes_and_qu() {
             section: browse::RecordSection::Question,
             received_at: Instant::now(),
             trigger: None,
+            rdata_digest: None,
         }],
         query_kas: vec![ptr_record(120)],
         query_authority: Vec::new(),

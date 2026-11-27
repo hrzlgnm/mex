@@ -3,7 +3,7 @@
 
 //! Rate checks over the retained packets: one source sending the same
 //! thing on one link again within a second (questions: RFC 6762 §5.2,
-//! #408).
+//! #408; records: §6, #407).
 
 use super::*;
 use crate::browse::Event;
@@ -37,12 +37,23 @@ impl Repeats {
 /// The repeats of one identity, given each packet's receive time (one
 /// per packet: copies inside a packet are one send), or `None` while
 /// every gap keeps the one-second floor.
-pub(super) fn repeats(mut times: Vec<Instant>) -> Option<Repeats> {
-    times.sort();
-    let min_gap = times.windows(2).map(|w| w[1] - w[0]).min()?;
+pub(super) fn repeats(times: Vec<Instant>) -> Option<Repeats> {
+    repeats_except(times.into_iter().map(|at| (at, false)).collect())
+}
+
+/// `repeats`, where a send flagged `true` is allowed to come early (an
+/// answer to a probe, RFC 6762 §6): the gap ending in it is not judged,
+/// but it still counts as a send, and the next gap starts from it.
+fn repeats_except(mut sends: Vec<(Instant, bool)>) -> Option<Repeats> {
+    sends.sort();
+    let min_gap = sends
+        .windows(2)
+        .filter(|w| !w[1].1)
+        .map(|w| w[1].0 - w[0].0)
+        .min()?;
     (min_gap < MIN_GAP).then(|| Repeats {
-        count: times.len(),
-        span: times[times.len() - 1] - times[0],
+        count: sends.len(),
+        span: sends[sends.len() - 1].0 - sends[0].0,
         min_gap,
     })
 }
@@ -145,6 +156,193 @@ pub(super) fn check_query_rate(
             message: format!("{} (at least 1 s, then doubling)", rep.describe("asked")),
             rfc: "RFC 6762 §5.2",
             requirement: "MUST",
+            response: None,
+            responders: Vec::new(),
+        });
+    }
+}
+
+/// Identity of one record transmission: the owner name folded ASCII-only
+/// (RFC 6762 §16), the type, the content, the responder address, and its
+/// link (interface name and index, so two unnamed links stay two).
+type SendKey = (String, u16, String, SocketAddr, Link);
+
+fn send_key(r: &RawRecord) -> SendKey {
+    let content = match r.rdata_digest {
+        // Out-of-scope rdata shows only `rdlength=<n>`: its digest tells
+        // a repeat from new content of one length (an SOA serial bump).
+        Some(digest) => format!("#{digest:016x}"),
+        // Name-valued rdata (PTR, CNAME, NS targets, the SRV target) folds
+        // ASCII case like any name, so a responder varying that case
+        // still repeats one record. Other rdata (TXT) compares exactly.
+        None if matches!(r.rtype, 2 | 5 | 12 | 33) => r.rdata.to_ascii_lowercase(),
+        None => r.rdata.clone(),
+    };
+    (
+        r.name.to_ascii_lowercase(),
+        r.rtype,
+        content,
+        r.source,
+        (r.iface.clone(), r.ifindex),
+    )
+}
+
+/// A probe query seen on a link (RFC 6762 §8.1): the owner names it asks
+/// about or proposes records for, folded ASCII-only.
+struct Probe {
+    at: Instant,
+    names: HashSet<String>,
+    iface: String,
+    ifindex: u32,
+}
+
+/// Multicast record sends in the retained packets, indexed once per
+/// analysis so every row is checked against them cheaply (#407).
+pub(super) struct MulticastIndex<'a> {
+    /// The retained packets, in arrival order (one listener thread
+    /// stamps and queues them).
+    events: &'a [Event],
+    /// Each identity's sends: receive time and packet index, one per
+    /// packet (a record in two sections of one response is one send).
+    sends: HashMap<SendKey, Vec<(Instant, usize)>>,
+    probes: Vec<Probe>,
+}
+
+impl<'a> MulticastIndex<'a> {
+    pub fn new(events: &'a [Event]) -> Self {
+        let mut sends: HashMap<SendKey, Vec<(Instant, usize)>> = HashMap::new();
+        let mut probes = Vec::new();
+        for (i, ev) in events.iter().enumerate() {
+            if ev.is_probe() {
+                // Every record of a packet shares its ingress link.
+                let first = &ev.query_authority[0];
+                probes.push(Probe {
+                    at: ev.received_at,
+                    names: ev
+                        .questions
+                        .iter()
+                        .chain(&ev.query_authority)
+                        .map(|r| r.name.to_ascii_lowercase())
+                        .collect(),
+                    iface: first.iface.clone(),
+                    ifindex: first.ifindex,
+                });
+            }
+            let mut in_packet = HashSet::new();
+            // Only multicast copies count, and a goodbye is a withdrawal,
+            // not a repeat.
+            for r in ev
+                .answers
+                .iter()
+                .filter(|r| r.dst_is_multicast && r.ttl > 0)
+            {
+                let key = send_key(r);
+                if in_packet.insert(key.clone()) {
+                    sends.entry(key).or_default().push((ev.received_at, i));
+                }
+            }
+        }
+        Self {
+            events,
+            sends,
+            probes,
+        }
+    }
+
+    /// Whether the copy at `at` answers a probe: one for `rec`'s owner
+    /// name arrived on its link in the second before, and after the
+    /// previous copy (`since`), which would otherwise have answered it.
+    /// Answering a probe is conflict defense, the one exception RFC 6762
+    /// §6 allows.
+    fn probed(&self, rec: &RawRecord, at: Instant, since: Option<Instant>) -> bool {
+        let name = rec.name.to_ascii_lowercase();
+        self.probes.iter().any(|p| {
+            p.at <= at
+                && at - p.at <= MIN_GAP
+                && since.is_none_or(|prev| p.at > prev)
+                && p.iface == rec.iface
+                && p.ifindex == rec.ifindex
+                && p.names.contains(&name)
+        })
+    }
+
+    /// The question a copy most likely answered (mDNS responses carry no
+    /// question section, so timing is all there is): the latest query
+    /// from another source on the copy's link, up to a second before it,
+    /// asking a name present in that response packet. `querier asking
+    /// name TYPE`.
+    fn trigger(&self, rec: &RawRecord, at: Instant, packet: usize) -> Option<String> {
+        let names: HashSet<String> = self.events[packet]
+            .answers
+            .iter()
+            .map(|r| r.name.to_ascii_lowercase())
+            .collect();
+        // Packets arrive in order: walk back only through the second
+        // before the copy, not the whole retained buffer.
+        self.events[..packet]
+            .iter()
+            .rev()
+            .take_while(|ev| at.saturating_duration_since(ev.received_at) <= MIN_GAP)
+            .filter(|ev| ev.source != rec.source && !ev.is_probe())
+            .find_map(|ev| {
+                ev.questions
+                    .iter()
+                    .find(|q| {
+                        q.iface == rec.iface
+                            && q.ifindex == rec.ifindex
+                            && names.contains(&q.name.to_ascii_lowercase())
+                    })
+                    .map(|q| format!("{} asking {} {}", q.source_label(), q.name, q.rtype_str))
+            })
+    }
+
+    /// `multicast-rate-limit` (#407): a responder multicasting one record
+    /// on one link again within a second breaks RFC 6762 §6 (MUST NOT,
+    /// except answering a probe). Each repeat renews the cached row, so
+    /// its TTL never counts down and its refresh never fires. The finding
+    /// takes `rec`'s full identity, so it sits on that Answers row of
+    /// `service`, and names what the repeats most likely answered.
+    pub fn check(&self, service: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
+        let Some(copies) = self.sends.get(&send_key(rec)) else {
+            return;
+        };
+        // A probe answer may come early, but it is still a multicast:
+        // the next copy must wait a second after it (RFC 6762 §6).
+        // Copies are in arrival order: each one's previous copy bounds
+        // which probes it can answer.
+        let probed: Vec<bool> = copies
+            .iter()
+            .enumerate()
+            .map(|(i, (at, _))| {
+                let since = i.checked_sub(1).map(|prev| copies[prev].0);
+                self.probed(rec, *at, since)
+            })
+            .collect();
+        let sends = copies.iter().zip(&probed).map(|((at, _), p)| (*at, *p));
+        let Some(rep) = repeats_except(sends.collect()) else {
+            return;
+        };
+        // What drove the repeats: probe answers answered the probe.
+        let trigger = copies
+            .iter()
+            .zip(&probed)
+            .rev()
+            .filter(|(_, p)| !**p)
+            .find_map(|((at, packet), _)| self.trigger(rec, *at, *packet))
+            .map(|t| format!(", answering {t}"))
+            .unwrap_or_default();
+        out.push(Anomaly {
+            kind: AnomalyKind::MulticastRateLimit,
+            severity: Severity::Warning,
+            service: service.to_string(),
+            record_name: Some(rec.name.clone()),
+            rtype: Some(rec.rtype),
+            rtype_str: Some(rec.rtype_str.clone()),
+            rdata: Some(rec.rdata.clone()),
+            source: Some(rec.source_label()),
+            message: format!("{}{trigger}", rep.describe("multicast")),
+            rfc: "RFC 6762 §6",
+            requirement: "MUST NOT",
             response: None,
             responders: Vec::new(),
         });

@@ -329,3 +329,383 @@ fn repeats_report_count_span_and_closest_gap() {
         "0.2"
     );
 }
+
+// --- #407: records multicast again within one second (RFC 6762 §6) ---
+
+const HOST: &str = "Repeater.local.";
+
+fn responder() -> SocketAddr {
+    "192.168.1.109:5353".parse().unwrap()
+}
+
+/// The repeater's A record as one response carries it.
+fn host_a(source: SocketAddr, iface: &str) -> RawRecord {
+    let mut r = rec_with(
+        HOST,
+        1,
+        "A",
+        "192.168.1.109",
+        120,
+        false,
+        true,
+        RecordSection::Additional,
+    );
+    r.source = source;
+    r.iface = iface.to_string();
+    r.ifindex = if iface.is_empty() { 0 } else { 2 };
+    r
+}
+
+/// A response packet carrying `records`, received `ms` after `at`.
+fn response_at(at: Instant, ms: u64, records: Vec<RawRecord>) -> Event {
+    let received_at = at + Duration::from_millis(ms);
+    let source = records.first().map(|r| r.source).unwrap_or_else(responder);
+    Event {
+        answers: records
+            .into_iter()
+            .map(|mut r| {
+                r.received_at = received_at;
+                r
+            })
+            .collect(),
+        questions: Vec::new(),
+        query_kas: Vec::new(),
+        query_authority: Vec::new(),
+        rcode: Some(0),
+        received_at,
+        raw_bytes: Vec::new(),
+        source,
+    }
+}
+
+/// `record` multicast at each offset (ms), one response each.
+fn sends(record: &RawRecord, offsets: &[u64]) -> Vec<Event> {
+    let at = base();
+    offsets
+        .iter()
+        .map(|ms| response_at(at, *ms, vec![record.clone()]))
+        .collect()
+}
+
+/// Analyze one service holding `answers` against `events`.
+fn analyze_answers(answers: &[RawRecord], events: &[Event]) -> Vec<Anomaly> {
+    let snap = Snapshot {
+        services: vec![ServiceView {
+            instance: "Inst",
+            service_type: "_http._tcp.local",
+            answers,
+            subtypes: &[],
+            denied_address_types: Vec::new(),
+        }],
+        enum_answers: Vec::new(),
+        pending_hosts: HashSet::new(),
+        questions: Vec::new(),
+        sightings: Vec::new(),
+        host_addresses: Vec::new(),
+        device_names: HashMap::new(),
+    };
+    analyze_observations(&snap, events, &[])
+}
+
+fn multicast_findings(found: &[Anomaly]) -> Vec<&Anomaly> {
+    found
+        .iter()
+        .filter(|a| a.kind == AnomalyKind::MulticastRateLimit)
+        .collect()
+}
+
+/// The cached row: the latest copy of `r`.
+fn cached(r: &RawRecord) -> RawRecord {
+    let mut c = r.clone();
+    c.received_at = base() + Duration::from_millis(1000);
+    c
+}
+
+#[test]
+fn record_multicast_twice_within_a_second_is_flagged() {
+    let a = host_a(responder(), "");
+    let events = sends(&a, &[0, 250, 500, 750, 1000]);
+    let found = analyze_answers(&[cached(&a)], &events);
+    let flood = multicast_findings(&found);
+    assert_eq!(flood.len(), 1, "{found:#?}");
+    let f = flood[0];
+    assert_eq!(f.severity, Severity::Warning);
+    assert_eq!(f.rfc, "RFC 6762 §6");
+    assert_eq!(f.requirement, "MUST NOT");
+    assert_eq!(f.service, SERVICE);
+    assert_eq!(f.record_name.as_deref(), Some(HOST));
+    assert_eq!(f.rtype, Some(1));
+    assert_eq!(f.rdata.as_deref(), Some("192.168.1.109"));
+    assert_eq!(f.source.as_deref(), Some("192.168.1.109:5353"));
+    assert!(
+        f.message.contains("multicast 5 times in 1 s"),
+        "{}",
+        f.message
+    );
+    assert!(
+        f.message.contains("as little as 0.25 s apart"),
+        "{}",
+        f.message
+    );
+    assert!(
+        !f.message.contains("answering"),
+        "no trigger: {}",
+        f.message
+    );
+}
+
+#[test]
+fn copies_a_second_or_more_apart_stay_quiet() {
+    let a = host_a(responder(), "");
+    // Exactly the floor, then RFC 6762 §8.3 announcements (1 s, doubling).
+    for offsets in [&[0, 1000, 2000][..], &[0, 1000, 3000][..]] {
+        let found = analyze_answers(&[cached(&a)], &sends(&a, offsets));
+        assert!(
+            multicast_findings(&found).is_empty(),
+            "{offsets:?}: {found:#?}"
+        );
+    }
+}
+
+#[test]
+fn copies_from_two_sources_or_on_two_links_stay_quiet() {
+    let other: SocketAddr = "192.168.1.110:5353".parse().unwrap();
+    let mine = host_a(responder(), "");
+    let theirs = host_a(other, "");
+    let mut events = sends(&mine, &[0]);
+    events.extend(sends(&theirs, &[250]));
+    let found = analyze_answers(&[cached(&mine), cached(&theirs)], &events);
+    assert!(multicast_findings(&found).is_empty(), "{found:#?}");
+
+    let on_eth = host_a(responder(), "eth0");
+    let on_wlan = host_a(responder(), "wlan0");
+    let mut events = sends(&on_eth, &[0]);
+    events.extend(sends(&on_wlan, &[250]));
+    let found = analyze_answers(&[cached(&on_eth), cached(&on_wlan)], &events);
+    assert!(multicast_findings(&found).is_empty(), "{found:#?}");
+}
+
+#[test]
+fn a_duplicate_copy_in_one_packet_counts_once() {
+    // The same record in the answer and additional sections.
+    let a = host_a(responder(), "");
+    let mut answer = a.clone();
+    answer.section = RecordSection::Answer;
+    let events = vec![response_at(base(), 0, vec![answer, a.clone()])];
+    let found = analyze_answers(&[cached(&a)], &events);
+    assert!(multicast_findings(&found).is_empty(), "{found:#?}");
+}
+
+#[test]
+fn unicast_copies_and_goodbyes_are_ignored() {
+    let a = host_a(responder(), "");
+    let mut unicast = a.clone();
+    unicast.dst_is_multicast = false;
+    let mut events = sends(&a, &[0]);
+    events.extend(sends(&unicast, &[250]));
+    let found = analyze_answers(&[cached(&a)], &events);
+    assert!(multicast_findings(&found).is_empty(), "unicast: {found:#?}");
+
+    let mut bye = a.clone();
+    bye.ttl = 0;
+    let mut events = sends(&a, &[0]);
+    events.extend(sends(&bye, &[250]));
+    let found = analyze_answers(&[cached(&a)], &events);
+    assert!(multicast_findings(&found).is_empty(), "goodbye: {found:#?}");
+}
+
+#[test]
+fn a_probe_just_before_a_copy_exempts_it() {
+    // Conflict defense (RFC 6762 §6): answering a probe for the name
+    // right away is allowed, even within a second of the last copy.
+    let a = host_a(responder(), "");
+    let at = base();
+    let prober: SocketAddr = "192.168.1.50:5353".parse().unwrap();
+    let mut probe = query_at(at, 200, vec![question(HOST, 255, "ANY", prober, "")]);
+    probe.query_authority = vec![host_a(prober, "")];
+    let events = vec![
+        response_at(at, 0, vec![a.clone()]),
+        probe,
+        response_at(at, 250, vec![a.clone()]),
+    ];
+    let found = analyze_answers(&[cached(&a)], &events);
+    assert!(multicast_findings(&found).is_empty(), "{found:#?}");
+}
+
+#[test]
+fn the_triggering_question_is_named() {
+    // .70 asks another name; the repeater's response carries both that
+    // answer and its own A record.
+    let a = host_a(responder(), "");
+    let srv = rec_with(
+        "fritz-box._igd2._tcp.local.",
+        33,
+        "SRV",
+        "0 0 49000 fritz.box.",
+        120,
+        true,
+        true,
+        RecordSection::Answer,
+    );
+    let mut srv = srv;
+    srv.source = responder();
+    let at = base();
+    let ask = |ms| {
+        query_at(
+            at,
+            ms,
+            vec![question(
+                "fritz-box._igd2._tcp.local.",
+                33,
+                "SRV",
+                querier(),
+                "",
+            )],
+        )
+    };
+    let events = vec![
+        ask(0),
+        response_at(at, 20, vec![srv.clone(), a.clone()]),
+        ask(200),
+        response_at(at, 220, vec![srv.clone(), a.clone()]),
+    ];
+    let found = analyze_answers(&[cached(&a)], &events);
+    let flood = multicast_findings(&found);
+    let host = flood
+        .iter()
+        .find(|f| f.record_name.as_deref() == Some(HOST))
+        .unwrap_or_else(|| panic!("{found:#?}"));
+    assert!(
+        host.message
+            .contains("answering 192.168.1.70:5353 asking fritz-box._igd2._tcp.local. SRV"),
+        "{}",
+        host.message
+    );
+}
+
+#[test]
+fn record_names_fold_ascii_case_only() {
+    let a = host_a(responder(), "");
+    let mut upper = a.clone();
+    upper.name = "REPEATER.local.".to_string();
+    let mut events = sends(&a, &[0]);
+    events.extend(sends(&upper, &[250]));
+    let found = analyze_answers(&[cached(&a)], &events);
+    assert_eq!(multicast_findings(&found).len(), 1, "{found:#?}");
+
+    let mut accented = a.clone();
+    accented.name = "Répéteur.local.".to_string();
+    let mut other = a.clone();
+    other.name = "rÉpéteur.local.".to_string();
+    let mut events = sends(&accented, &[0]);
+    events.extend(sends(&other, &[250]));
+    let found = analyze_answers(&[cached(&accented)], &events);
+    assert!(multicast_findings(&found).is_empty(), "{found:#?}");
+}
+
+#[test]
+fn ptr_targets_fold_case_but_txt_data_does_not() {
+    // An enumeration PTR whose target case varies is one record (ingest
+    // replaces it by a case-folded target): its repeats still count.
+    let mut ptr = rec(ENUM_SERVICE, 12, "PTR", "_ipp._tcp.local.", 4500, false);
+    ptr.source = responder();
+    let mut upper = ptr.clone();
+    upper.rdata = "_IPP._tcp.local.".to_string();
+    let mut events = sends(&ptr, &[0]);
+    events.extend(sends(&upper, &[250]));
+    let row = cached(&upper);
+    let snap = Snapshot {
+        services: Vec::new(),
+        enum_answers: vec![&row],
+        pending_hosts: HashSet::new(),
+        questions: Vec::new(),
+        sightings: Vec::new(),
+        host_addresses: Vec::new(),
+        device_names: HashMap::new(),
+    };
+    let found = analyze_observations(&snap, &events, &[]);
+    let flood = multicast_findings(&found);
+    assert_eq!(flood.len(), 1, "{found:#?}");
+    assert_eq!(flood[0].service, ENUMERATION_SERVICE);
+
+    // TXT data is case-sensitive: two different records, once each.
+    let mut txt = rec(NAME, 16, "TXT", "a=1", 120, true);
+    txt.source = responder();
+    let mut other = txt.clone();
+    other.rdata = "A=1".to_string();
+    let mut events = sends(&txt, &[0]);
+    events.extend(sends(&other, &[250]));
+    let found = analyze_answers(&[cached(&txt)], &events);
+    assert!(multicast_findings(&found).is_empty(), "{found:#?}");
+}
+
+#[test]
+fn name_valued_rdata_folds_case() {
+    // An SRV target is a name: a responder varying its case still
+    // repeats one record.
+    let mut srv = rec(NAME, 33, "SRV", "0 0 80 Host.local.", 120, true);
+    srv.source = responder();
+    let mut upper = srv.clone();
+    upper.rdata = "0 0 80 HOST.local.".to_string();
+    let mut events = sends(&srv, &[0]);
+    events.extend(sends(&upper, &[250]));
+    let found = analyze_answers(&[cached(&srv)], &events);
+    assert_eq!(multicast_findings(&found).len(), 1, "{found:#?}");
+}
+
+#[test]
+fn opaque_records_compare_by_content_not_length() {
+    // Out-of-scope records show only `rdlength=<n>`: two SOA copies of
+    // one length but different serials are two records, not a repeat.
+    let mut soa = rec("fritz.box.", 6, "TYPE6", "rdlength=49", 4500, false);
+    soa.source = responder();
+    soa.rdata_digest = Some(1);
+    let mut bumped = soa.clone();
+    bumped.rdata_digest = Some(2);
+    let mut events = sends(&soa, &[0]);
+    events.extend(sends(&bumped, &[250]));
+    let found = analyze_answers(&[cached(&bumped)], &events);
+    assert!(multicast_findings(&found).is_empty(), "{found:#?}");
+    // The same content again is a repeat.
+    let mut events = sends(&soa, &[0]);
+    events.extend(sends(&soa, &[250]));
+    let found = analyze_answers(&[cached(&soa)], &events);
+    assert_eq!(multicast_findings(&found).len(), 1, "{found:#?}");
+}
+
+#[test]
+fn copies_on_two_unnamed_links_stay_quiet() {
+    let mut on_three = host_a(responder(), "");
+    on_three.ifindex = 3;
+    let mut on_four = on_three.clone();
+    on_four.ifindex = 4;
+    let mut events = sends(&on_three, &[0]);
+    events.extend(sends(&on_four, &[250]));
+    let found = analyze_answers(&[cached(&on_three), cached(&on_four)], &events);
+    assert!(multicast_findings(&found).is_empty(), "{found:#?}");
+}
+
+#[test]
+fn a_probe_answer_still_counts_as_the_last_multicast() {
+    // RFC 6762 §6: the probe answer itself is allowed, but the next
+    // multicast must still wait a second after it: 751 ms is too soon.
+    let a = host_a(responder(), "");
+    let at = base();
+    let prober: SocketAddr = "192.168.1.50:5353".parse().unwrap();
+    let mut probe = query_at(at, 200, vec![question(HOST, 255, "ANY", prober, "")]);
+    probe.query_authority = vec![host_a(prober, "")];
+    let events = vec![
+        response_at(at, 0, vec![a.clone()]),
+        probe,
+        response_at(at, 250, vec![a.clone()]),
+        response_at(at, 1001, vec![a.clone()]),
+    ];
+    let found = analyze_answers(&[cached(&a)], &events);
+    let flood = multicast_findings(&found);
+    assert_eq!(flood.len(), 1, "{found:#?}");
+    assert!(
+        flood[0].message.contains("as little as 0.75 s apart"),
+        "{}",
+        flood[0].message
+    );
+}

@@ -181,6 +181,12 @@ pub struct RawRecord {
     /// only; `None` elsewhere or when no matching question was seen
     /// shortly before.
     pub trigger: Option<QueryTrigger>,
+    /// Digest of an out-of-scope record's rdata bytes, which are never
+    /// kept (`rdata` shows only `rdlength=<n>`): enough to tell a repeat
+    /// from changed content of one length (an SOA serial bump) without
+    /// holding or interpreting the data. `None` for in-scope records,
+    /// whose `rdata` already names their content.
+    pub rdata_digest: Option<u64>,
 }
 
 impl RawRecord {

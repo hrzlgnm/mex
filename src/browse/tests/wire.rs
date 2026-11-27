@@ -413,6 +413,43 @@ fn malformed_out_of_scope_rdata_never_drops_the_packet() {
 }
 
 #[test]
+fn opaque_records_carry_a_content_digest_only() {
+    // Two out-of-scope TYPE6 records of one length: same bytes, same
+    // digest; one byte changed, another digest. Only `rdlength` shows.
+    let name: &[u8] = b"\x04host\x05local\x00";
+    let digest_of = |rdata: [u8; 3]| {
+        let mut raw = vec![0, 0, 0x84, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+        raw.extend_from_slice(name);
+        raw.extend_from_slice(&[0, 6, 0, 1, 0, 0, 0, 120, 0, 3]);
+        raw.extend_from_slice(&rdata);
+        let ev =
+            parse_packet(&raw, test_source(), std::net::IpAddr::V4(MDNS_V4), "br0", 3).unwrap();
+        assert_eq!(ev.answers[0].rdata, "rdlength=3");
+        ev.answers[0]
+            .rdata_digest
+            .expect("an opaque record has a digest")
+    };
+    assert_eq!(digest_of([1, 2, 3]), digest_of([1, 2, 3]));
+    assert_ne!(digest_of([1, 2, 3]), digest_of([1, 2, 4]));
+    // In-scope records name their content already.
+    let mut r = Packet::new_reply(0);
+    r.answers.push(known_answer(
+        "svc._http._tcp.local.",
+        "Inst.svc._http._tcp.local.",
+        120,
+    ));
+    let ev = parse_packet(
+        &r.build_bytes_vec().unwrap(),
+        test_source(),
+        std::net::IpAddr::V4(MDNS_V4),
+        "enx",
+        2,
+    )
+    .unwrap();
+    assert_eq!(ev.answers[0].rdata_digest, None);
+}
+
+#[test]
 fn opt_before_other_additionals_keeps_records_aligned() {
     // Response: A host.local in Answer; Additional holds OPT first,
     // then AAAA host.local, then an MX. The parser lifts the OPT out
