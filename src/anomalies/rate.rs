@@ -201,8 +201,9 @@ struct Probe {
     ifindex: u32,
 }
 
-/// One device asking one question on one link: the device name, the
-/// question name folded ASCII-only, its type, and the link.
+/// One device asking one question on one link: the device identity
+/// (`DeviceLabel::id`), the question name folded ASCII-only, its type,
+/// and the link.
 type DeviceAskingKey = (String, String, u16, Link);
 
 /// Multicast record sends in the retained packets, indexed once per
@@ -216,14 +217,34 @@ pub(super) struct MulticastIndex<'a> {
     sends: HashMap<SendKey, Vec<(Instant, usize)>>,
     probes: Vec<Probe>,
     /// Device names behind source addresses, for naming a trigger.
-    device_names: &'a HashMap<IpAddr, String>,
+    device_names: &'a HashMap<IpAddr, DeviceLabel>,
+    /// Each device's display name, by identity: an exact match's name
+    /// beats an inferred (`~`) one, so the name doesn't depend on which
+    /// address asked last.
+    device_display: HashMap<&'a str, &'a str>,
     /// Each known device's querier labels per question and link, sorted:
     /// one device asking over IPv4 and IPv6 names both addresses.
     device_askers: HashMap<DeviceAskingKey, BTreeSet<String>>,
 }
 
+/// One display name per device identity: an exact match's name over an
+/// inferred one (`~`-prefixed), then the alphabetically first.
+fn display_names(devices: &HashMap<IpAddr, DeviceLabel>) -> HashMap<&str, &str> {
+    let mut out: HashMap<&str, &str> = HashMap::new();
+    for d in devices.values() {
+        out.entry(d.id.as_str())
+            .and_modify(|cur| {
+                if (d.name.starts_with('~'), d.name.as_str()) < (cur.starts_with('~'), *cur) {
+                    *cur = d.name.as_str();
+                }
+            })
+            .or_insert(d.name.as_str());
+    }
+    out
+}
+
 impl<'a> MulticastIndex<'a> {
-    pub fn new(events: &'a [Event], device_names: &'a HashMap<IpAddr, String>) -> Self {
+    pub fn new(events: &'a [Event], device_names: &'a HashMap<IpAddr, DeviceLabel>) -> Self {
         let mut sends: HashMap<SendKey, Vec<(Instant, usize)>> = HashMap::new();
         let mut probes = Vec::new();
         let mut device_askers: HashMap<DeviceAskingKey, BTreeSet<String>> = HashMap::new();
@@ -247,7 +268,7 @@ impl<'a> MulticastIndex<'a> {
                     if let Some(device) = device_names.get(&q.source.ip()) {
                         device_askers
                             .entry((
-                                device.clone(),
+                                device.id.clone(),
                                 q.name.to_ascii_lowercase(),
                                 q.rtype,
                                 (q.iface.clone(), q.ifindex),
@@ -275,6 +296,7 @@ impl<'a> MulticastIndex<'a> {
             events,
             sends,
             probes,
+            device_display: display_names(device_names),
             device_names,
             device_askers,
         }
@@ -334,13 +356,14 @@ impl<'a> MulticastIndex<'a> {
         let device = askings.iter().find_map(|q| {
             let device = self.device_names.get(&q.source.ip())?;
             let key = (
-                device.clone(),
+                device.id.clone(),
                 q.name.to_ascii_lowercase(),
                 q.rtype,
                 (q.iface.clone(), q.ifindex),
             );
             let labels = self.device_askers.get(&key)?;
-            Some((q, device, labels))
+            let name = self.device_display.get(device.id.as_str())?;
+            Some((q, name, labels))
         });
         if let Some((q, device, labels)) = device {
             let labels: Vec<&str> = labels.iter().map(String::as_str).collect();

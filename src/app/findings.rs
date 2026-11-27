@@ -175,7 +175,15 @@ impl App {
             .chain(queriers)
             .collect::<HashSet<_>>()
             .into_iter()
-            .filter_map(|ip| book.resolve(ip).map(|d| (ip, d.display())))
+            .filter_map(|ip| {
+                book.resolve(ip).map(|d| {
+                    let label = anomalies::DeviceLabel {
+                        id: d.host_id(),
+                        name: d.display(),
+                    };
+                    (ip, label)
+                })
+            })
             .collect();
         let snap = anomalies::Snapshot {
             services,

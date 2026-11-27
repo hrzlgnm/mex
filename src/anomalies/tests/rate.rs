@@ -616,7 +616,7 @@ fn dual_stack_flood(record: &RawRecord, queriers: &[SocketAddr]) -> Vec<Event> {
 fn analyze_answers_named(
     answers: &[RawRecord],
     events: &[Event],
-    device_names: HashMap<std::net::IpAddr, String>,
+    device_names: HashMap<std::net::IpAddr, DeviceLabel>,
 ) -> Vec<Anomaly> {
     let snap = Snapshot {
         services: vec![ServiceView {
@@ -636,6 +636,15 @@ fn analyze_answers_named(
     analyze_observations(&snap, events, &[])
 }
 
+/// The device `homeassistant.local`, matched exactly as `name`, or
+/// inferred as `~name`.
+fn device(name: &str) -> DeviceLabel {
+    DeviceLabel {
+        id: "homeassistant".to_string(),
+        name: name.to_string(),
+    }
+}
+
 fn flood_message(found: &[Anomaly]) -> String {
     let flood = multicast_findings(found);
     assert_eq!(flood.len(), 1, "{found:#?}");
@@ -649,8 +658,8 @@ fn a_dual_stack_querier_is_named_as_its_device() {
     // the same text whichever copy arrived last.
     let a = host_a(responder(), "");
     let names: HashMap<_, _> = [
-        (querier().ip(), "homeassistant".to_string()),
-        (querier_v6().ip(), "homeassistant".to_string()),
+        (querier().ip(), device("homeassistant")),
+        (querier_v6().ip(), device("homeassistant")),
     ]
     .into();
     let want = "answering homeassistant (192.168.1.70:5353, [fe80::8534:69b3:f34a:ac9d]:5353) \
@@ -671,13 +680,37 @@ fn a_device_known_by_one_address_still_names_the_device() {
     // Only the IPv4 address resolves: the device wins even when the
     // unresolved IPv6 query is the latest.
     let a = host_a(responder(), "");
-    let names: HashMap<_, _> = [(querier().ip(), "homeassistant".to_string())].into();
+    let names: HashMap<_, _> = [(querier().ip(), device("homeassistant"))].into();
     let events = dual_stack_flood(&a, &[querier(), querier_v6()]);
     let msg = flood_message(&analyze_answers_named(&[cached(&a)], &events, names));
     assert!(
         msg.contains("answering homeassistant (192.168.1.70:5353) asking Repeater.local. A"),
         "{msg}"
     );
+}
+
+#[test]
+fn an_exact_and_an_inferred_match_are_one_device() {
+    // The IPv4 address matches exactly, the link-local one only by
+    // interface ID (`~`): still one device, named by its exact match,
+    // with both addresses, in either arrival order.
+    let a = host_a(responder(), "");
+    let names: HashMap<_, _> = [
+        (querier().ip(), device("homeassistant")),
+        (querier_v6().ip(), device("~homeassistant")),
+    ]
+    .into();
+    let want = "answering homeassistant (192.168.1.70:5353, [fe80::8534:69b3:f34a:ac9d]:5353) \
+                asking Repeater.local. A";
+    for order in [[querier(), querier_v6()], [querier_v6(), querier()]] {
+        let events = dual_stack_flood(&a, &order);
+        let msg = flood_message(&analyze_answers_named(
+            &[cached(&a)],
+            &events,
+            names.clone(),
+        ));
+        assert!(msg.contains(want), "{msg}");
+    }
 }
 
 #[test]

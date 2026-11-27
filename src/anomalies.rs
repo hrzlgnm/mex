@@ -266,9 +266,19 @@ pub struct Snapshot<'a> {
     /// Live A/AAAA announcements per hostname that a live service points
     /// at (selected host or live SRV target), for `conflicting-answers`.
     pub host_addresses: Vec<HostAddressView<'a>>,
-    /// Device names behind responder and querier IPs (#246), for finding
+    /// Devices behind responder and querier IPs (#246), for finding
     /// messages only: never part of a finding's identity.
-    pub device_names: HashMap<std::net::IpAddr, String>,
+    pub device_names: HashMap<std::net::IpAddr, DeviceLabel>,
+}
+
+/// The device behind a source address, as finding messages name it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceLabel {
+    /// The device's identity (`host_id` of its preferred name): an
+    /// exact and an inferred match of one device share it.
+    pub id: String,
+    /// Display form, `~`-prefixed when inferred.
+    pub name: String,
 }
 
 /// Every A/AAAA record mex holds for one hostname (host id form).
@@ -322,7 +332,7 @@ fn is_live(rec: &RawRecord, now: Instant) -> bool {
 /// (e.g. `fritz.box` from a mesh: an observation, not a violation).
 fn check_conflicting_answers(
     view: &HostAddressView<'_>,
-    names: &HashMap<std::net::IpAddr, String>,
+    names: &HashMap<std::net::IpAddr, DeviceLabel>,
     now: Instant,
     out: &mut Vec<Anomaly>,
 ) {
@@ -390,7 +400,7 @@ fn check_conflicting_answers(
             .map(|(addrs, sources)| Responder {
                 name: sources
                     .iter()
-                    .find_map(|(s, _)| names.get(&s.ip()).cloned()),
+                    .find_map(|(s, _)| names.get(&s.ip()).map(|d| d.name.clone())),
                 sources: sources.into_iter().map(|(_, label)| label).collect(),
                 addresses: addrs.into_iter().collect(),
             })
