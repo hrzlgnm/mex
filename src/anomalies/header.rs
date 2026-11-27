@@ -29,7 +29,9 @@ pub(super) fn check_query_aa_bit(
     events: &[Event],
     out: &mut Vec<Anomaly>,
 ) {
-    if questions.is_empty() {
+    // Nearly every querier keeps AA clear: count nothing until one
+    // retained query has it set.
+    if questions.is_empty() || !events.iter().any(Event::is_authoritative_query) {
         return;
     }
     let mut counts: HashMap<AskingKey, AaCount> = HashMap::new();
