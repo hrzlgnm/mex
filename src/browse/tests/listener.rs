@@ -133,6 +133,7 @@ fn dropping_the_query_sender_stops_the_listener() {
             drops: Arc::new(DropStats::default()),
             transmit: transmit.clone(),
             waker: waker.clone(),
+            own_sends: mpsc::channel().0,
         },
         Some(HashSet::new()),
     );
@@ -214,6 +215,7 @@ fn listener_runs_with_one_family_missing() {
             drops: Arc::new(DropStats::default()),
             transmit: Arc::new(TransmitState::new(true, false)),
             waker,
+            own_sends: mpsc::channel().0,
         },
         Some(HashSet::new()),
     );
@@ -277,6 +279,7 @@ fn bare_listener(
             drops: drops.clone(),
             transmit: Arc::new(TransmitState::new(true, true)),
             waker,
+            own_sends: mpsc::channel().0,
         },
         selection,
     );

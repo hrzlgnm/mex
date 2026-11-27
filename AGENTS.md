@@ -44,7 +44,9 @@ Headless run (no TTY) logs to stderr.
   are logged once each.
   Multicast loop enabled, so responders on this host (avahi,
   python-zeroconf) hear our queries; our own looped-back query copies are
-  dropped by exact bytes (`SentCopies`, one drop per sent copy). The
+  dropped by exact bytes (`SentCopies`, one drop per sent copy); each
+  copy that left is instead reported to the app as a `browse::OwnSend`
+  (questions, egress link, family, send instant) on its own channel. The
   loopback interface stays out unless selected with `-i`. Unicast-dst
   packets from off-link subnets are refused (RFC 6762 §11) with a diagnostics
   counter.
@@ -62,6 +64,10 @@ Headless run (no TTY) logs to stderr.
   paths. Tests live in `src/browse/tests/`, one file per child module
   plus `transmit`.
 * `src/app.rs` — browser state, query scheduling, ingest/expire, selection.
+  Our own sent copies (`OwnSend`, #431) are kept apart from received
+  packets, no older than a second before the oldest retained one and
+  capped; only the multicast-rate check reads them (mex as the trigger,
+  copies after our queries), never a view, counter or other check.
   Messages with a non-zero OPCODE (RFC 6762 §18.3, `Event::is_ignored`)
   and responses with a non-zero RCODE (§18.11) stop at ingest but stay in
   the packet log; non-zero-OPCODE ones are also dropped before the

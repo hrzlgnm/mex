@@ -464,7 +464,7 @@ fn check_conflicting_answers(
 /// Answers row shows its own finding.
 #[cfg(test)]
 pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
-    analyze_observations(snap, &[], &[])
+    analyze_observations(snap, &[], &[], &[])
 }
 
 /// Analyze browser state and retained response packets. Packet-scoped checks
@@ -472,6 +472,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
 pub fn analyze_observations(
     snap: &Snapshot,
     events: &[crate::browse::Event],
+    own_sends: &[crate::browse::OwnSend],
     address_queries: &[AddressQueryView],
 ) -> Vec<Anomaly> {
     // RFC 6762 §18.3: a message with a non-zero OPCODE carries no mDNS
@@ -520,7 +521,7 @@ pub fn analyze_observations(
     };
 
     // Multicast sends per record identity, indexed once for every row.
-    let multicasts = rate::MulticastIndex::new(events, &snap.device_names);
+    let multicasts = rate::MulticastIndex::new(events, own_sends, &snap.device_names);
 
     for svc in &snap.services {
         let service_id = service_id(svc.instance, svc.service_type);

@@ -24,6 +24,7 @@ fn ingest(app: &mut App, rec: &browse::RawRecord) {
 mod input;
 mod manual_refresh;
 mod out_of_scope;
+mod own_sends;
 mod per_link_copies;
 mod per_nic_answers;
 mod question_window;

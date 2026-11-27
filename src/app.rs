@@ -622,6 +622,10 @@ const SIGHTINGS_CAP: usize = 256;
 /// The overlay shows only the top talkers; the cap keeps spoofed or
 /// churning source addresses from growing the map without bound.
 const SOURCE_RX_CAP: usize = 256;
+/// Our own sent query copies kept for the multicast-rate check (#431):
+/// twice the 2000 retained packets, so a busy round of ours on several
+/// links still covers the whole retained window.
+const OWN_SENDS_CAP: usize = 4000;
 
 /// How long a Questions-pane row lives after its querier last asked
 /// (#238). Equal to the long mDNS TTL (4500 s): our own steady demand
@@ -855,6 +859,13 @@ pub struct App {
     state_dump_dir: std::path::PathBuf,
 
     rx: mpsc::Receiver<browse::Event>,
+    /// Our own sent query copies, reported by the listener (#431).
+    own_rx: mpsc::Receiver<browse::OwnSend>,
+    /// The retained ones, in send order: no older than the second before
+    /// the oldest retained packet, at most `OWN_SENDS_CAP`. Only the
+    /// multicast-rate check reads them; they never displace a received
+    /// packet.
+    own_sends: Vec<browse::OwnSend>,
     query_tx: browse::QueryTx,
     /// Query scheduling state (RFC 6762 §5.2/§5.4/§7.1/§7.3); see
     /// [`Scheduler`].
@@ -1200,7 +1211,7 @@ impl App {
     /// `interfaces` restricts discovery to the named links (`None`
     /// browses all usable links).
     pub fn new_with(passive: bool, interfaces: Option<HashSet<String>>) -> Result<Self> {
-        let (query_tx, rx, drop_stats) = browse::spawn(interfaces.clone())?;
+        let (query_tx, rx, own_rx, drop_stats) = browse::spawn(interfaces.clone())?;
         // Tests must not depend on the host's interfaces: pin both
         // families to "can transmit"; hold tests pin their own state.
         #[cfg(test)]
@@ -1221,6 +1232,8 @@ impl App {
             start_time: Instant::now(),
             running: true,
             rx,
+            own_rx,
+            own_sends: Vec::new(),
             query_tx,
             last_ip_refresh: Instant::now(),
             collapsed_hosts: HashSet::new(),
@@ -1425,6 +1438,28 @@ impl App {
         }
     }
 
+    /// Take the listener's reports of our own sent copies, and keep
+    /// only those a retained packet could answer: sent at most a second
+    /// before the oldest one. With nothing retained yet, a reply may
+    /// still come, so only the cap applies.
+    fn drain_own_sends(&mut self) {
+        while let Ok(sent) = self.own_rx.try_recv() {
+            self.own_sends.push(sent);
+        }
+        if let Some(oldest) = self.raw_events.first() {
+            let horizon = oldest.received_at.checked_sub(Duration::from_secs(1));
+            let stale = self
+                .own_sends
+                .iter()
+                .take_while(|s| horizon.is_some_and(|h| s.sent_at < h))
+                .count();
+            self.own_sends.drain(..stale);
+        }
+        if self.own_sends.len() > OWN_SENDS_CAP {
+            self.own_sends.drain(..self.own_sends.len() - OWN_SENDS_CAP);
+        }
+    }
+
     fn pending_addrs_count(&self) -> usize {
         self.pending_addrs.values().map(Vec::len).sum()
     }
@@ -1447,6 +1482,7 @@ impl App {
             self.raw_events
                 .drain(0..self.raw_events.len().saturating_sub(2000));
         }
+        self.drain_own_sends();
         // Prune the sliding rate windows even on idle ticks.
         while self
             .diagnostics

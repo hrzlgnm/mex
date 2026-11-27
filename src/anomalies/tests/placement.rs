@@ -89,7 +89,7 @@ fn findings(rows: Vec<QuestionView<'_>>, events: &[Event]) -> Vec<Anomaly> {
         host_addresses: Vec::new(),
         device_names: HashMap::new(),
     };
-    analyze_observations(&snap, events, &[])
+    analyze_observations(&snap, events, &[], &[])
         .into_iter()
         .filter(|a| a.kind == AnomalyKind::MisplacedKnownAnswer)
         .collect()
