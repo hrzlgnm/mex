@@ -9,6 +9,7 @@ use crate::browse::{rtype_from_str, RawRecord, ENUM_SERVICE};
 
 mod header;
 mod naming;
+mod placement;
 mod questions;
 mod rate;
 mod records;
@@ -125,6 +126,7 @@ pub enum AnomalyKind {
     QueryRateLimit,
     MulticastRateLimit,
     QueryAaBit,
+    MisplacedKnownAnswer,
 }
 
 impl AnomalyKind {
@@ -150,6 +152,7 @@ impl AnomalyKind {
             AnomalyKind::QueryRateLimit => "query-rate-limit",
             AnomalyKind::MulticastRateLimit => "multicast-rate-limit",
             AnomalyKind::QueryAaBit => "query-aa-bit",
+            AnomalyKind::MisplacedKnownAnswer => "misplaced-known-answer",
         }
     }
 
@@ -171,6 +174,7 @@ impl AnomalyKind {
             AnomalyKind::UnsupportedQuestion
                 | AnomalyKind::QueryRateLimit
                 | AnomalyKind::QueryAaBit
+                | AnomalyKind::MisplacedKnownAnswer
         )
     }
 }
@@ -597,6 +601,7 @@ pub fn analyze_observations(
     }
     rate::check_query_rate(&snap.questions, events, &mut out);
     header::check_query_aa_bit(&snap.questions, events, &mut out);
+    placement::check_misplaced_known_answers(&snap.questions, events, &mut out);
 
     for view in &snap.host_addresses {
         check_conflicting_answers(view, &snap.device_names, now, &mut out);

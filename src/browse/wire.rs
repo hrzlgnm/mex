@@ -197,6 +197,9 @@ pub(crate) fn parse_packet(
     // (RFC 6762 §8.1): kept apart, never filed, only to tell probes. An
     // OPT pseudo-record only ever rides in the additional section.
     let mut query_authority = Vec::new();
+    // A query's additional section: misplaced known answers (#424), kept
+    // apart and never filed, like the authority section.
+    let mut query_additional = Vec::new();
     if !is_response {
         for (i, rec) in pkt.answers.iter().enumerate() {
             let w = wire.answer.get(i).copied();
@@ -214,6 +217,13 @@ pub(crate) fn parse_packet(
                 record_row(rec, w, RecordSection::Authority, ing)
             })
             .collect();
+        for (i, rec) in pkt.additional_records.iter().enumerate() {
+            let w = wire.additional.get(i).copied();
+            if is_opt(rec, w) {
+                continue;
+            }
+            query_additional.push(record_row(rec, w, RecordSection::Additional, ing));
+        }
     }
 
     let mut questions = Vec::new();
@@ -230,6 +240,7 @@ pub(crate) fn parse_packet(
         questions,
         query_kas,
         query_authority,
+        query_additional,
         rcode: is_response.then(|| raw.get(3).copied().unwrap_or_default() & 0x0f),
         received_at: Instant::now(),
         raw_bytes: raw.to_vec(),

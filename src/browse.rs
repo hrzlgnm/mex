@@ -243,6 +243,11 @@ pub struct Event {
     /// records (RFC 6762 §8.1). Never filed; a non-empty list marks the
     /// query as a probe, which the rate checks exempt (#408, #407).
     pub query_authority: Vec<RawRecord>,
+    /// Additional-section records of a query packet, EDNS0 OPT left out.
+    /// Known answers belong in the Answer section (RFC 6762 §7.1), so
+    /// these suppress nothing: never filed, never known answers for §7.3,
+    /// only flagged (`misplaced-known-answer`, #424).
+    pub query_additional: Vec<RawRecord>,
     /// DNS header response code for a response packet; queries are `None`.
     pub rcode: Option<u8>,
     pub received_at: Instant,

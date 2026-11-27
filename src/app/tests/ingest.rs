@@ -331,6 +331,7 @@ fn reverse_ptr_creates_no_pending_service() {
         questions: vec![],
         query_kas: vec![],
         query_authority: Vec::new(),
+        query_additional: Vec::new(),
         rcode: Some(0),
         received_at: Instant::now(),
         raw_bytes: vec![],
@@ -873,6 +874,7 @@ fn nonzero_rcode_response_records_are_not_ingested() {
             questions: Vec::new(),
             query_kas: Vec::new(),
             query_authority: Vec::new(),
+            query_additional: Vec::new(),
             rcode: Some(3),
             received_at: Instant::now(),
             raw_bytes: vec![0x01],
@@ -1436,4 +1438,39 @@ fn service_records_keep_rdata_case() {
         .filter(|r| r.rtype == 16)
         .count();
     assert_eq!(txts, 2);
+}
+
+#[test]
+fn a_query_s_additional_records_are_never_filed_nor_known_answers() {
+    // #424: a querier listing its known answers in the Additional section.
+    // They are beliefs like known answers, but in the wrong place: no
+    // answers, no sightings, and no known answers for §7.3 suppression.
+    let mut app = App::new().unwrap();
+    let mut ev = query_event(
+        "_services._dns-sd._udp.local.",
+        12,
+        "PTR",
+        false,
+        Vec::new(),
+        remote_source(),
+    );
+    ev.query_additional = vec![ka_record(
+        "_services._dns-sd._udp.local.",
+        "_http._tcp.local.",
+    )];
+    app.ingest_event(&ev);
+    assert_eq!(app.enum_entries[0].questions.len(), 1);
+    assert!(app.enum_entries[0].answers.is_empty());
+    assert!(app.scheduler.enum_known().is_empty());
+    assert!(app.sightings.is_empty(), "{:#?}", app.sightings.len());
+    let overheard = app
+        .scheduler
+        .overheard()
+        .get(&("_services._dns-sd._udp.local".to_string(), 12))
+        .expect("the question is overheard");
+    assert!(
+        overheard.1.is_empty(),
+        "no known answers: {:?}",
+        overheard.1
+    );
 }

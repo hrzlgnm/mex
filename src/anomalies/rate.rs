@@ -73,14 +73,57 @@ pub(super) fn fmt_secs(d: Duration) -> String {
 /// Identity of one question as a Questions row knows it: the name folded
 /// ASCII-only (RFC 6762 §16), the type, and the querier address. Rows
 /// carry no ingress link, so links are told apart below it.
-pub(super) type AskingKey = (String, u16, SocketAddr);
+type AskingKey = (String, u16, SocketAddr);
 
 /// An ingress link: interface name and index, so two unnamed links stay
 /// two.
 type Link = (String, u32);
 
-pub(super) fn asking_key(name: &str, rtype: u16, source: SocketAddr) -> AskingKey {
+fn asking_key(name: &str, rtype: u16, source: SocketAddr) -> AskingKey {
     (name.to_ascii_lowercase(), rtype, source)
+}
+
+/// A tally per question over the retained queries, for the findings that
+/// count a querier's queries (#423, #424): per querier over every link,
+/// and per querier and link label. Questions rows carry no ingress link,
+/// so they read the first; a sighting row labelled with its link
+/// (`address@iface`) reads only its own link (an IPv6 zone already sits
+/// in the address).
+pub(super) struct QuestionTally<T> {
+    all: HashMap<AskingKey, T>,
+    per_link: HashMap<(AskingKey, String), T>,
+}
+
+impl<T: Default> QuestionTally<T> {
+    pub(super) fn new() -> Self {
+        Self {
+            all: HashMap::new(),
+            per_link: HashMap::new(),
+        }
+    }
+
+    /// Apply `add` once per question of `ev`: a question asked twice in
+    /// one packet is one query.
+    pub(super) fn add_packet(&mut self, ev: &Event, add: impl Fn(&mut T)) {
+        let mut in_packet = HashSet::new();
+        for q in &ev.questions {
+            let key = asking_key(&q.name, q.rtype, q.source);
+            if in_packet.insert(key.clone()) {
+                add(self.all.entry(key.clone()).or_default());
+                add(self.per_link.entry((key, q.source_label())).or_default());
+            }
+        }
+    }
+
+    /// The tally for the row `q`.
+    pub(super) fn get(&self, q: &QuestionView<'_>) -> Option<&T> {
+        let key = asking_key(q.name, q.rtype, q.source);
+        if q.source_label == q.source.to_string() {
+            self.all.get(&key)
+        } else {
+            self.per_link.get(&(key, q.source_label.clone()))
+        }
+    }
 }
 
 /// A continuous querier, the only kind RFC 6762 §5.2 binds: it asks

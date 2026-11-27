@@ -100,7 +100,8 @@ Headless run (no TTY) logs to stderr.
   (unresolved targets, address-query evidence), `naming` (service type,
   label and subtype checks), `questions` (question verdicts), `rate`
   (sends repeated within a second, over the retained packets), `header`
-  (query header bits, over the retained packets), `scope`
+  (query header bits, over the retained packets), `placement` (records in
+  query sections responders ignore), `scope`
   (finding display scopes). Tests live in `src/anomalies/tests/`, one file
   per topic.
 * `src/ui.rs` — ratatui rendering only. It reads focus, selection and

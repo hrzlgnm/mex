@@ -4,7 +4,7 @@
 //! Query header checks over the retained packets: header bits a querier
 //! must not set (RFC 6762 §18, #423).
 
-use super::rate::{asking_key, AskingKey};
+use super::rate::QuestionTally;
 use super::*;
 use crate::browse::Event;
 
@@ -22,10 +22,7 @@ struct AaCount {
 /// ignore it). Every querier is held to it, one-shot or probing alike.
 /// Each finding goes on the querier's Questions row of every service the
 /// question files under, with how many of that question's retained
-/// queries carried the bit. Questions rows carry no ingress link, so a
-/// querier's queries on every link count together there; a sighting row
-/// labelled with its link (`address@iface`) counts that link's queries
-/// only.
+/// queries carried the bit, counted per link as `QuestionTally` says.
 pub(super) fn check_query_aa_bit(
     questions: &[QuestionView<'_>],
     events: &[Event],
@@ -36,36 +33,16 @@ pub(super) fn check_query_aa_bit(
     if questions.is_empty() || !events.iter().any(Event::is_authoritative_query) {
         return;
     }
-    // Per querier over every link, and per querier and link label.
-    let mut counts: HashMap<AskingKey, AaCount> = HashMap::new();
-    let mut per_link: HashMap<(AskingKey, String), AaCount> = HashMap::new();
+    let mut counts = QuestionTally::<AaCount>::new();
     for ev in events {
-        let aa = ev.is_authoritative_query();
-        // A question asked twice in one packet is one query.
-        let mut in_packet = HashSet::new();
-        for q in &ev.questions {
-            let key = asking_key(&q.name, q.rtype, q.source);
-            if in_packet.insert(key.clone()) {
-                for count in [
-                    counts.entry(key.clone()).or_default(),
-                    per_link.entry((key, q.source_label())).or_default(),
-                ] {
-                    count.queries += 1;
-                    count.authoritative += usize::from(aa);
-                }
-            }
-        }
+        let aa = usize::from(ev.is_authoritative_query());
+        counts.add_packet(ev, |count| {
+            count.queries += 1;
+            count.authoritative += aa;
+        });
     }
     for q in questions {
-        let key = asking_key(q.name, q.rtype, q.source);
-        // A bare label stands for every link; a link-qualified one for its
-        // own link (an IPv6 zone already sits in the address).
-        let count = if q.source_label == q.source.to_string() {
-            counts.get(&key)
-        } else {
-            per_link.get(&(key, q.source_label.clone()))
-        };
-        let Some(count) = count else {
+        let Some(count) = counts.get(q) else {
             continue;
         };
         if count.authoritative == 0 {
