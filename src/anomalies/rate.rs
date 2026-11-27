@@ -172,10 +172,12 @@ fn send_key(r: &RawRecord) -> SendKey {
         // Out-of-scope rdata shows only `rdlength=<n>`: its digest tells
         // a repeat from new content of one length (an SOA serial bump).
         Some(digest) => format!("#{digest:016x}"),
-        // Name-valued rdata (PTR, CNAME, NS targets, the SRV target) folds
-        // ASCII case like any name, so a responder varying that case
-        // still repeats one record. Other rdata (TXT) compares exactly.
-        None if matches!(r.rtype, 2 | 5 | 12 | 33) => r.rdata.to_ascii_lowercase(),
+        // Name-valued rdata (PTR, CNAME, NS targets, the SRV target, the
+        // NSEC next name) folds ASCII case like any name, so a responder
+        // varying that case still repeats one record. The NSEC bitmap's
+        // mnemonics stay distinct when folded. Other rdata (TXT) compares
+        // exactly.
+        None if matches!(r.rtype, 2 | 5 | 12 | 33 | 47) => r.rdata.to_ascii_lowercase(),
         None => r.rdata.clone(),
     };
     (
