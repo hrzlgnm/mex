@@ -312,7 +312,19 @@ pub(super) fn record_row(
         section,
         received_at: Instant::now(),
         trigger: None,
+        rdata_digest: (!in_scope).then(|| opaque_digest(&rec.rdata)),
     }
+}
+
+/// Digest of an out-of-scope record's rdata bytes (the parser keeps them
+/// as opaque `NULL` data): an identity without holding the data.
+fn opaque_digest(rdata: &RData<'_>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    if let RData::NULL(_, data) = rdata {
+        data.get_data().hash(&mut h);
+    }
+    h.finish()
 }
 
 pub(super) fn question_row(q: &Question<'_>, ing: Ingress<'_>) -> RawRecord {
@@ -341,6 +353,7 @@ pub(super) fn question_row(q: &Question<'_>, ing: Ingress<'_>) -> RawRecord {
         section: RecordSection::Question,
         received_at: Instant::now(),
         trigger: None,
+        rdata_digest: None,
     }
 }
 

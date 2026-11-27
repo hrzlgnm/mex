@@ -37,12 +37,23 @@ impl Repeats {
 /// The repeats of one identity, given each packet's receive time (one
 /// per packet: copies inside a packet are one send), or `None` while
 /// every gap keeps the one-second floor.
-pub(super) fn repeats(mut times: Vec<Instant>) -> Option<Repeats> {
-    times.sort();
-    let min_gap = times.windows(2).map(|w| w[1] - w[0]).min()?;
+pub(super) fn repeats(times: Vec<Instant>) -> Option<Repeats> {
+    repeats_except(times.into_iter().map(|at| (at, false)).collect())
+}
+
+/// `repeats`, where a send flagged `true` is allowed to come early (an
+/// answer to a probe, RFC 6762 §6): the gap ending in it is not judged,
+/// but it still counts as a send, and the next gap starts from it.
+fn repeats_except(mut sends: Vec<(Instant, bool)>) -> Option<Repeats> {
+    sends.sort();
+    let min_gap = sends
+        .windows(2)
+        .filter(|w| !w[1].1)
+        .map(|w| w[1].0 - w[0].0)
+        .min()?;
     (min_gap < MIN_GAP).then(|| Repeats {
-        count: times.len(),
-        span: times[times.len() - 1] - times[0],
+        count: sends.len(),
+        span: sends[sends.len() - 1].0 - sends[0].0,
         min_gap,
     })
 }
@@ -152,24 +163,27 @@ pub(super) fn check_query_rate(
 }
 
 /// Identity of one record transmission: the owner name folded ASCII-only
-/// (RFC 6762 §16), the type, the rdata, and the responder as findings
-/// name it (address plus link).
-type SendKey = (String, u16, String, String);
+/// (RFC 6762 §16), the type, the content, the responder address, and its
+/// link (interface name and index, so two unnamed links stay two).
+type SendKey = (String, u16, String, SocketAddr, Link);
 
 fn send_key(r: &RawRecord) -> SendKey {
-    // A PTR target is a name, and ingest replaces a PTR row whose target
-    // differs only in case: a responder varying that case still repeats
-    // one record. Other rdata (TXT) is compared exactly, like ingest.
-    let rdata = if r.rtype == 12 {
-        r.rdata.to_ascii_lowercase()
-    } else {
-        r.rdata.clone()
+    let content = match r.rdata_digest {
+        // Out-of-scope rdata shows only `rdlength=<n>`: its digest tells
+        // a repeat from new content of one length (an SOA serial bump).
+        Some(digest) => format!("#{digest:016x}"),
+        // Name-valued rdata (PTR, CNAME, NS targets, the SRV target) folds
+        // ASCII case like any name, so a responder varying that case
+        // still repeats one record. Other rdata (TXT) compares exactly.
+        None if matches!(r.rtype, 2 | 5 | 12 | 33) => r.rdata.to_ascii_lowercase(),
+        None => r.rdata.clone(),
     };
     (
         r.name.to_ascii_lowercase(),
         r.rtype,
-        rdata,
-        r.source_label(),
+        content,
+        r.source,
+        (r.iface.clone(), r.ifindex),
     )
 }
 
@@ -235,14 +249,17 @@ impl<'a> MulticastIndex<'a> {
         }
     }
 
-    /// Whether a probe for `rec`'s owner name arrived on its link in the
-    /// second before `at`: answering it is conflict defense, the one
-    /// exception RFC 6762 §6 allows.
-    fn probed(&self, rec: &RawRecord, at: Instant) -> bool {
+    /// Whether the copy at `at` answers a probe: one for `rec`'s owner
+    /// name arrived on its link in the second before, and after the
+    /// previous copy (`since`), which would otherwise have answered it.
+    /// Answering a probe is conflict defense, the one exception RFC 6762
+    /// §6 allows.
+    fn probed(&self, rec: &RawRecord, at: Instant, since: Option<Instant>) -> bool {
         let name = rec.name.to_ascii_lowercase();
         self.probes.iter().any(|p| {
             p.at <= at
                 && at - p.at <= MIN_GAP
+                && since.is_none_or(|prev| p.at > prev)
                 && p.iface == rec.iface
                 && p.ifindex == rec.ifindex
                 && p.names.contains(&name)
@@ -289,18 +306,29 @@ impl<'a> MulticastIndex<'a> {
         let Some(copies) = self.sends.get(&send_key(rec)) else {
             return;
         };
-        let kept: Vec<(Instant, usize)> = copies
+        // A probe answer may come early, but it is still a multicast:
+        // the next copy must wait a second after it (RFC 6762 §6).
+        // Copies are in arrival order: each one's previous copy bounds
+        // which probes it can answer.
+        let probed: Vec<bool> = copies
             .iter()
-            .copied()
-            .filter(|(at, _)| !self.probed(rec, *at))
+            .enumerate()
+            .map(|(i, (at, _))| {
+                let since = i.checked_sub(1).map(|prev| copies[prev].0);
+                self.probed(rec, *at, since)
+            })
             .collect();
-        let Some(rep) = repeats(kept.iter().map(|(at, _)| *at).collect()) else {
+        let sends = copies.iter().zip(&probed).map(|((at, _), p)| (*at, *p));
+        let Some(rep) = repeats_except(sends.collect()) else {
             return;
         };
-        let trigger = kept
+        // What drove the repeats: probe answers answered the probe.
+        let trigger = copies
             .iter()
+            .zip(&probed)
             .rev()
-            .find_map(|(at, packet)| self.trigger(rec, *at, *packet))
+            .filter(|(_, p)| !**p)
+            .find_map(|((at, packet), _)| self.trigger(rec, *at, *packet))
             .map(|t| format!(", answering {t}"))
             .unwrap_or_default();
         out.push(Anomaly {

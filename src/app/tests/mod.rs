@@ -71,6 +71,7 @@ fn raw_record(name: &str, rtype: u16, rtype_str: &str, rdata: &str, ttl: u32) ->
         section: browse::RecordSection::Answer,
         received_at: Instant::now(),
         trigger: None,
+        rdata_digest: None,
     }
 }
 
@@ -326,6 +327,7 @@ fn query_event(
         section: browse::RecordSection::Question,
         received_at: Instant::now(),
         trigger: None,
+        rdata_digest: None,
     };
     browse::Event {
         answers: Vec::new(),

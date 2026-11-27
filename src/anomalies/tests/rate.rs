@@ -638,3 +638,74 @@ fn ptr_targets_fold_case_but_txt_data_does_not() {
     let found = analyze_answers(&[cached(&txt)], &events);
     assert!(multicast_findings(&found).is_empty(), "{found:#?}");
 }
+
+#[test]
+fn name_valued_rdata_folds_case() {
+    // An SRV target is a name: a responder varying its case still
+    // repeats one record.
+    let mut srv = rec(NAME, 33, "SRV", "0 0 80 Host.local.", 120, true);
+    srv.source = responder();
+    let mut upper = srv.clone();
+    upper.rdata = "0 0 80 HOST.local.".to_string();
+    let mut events = sends(&srv, &[0]);
+    events.extend(sends(&upper, &[250]));
+    let found = analyze_answers(&[cached(&srv)], &events);
+    assert_eq!(multicast_findings(&found).len(), 1, "{found:#?}");
+}
+
+#[test]
+fn opaque_records_compare_by_content_not_length() {
+    // Out-of-scope records show only `rdlength=<n>`: two SOA copies of
+    // one length but different serials are two records, not a repeat.
+    let mut soa = rec("fritz.box.", 6, "TYPE6", "rdlength=49", 4500, false);
+    soa.source = responder();
+    soa.rdata_digest = Some(1);
+    let mut bumped = soa.clone();
+    bumped.rdata_digest = Some(2);
+    let mut events = sends(&soa, &[0]);
+    events.extend(sends(&bumped, &[250]));
+    let found = analyze_answers(&[cached(&bumped)], &events);
+    assert!(multicast_findings(&found).is_empty(), "{found:#?}");
+    // The same content again is a repeat.
+    let mut events = sends(&soa, &[0]);
+    events.extend(sends(&soa, &[250]));
+    let found = analyze_answers(&[cached(&soa)], &events);
+    assert_eq!(multicast_findings(&found).len(), 1, "{found:#?}");
+}
+
+#[test]
+fn copies_on_two_unnamed_links_stay_quiet() {
+    let mut on_three = host_a(responder(), "");
+    on_three.ifindex = 3;
+    let mut on_four = on_three.clone();
+    on_four.ifindex = 4;
+    let mut events = sends(&on_three, &[0]);
+    events.extend(sends(&on_four, &[250]));
+    let found = analyze_answers(&[cached(&on_three), cached(&on_four)], &events);
+    assert!(multicast_findings(&found).is_empty(), "{found:#?}");
+}
+
+#[test]
+fn a_probe_answer_still_counts_as_the_last_multicast() {
+    // RFC 6762 §6: the probe answer itself is allowed, but the next
+    // multicast must still wait a second after it: 751 ms is too soon.
+    let a = host_a(responder(), "");
+    let at = base();
+    let prober: SocketAddr = "192.168.1.50:5353".parse().unwrap();
+    let mut probe = query_at(at, 200, vec![question(HOST, 255, "ANY", prober, "")]);
+    probe.query_authority = vec![host_a(prober, "")];
+    let events = vec![
+        response_at(at, 0, vec![a.clone()]),
+        probe,
+        response_at(at, 250, vec![a.clone()]),
+        response_at(at, 1001, vec![a.clone()]),
+    ];
+    let found = analyze_answers(&[cached(&a)], &events);
+    let flood = multicast_findings(&found);
+    assert_eq!(flood.len(), 1, "{found:#?}");
+    assert!(
+        flood[0].message.contains("as little as 0.75 s apart"),
+        "{}",
+        flood[0].message
+    );
+}

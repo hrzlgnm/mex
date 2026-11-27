@@ -668,6 +668,7 @@ mod tests {
             section: crate::browse::RecordSection::Answer,
             received_at: Instant::now(),
             trigger: None,
+            rdata_digest: None,
         }
     }
 

@@ -74,6 +74,7 @@ fn rec_with(
         section,
         received_at: Instant::now(),
         trigger: None,
+        rdata_digest: None,
     }
 }
 
