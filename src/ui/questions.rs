@@ -44,15 +44,13 @@ pub(super) fn draw_questions_tab(
     let shown = worst_of(per_question.iter().flatten());
     let identity_count = crate::anomalies::identity_counts(per_question.iter().flatten());
     // Cells plus row style first: LAST/DUE widths size to content
-    // (like SOURCE below) instead of clipping long states.
-    let mut body: Vec<(Vec<String>, Style)> = Vec::new();
-    let mut marks = Vec::new();
-    // Each question's identity: the drawn rows own it, not a list
+    // (like SOURCE below) instead of clipping long states. Each row also
+    // keeps its question's identity: the drawn rows own it, not a list
     // position that a newer question would shift (#413).
-    let mut keys = Vec::new();
+    let mut body: Vec<(Vec<String>, Style, crate::app::DetailCursorKey)> = Vec::new();
+    let mut marks = Vec::new();
     for (q, (name, rtype, source, seen_at, _)) in target.ordered_questions().into_iter().enumerate()
     {
-        keys.push(crate::app::DetailCursorKey::question(name, rtype, *source));
         // Latest event and owning timer for this interest, from the
         // authoritative per-interest state (app.rs): rows stay dumb.
         let self_row = *source == crate::app::SELF_SOURCE;
@@ -134,6 +132,7 @@ pub(super) fn draw_questions_tab(
                 crate::browse::unescape_name(name),
             ],
             style,
+            crate::app::DetailCursorKey::question(name, rtype, *source),
         ));
     }
 
@@ -141,13 +140,13 @@ pub(super) fn draw_questions_tab(
     // content, so the floor only matters when every cell is blank.
     let last_w = body
         .iter()
-        .map(|(cells, _)| cells[1].len())
+        .map(|(cells, _, _)| cells[1].len())
         .max()
         .unwrap_or(4)
         .clamp(8, 20) as u16;
     let due_w = body
         .iter()
-        .map(|(cells, _)| cells[2].len())
+        .map(|(cells, _, _)| cells[2].len())
         .max()
         .unwrap_or(3)
         .clamp(8, 15) as u16;
@@ -175,7 +174,7 @@ pub(super) fn draw_questions_tab(
     // to their question.
     let mut owners = Vec::new();
     let mut heights = Vec::new();
-    for (q, ((cells, style), key)) in body.into_iter().zip(keys).enumerate() {
+    for (q, (cells, style, key)) in body.into_iter().enumerate() {
         question_positions.push(rows.len());
         let mut cells = cells.into_iter();
         let mut row_cells = vec![marked_cell(

@@ -91,7 +91,12 @@ impl DrawnRows {
     /// Lines between the rows of owners `a` and `b` (each owner's first
     /// row, its own row), `None` when either has no row.
     pub fn lines_between_owners(&self, a: &DetailCursorKey, b: &DetailCursorKey) -> Option<usize> {
-        let first = |o: &DetailCursorKey| self.owners.iter().position(|x| x.as_ref() == Some(o));
+        // Matched like a click resolves them (record names fold case).
+        let first = |o: &DetailCursorKey| {
+            self.owners
+                .iter()
+                .position(|x| x.as_ref().is_some_and(|k| k.same_row(o)))
+        };
         let (ra, rb) = (first(a)?, first(b)?);
         let (lo, hi) = (ra.min(rb), ra.max(rb));
         Some(self.heights[lo..hi].iter().map(|h| usize::from(*h)).sum())

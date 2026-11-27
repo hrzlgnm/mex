@@ -144,6 +144,59 @@ impl DetailCursorKey {
             source,
         }
     }
+
+    /// Whether `r` is this record row. Same row identity as
+    /// `push_record`: the owner name folds ASCII case, so a replacing
+    /// copy is still the same row.
+    fn is_record(&self, r: &browse::RawRecord) -> bool {
+        match self {
+            Self::Record {
+                name,
+                rtype,
+                rdata,
+                source,
+                ifindex,
+            } => {
+                r.name.eq_ignore_ascii_case(name)
+                    && r.rtype == *rtype
+                    && &r.rdata == rdata
+                    && r.source == *source
+                    && r.ifindex == *ifindex
+            }
+            Self::Question { .. } => false,
+        }
+    }
+
+    /// Whether two identities name the same row, by the same rules as
+    /// resolving them (`is_record`): record names fold ASCII case.
+    pub fn same_row(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Record {
+                    name,
+                    rtype,
+                    rdata,
+                    source,
+                    ifindex,
+                },
+                Self::Record {
+                    name: n,
+                    rtype: t,
+                    rdata: d,
+                    source: s,
+                    ifindex: i,
+                },
+            ) => {
+                name.eq_ignore_ascii_case(n)
+                    && rtype == t
+                    && rdata == d
+                    && source == s
+                    && ifindex == i
+            }
+            (a @ Self::Question { .. }, b @ Self::Question { .. }) => a == b,
+            _ => false,
+        }
+    }
 }
 
 struct PendingService {

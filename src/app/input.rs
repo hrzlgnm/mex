@@ -940,8 +940,10 @@ impl App {
         // On drawn Answers rows a page is a viewport of lines, so tall
         // rows (wrapped findings, #410) count as drawn. Questions and
         // undrawn tables count one line per cursor step.
-        let drawn = self.layout.answers_rows.borrow().clone();
+        // Sync first: a target change clears the drawn rows, which then
+        // belong to the old target.
         self.sync_detail_cursor();
+        let drawn = self.layout.answers_rows.borrow().clone();
         let start = self.view_state.detail_selected;
         let start_key = self.detail_anchor.clone();
         for _ in 0..budget.min(1000) {
@@ -1087,21 +1089,8 @@ impl App {
     ) -> Option<usize> {
         let raws = target.ordered_answers();
         match key {
-            DetailCursorKey::Record {
-                name,
-                rtype,
-                rdata,
-                source,
-                ifindex,
-            } => raws.iter().position(|r| {
-                // Same row identity as `push_record`: the owner name
-                // folds ASCII case, so a replacing copy keeps the cursor.
-                r.name.eq_ignore_ascii_case(name)
-                    && r.rtype == *rtype
-                    && &r.rdata == rdata
-                    && r.source == *source
-                    && r.ifindex == *ifindex
-            }),
+            // A replacing copy (owner name case folded) keeps the cursor.
+            DetailCursorKey::Record { .. } => raws.iter().position(|r| key.is_record(r)),
             DetailCursorKey::Question {
                 name,
                 rtype,
