@@ -4,6 +4,8 @@
 use ratatui::layout::Rect;
 use std::cell::{Cell, RefCell};
 
+use super::DetailCursorKey;
+
 /// What the last frame measured or clamped, shared between draw and input.
 ///
 /// `ui` records pane geometry, viewport heights, row maps and hex hit
@@ -55,20 +57,21 @@ pub struct Layout {
 /// taller than one line, so screen lines and table rows differ.
 #[derive(Debug, Clone, Default)]
 pub struct DrawnRows {
-    owners: Vec<Option<usize>>,
+    owners: Vec<Option<DetailCursorKey>>,
     heights: Vec<u16>,
 }
 
 impl DrawnRows {
     /// Rows with their owners and heights; a missing height counts as 1.
-    pub fn new(owners: Vec<Option<usize>>, mut heights: Vec<u16>) -> Self {
+    pub fn new(owners: Vec<Option<DetailCursorKey>>, mut heights: Vec<u16>) -> Self {
         heights.resize(owners.len(), 1);
         Self { owners, heights }
     }
 
-    /// Owner of table row `row`.
-    pub fn owner(&self, row: usize) -> Option<usize> {
-        self.owners.get(row).copied().flatten()
+    /// Owner of table row `row`: an identity, not a list position, so a
+    /// reorder between the draw and a click can't retarget it (#413).
+    pub fn owner(&self, row: usize) -> Option<&DetailCursorKey> {
+        self.owners.get(row)?.as_ref()
     }
 
     /// Table row drawn at viewport line `line` while the table shows
@@ -87,8 +90,8 @@ impl DrawnRows {
 
     /// Lines between the rows of owners `a` and `b` (each owner's first
     /// row, its own row), `None` when either has no row.
-    pub fn lines_between_owners(&self, a: usize, b: usize) -> Option<usize> {
-        let first = |o| self.owners.iter().position(|x| *x == Some(o));
+    pub fn lines_between_owners(&self, a: &DetailCursorKey, b: &DetailCursorKey) -> Option<usize> {
+        let first = |o: &DetailCursorKey| self.owners.iter().position(|x| x.as_ref() == Some(o));
         let (ra, rb) = (first(a)?, first(b)?);
         let (lo, hi) = (ra.min(rb), ra.max(rb));
         Some(self.heights[lo..hi].iter().map(|h| usize::from(*h)).sum())

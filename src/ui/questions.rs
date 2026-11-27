@@ -47,8 +47,12 @@ pub(super) fn draw_questions_tab(
     // (like SOURCE below) instead of clipping long states.
     let mut body: Vec<(Vec<String>, Style)> = Vec::new();
     let mut marks = Vec::new();
+    // Each question's identity: the drawn rows own it, not a list
+    // position that a newer question would shift (#413).
+    let mut keys = Vec::new();
     for (q, (name, rtype, source, seen_at, _)) in target.ordered_questions().into_iter().enumerate()
     {
+        keys.push(crate::app::DetailCursorKey::question(name, rtype, *source));
         // Latest event and owning timer for this interest, from the
         // authoritative per-interest state (app.rs): rows stay dumb.
         let self_row = *source == crate::app::SELF_SOURCE;
@@ -167,11 +171,11 @@ pub(super) fn draw_questions_tab(
     let fit = FindingFit::new(area, &widths, area.height.saturating_sub(4) as usize);
     let mut rows: Vec<Row> = Vec::new();
     let mut question_positions = Vec::with_capacity(body.len());
-    // Row -> question index and height as drawn: finding rows belong to
-    // their question.
+    // Row -> question identity and height as drawn: finding rows belong
+    // to their question.
     let mut owners = Vec::new();
     let mut heights = Vec::new();
-    for (q, (cells, style)) in body.into_iter().enumerate() {
+    for (q, ((cells, style), key)) in body.into_iter().zip(keys).enumerate() {
         question_positions.push(rows.len());
         let mut cells = cells.into_iter();
         let mut row_cells = vec![marked_cell(
@@ -181,12 +185,12 @@ pub(super) fn draw_questions_tab(
         )];
         row_cells.extend(cells.map(Cell::from));
         rows.push(Row::new(row_cells).style(style));
-        owners.push(Some(q));
+        owners.push(Some(key.clone()));
         heights.push(1);
         for a in &per_question[q] {
             let (row, height) = finding_row(a, &identity_count, &book, 3, 4, true, &fit);
             rows.push(row);
-            owners.push(Some(q));
+            owners.push(Some(key.clone()));
             heights.push(height);
         }
     }

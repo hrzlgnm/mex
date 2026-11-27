@@ -10,6 +10,7 @@ mod conflicting_answers;
 mod denials;
 mod devices;
 mod diagnostics;
+mod drawn_rows;
 mod finding_owners;
 mod finding_targets;
 mod finding_wrap;

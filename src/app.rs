@@ -101,14 +101,15 @@ pub(crate) fn record_liveness(rec: &browse::RawRecord) -> RecordLiveness {
     }
 }
 
-/// Identity of the cursor row, so the selection survives resorting of the
-/// table (TTL countdowns and re-announcements constantly reshuffle rows).
-/// Matches the dedup identities used at ingest.
 /// Identity of one expandable TXT row: per link, like every row (#264).
 type TxtKey = (String, String, std::net::SocketAddr, u32);
 
-#[derive(Clone, PartialEq, Eq)]
-enum DetailCursorKey {
+/// Identity of a detail row (record or question), so the cursor and
+/// clicks survive resorting of the table (TTL countdowns, re-announcements
+/// and new questions constantly reshuffle rows; #413). Matches the dedup
+/// identities used at ingest; resolve it with `App::position_of_detail`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetailCursorKey {
     Record {
         name: String,
         rtype: u16,
@@ -121,6 +122,28 @@ enum DetailCursorKey {
         rtype: String,
         source: std::net::SocketAddr,
     },
+}
+
+impl DetailCursorKey {
+    /// Identity of a record row.
+    pub fn record(r: &browse::RawRecord) -> Self {
+        Self::Record {
+            name: r.name.clone(),
+            rtype: r.rtype,
+            rdata: r.rdata.clone(),
+            source: r.source,
+            ifindex: r.ifindex,
+        }
+    }
+
+    /// Identity of a question row.
+    pub fn question(name: &str, rtype: &str, source: std::net::SocketAddr) -> Self {
+        Self::Question {
+            name: name.to_string(),
+            rtype: rtype.to_string(),
+            source,
+        }
+    }
 }
 
 struct PendingService {

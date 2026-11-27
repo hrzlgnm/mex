@@ -512,10 +512,13 @@ impl App {
         let offset = self.layout.detail_offset.get();
         // Finding and TXT child rows select their parent record, info and
         // block rows nothing. Hit-test the frame as drawn: findings can
-        // change between drawing and the click, and wrapped findings
-        // (#410) take more than one line.
+        // change between drawing and the click, wrapped findings (#410)
+        // take more than one line, and records can reorder, so the drawn
+        // row's identity picks the record (#413); one gone since selects
+        // nothing.
         if let Some(rows) = self.layout.answers_rows.borrow().as_ref() {
-            return rows.owner(rows.row_at_line(offset, line)?);
+            let key = rows.owner(rows.row_at_line(offset, line)?)?;
+            return Self::position_of_detail(&self.display_detail()?, key);
         }
         // Nothing drawn for this target yet: the current layout, one
         // line per row.
@@ -567,11 +570,13 @@ impl App {
         let raws = target.ordered_answers().len();
         let offset = self.layout.questions_offset.get();
         // Each question row is followed by its finding rows (#248), which
-        // can wrap (#410); hit the frame as drawn, else the current
-        // layout at one line per row.
+        // can wrap (#410); hit the frame as drawn, by the drawn question's
+        // identity (new questions sort first and shift the list, #413),
+        // else the current layout at one line per row.
         let drawn = self.layout.questions_rows.borrow().as_ref().map(|rows| {
             rows.row_at_line(offset, rel)
                 .and_then(|table_row| rows.owner(table_row))
+                .and_then(|key| Self::position_of_detail(&target, key))
         });
         let table_row = offset.saturating_add(rel);
         let hit = drawn.unwrap_or_else(|| {
@@ -579,15 +584,14 @@ impl App {
             let mut row = 0;
             for (q, findings) in self.question_findings(&target, &found).iter().enumerate() {
                 if (row..=row + findings.len()).contains(&table_row) {
-                    return Some(q);
+                    return Some(raws + q);
                 }
                 row += 1 + findings.len();
             }
             None
         });
-        if let Some(question) = hit {
+        if let Some(idx) = hit {
             self.view_state.detail_free_scroll = false;
-            let idx = raws + question;
             if self.view_state.detail_selected != idx {
                 self.view_state.detail_selected = idx;
                 self.restart_for_new_row();
@@ -937,7 +941,9 @@ impl App {
         // rows (wrapped findings, #410) count as drawn. Questions and
         // undrawn tables count one line per cursor step.
         let drawn = self.layout.answers_rows.borrow().clone();
+        self.sync_detail_cursor();
         let start = self.view_state.detail_selected;
+        let start_key = self.detail_anchor.clone();
         for _ in 0..budget.min(1000) {
             let before = self.view_state.detail_selected;
             self.move_detail_cursor(pages.signum());
@@ -945,10 +951,12 @@ impl App {
             if now == before {
                 break;
             }
-            let Some(lines) = drawn
-                .as_ref()
-                .and_then(|d| d.lines_between_owners(start, now))
-            else {
+            // Rows are matched by identity, as drawn (#413); the anchor
+            // follows every cursor step.
+            let lines = drawn.as_ref().and_then(|d| {
+                d.lines_between_owners(start_key.as_ref()?, self.detail_anchor.as_ref()?)
+            });
+            let Some(lines) = lines else {
                 continue;
             };
             if lines > budget && before != start {
@@ -1063,24 +1071,13 @@ impl App {
     ) -> Option<DetailCursorKey> {
         let raws = target.ordered_answers();
         if index < raws.len() {
-            let r = raws[index];
-            return Some(DetailCursorKey::Record {
-                name: r.name.clone(),
-                rtype: r.rtype,
-                rdata: r.rdata.clone(),
-                source: r.source,
-                ifindex: r.ifindex,
-            });
+            return Some(DetailCursorKey::record(raws[index]));
         }
         target
             .ordered_questions()
             .into_iter()
             .nth(index - raws.len())
-            .map(|q| DetailCursorKey::Question {
-                name: q.0.clone(),
-                rtype: q.1.clone(),
-                source: q.2,
-            })
+            .map(|q| DetailCursorKey::question(&q.0, &q.1, q.2))
     }
 
     /// Index of the row with an identity, if still present.

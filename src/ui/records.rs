@@ -105,12 +105,20 @@ pub(super) fn draw_records_tab(
     let fit = FindingFit::new(area, &widths, viewport.saturating_sub(1));
     let (rows, raw_positions, heights) =
         detail_table_rows(app, &target, &layout, &book, &own, show_sect, &fit);
+    // Each row's owning record by identity, so a click resolves the
+    // record drawn there even if the list reorders first (#413).
+    let answers = target.ordered_answers();
+    let owners = layout
+        .iter()
+        .map(|l| {
+            l.owning_record()
+                .and_then(|i| answers.get(i))
+                .map(|r| crate::app::DetailCursorKey::record(r))
+        })
+        .collect();
     app.layout()
         .answers_rows
-        .replace(Some(crate::app::DrawnRows::new(
-            layout.iter().map(|l| l.owning_record()).collect(),
-            heights.clone(),
-        )));
+        .replace(Some(crate::app::DrawnRows::new(owners, heights.clone())));
     let total_rows = rows.len();
     let mut header = vec!["TYPE", "TTL", "FLUSH", "SOURCE", "RDATA"];
     if show_sect {
