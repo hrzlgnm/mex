@@ -55,23 +55,37 @@ pub struct Layout {
 /// One table's rows as drawn: each row's owner (`None` per info, block
 /// or unowned row) and its height in lines. Wrapped findings (#410) are
 /// taller than one line, so screen lines and table rows differ.
+///
+/// Owners are identities, not list positions, so a reorder between the
+/// draw and a click can't retarget a row (#413). Each identity is held
+/// once in `keys`; rows point at it, so the many child rows of one
+/// record (findings, expanded TXT pairs) don't each clone its rdata.
 #[derive(Debug, Clone, Default)]
 pub struct DrawnRows {
-    owners: Vec<Option<DetailCursorKey>>,
+    keys: Vec<DetailCursorKey>,
+    owners: Vec<Option<usize>>,
     heights: Vec<u16>,
 }
 
 impl DrawnRows {
-    /// Rows with their owners and heights; a missing height counts as 1.
-    pub fn new(owners: Vec<Option<DetailCursorKey>>, mut heights: Vec<u16>) -> Self {
+    /// Rows owned by `keys[owner]`, with their heights; a missing height
+    /// counts as 1.
+    pub fn new(
+        keys: Vec<DetailCursorKey>,
+        owners: Vec<Option<usize>>,
+        mut heights: Vec<u16>,
+    ) -> Self {
         heights.resize(owners.len(), 1);
-        Self { owners, heights }
+        Self {
+            keys,
+            owners,
+            heights,
+        }
     }
 
-    /// Owner of table row `row`: an identity, not a list position, so a
-    /// reorder between the draw and a click can't retarget it (#413).
+    /// Owner of table row `row`.
     pub fn owner(&self, row: usize) -> Option<&DetailCursorKey> {
-        self.owners.get(row)?.as_ref()
+        self.keys.get(self.owners.get(row).copied().flatten()?)
     }
 
     /// Table row drawn at viewport line `line` while the table shows
@@ -91,11 +105,10 @@ impl DrawnRows {
     /// Lines between the rows of owners `a` and `b` (each owner's first
     /// row, its own row), `None` when either has no row.
     pub fn lines_between_owners(&self, a: &DetailCursorKey, b: &DetailCursorKey) -> Option<usize> {
-        // Matched like a click resolves them (record names fold case).
+        // Matched like a click resolves them (names fold ASCII case).
         let first = |o: &DetailCursorKey| {
-            self.owners
-                .iter()
-                .position(|x| x.as_ref().is_some_and(|k| k.same_row(o)))
+            let key = self.keys.iter().position(|k| k.same_row(o))?;
+            self.owners.iter().position(|x| *x == Some(key))
         };
         let (ra, rb) = (first(a)?, first(b)?);
         let (lo, hi) = (ra.min(rb), ra.max(rb));

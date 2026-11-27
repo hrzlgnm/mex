@@ -1088,19 +1088,16 @@ impl App {
         key: &DetailCursorKey,
     ) -> Option<usize> {
         let raws = target.ordered_answers();
-        match key {
-            // A replacing copy (owner name case folded) keeps the cursor.
-            DetailCursorKey::Record { .. } => raws.iter().position(|r| key.is_record(r)),
-            DetailCursorKey::Question {
-                name,
-                rtype,
-                source,
-            } => target
+        // A replacing copy (names folding ASCII case, as ingest files
+        // them) keeps the cursor and click target. Records first, then
+        // questions, as the detail index counts them.
+        raws.iter().position(|r| key.is_record(r)).or_else(|| {
+            target
                 .ordered_questions()
                 .iter()
-                .position(|q| q.0 == *name && q.1 == *rtype && q.2 == *source)
-                .map(|pos| pos + raws.len()),
-        }
+                .position(|q| key.is_question(&q.0, &q.1, q.2))
+                .map(|pos| pos + raws.len())
+        })
     }
 
     /// Keep the detail cursor pointed at the displayed target, resetting to

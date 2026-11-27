@@ -145,9 +145,10 @@ impl DetailCursorKey {
         }
     }
 
-    /// Whether `r` is this record row. Same row identity as
-    /// `push_record`: the owner name folds ASCII case, so a replacing
-    /// copy is still the same row.
+    /// Whether `r` is this record row, by the ingest identities: the
+    /// owner name folds ASCII case (`push_record`), and so does a PTR
+    /// target, a name (enum rows replace by `same_ptr_target`). Other
+    /// rdata compares exactly (TXT data is case-sensitive).
     fn is_record(&self, r: &browse::RawRecord) -> bool {
         match self {
             Self::Record {
@@ -159,7 +160,7 @@ impl DetailCursorKey {
             } => {
                 r.name.eq_ignore_ascii_case(name)
                     && r.rtype == *rtype
-                    && &r.rdata == rdata
+                    && same_rdata(*rtype, &r.rdata, rdata)
                     && r.source == *source
                     && r.ifindex == *ifindex
             }
@@ -167,8 +168,9 @@ impl DetailCursorKey {
         }
     }
 
-    /// Whether two identities name the same row, by the same rules as
-    /// resolving them (`is_record`): record names fold ASCII case.
+    /// Whether two identities name the same row, by the rules that
+    /// resolve them: names fold ASCII case (`is_record`; question rows
+    /// as in `file_question_row`).
     pub fn same_row(&self, other: &Self) -> bool {
         match (self, other) {
             (
@@ -189,13 +191,47 @@ impl DetailCursorKey {
             ) => {
                 name.eq_ignore_ascii_case(n)
                     && rtype == t
-                    && rdata == d
+                    && same_rdata(*rtype, rdata, d)
                     && source == s
                     && ifindex == i
             }
-            (a @ Self::Question { .. }, b @ Self::Question { .. }) => a == b,
+            (
+                Self::Question {
+                    name,
+                    rtype,
+                    source,
+                },
+                Self::Question {
+                    name: n,
+                    rtype: t,
+                    source: s,
+                },
+            ) => name.eq_ignore_ascii_case(n) && rtype == t && source == s,
             _ => false,
         }
+    }
+
+    /// Whether this question row is `(name, rtype, source)`: the name
+    /// folds ASCII case, as `file_question_row` files it.
+    fn is_question(&self, name: &str, rtype: &str, source: std::net::SocketAddr) -> bool {
+        match self {
+            Self::Question {
+                name: n,
+                rtype: t,
+                source: s,
+            } => n.eq_ignore_ascii_case(name) && t == rtype && *s == source,
+            Self::Record { .. } => false,
+        }
+    }
+}
+
+/// Whether two rdata strings of type `rtype` are the same row's: a PTR
+/// target is a name and folds ASCII case, any other rdata is exact.
+fn same_rdata(rtype: u16, a: &str, b: &str) -> bool {
+    if rtype == 12 {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
     }
 }
 

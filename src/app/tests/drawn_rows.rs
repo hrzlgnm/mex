@@ -121,9 +121,10 @@ fn paging_matches_drawn_records_whatever_their_name_case() {
     let other = raw_record("Test._http._tcp.local.", 33, "SRV", "0 0 80 x.", 120);
     let rows = DrawnRows::new(
         vec![
-            Some(DetailCursorKey::record(&drawn)),
-            Some(DetailCursorKey::record(&other)),
+            DetailCursorKey::record(&drawn),
+            DetailCursorKey::record(&other),
         ],
+        vec![Some(0), Some(1)],
         vec![3, 1],
     );
     assert_eq!(
@@ -133,4 +134,105 @@ fn paging_matches_drawn_records_whatever_their_name_case() {
         ),
         Some(3)
     );
+}
+
+#[test]
+fn row_identities_follow_the_ingest_rules() {
+    let src: SocketAddr = "192.168.1.2:5353".parse().unwrap();
+    // Question names fold ASCII case, like `file_question_row`.
+    let asked = DetailCursorKey::question("Test._http._tcp.local.", "TXT", src);
+    let reasked = DetailCursorKey::question("TEST._http._tcp.local.", "TXT", src);
+    assert!(asked.same_row(&reasked));
+    let other_type = DetailCursorKey::question("Test._http._tcp.local.", "SRV", src);
+    assert!(!asked.same_row(&other_type));
+    // A record is never a question.
+    let rec = raw_record("Test._http._tcp.local.", 16, "TXT", "a=1", 120);
+    assert!(!DetailCursorKey::record(&rec).same_row(&asked));
+    assert!(!asked.same_row(&DetailCursorKey::record(&rec)));
+    // PTR targets are names: their case folds (enum rows replace by a
+    // case-folded target); other rdata, like TXT, compares exactly.
+    let ptr = raw_record(
+        "_services._dns-sd._udp.local.",
+        12,
+        "PTR",
+        "_ipp._tcp.local.",
+        4500,
+    );
+    let mut ptr_upper = ptr.clone();
+    ptr_upper.rdata = "_IPP._tcp.local.".to_string();
+    assert!(DetailCursorKey::record(&ptr).same_row(&DetailCursorKey::record(&ptr_upper)));
+    let mut txt_upper = rec.clone();
+    txt_upper.rdata = "A=1".to_string();
+    assert!(!DetailCursorKey::record(&rec).same_row(&DetailCursorKey::record(&txt_upper)));
+}
+
+#[test]
+fn click_selects_a_question_re_asked_in_another_case() {
+    let mut app = App::new().unwrap();
+    service_with_txt(&mut app, "a=1; b=2");
+    for i in 0..3 {
+        ask(&mut app, "Test._http._tcp.local.", querier(i));
+    }
+    let buf = draw(&app);
+    let area = app.layout.questions_rect.get();
+    let lines = pane_lines(&buf, area);
+    let asker = querier(1);
+    let line = lines
+        .iter()
+        .position(|l| l.contains(&asker.to_string()))
+        .unwrap_or_else(|| panic!("{asker} row: {lines:#?}"));
+    // The same querier asks again in another case: the row is replaced
+    // (and moves up, newest first) under the new spelling.
+    ask(&mut app, "TEST._HTTP._tcp.local.", asker);
+    app.click_questions(area.y + line as u16);
+    match app.selected_detail_entry() {
+        Some(DetailEntry::Question { source, name, .. }) => {
+            assert_eq!(*source, asker);
+            assert_eq!(name, "TEST._HTTP._tcp.local.");
+        }
+        _ => panic!("cursor on the re-asked question"),
+    }
+}
+
+#[test]
+fn click_selects_an_enum_row_re_announced_in_another_case() {
+    let mut app = App::new().unwrap();
+    ingest(
+        &mut app,
+        &enum_row("_http._tcp.local.", 4500, "192.168.1.3:5353", 0),
+    );
+    ingest(
+        &mut app,
+        &enum_row("_ipp._tcp.local.", 4500, "192.168.1.4:5353", 0),
+    );
+    let pos = app
+        .display_items()
+        .iter()
+        .position(|it| matches!(it, DisplayItem::Enum { .. }))
+        .expect("enum row");
+    app.view_state.selected_display = pos;
+    app.clamp_selection();
+    let buf = draw(&app);
+    let area = app.layout.answers_rect.get();
+    let lines = pane_lines(&buf, area);
+    let line = lines
+        .iter()
+        .position(|l| l.contains("_ipp._tcp.local"))
+        .unwrap_or_else(|| panic!("_ipp row: {lines:#?}"));
+    // Re-announced with the target's case changed: the row is replaced.
+    ingest(
+        &mut app,
+        &enum_row("_IPP._tcp.local.", 4500, "192.168.1.4:5353", 0),
+    );
+    app.click_answers(area.y + line as u16);
+    match app.selected_detail_entry() {
+        Some(DetailEntry::Record(r)) => {
+            assert!(
+                r.rdata.eq_ignore_ascii_case("_ipp._tcp.local."),
+                "{}",
+                r.rdata
+            )
+        }
+        _ => panic!("cursor on the re-announced enum row"),
+    }
 }

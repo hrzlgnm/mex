@@ -170,11 +170,13 @@ pub(super) fn draw_questions_tab(
     let fit = FindingFit::new(area, &widths, area.height.saturating_sub(4) as usize);
     let mut rows: Vec<Row> = Vec::new();
     let mut question_positions = Vec::with_capacity(body.len());
-    // Row -> question identity and height as drawn: finding rows belong
-    // to their question.
+    // Row -> question identity (one per question, shared by index) and
+    // height as drawn: finding rows belong to their question.
+    let mut keys = Vec::with_capacity(body.len());
     let mut owners = Vec::new();
     let mut heights = Vec::new();
     for (q, (cells, style, key)) in body.into_iter().enumerate() {
+        keys.push(key);
         question_positions.push(rows.len());
         let mut cells = cells.into_iter();
         let mut row_cells = vec![marked_cell(
@@ -184,18 +186,22 @@ pub(super) fn draw_questions_tab(
         )];
         row_cells.extend(cells.map(Cell::from));
         rows.push(Row::new(row_cells).style(style));
-        owners.push(Some(key.clone()));
+        owners.push(Some(q));
         heights.push(1);
         for a in &per_question[q] {
             let (row, height) = finding_row(a, &identity_count, &book, 3, 4, true, &fit);
             rows.push(row);
-            owners.push(Some(key.clone()));
+            owners.push(Some(q));
             heights.push(height);
         }
     }
     app.layout()
         .questions_rows
-        .replace(Some(crate::app::DrawnRows::new(owners, heights.clone())));
+        .replace(Some(crate::app::DrawnRows::new(
+            keys,
+            owners,
+            heights.clone(),
+        )));
 
     // The Questions table is its own focus stop: light its border when
     // focused.
