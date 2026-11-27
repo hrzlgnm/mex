@@ -5,6 +5,7 @@ use super::*;
 use std::net::SocketAddr;
 
 mod answer_sections;
+mod answers_scroll;
 mod conflicting_answers;
 mod denials;
 mod devices;

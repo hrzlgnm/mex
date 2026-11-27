@@ -171,12 +171,21 @@ pub(super) fn draw_records_tab(
     let mut offset = app.layout().detail_offset.get();
     if !app.view_state().detail_free_scroll {
         if let Some(selected) = selected_table_row {
-            let extent_end = raw_positions
-                .get(app.view_state().detail_selected + 1)
-                .copied()
-                .unwrap_or(total_rows);
+            let record = app.view_state().detail_selected;
+            let extent_end = raw_positions.get(record + 1).copied().unwrap_or(total_rows);
+            // Rows above the first record (info lines, service and
+            // host blocks) belong to its extent, so moving back to it
+            // brings them into view again (#406).
+            let extent_start = if record == 0 { 0 } else { selected };
             let viewport = area.height.saturating_sub(3) as usize;
-            offset = fit_row_extent(offset, selected, extent_end, viewport, total_rows);
+            offset = fit_row_extent(
+                offset,
+                extent_start,
+                selected,
+                extent_end,
+                viewport,
+                total_rows,
+            );
         }
     } else {
         let viewport = area.height.saturating_sub(3) as usize;
@@ -198,11 +207,14 @@ pub(super) fn draw_records_tab(
     app.layout().detail_offset.set(tstate.offset());
 }
 
-/// Viewport offset that keeps `selected` visible and pulls the child
-/// extent `[selected, extent_end)` into view when it fits; oversized
-/// extents pin the parent to the top. Pure helper, unit-tested below.
+/// Viewport offset that keeps `selected` visible and pulls its extent
+/// `[start, extent_end)` into view: the child rows below it first
+/// (oversized child extents pin the parent to the top), then the
+/// leading rows from `start` (`start < selected` only for the first
+/// record) as far as they fit. Pure helper, unit-tested in `ui.rs`.
 pub(super) fn fit_row_extent(
     offset: usize,
+    start: usize,
     selected: usize,
     extent_end: usize,
     viewport: usize,
@@ -215,6 +227,12 @@ pub(super) fn fit_row_extent(
     let mut fitted = offset.min(max_offset).min(selected);
     if extent_end > fitted + viewport {
         fitted = extent_end.saturating_sub(viewport).min(selected);
+    }
+    if start < selected {
+        // Topmost row the viewport can start at while the children
+        // and the selected row still fit below it.
+        let lowest = start.max(extent_end.saturating_sub(viewport)).min(selected);
+        fitted = fitted.min(lowest);
     }
     fitted.min(max_offset)
 }
