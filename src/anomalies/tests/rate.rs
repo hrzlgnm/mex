@@ -661,15 +661,20 @@ fn nsec_next_name_folds_case_but_bitmap_does_not() {
     nsec.source = responder();
     let mut upper = nsec.clone();
     upper.rdata = "HOST.local. A AAAA".to_string();
-    let mut events = sends(&nsec, &[0]);
-    events.extend(sends(&upper, &[250]));
+    let at = base();
+    let events = vec![
+        response_at(at, 0, vec![nsec.clone()]),
+        response_at(at, 250, vec![upper]),
+    ];
     let found = analyze_answers(&[cached(&nsec)], &events);
     assert_eq!(multicast_findings(&found).len(), 1, "{found:#?}");
     // A different bitmap is a different record, not a repeat.
     let mut fewer = nsec.clone();
     fewer.rdata = "host.local. A".to_string();
-    let mut events = sends(&nsec, &[0]);
-    events.extend(sends(&fewer, &[250]));
+    let events = vec![
+        response_at(at, 0, vec![nsec]),
+        response_at(at, 250, vec![fewer.clone()]),
+    ];
     let found = analyze_answers(&[cached(&fewer)], &events);
     assert!(multicast_findings(&found).is_empty(), "{found:#?}");
 }
