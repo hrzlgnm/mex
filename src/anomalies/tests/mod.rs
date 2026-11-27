@@ -10,6 +10,7 @@ mod conflicts;
 mod flush;
 mod naming;
 mod questions;
+mod rate;
 mod records;
 mod resolve;
 mod responses;

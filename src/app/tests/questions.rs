@@ -106,6 +106,7 @@ fn unsupported_question_routes_as_info_with_display_key() {
         answers: Vec::new(),
         questions: vec![q],
         query_kas: Vec::new(),
+        query_authority: Vec::new(),
         rcode: None,
         received_at: Instant::now(),
         raw_bytes: vec![0x01, 0x02],
@@ -199,6 +200,7 @@ fn questions_pane_shows_last_and_due() {
         answers: Vec::new(),
         questions: vec![soa],
         query_kas: Vec::new(),
+        query_authority: Vec::new(),
         rcode: None,
         received_at: Instant::now(),
         raw_bytes: vec![0x01, 0x02],
@@ -364,5 +366,47 @@ fn question_rows_dedup_names_case_insensitively() {
     assert_eq!(
         rows[0].0, "_http._tcp.local",
         "the latest asking's case is shown"
+    );
+}
+
+#[test]
+fn querier_repeating_a_question_gets_a_rate_finding_on_its_row() {
+    // #408: one querier asks the instance's SRV again and again, far
+    // faster than once a second (RFC 6762 §5.2).
+    let mut app = App::new().unwrap();
+    service_with_txt(&mut app, "a=1; b=2");
+    let chatty: SocketAddr = "192.168.1.70:5353".parse().unwrap();
+    for _ in 0..4 {
+        let mut ev = query_event(
+            "Test._http._tcp.local.",
+            33,
+            "SRV",
+            false,
+            Vec::new(),
+            chatty,
+        );
+        // On a named link, as live traffic is: the Questions row itself
+        // keeps no link, and must still get the finding.
+        ev.questions[0].iface = "eth0".to_string();
+        ev.questions[0].ifindex = 2;
+        ingest_packet(&mut app, ev);
+    }
+    let found = app.anomalies();
+    let target = app.display_detail().unwrap();
+    let rows = app.question_findings(&target, &found);
+    let questions = target.ordered_questions();
+    let row = questions
+        .iter()
+        .position(|q| q.2 == chatty && q.1 == "SRV")
+        .expect("the chatty querier's SRV row");
+    let rate: Vec<_> = rows[row]
+        .iter()
+        .filter(|a| a.kind == anomalies::AnomalyKind::QueryRateLimit)
+        .collect();
+    assert_eq!(rate.len(), 1, "{:#?}", rows[row]);
+    assert!(
+        rate[0].message.contains("asked 4 times"),
+        "{}",
+        rate[0].message
     );
 }
