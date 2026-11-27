@@ -9,6 +9,7 @@ use crate::browse::{rtype_from_str, RawRecord, ENUM_SERVICE};
 
 mod naming;
 mod questions;
+mod rate;
 mod records;
 mod resolve;
 mod scope;
@@ -120,6 +121,7 @@ pub enum AnomalyKind {
     TypeFormat,
     EnumSubtype,
     ConflictingAnswers,
+    QueryRateLimit,
 }
 
 impl AnomalyKind {
@@ -142,6 +144,7 @@ impl AnomalyKind {
             AnomalyKind::TypeFormat => "type-format",
             AnomalyKind::EnumSubtype => "enum-subtype",
             AnomalyKind::ConflictingAnswers => "conflicting-answers",
+            AnomalyKind::QueryRateLimit => "query-rate-limit",
         }
     }
 
@@ -158,7 +161,10 @@ impl AnomalyKind {
 
     /// Whether this is a demand-side (observed question) finding.
     pub fn is_question(self) -> bool {
-        matches!(self, AnomalyKind::UnsupportedQuestion)
+        matches!(
+            self,
+            AnomalyKind::UnsupportedQuestion | AnomalyKind::QueryRateLimit
+        )
     }
 }
 
@@ -566,6 +572,7 @@ pub fn analyze_observations(
     for q in &snap.questions {
         check_question(q, &mut out);
     }
+    rate::check_query_rate(&snap.questions, events, &mut out);
 
     for view in &snap.host_addresses {
         check_conflicting_answers(view, &snap.device_names, now, &mut out);

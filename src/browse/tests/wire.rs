@@ -135,6 +135,54 @@ fn query_known_answers_are_not_filed_as_records() {
 }
 
 #[test]
+fn probe_authority_records_are_kept_apart_not_filed() {
+    // A probe (RFC 6762 §8.1): a QU/ANY question plus the proposed
+    // record in the authority section.
+    let mut q = Packet::new_query(0);
+    q.questions.push(simple_dns::Question::new(
+        simple_dns::Name::new_unchecked("Inst._http._tcp.local."),
+        QTYPE::ANY,
+        QCLASS::CLASS(CLASS::IN),
+        true,
+    ));
+    q.name_servers.push(known_answer(
+        "_http._tcp.local.",
+        "Inst._http._tcp.local.",
+        120,
+    ));
+    let ev = parse_packet(
+        &q.build_bytes_vec().unwrap(),
+        test_source(),
+        std::net::IpAddr::V4(MDNS_V4),
+        "enx",
+        2,
+    )
+    .unwrap();
+    assert!(ev.answers.is_empty(), "never filed as records");
+    assert!(ev.query_kas.is_empty());
+    assert_eq!(ev.query_authority.len(), 1);
+    assert_eq!(ev.query_authority[0].rdata, "Inst._http._tcp.local.");
+    assert_eq!(ev.questions.len(), 1);
+    // A response's authority section stays an answer section.
+    let mut r = Packet::new_reply(0);
+    r.name_servers.push(known_answer(
+        "_http._tcp.local.",
+        "Inst._http._tcp.local.",
+        120,
+    ));
+    let ev = parse_packet(
+        &r.build_bytes_vec().unwrap(),
+        test_source(),
+        std::net::IpAddr::V4(MDNS_V4),
+        "enx",
+        2,
+    )
+    .unwrap();
+    assert!(ev.query_authority.is_empty());
+    assert_eq!(ev.answers.len(), 1);
+}
+
+#[test]
 fn query_qu_bit_is_parsed() {
     let mut q = Packet::new_query(0);
     q.questions.push(simple_dns::Question::new(

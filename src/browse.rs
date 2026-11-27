@@ -233,11 +233,24 @@ pub struct Event {
     /// as sightings (queries are beliefs, not facts); used only for
     /// duplicate question suppression (§7.3) subset checks.
     pub query_kas: Vec<RawRecord>,
+    /// Authority-section records of a query packet: a probe's proposed
+    /// records (RFC 6762 §8.1). Never filed; a non-empty list marks the
+    /// query as a probe, which the rate checks exempt (#408, #407).
+    pub query_authority: Vec<RawRecord>,
     /// DNS header response code for a response packet; queries are `None`.
     pub rcode: Option<u8>,
     pub received_at: Instant,
     pub raw_bytes: Vec<u8>,
     pub source: SocketAddr,
+}
+
+impl Event {
+    /// Whether this is a probe query (RFC 6762 §8.1): it carries the
+    /// records it proposes in the authority section. A question alone,
+    /// even ANY, doesn't make a probe here.
+    pub fn is_probe(&self) -> bool {
+        !self.query_authority.is_empty()
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -193,6 +193,10 @@ pub(crate) fn parse_packet(
     // Known answers in queries are parsed separately for duplicate
     // question suppression (§7.3) and never filed as answers.
     let mut query_kas = Vec::new();
+    // A query's authority section holds a probe's proposed records
+    // (RFC 6762 §8.1): kept apart, never filed, only to tell probes. An
+    // OPT pseudo-record only ever rides in the additional section.
+    let mut query_authority = Vec::new();
     if !is_response {
         for (i, rec) in pkt.answers.iter().enumerate() {
             let w = wire.answer.get(i).copied();
@@ -201,6 +205,15 @@ pub(crate) fn parse_packet(
             }
             query_kas.push(record_row(rec, w, RecordSection::KnownAnswer, ing));
         }
+        query_authority = pkt
+            .name_servers
+            .iter()
+            .enumerate()
+            .map(|(i, rec)| {
+                let w = wire.authority.get(i).copied();
+                record_row(rec, w, RecordSection::Authority, ing)
+            })
+            .collect();
     }
 
     let mut questions = Vec::new();
@@ -216,6 +229,7 @@ pub(crate) fn parse_packet(
         answers,
         questions,
         query_kas,
+        query_authority,
         rcode: is_response.then(|| raw.get(3).copied().unwrap_or_default() & 0x0f),
         received_at: Instant::now(),
         raw_bytes: raw.to_vec(),
