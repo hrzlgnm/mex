@@ -826,10 +826,11 @@ impl App {
             if !still_expiring {
                 self.scheduler.refresh_answered(&key);
             }
-            // RFC 6762 §5.2: a unique answer (cache-flush bit) means no
-            // other answers are forthcoming, so dampen the exponential
-            // discovery stream and let the 80%-TTL refresh take over.
-            if rec.flush_bit {
+            // RFC 6762 §5.2: a unique answer (cache-flush bit, or a type
+            // unique by definition) means no other answers are
+            // forthcoming, so dampen the exponential discovery stream and
+            // let the 80%-TTL refresh take over.
+            if is_unique_answer(rec) {
                 let ckey = Scheduler::continuous_key(rec.name.trim_end_matches('.'), rec.rtype);
                 self.scheduler.dampen(&ckey);
             }

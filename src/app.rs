@@ -478,6 +478,15 @@ pub const UNATTRIBUTED_HOST: &str = "(unattributed).";
 pub const ENUM_GROUP_NAME: &str = "(enumeration)";
 pub const UNATTRIBUTED_GROUP_NAME: &str = "(unattributed)";
 
+/// Whether `rec` is a unique answer, the complete answer to its question
+/// (RFC 6762 §7.1: a querier holding one "has no reason to be sending the
+/// query at all"): it carries the cache-flush bit, or its type is unique
+/// by definition, SRV and TXT (DNS-SD) or A/AAAA (one host's addresses),
+/// which some responders send without the bit (#438). PTR stays shared.
+fn is_unique_answer(rec: &browse::RawRecord) -> bool {
+    rec.flush_bit || matches!(rec.rtype, 1 | 16 | 28 | 33)
+}
+
 /// Whether a response carries a non-zero RCODE, which RFC 6762 §18.11
 /// says MUST be silently ignored on receipt.
 fn has_nonzero_rcode(ev: &browse::Event) -> bool {

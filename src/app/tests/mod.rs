@@ -38,6 +38,7 @@ mod service_identity;
 mod srv_target;
 mod state_dump;
 mod transmit_state;
+mod unique_types;
 mod view;
 
 fn test_source() -> SocketAddr {

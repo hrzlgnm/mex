@@ -1,0 +1,101 @@
+// Copyright 2026 hrzlgnm
+// SPDX-License-Identifier: MIT
+
+// --- #438: SRV/TXT/A/AAAA are unique by type, flush bit or not ---
+
+use super::*;
+
+/// Route the app's queries to a channel the test reads.
+fn capture(app: &mut App) -> mpsc::Receiver<browse::QueryBatch> {
+    let (query_tx, rx) = browse::QueryTx::capturing();
+    app.query_tx = query_tx;
+    rx
+}
+
+/// The `(name, type)` of every question handed over so far.
+fn asked(rx: &mpsc::Receiver<browse::QueryBatch>) -> Vec<(String, u16)> {
+    rx.try_iter()
+        .flatten()
+        .map(|q| (q.name.to_ascii_lowercase(), u16::from(q.record_type)))
+        .collect()
+}
+
+fn interval(app: &App, name: &str, rtype: u16) -> Duration {
+    app.scheduler
+        .continuous()
+        .get(&(name.to_string(), rtype))
+        .unwrap_or_else(|| panic!("{name} {rtype} stream"))
+        .interval
+}
+
+/// A pending instance (PTR seen) with its SRV/TXT streams started.
+fn pending_app() -> App {
+    let mut app = App::new().unwrap();
+    ingest(&mut app, &ptr_record(4500));
+    app.send_queries();
+    app
+}
+
+const INSTANCE: &str = "test._http._tcp.local";
+
+#[test]
+fn srv_and_txt_without_the_flush_bit_dampen_their_streams() {
+    let mut app = pending_app();
+    let mut srv = srv_record(120);
+    srv.flush_bit = false;
+    ingest(&mut app, &srv);
+    let mut txt = txt_record("a=1");
+    txt.flush_bit = false;
+    ingest(&mut app, &txt);
+    assert_eq!(interval(&app, INSTANCE, 33), MAX_CONTINUOUS_INTERVAL);
+    assert_eq!(interval(&app, INSTANCE, 16), MAX_CONTINUOUS_INTERVAL);
+}
+
+#[test]
+fn a_ptr_answer_keeps_its_discovery_stream() {
+    // PTR is shared (RFC 6762 §7.1): more instances may answer, so its
+    // stream keeps doubling and lists known answers instead.
+    let app = pending_app();
+    assert!(interval(&app, "_http._tcp.local", 12) < MAX_CONTINUOUS_INTERVAL);
+}
+
+#[test]
+fn a_goodbye_never_dampens() {
+    let mut app = pending_app();
+    let mut bye = srv_record(0);
+    bye.flush_bit = false;
+    ingest(&mut app, &bye);
+    let streams = app.scheduler.continuous();
+    if let Some(entry) = streams.get(&(INSTANCE.to_string(), 33)) {
+        assert!(entry.interval < MAX_CONTINUOUS_INTERVAL);
+    }
+}
+
+#[test]
+fn a_dampened_question_comes_back_only_through_the_refresh() {
+    let mut app = pending_app();
+    let rx = capture(&mut app);
+    let mut srv = srv_record(120);
+    srv.flush_bit = false;
+    ingest(&mut app, &srv);
+    // Every stream due: the dampened SRV is not among them.
+    let now = Instant::now() - Duration::from_millis(1);
+    for entry in app.scheduler.continuous_mut().values_mut() {
+        if entry.interval < MAX_CONTINUOUS_INTERVAL {
+            entry.next_due = now;
+        }
+    }
+    app.send_queries();
+    let srv_key = (INSTANCE.to_string(), 33);
+    assert!(!asked(&rx).contains(&srv_key));
+    // Aged into its 80% window, the refresh asks it.
+    for svc in &mut app.services {
+        for rec in &mut svc.answers {
+            if rec.rtype == 33 {
+                rec.received_at = Instant::now() - Duration::from_secs(100);
+            }
+        }
+    }
+    app.send_queries();
+    assert!(asked(&rx).contains(&srv_key));
+}

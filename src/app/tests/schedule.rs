@@ -188,16 +188,21 @@ fn missing_address_still_queried_promptly() {
 }
 
 #[test]
-fn shared_cached_answer_does_not_dampen() {
+fn an_address_cached_without_the_flush_bit_still_dampens() {
+    // #438: A/AAAA are unique by type (RFC 6762 §7.1: the cached answer
+    // is complete), so a responder leaving off the flush bit doesn't keep
+    // mex asking for them.
     let mut app = App::new().unwrap();
     ingest_srv_with_addresses(&mut app, false);
     app.poll_continuous();
-    let entry = app
-        .scheduler
-        .continuous()
-        .get(&("test.local".to_string(), 1))
-        .expect("address interest");
-    assert_eq!(entry.interval, Duration::from_secs(1));
+    for rtype in [1, 28] {
+        let entry = app
+            .scheduler
+            .continuous()
+            .get(&("test.local".to_string(), rtype))
+            .expect("address interest");
+        assert_eq!(entry.interval, MAX_CONTINUOUS_INTERVAL);
+    }
 }
 
 #[test]
