@@ -175,6 +175,7 @@ fn questions_pane_shows_last_and_due() {
     select_instance(&mut app, "Test");
     // Continuous stream exists (browse timer); SRV refresh due now.
     app.poll_continuous();
+    app.flush_outbox();
     for svc in &mut app.services {
         for rec in &mut svc.answers {
             if rec.rtype == 33 {
@@ -183,6 +184,7 @@ fn questions_pane_shows_last_and_due() {
         }
     }
     app.requery_expiring();
+    app.flush_outbox();
     // An observed PTR question from a peer.
     let ev = query_event(
         "_http._tcp.local.",

@@ -207,6 +207,7 @@ fn dump_reports_interest_query_state_and_truncation() {
         }
     }
     app.requery_expiring();
+    app.flush_outbox();
     let dump = app.state_dump();
     let srv = dump
         .interests

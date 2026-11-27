@@ -486,6 +486,7 @@ fn query_provenance_records_transmit_suppress_observe() {
         }
     }
     app.requery_expiring();
+    app.flush_outbox();
     // No overheard query: the SRV refresh is transmitted.
     let srv_key = ("test._http._tcp.local".to_string(), 33);
     let prov = app
@@ -520,6 +521,7 @@ fn query_provenance_records_transmit_suppress_observe() {
     // of TTL apart, so without backdating the second run skips it.
     make_refresh_due(&mut app, "Test._http._tcp.local", 33);
     app.requery_expiring();
+    app.flush_outbox();
     let prov = app
         .scheduler
         .query_history()
@@ -596,6 +598,7 @@ fn interest_view_reports_timer_and_status() {
     ingest(&mut app, &srv_record(120));
     // Continuous stream exists after a poll; no refresh due yet.
     app.poll_continuous();
+    app.flush_outbox();
     let view = app.interest_view(&("_http._tcp.local".to_string(), 12));
     assert_eq!(view.timer, TimerKind::Browse);
     assert!(view.next_due.is_some());
@@ -612,6 +615,7 @@ fn interest_view_reports_timer_and_status() {
         }
     }
     app.requery_expiring();
+    app.flush_outbox();
     let view = app.interest_view(&("test._http._tcp.local".to_string(), 33));
     assert_eq!(view.timer, TimerKind::Refresh);
     assert_eq!(view.status, InterestStatus::Transmitted);
@@ -642,6 +646,7 @@ fn pihole_cycle_expires_after_four_misses_then_rescues() {
     for expected in 1u8..=4u8 {
         make_refresh_due(&mut app, "Test._http._tcp.local", 33);
         app.requery_expiring();
+        app.flush_outbox();
         if expected < 4 {
             let view = app.interest_view(&("test._http._tcp.local".to_string(), 33));
             assert_eq!(view.status, InterestStatus::Transmitted);
@@ -1189,6 +1194,7 @@ fn due_non_ptr_interest_goes_out_without_known_answers() {
     ingest(&mut app, &ptr_record(120)); // pending: SRV/TXT wanted
     let srv = ("test._http._tcp.local".to_string(), 33);
     app.poll_continuous(); // creates the streams
+    app.flush_outbox();
     app.scheduler
         .continuous_mut()
         .get_mut(&srv)
@@ -1202,6 +1208,7 @@ fn due_non_ptr_interest_goes_out_without_known_answers() {
         }
     }
     app.poll_continuous();
+    app.flush_outbox();
     assert_eq!(app.diagnostics.q_sent_continuous, sent_before + 1);
     assert_eq!(
         app.diagnostics.ka_sent, ka_before,

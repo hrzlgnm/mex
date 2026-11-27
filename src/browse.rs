@@ -333,13 +333,18 @@ pub struct OwnSend {
     pub sent_at: Instant,
 }
 
+/// The questions one scheduler tick asks (#430): they leave together, as
+/// few packets as fit per egress interface and family. The manual
+/// refresh sends a batch of one.
+pub type QueryBatch = Vec<QueryRequest>;
+
 /// Query sender for the listener thread. Each request is queued once
 /// and the poll loop is woken, so it leaves immediately on every usable
 /// link of both families (solicited queries reach v6-only responders
 /// too).
 pub struct QueryTx {
     /// `None` only while dropping: closing it stops the listener.
-    tx: Option<mpsc::Sender<QueryRequest>>,
+    tx: Option<mpsc::Sender<QueryBatch>>,
     waker: Arc<mio::Waker>,
     transmit: Arc<TransmitState>,
 }
@@ -448,18 +453,34 @@ impl QueryTx {
         }
     }
 
+    /// A sender whose batches land on the returned receiver instead of a
+    /// listener (#430), with both families able to transmit: tests read
+    /// what one tick hands over without opening sockets.
+    #[cfg(test)]
+    pub(crate) fn capturing() -> (Self, mpsc::Receiver<QueryBatch>) {
+        let poll = mio::Poll::new().expect("poll");
+        let waker = Arc::new(mio::Waker::new(poll.registry(), WAKER_TOKEN).expect("waker"));
+        let (tx, rx) = mpsc::channel();
+        let query_tx = Self {
+            tx: Some(tx),
+            waker,
+            transmit: Arc::new(TransmitState::new(true, true)),
+        };
+        (query_tx, rx)
+    }
+
     /// The shared per-family transmit state.
     pub fn transmit(&self) -> &TransmitState {
         &self.transmit
     }
 
-    /// Queue a query and wake the listener. Returns `true` when the
-    /// listener accepted the request — the transport may still fail to
-    /// send (encode error, closed socket), which is logged in
-    /// `send_query` and cannot be reflected here. Wakes may coalesce:
-    /// the queue is the source of truth, drained on every loop pass.
-    pub fn send(&self, req: QueryRequest) -> bool {
-        if self.tx.as_ref().is_none_or(|tx| tx.send(req).is_err()) {
+    /// Queue a batch of questions and wake the listener. Returns `true`
+    /// when the listener accepted it — the transport may still fail to
+    /// send (encode error, closed socket), which is logged on the send
+    /// path and cannot be reflected here. Wakes may coalesce: the queue
+    /// is the source of truth, drained on every loop pass.
+    pub fn send(&self, batch: QueryBatch) -> bool {
+        if self.tx.as_ref().is_none_or(|tx| tx.send(batch).is_err()) {
             return false;
         }
         if let Err(e) = self.waker.wake() {

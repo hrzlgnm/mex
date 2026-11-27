@@ -82,8 +82,8 @@ fn query_send_wakes_the_poll_and_is_drained() {
         known_answers: Vec::new(),
         qu: false,
     };
-    assert!(query_tx.send(req.clone()));
-    assert!(query_tx.send(req));
+    assert!(query_tx.send(vec![req.clone()]));
+    assert!(query_tx.send(vec![req]));
     let mut events = mio::Events::with_capacity(4);
     let started = Instant::now();
     poll.poll(&mut events, Some(Duration::from_secs(5)))
@@ -98,12 +98,15 @@ fn query_send_wakes_the_poll_and_is_drained() {
     );
     let mut names = Vec::new();
     assert_eq!(
-        drain_queries(&rx, QUERY_BUDGET, |q| names.push(q.name.clone())),
+        drain_queries(&rx, QUERY_BUDGET, |q| {
+            names.push(q[0].name.clone());
+            1
+        }),
         (2, QueueState::Empty)
     );
     assert_eq!(names, vec!["_http._tcp.local"; 2]);
     assert_eq!(
-        drain_queries(&rx, QUERY_BUDGET, |_| {}),
+        drain_queries(&rx, QUERY_BUDGET, |_| 1),
         (0, QueueState::Empty),
         "drained once"
     );
@@ -164,21 +167,27 @@ fn query_drain_is_budgeted_per_pass() {
     // most the budget and reports the rest as pending.
     let (tx, rx) = mpsc::channel();
     for i in 0..5 {
-        tx.send(QueryRequest {
+        tx.send(vec![QueryRequest {
             name: format!("q{i}.local"),
             record_type: TYPE::A,
             known_answers: Vec::new(),
             qu: false,
-        })
+        }])
         .unwrap();
     }
     let mut sent = Vec::new();
     assert_eq!(
-        drain_queries(&rx, 3, |q| sent.push(q.name.clone())),
+        drain_queries(&rx, 3, |q| {
+            sent.push(q[0].name.clone());
+            1
+        }),
         (3, QueueState::More)
     );
     assert_eq!(
-        drain_queries(&rx, 3, |q| sent.push(q.name.clone())),
+        drain_queries(&rx, 3, |q| {
+            sent.push(q[0].name.clone());
+            1
+        }),
         (2, QueueState::Empty)
     );
     assert_eq!(
@@ -526,12 +535,12 @@ fn query_send_fails_once_the_listener_is_gone() {
         waker,
         transmit: Arc::new(TransmitState::new(true, true)),
     };
-    assert!(!query_tx.send(QueryRequest {
+    assert!(!query_tx.send(vec![QueryRequest {
         name: "_http._tcp.local".to_string(),
         record_type: TYPE::PTR,
         known_answers: Vec::new(),
         qu: false,
-    }));
+    }]));
 }
 
 #[test]
@@ -561,4 +570,17 @@ fn an_ipv4_copy_s_link_index_comes_from_the_name_map() {
     let ifnames = HashMap::from([(2, "eth0".to_string()), (3, "wlan0".to_string())]);
     assert_eq!(link_index(&ifnames, "wlan0"), 3);
     assert_eq!(link_index(&ifnames, "gone0"), 0, "unknown: matches no copy");
+}
+
+#[test]
+fn the_send_budget_counts_packets_not_batches() {
+    // #430: a batch may take several packets. A pass stops once the
+    // packets sent reach the budget; a batch is never split, so the last
+    // one may overrun it, and the rest waits for the next pass.
+    let (tx, rx) = mpsc::channel();
+    for packets in [2usize, 2, 2] {
+        tx.send(packets).unwrap();
+    }
+    assert_eq!(drain_queries(&rx, 3, |n| *n), (4, QueueState::More));
+    assert_eq!(drain_queries(&rx, 3, |n| *n), (2, QueueState::Empty));
 }

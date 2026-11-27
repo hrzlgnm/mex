@@ -180,16 +180,18 @@ pub(super) fn send_targets<'a>(
     }
 }
 
-/// One copy of the query per usable link, each forced out its own link:
-/// without the per-packet interface the kernel sends everything via the
-/// default multicast interface and other links (e.g. a bridge) never see
-/// our queries. No usable link means no copy (`send_targets`). Returns
-/// one `OwnSend` per copy that left without error (#431): a failed pin
-/// or send, or a request that can't be encoded, reports nothing. An IPv4
+/// One copy of each packet of the batch per usable link, each forced out
+/// its own link: without the per-packet interface the kernel sends
+/// everything via the default multicast interface and other links (e.g.
+/// a bridge) never see our queries. The batch is encoded per link, since
+/// known answers are scoped to it (`encode_batch`). No usable link means
+/// no copy (`send_targets`). Returns one `OwnSend` per copy that left
+/// without error (#431), with every question it asked: a failed pin or
+/// send, or a question that can't be encoded, reports nothing. An IPv4
 /// copy's link index is left 0 for the caller, which knows the names.
 pub(super) fn send_on_all_interfaces(
     socket: &impl QuerySocket,
-    req: &QueryRequest,
+    batch: &[QueryRequest],
     family: Family,
     ifaces_v4: &[(String, Ipv4Addr)],
     ifaces_v6: &[(String, u32)],
@@ -212,35 +214,37 @@ pub(super) fn send_on_all_interfaces(
             }
             continue;
         }
-        let Some((bytes, sent)) = send_query(socket, req, dest, link) else {
-            continue;
-        };
-        match sent {
-            Ok(()) => {
-                let now = Instant::now();
-                sent_copies.record(&bytes, now);
-                sent_ok.push(OwnSend {
-                    questions: vec![(req.name.clone(), u16::from(req.record_type))],
-                    iface: link.to_string(),
-                    // An IPv6 copy is pinned by index; an IPv4 one by
-                    // address, so the listener fills its index in.
-                    ifindex: match egress {
-                        Egress::V6(idx) => idx,
-                        Egress::V4(_) => 0,
-                    },
-                    v6: family == Family::V6,
-                    sent_at: now,
-                });
-                if failures.record_success(family, link).is_some() {
-                    log::info!("mex: {family_label} send on {link} recovered");
+        for (bytes, asked) in encode_batch(batch, link) {
+            match socket.send_to(&bytes, dest) {
+                Ok(()) => {
+                    let now = Instant::now();
+                    sent_copies.record(&bytes, now);
+                    sent_ok.push(OwnSend {
+                        questions: asked
+                            .iter()
+                            .map(|&i| (batch[i].name.clone(), u16::from(batch[i].record_type)))
+                            .collect(),
+                        iface: link.to_string(),
+                        // An IPv6 copy is pinned by index; an IPv4 one by
+                        // address, so the listener fills its index in.
+                        ifindex: match egress {
+                            Egress::V6(idx) => idx,
+                            Egress::V4(_) => 0,
+                        },
+                        v6: family == Family::V6,
+                        sent_at: now,
+                    });
+                    if failures.record_success(family, link).is_some() {
+                        log::info!("mex: {family_label} send on {link} recovered");
+                    }
                 }
-            }
-            Err(e) => {
-                if failures
-                    .record_failure(family, link, SendOp::Send, e.kind())
-                    .is_some()
-                {
-                    log::error!("mex: {family_label} send on {link} to {dest} failed: {e}");
+                Err(e) => {
+                    if failures
+                        .record_failure(family, link, SendOp::Send, e.kind())
+                        .is_some()
+                    {
+                        log::error!("mex: {family_label} send on {link} to {dest} failed: {e}");
+                    }
                 }
             }
         }
@@ -301,6 +305,49 @@ pub(super) const MAX_NAME_OCTETS: usize = 255;
 /// is the roomier deduction).
 pub(super) const MAX_QUERY_BYTES: usize = 9000 - 40 - 8;
 
+/// One question ready for the wire on one egress interface: its owner
+/// name, type, QU bit and its known answers scoped to that interface.
+pub(super) struct WireQuestion {
+    qname: simple_dns::Name<'static>,
+    record_type: TYPE,
+    qu: bool,
+    kas: Vec<(simple_dns::Name<'static>, u32)>,
+}
+
+impl WireQuestion {
+    /// `req` as it goes out on `egress_iface`. `None` means the owner
+    /// name cannot go on the wire (see `wire_name`), which is logged
+    /// because the scheduler has already counted the query as sent; an
+    /// unencodable known answer is skipped, the rest kept.
+    pub(super) fn new(req: &QueryRequest, egress_iface: &str) -> Option<Self> {
+        let Some(qname) = wire_name(&req.name) else {
+            log::warn!(
+                "mex: cannot encode {:?} query name {:?}",
+                u16::from(req.record_type),
+                req.name
+            );
+            return None;
+        };
+        let mut kas = Vec::with_capacity(req.known_answers.len());
+        for (ka_target, ka_ttl) in known_answers_for_iface(&req.known_answers, egress_iface) {
+            let Some(rdata) = wire_name(ka_target) else {
+                log::warn!(
+                    "mex: cannot encode known answer {ka_target:?} for {}",
+                    req.name
+                );
+                continue;
+            };
+            kas.push((rdata, ka_ttl));
+        }
+        Some(Self {
+            qname,
+            record_type: req.record_type,
+            qu: req.qu,
+            kas,
+        })
+    }
+}
+
 /// Encode one query for an egress interface. `None` means the owner name
 /// cannot go on the wire (see `wire_name`) or the codec failed; that is
 /// logged because the scheduler has already counted the query as sent.
@@ -313,60 +360,120 @@ pub(super) const MAX_QUERY_BYTES: usize = 9000 - 40 - 8;
 /// dropped one would lose the refresh silently (EMSGSIZE on send, past
 /// the 65507-byte kernel limit). Full multipacket known-answer
 /// suppression (RFC 6762 §7.2, TC-bit follow-ups) is future work.
+///
+/// The send path packs batches (`encode_batch`); this one-question form
+/// is the tests' view of a single question on the wire.
+#[cfg(test)]
 pub(super) fn encode_query(req: &QueryRequest, egress_iface: &str) -> Option<Vec<u8>> {
     encode_query_into(&mut std::io::Cursor::new(Vec::new()), req, egress_iface)
 }
 
 /// `encode_query` through `sink`, which every build (including the
 /// known-answer truncation retries) writes to.
+#[cfg(test)]
 pub(super) fn encode_query_into(
     sink: &mut dyn WireSink,
     req: &QueryRequest,
     egress_iface: &str,
 ) -> Option<Vec<u8>> {
-    let qname = match wire_name(&req.name) {
-        Some(n) => n,
-        None => {
-            log::warn!(
-                "mex: cannot encode {:?} query name {:?}",
-                u16::from(req.record_type),
-                req.name
-            );
-            return None;
-        }
-    };
-    let mut kas = Vec::with_capacity(req.known_answers.len());
-    for (ka_target, ka_ttl) in known_answers_for_iface(&req.known_answers, egress_iface) {
-        let Some(rdata) = wire_name(ka_target) else {
-            log::warn!(
-                "mex: cannot encode known answer {ka_target:?} for {}",
-                req.name
-            );
-            continue;
-        };
-        kas.push((rdata, ka_ttl));
-    }
+    let question = WireQuestion::new(req, egress_iface)?;
+    encode_alone(sink, question, &req.name)
+}
 
-    let mut bytes = build_query_into(sink, &qname, req.record_type, req.qu, &kas)?;
+/// One question in a packet of its own, shedding known answers (halving,
+/// logged) while it is over `MAX_QUERY_BYTES`, never the question.
+fn encode_alone(sink: &mut dyn WireSink, mut q: WireQuestion, name: &str) -> Option<Vec<u8>> {
+    let mut bytes = build_packet_into(sink, &[&q])?;
     if bytes.len() > MAX_QUERY_BYTES {
-        let total = kas.len();
+        let total = q.kas.len();
         let mut n = total;
         while n > 0 {
             n /= 2;
-            kas.truncate(n);
-            bytes = build_query_into(sink, &qname, req.record_type, req.qu, &kas)?;
+            q.kas.truncate(n);
+            bytes = build_packet_into(sink, &[&q])?;
             if bytes.len() <= MAX_QUERY_BYTES {
                 break;
             }
         }
         log::warn!(
-            "mex: truncated known answers for {} to {} of {total} ({} bytes)",
-            req.name,
-            kas.len(),
+            "mex: truncated known answers for {name} to {} of {total} ({} bytes)",
+            q.kas.len(),
             bytes.len()
         );
     }
     Some(bytes)
+}
+
+/// One encoded packet of a batch, with the indexes (into the batch) of
+/// the questions it asks.
+pub(super) type BatchPacket = (Vec<u8>, Vec<usize>);
+
+/// Encode the questions due together (#430) for one egress interface:
+/// as few packets as fit, all questions in the Question section and each
+/// one's interface-scoped known answers in the Answer section, names
+/// compressed across the packet. A packet that would exceed
+/// `MAX_QUERY_BYTES` is closed and the question moves on to the next one,
+/// whole with its known answers; only a question too large on its own
+/// sheds known answers. An unencodable question is skipped (logged), the
+/// rest still sent. A codec failure ends the batch: what was encoded
+/// before it is kept.
+pub(super) fn encode_batch(batch: &[QueryRequest], egress_iface: &str) -> Vec<BatchPacket> {
+    encode_batch_into(&mut std::io::Cursor::new(Vec::new()), batch, egress_iface)
+}
+
+/// `encode_batch` through `sink`, which every build writes to.
+pub(super) fn encode_batch_into(
+    sink: &mut dyn WireSink,
+    batch: &[QueryRequest],
+    egress_iface: &str,
+) -> Vec<BatchPacket> {
+    let mut packets = Vec::new();
+    // The packet being filled: its questions, their batch indexes, and
+    // its bytes so far.
+    let mut open: Vec<WireQuestion> = Vec::new();
+    let mut open_idx: Vec<usize> = Vec::new();
+    let mut open_bytes: Vec<u8> = Vec::new();
+    for (i, req) in batch.iter().enumerate() {
+        let Some(question) = WireQuestion::new(req, egress_iface) else {
+            continue;
+        };
+        if !open.is_empty() {
+            let with: Vec<&WireQuestion> = open.iter().chain([&question]).collect();
+            let Some(bytes) = build_packet_into(sink, &with) else {
+                break;
+            };
+            if bytes.len() <= MAX_QUERY_BYTES {
+                open.push(question);
+                open_idx.push(i);
+                open_bytes = bytes;
+                continue;
+            }
+            // Full: close it, the question starts the next one.
+            packets.push((
+                std::mem::take(&mut open_bytes),
+                std::mem::take(&mut open_idx),
+            ));
+            open.clear();
+        }
+        let Some(bytes) = build_packet_into(sink, &[&question]) else {
+            break;
+        };
+        if bytes.len() <= MAX_QUERY_BYTES {
+            open.push(question);
+            open_idx.push(i);
+            open_bytes = bytes;
+        } else {
+            // Too large even alone: its own packet, known answers shed.
+            let Some(bytes) = encode_alone(sink, question, &req.name) else {
+                break;
+            };
+            packets.push((bytes, vec![i]));
+        }
+    }
+    if !open.is_empty() {
+        packets.push((open_bytes, open_idx));
+    }
+    packets
 }
 
 /// One query packet: question plus the given known answers, names
@@ -389,31 +496,55 @@ pub(super) fn build_query(
 /// `build_query` through `sink`; the codec only fails when the sink
 /// does.
 pub(super) fn build_query_into(
-    mut sink: &mut dyn WireSink,
+    sink: &mut dyn WireSink,
     qname: &simple_dns::Name<'_>,
     record_type: TYPE,
     qu: bool,
     kas: &[(simple_dns::Name<'_>, u32)],
 ) -> Option<Vec<u8>> {
-    let mut pkt = Packet::new_query(0);
-    pkt.questions.push(simple_dns::Question::new(
-        qname.clone(),
-        QTYPE::TYPE(record_type),
-        QCLASS::CLASS(CLASS::IN),
+    let question = WireQuestion {
+        qname: qname.clone().into_owned(),
+        record_type,
         qu,
-    ));
-    for (rdata, ttl) in kas {
-        pkt.answers.push(ResourceRecord::new(
-            qname.clone(),
-            CLASS::IN,
-            *ttl,
-            RData::PTR(rdata.clone().into()),
+        kas: kas
+            .iter()
+            .map(|(rdata, ttl)| (rdata.clone().into_owned(), *ttl))
+            .collect(),
+    };
+    build_packet_into(sink, &[&question])
+}
+
+/// One query packet asking `questions`, each one's known answers in the
+/// Answer section, names compressed across the packet. `None` only on
+/// codec failure (logged).
+fn build_packet_into(mut sink: &mut dyn WireSink, questions: &[&WireQuestion]) -> Option<Vec<u8>> {
+    let mut pkt = Packet::new_query(0);
+    for q in questions {
+        pkt.questions.push(simple_dns::Question::new(
+            q.qname.clone(),
+            QTYPE::TYPE(q.record_type),
+            QCLASS::CLASS(CLASS::IN),
+            q.qu,
         ));
+    }
+    for q in questions {
+        for (rdata, ttl) in &q.kas {
+            pkt.answers.push(ResourceRecord::new(
+                q.qname.clone(),
+                CLASS::IN,
+                *ttl,
+                RData::PTR(rdata.clone().into()),
+            ));
+        }
     }
     match pkt.write_compressed_to(&mut sink) {
         Ok(()) => Some(sink.take_bytes()),
         Err(e) => {
-            log::warn!("mex: cannot encode query for {qname}: {e}");
+            let first = questions
+                .first()
+                .map(|q| q.qname.to_string())
+                .unwrap_or_default();
+            log::warn!("mex: cannot encode query for {first}: {e}");
             None
         }
     }
@@ -423,18 +554,4 @@ pub(crate) fn inferred_question_packet(name: &str, rtype: u16, qu: bool) -> Opti
     let qname = wire_name(name)?;
     let record_type = record_type_from_u16(rtype)?;
     build_query(&qname, record_type, qu, &[])
-}
-
-/// Encode and send one query copy, returning its bytes with the send
-/// result. `None` when encoding failed (already logged in
-/// `encode_query`), so nothing was sent.
-pub(super) fn send_query(
-    socket: &impl QuerySocket,
-    req: &QueryRequest,
-    dest: SocketAddr,
-    egress_iface: &str,
-) -> Option<(Vec<u8>, std::io::Result<()>)> {
-    let bytes = encode_query(req, egress_iface)?;
-    let sent = socket.send_to(&bytes, dest);
-    Some((bytes, sent))
 }

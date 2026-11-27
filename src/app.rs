@@ -867,6 +867,9 @@ pub struct App {
     /// packet.
     own_sends: Vec<browse::OwnSend>,
     query_tx: browse::QueryTx,
+    /// The questions this tick asks (#430), sent as one batch when the
+    /// tick's schedules have run (`flush_outbox`).
+    outbox: browse::QueryBatch,
     /// Query scheduling state (RFC 6762 §5.2/§5.4/§7.1/§7.3); see
     /// [`Scheduler`].
     scheduler: Scheduler,
@@ -1235,6 +1238,7 @@ impl App {
             own_rx,
             own_sends: Vec::new(),
             query_tx,
+            outbox: Vec::new(),
             last_ip_refresh: Instant::now(),
             collapsed_hosts: HashSet::new(),
             expanded_txt: HashSet::new(),
