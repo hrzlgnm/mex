@@ -331,17 +331,30 @@ impl FindingFit {
     }
 }
 
-/// Display width of one char in terminal cells.
-fn char_width(c: char) -> usize {
-    Span::raw(&*c.encode_utf8(&mut [0; 4])).width()
+/// One grapheme with its style: the unit ratatui draws, so wrapping
+/// measures and breaks exactly where rendering does.
+type Glyph<'a> = (&'a str, Style);
+
+/// The styled graphemes of `spans`, in order.
+fn glyphs<'a>(spans: &'a [Span<'a>]) -> impl Iterator<Item = Glyph<'a>> {
+    spans
+        .iter()
+        .flat_map(|s| s.styled_graphemes(Style::default()))
+        .map(|g| (g.symbol, g.style))
+}
+
+/// Display width of one grapheme in terminal cells, as ratatui draws it.
+fn glyph_width(g: &str) -> usize {
+    Span::raw(g).width()
 }
 
 /// Word-wrap styled spans to `width` cells (#410): breaks at spaces
 /// (runs of spaces collapse, none starts a line), breaks words wider
-/// than the line, and keeps every char's style. At least one line.
+/// than the line between graphemes, and keeps every grapheme's style.
+/// Text that fits is returned as is. At least one line.
 fn wrap_spans(spans: &[Span<'_>], width: usize) -> Vec<Line<'static>> {
-    /// A word's chars, each with its style.
-    type Word = Vec<(char, Style)>;
+    /// A word's graphemes, each with its style.
+    type Word<'a> = Vec<Glyph<'a>>;
     let width = width.max(1);
     // Text that fits stays exactly as it is, spaces included.
     if spans.iter().map(Span::width).sum::<usize>() <= width {
@@ -355,46 +368,44 @@ fn wrap_spans(spans: &[Span<'_>], width: usize) -> Vec<Line<'static>> {
     // Words, each with the style of the space before it.
     let mut words: Vec<(Option<Style>, Word)> = Vec::new();
     let mut sep = None;
-    let mut word: Vec<(char, Style)> = Vec::new();
-    for span in spans {
-        for c in span.content.chars() {
-            if c == ' ' {
-                if !word.is_empty() {
-                    words.push((sep.take(), std::mem::take(&mut word)));
-                }
-                sep.get_or_insert(span.style);
-            } else {
-                word.push((c, span.style));
+    let mut word: Word = Vec::new();
+    for (g, style) in glyphs(spans) {
+        if g == " " {
+            if !word.is_empty() {
+                words.push((sep.take(), std::mem::take(&mut word)));
             }
+            sep.get_or_insert(style);
+        } else {
+            word.push((g, style));
         }
     }
     if !word.is_empty() {
         words.push((sep.take(), word));
     }
 
-    let mut lines: Vec<Vec<(char, Style)>> = Vec::new();
-    let mut cur: Vec<(char, Style)> = Vec::new();
+    let mut lines: Vec<Word> = Vec::new();
+    let mut cur: Word = Vec::new();
     let mut used = 0;
-    for (sep, chars) in words {
-        let w: usize = chars.iter().map(|(c, _)| char_width(*c)).sum();
+    for (sep, word) in words {
+        let w: usize = word.iter().map(|(g, _)| glyph_width(g)).sum();
         if !cur.is_empty() {
             if used + 1 + w <= width {
-                cur.push((' ', sep.unwrap_or_default()));
-                cur.extend(chars);
+                cur.push((" ", sep.unwrap_or_default()));
+                cur.extend(word);
                 used += 1 + w;
                 continue;
             }
             lines.push(std::mem::take(&mut cur));
             used = 0;
         }
-        for (c, style) in chars {
-            let cw = char_width(c);
-            if used > 0 && used + cw > width {
+        for (g, style) in word {
+            let gw = glyph_width(g);
+            if used > 0 && used + gw > width {
                 lines.push(std::mem::take(&mut cur));
                 used = 0;
             }
-            cur.push((c, style));
-            used += cw;
+            cur.push((g, style));
+            used += gw;
         }
     }
     if !cur.is_empty() || lines.is_empty() {
@@ -403,18 +414,18 @@ fn wrap_spans(spans: &[Span<'_>], width: usize) -> Vec<Line<'static>> {
     lines.into_iter().map(styled_line).collect()
 }
 
-/// One line from styled chars, runs of one style merged into a span.
-fn styled_line(chars: Vec<(char, Style)>) -> Line<'static> {
+/// One line from styled graphemes, runs of one style merged into a span.
+fn styled_line(glyphs: Vec<Glyph<'_>>) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut run = String::new();
     let mut run_style: Option<Style> = None;
-    for (c, style) in chars {
+    for (g, style) in glyphs {
         match run_style {
             Some(s) if s != style => spans.push(Span::styled(std::mem::take(&mut run), s)),
             _ => {}
         }
         run_style = Some(style);
-        run.push(c);
+        run.push_str(g);
     }
     if let Some(style) = run_style {
         spans.push(Span::styled(run, style));
@@ -435,22 +446,20 @@ fn finding_lines(
     let max_lines = max_lines.max(1);
     if lines.len() > max_lines {
         lines.truncate(max_lines);
+        // Drop whole graphemes until `…` fits on the last line.
         let last = lines.pop().unwrap_or_default();
-        let mut chars: Vec<(char, Style)> = last
-            .spans
-            .iter()
-            .flat_map(|s| s.content.chars().map(move |c| (c, s.style)))
-            .collect();
-        let style = chars.last().map(|(_, s)| *s).unwrap_or_default();
-        let mut used: usize = chars.iter().map(|(c, _)| char_width(*c)).sum();
+        let mut kept: Vec<Glyph<'_>> = glyphs(&last.spans).collect();
+        let style = kept.last().map(|(_, s)| *s).unwrap_or_default();
+        let mut used: usize = kept.iter().map(|(g, _)| glyph_width(g)).sum();
         while used + 1 > width.max(1) {
-            match chars.pop() {
-                Some((c, _)) => used -= char_width(c),
+            match kept.pop() {
+                Some((g, _)) => used -= glyph_width(g),
                 None => break,
             }
         }
-        chars.push(('…', style));
-        lines.push(styled_line(chars));
+        kept.push(("…", style));
+        let cut = styled_line(kept);
+        lines.push(cut);
     }
     lines
 }
@@ -801,6 +810,19 @@ mod tests {
         let spans = [Span::raw("日日日")];
         assert_eq!(texts(&wrap_spans(&spans, 6)), ["日日日"]);
         assert_eq!(texts(&wrap_spans(&spans, 5)), ["日日", "日"]);
+    }
+
+    #[test]
+    fn wrap_spans_measures_and_keeps_whole_graphemes() {
+        // `❤️` is `❤` plus a variation selector: two cells as drawn,
+        // though its chars measure one. `b` must move to the next line.
+        let lines = wrap_spans(&[Span::raw("a❤️b")], 3);
+        assert_eq!(texts(&lines), ["a❤️", "b"]);
+        assert!(lines.iter().all(|l| l.width() <= 3));
+        // A ZWJ family is one grapheme: never split.
+        let family = "👩\u{200d}👩\u{200d}👧";
+        let lines = wrap_spans(&[Span::raw(format!("ab{family}"))], 3);
+        assert_eq!(texts(&lines), ["ab".to_string(), family.to_string()]);
     }
 
     #[test]
