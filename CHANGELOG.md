@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.25.0](https://github.com/hrzlgnm/mex/compare/v0.24.0...v0.25.0) (2026-11-27)
+
+
+### Features
+
+* wrap long findings onto multiple lines in the Answers and Questions panes ([#412](https://github.com/hrzlgnm/mex/issues/412)) ([839fd45](https://github.com/hrzlgnm/mex/commit/839fd4547f14097d572124c2d6c429367153490d))
+
+
+### Bug Fixes
+
+* bring back the rows above the first record when the cursor returns to it ([#409](https://github.com/hrzlgnm/mex/issues/409)) ([d77560f](https://github.com/hrzlgnm/mex/commit/d77560fd9871ffc50c61dcdcc8ab1e07c5f7919f))
+* resolve clicks by the drawn row's identity, not its list position ([#415](https://github.com/hrzlgnm/mex/issues/415)) ([a42ce0a](https://github.com/hrzlgnm/mex/commit/a42ce0a1142eeec2142f11ecc8e07a818e527712))
+
+
+### Dependencies
+
+* lock file maintenance ([#416](https://github.com/hrzlgnm/mex/issues/416)) ([ff0a831](https://github.com/hrzlgnm/mex/commit/ff0a831ab3564d055c2ed93a9740e790b14d2574))
+
 ## [0.24.0](https://github.com/hrzlgnm/mex/compare/v0.23.0...v0.24.0) (2026-11-26)
 
 
