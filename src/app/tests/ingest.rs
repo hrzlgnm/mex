@@ -1535,3 +1535,127 @@ fn an_out_of_scope_record_in_a_query_s_additional_is_flagged_never_sighted() {
         ]
     );
 }
+
+/// DNS header flags byte for OPCODE 5 (UPDATE): bits 3–6.
+const OPCODE_UPDATE: u8 = 5 << 3;
+
+/// A header with `flags` in its flags byte, no counts: enough for the
+/// event accessors, which read only the stored bytes.
+fn header(flags: u8) -> Vec<u8> {
+    vec![0, 0, flags, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+}
+
+#[test]
+fn nonzero_opcode_response_is_ignored_but_logged_and_counted() {
+    // RFC 6762 §18.3 (#427): the message is silently ignored, so neither
+    // its address nor its out-of-scope record reaches state, but the
+    // packet log keeps it and diagnostics count it.
+    let mut app = App::new().unwrap();
+    ingest(&mut app, &ptr_record(4500));
+    ingest(&mut app, &srv_record(120));
+    let sightings = app.sightings.len();
+    ingest_packet(
+        &mut app,
+        browse::Event {
+            answers: vec![
+                raw_record("test.local.", 1, "A", "192.168.1.10", 120),
+                raw_record("test.local.", 6, "TYPE6", "rdlength=3", 120),
+            ],
+            questions: Vec::new(),
+            query_kas: Vec::new(),
+            query_authority: Vec::new(),
+            query_additional: Vec::new(),
+            rcode: Some(0),
+            received_at: Instant::now(),
+            raw_bytes: header(0x84 | OPCODE_UPDATE),
+            source: test_source(),
+        },
+    );
+    assert!(app.services[0].answers.iter().all(|r| r.rtype != 1));
+    assert_eq!(app.sightings.len(), sightings, "no sighting filed");
+    assert_eq!(app.raw_events.len(), 1, "packet log keeps the raw packet");
+    let row = app
+        .diagnostics_rows()
+        .into_iter()
+        .find(|(k, _)| k == "ignored opcode")
+        .expect("ignored opcode row");
+    assert!(
+        row.1.starts_with("1 total · last 192.168.1.2:5353 "),
+        "{}",
+        row.1
+    );
+    assert_eq!(
+        app.state_dump().diagnostics.get("opcode_ignored_packets"),
+        Some(&1)
+    );
+}
+
+#[test]
+fn nonzero_opcode_query_files_no_question_and_moves_no_schedule() {
+    // RFC 6762 §18.3 (#427): no Questions row, and no overheard entry
+    // for §7.3 duplicate suppression.
+    let mut app = App::new().unwrap();
+    let mut ev = query_event(
+        "_services._dns-sd._udp.local.",
+        12,
+        "PTR",
+        false,
+        Vec::new(),
+        remote_source(),
+    );
+    ev.raw_bytes = header(OPCODE_UPDATE);
+    ingest_packet(&mut app, ev);
+    assert!(app.enum_entries.iter().all(|e| e.questions.is_empty()));
+    assert!(app.scheduler.overheard().is_empty());
+    assert_eq!(app.diagnostics.opcode_ignored, 1);
+    // OPCODE 0 is handled as before.
+    let mut ev = query_event(
+        "_services._dns-sd._udp.local.",
+        12,
+        "PTR",
+        false,
+        Vec::new(),
+        remote_source(),
+    );
+    ev.raw_bytes = header(0);
+    ingest_packet(&mut app, ev);
+    assert_eq!(app.enum_entries[0].questions.len(), 1);
+    assert!(!app.scheduler.overheard().is_empty());
+    assert_eq!(app.diagnostics.opcode_ignored, 1);
+}
+
+#[test]
+fn the_ignored_opcode_row_reads_zero_without_any() {
+    let app = App::new().unwrap();
+    let row = app
+        .diagnostics_rows()
+        .into_iter()
+        .find(|(k, _)| k == "ignored opcode")
+        .expect("ignored opcode row");
+    assert_eq!(row.1, "0 total");
+    assert_eq!(
+        app.state_dump().diagnostics.get("opcode_ignored_packets"),
+        Some(&0)
+    );
+}
+
+#[test]
+fn a_message_with_nonzero_opcode_and_rcode_is_still_counted() {
+    // #427: the OPCODE check runs first, so the RCODE return can't hide it.
+    let mut app = App::new().unwrap();
+    ingest_packet(
+        &mut app,
+        browse::Event {
+            answers: vec![raw_record("test.local.", 1, "A", "192.168.1.10", 120)],
+            questions: Vec::new(),
+            query_kas: Vec::new(),
+            query_authority: Vec::new(),
+            query_additional: Vec::new(),
+            rcode: Some(3),
+            received_at: Instant::now(),
+            raw_bytes: header(0x84 | OPCODE_UPDATE),
+            source: test_source(),
+        },
+    );
+    assert_eq!(app.diagnostics.opcode_ignored, 1);
+}

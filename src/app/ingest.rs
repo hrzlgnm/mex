@@ -6,9 +6,22 @@ use super::*;
 impl App {
     pub(super) fn ingest_event(&mut self, ev: &browse::Event) {
         self.touch();
-        // RFC 6762 §18.11: messages received with a non-zero RCODE MUST be
-        // silently ignored. The raw packet stays in the packet log for
-        // inspection, but none of its records or questions reach state.
+        // RFC 6762 §18.3: a message with a non-zero OPCODE, query or
+        // response, MUST be silently ignored. The raw packet stays in the
+        // packet log for inspection, but none of its records or questions
+        // reach state. Checked first, so one with a non-zero RCODE as well
+        // is still counted, and the overlay shows something sends them.
+        if ev.is_ignored() {
+            log::debug!(
+                "mex: ignoring message from {} with OPCODE {}",
+                ev.source,
+                ev.opcode()
+            );
+            self.diagnostics.opcode_ignored += 1;
+            self.diagnostics.opcode_ignored_last = Some((ev.source, Instant::now()));
+            return;
+        }
+        // RFC 6762 §18.11: likewise for a response with a non-zero RCODE.
         if has_nonzero_rcode(ev) {
             log::debug!(
                 "mex: ignoring response from {} with RCODE {:?}",

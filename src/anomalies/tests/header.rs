@@ -258,3 +258,24 @@ fn a_link_labelled_row_counts_its_own_link() {
         "{found:#?}"
     );
 }
+
+/// RFC 6762 §18.3 (#427): an AA-set query with a non-zero OPCODE (here
+/// UPDATE) is ignored, not judged as a query.
+#[test]
+fn a_nonzero_opcode_message_raises_no_aa_finding() {
+    let q = question(NAME, 33, "SRV", querier());
+    let update = 5 << 3;
+    let events: Vec<_> = (0..3)
+        .map(|_| packet(AA | update, vec![q.clone()]))
+        .collect();
+    assert!(aa_findings(vec![row(SERVICE, &q)], &events).is_empty());
+    // One standard query among them is judged alone.
+    let mut events = events;
+    events.push(packet(AA, vec![q.clone()]));
+    let found = aa_findings(vec![row(SERVICE, &q)], &events);
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert_eq!(
+        found[0].message,
+        "AA bit set in 1 of 1 query (must be zero in queries)"
+    );
+}

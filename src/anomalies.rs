@@ -474,6 +474,20 @@ pub fn analyze_observations(
     events: &[crate::browse::Event],
     address_queries: &[AddressQueryView],
 ) -> Vec<Anomaly> {
+    // RFC 6762 §18.3: a message with a non-zero OPCODE carries no mDNS
+    // meaning, so no check counts it (#427). Copied only when one is
+    // retained, which is rare.
+    let kept: Vec<crate::browse::Event>;
+    let events = if events.iter().any(crate::browse::Event::is_ignored) {
+        kept = events
+            .iter()
+            .filter(|ev| !ev.is_ignored())
+            .cloned()
+            .collect();
+        &kept[..]
+    } else {
+        events
+    };
     let now = Instant::now();
     let mut out: Vec<Anomaly> = Vec::new();
 

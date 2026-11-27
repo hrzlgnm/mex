@@ -299,6 +299,10 @@ impl App {
             "malformed_packets".to_string(),
             self.drop_stats.malformed_total(),
         );
+        diagnostics.insert(
+            "opcode_ignored_packets".to_string(),
+            self.diagnostics.opcode_ignored,
+        );
         // mex's own process cost: `dump_entries` inserts a key only
         // where the platform measures it.
         for (key, value) in rusage::dump_entries(&rusage::sample()) {

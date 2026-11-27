@@ -166,7 +166,7 @@ impl App {
         let queriers = self
             .raw_events
             .iter()
-            .filter(|ev| !ev.questions.is_empty())
+            .filter(|ev| !ev.questions.is_empty() && !ev.is_ignored())
             .map(|ev| ev.source.ip());
         let device_names = host_addresses
             .iter()

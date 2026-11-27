@@ -737,6 +737,10 @@ pub struct DiagnosticsCounters {
     pub services_expired_total: u64,
     /// Out-of-scope sightings evicted by `SIGHTINGS_CAP`.
     pub sightings_dropped: u64,
+    /// Messages ignored for a non-zero OPCODE (RFC 6762 §18.3), and the
+    /// last one's source and arrival.
+    pub opcode_ignored: u64,
+    pub opcode_ignored_last: Option<(std::net::SocketAddr, Instant)>,
 }
 
 impl DiagnosticsCounters {
@@ -1433,7 +1437,7 @@ impl App {
         }
         let target_changed = batch
             .iter()
-            .filter(|ev| !has_nonzero_rcode(ev))
+            .filter(|ev| !has_nonzero_rcode(ev) && !ev.is_ignored())
             .any(|ev| ev.answers.iter().any(|rec| rec.rtype == 33 && rec.ttl > 0));
         for ev in &batch {
             self.note_packet_diagnostics(ev);
