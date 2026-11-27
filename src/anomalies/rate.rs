@@ -478,10 +478,12 @@ impl<'a> MulticastIndex<'a> {
         at: Instant,
         names: &'s HashSet<String>,
     ) -> impl Iterator<Item = (Instant, &'s (String, u16))> + 's {
-        self.own_sends
+        // In send order: start at the last send at or before `at`, so the
+        // walk covers only the second before it.
+        let end = self.own_sends.partition_point(|s| s.sent_at <= at);
+        self.own_sends[..end]
             .iter()
             .rev()
-            .skip_while(move |s| s.sent_at > at)
             .take_while(move |s| at - s.sent_at <= MIN_GAP)
             .filter(move |s| s.iface == rec.iface && s.ifindex == rec.ifindex)
             .filter_map(move |s| {
