@@ -1638,3 +1638,24 @@ fn the_ignored_opcode_row_reads_zero_without_any() {
         Some(&0)
     );
 }
+
+#[test]
+fn a_message_with_nonzero_opcode_and_rcode_is_still_counted() {
+    // #427: the OPCODE check runs first, so the RCODE return can't hide it.
+    let mut app = App::new().unwrap();
+    ingest_packet(
+        &mut app,
+        browse::Event {
+            answers: vec![raw_record("test.local.", 1, "A", "192.168.1.10", 120)],
+            questions: Vec::new(),
+            query_kas: Vec::new(),
+            query_authority: Vec::new(),
+            query_additional: Vec::new(),
+            rcode: Some(3),
+            received_at: Instant::now(),
+            raw_bytes: header(0x84 | OPCODE_UPDATE),
+            source: test_source(),
+        },
+    );
+    assert_eq!(app.diagnostics.opcode_ignored, 1);
+}
