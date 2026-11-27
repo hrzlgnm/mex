@@ -207,3 +207,53 @@ fn an_enumeration_question_is_flagged_there() {
     assert_eq!(found.len(), 1, "{found:#?}");
     assert_eq!(found[0].service, ENUMERATION_SERVICE);
 }
+
+/// `q` as received on `iface`.
+fn on_link(q: &RawRecord, iface: &str, ifindex: u32) -> RawRecord {
+    let mut q = q.clone();
+    q.iface = iface.to_string();
+    q.ifindex = ifindex;
+    q
+}
+
+/// A sighting row for `q`, labelled with its link.
+fn sighting(q: &RawRecord) -> QuestionView<'_> {
+    QuestionView {
+        source_label: q.source_label(),
+        ..row(SERVICE, q)
+    }
+}
+
+/// A sighting row names its link: it counts that link's queries only,
+/// while a Questions row (no link) counts every link's.
+#[test]
+fn a_link_labelled_row_counts_its_own_link() {
+    let q = question(NAME, 33, "SRV", querier());
+    let eth0 = on_link(&q, "eth0", 2);
+    let wlan0 = on_link(&q, "wlan0", 3);
+    let mut events = queries(&eth0, 2, 2);
+    events.extend(queries(&wlan0, 3, 0));
+    let found = aa_findings(
+        vec![sighting(&eth0), sighting(&wlan0), row(SERVICE, &q)],
+        &events,
+    );
+    let mut got: Vec<_> = found
+        .iter()
+        .map(|a| (a.source.clone().unwrap(), a.message.clone()))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            (
+                "192.168.1.70:5353".to_string(),
+                "AA bit set in 2 of 5 queries (must be zero in queries)".to_string()
+            ),
+            (
+                "192.168.1.70:5353@eth0".to_string(),
+                "AA bit set in 2 of 2 queries (must be zero in queries)".to_string()
+            ),
+        ],
+        "{found:#?}"
+    );
+}
