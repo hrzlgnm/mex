@@ -331,6 +331,7 @@ fn reverse_ptr_creates_no_pending_service() {
         questions: vec![],
         query_kas: vec![],
         query_authority: Vec::new(),
+        query_additional: Vec::new(),
         rcode: Some(0),
         received_at: Instant::now(),
         raw_bytes: vec![],
@@ -873,6 +874,7 @@ fn nonzero_rcode_response_records_are_not_ingested() {
             questions: Vec::new(),
             query_kas: Vec::new(),
             query_authority: Vec::new(),
+            query_additional: Vec::new(),
             rcode: Some(3),
             received_at: Instant::now(),
             raw_bytes: vec![0x01],
@@ -1436,4 +1438,100 @@ fn service_records_keep_rdata_case() {
         .filter(|r| r.rtype == 16)
         .count();
     assert_eq!(txts, 2);
+}
+
+#[test]
+fn a_query_s_additional_records_are_never_filed_nor_known_answers() {
+    // #424: a querier listing its known answers in the Additional section.
+    // They are beliefs like known answers, but in the wrong place: no
+    // answers, no sightings, and no known answers for §7.3 suppression.
+    let mut app = App::new().unwrap();
+    let mut ev = query_event(
+        "_services._dns-sd._udp.local.",
+        12,
+        "PTR",
+        false,
+        Vec::new(),
+        remote_source(),
+    );
+    ev.query_additional = vec![ka_record(
+        "_services._dns-sd._udp.local.",
+        "_http._tcp.local.",
+    )];
+    app.ingest_event(&ev);
+    assert_eq!(app.enum_entries[0].questions.len(), 1);
+    assert!(app.enum_entries[0].answers.is_empty());
+    assert!(app.scheduler.enum_known().is_empty());
+    assert!(app.sightings.is_empty(), "{:#?}", app.sightings.len());
+    let overheard = app
+        .scheduler
+        .overheard()
+        .get(&("_services._dns-sd._udp.local".to_string(), 12))
+        .expect("the question is overheard");
+    assert!(
+        overheard.1.is_empty(),
+        "no known answers: {:?}",
+        overheard.1
+    );
+}
+
+/// A query from 192.168.1.70 for `Test._http._tcp.local.` of type
+/// `qtype` whose Additional section holds `additional` (each a whole
+/// record, the owner compressed to the question at offset 12).
+fn query_with_additional(qtype: u8, additional: &[&[u8]]) -> browse::Event {
+    let mut raw = vec![0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, additional.len() as u8];
+    raw.extend_from_slice(b"\x04Test\x05_http\x04_tcp\x05local\x00");
+    raw.extend_from_slice(&[0, qtype, 0, 1]);
+    for record in additional {
+        raw.extend_from_slice(record);
+    }
+    browse::parse_packet(
+        &raw,
+        "192.168.1.70:5353".parse().unwrap(),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(224, 0, 0, 251)),
+        "br0",
+        3,
+    )
+    .expect("packet parses")
+}
+
+const OPT: &[u8] = &[0, 0, 41, 0x05, 0xa0, 0, 0, 0, 0, 0, 0];
+/// TYPE6 with 3 bytes of garbage: out of scope, never decoded.
+const OPAQUE: &[u8] = &[0xc0, 12, 0, 6, 0, 1, 0, 0, 0, 120, 0, 3, 0xff, 0xff, 0xff];
+
+fn misplaced_findings(app: &App) -> Vec<String> {
+    app.anomalies()
+        .into_iter()
+        .filter(|a| a.kind == anomalies::AnomalyKind::MisplacedKnownAnswer)
+        .map(|a| a.message)
+        .collect()
+}
+
+#[test]
+fn a_query_with_only_opt_in_additional_raises_no_misplaced_known_answer() {
+    // #424: EDNS0 OPT is no known answer, wherever it sits.
+    let mut app = App::new().unwrap();
+    service_with_txt(&mut app, "a=1");
+    ingest_packet(&mut app, query_with_additional(33, &[OPT, OPT]));
+    assert!(misplaced_findings(&app).is_empty());
+}
+
+#[test]
+fn an_out_of_scope_record_in_a_query_s_additional_is_flagged_never_sighted() {
+    // #424: an out-of-scope record in a response becomes a sighting; in a
+    // query's Additional section it is a misplaced belief: flagged, opaque,
+    // never filed. The question is ANY, so the TYPE6 record answers it.
+    let mut app = App::new().unwrap();
+    service_with_txt(&mut app, "a=1");
+    let sightings = app.sightings.len();
+    ingest_packet(&mut app, query_with_additional(255, &[OPT, OPAQUE]));
+    assert_eq!(app.sightings.len(), sightings, "no sighting filed");
+    assert_eq!(
+        misplaced_findings(&app),
+        vec![
+            "known answer Test._http._tcp.local. TYPE6 in the Additional section of 1 query; \
+             responders suppress only on the Answer section"
+                .to_string()
+        ]
+    );
 }

@@ -107,6 +107,7 @@ fn unsupported_question_routes_as_info_with_display_key() {
         questions: vec![q],
         query_kas: Vec::new(),
         query_authority: Vec::new(),
+        query_additional: Vec::new(),
         rcode: None,
         received_at: Instant::now(),
         raw_bytes: vec![0x01, 0x02],
@@ -201,6 +202,7 @@ fn questions_pane_shows_last_and_due() {
         questions: vec![soa],
         query_kas: Vec::new(),
         query_authority: Vec::new(),
+        query_additional: Vec::new(),
         rcode: None,
         received_at: Instant::now(),
         raw_bytes: vec![0x01, 0x02],
@@ -447,5 +449,46 @@ fn querier_setting_the_aa_bit_gets_a_finding_on_its_row() {
     assert_eq!(
         aa[0].message,
         "AA bit set in 1 of 1 query (must be zero in queries)"
+    );
+}
+
+#[test]
+fn querier_misplacing_a_known_answer_gets_a_finding_on_its_row() {
+    // #424: the known SRV rides in the query's Additional section.
+    let mut app = App::new().unwrap();
+    service_with_txt(&mut app, "a=1; b=2");
+    let querier: SocketAddr = "192.168.1.70:5353".parse().unwrap();
+    let mut ev = query_event(
+        "Test._http._tcp.local.",
+        33,
+        "SRV",
+        false,
+        Vec::new(),
+        querier,
+    );
+    ev.questions[0].iface = "eth0".to_string();
+    ev.questions[0].ifindex = 2;
+    let mut srv = srv_record(120);
+    srv.source = querier;
+    srv.section = browse::RecordSection::Additional;
+    ev.query_additional = vec![srv];
+    ingest_packet(&mut app, ev);
+    let found = app.anomalies();
+    let target = app.display_detail().unwrap();
+    let rows = app.question_findings(&target, &found);
+    let questions = target.ordered_questions();
+    let row = questions
+        .iter()
+        .position(|q| q.2 == querier && q.1 == "SRV")
+        .expect("the querier's SRV row");
+    let misplaced: Vec<_> = rows[row]
+        .iter()
+        .filter(|a| a.kind == anomalies::AnomalyKind::MisplacedKnownAnswer)
+        .collect();
+    assert_eq!(misplaced.len(), 1, "{:#?}", rows[row]);
+    assert_eq!(
+        misplaced[0].message,
+        "known answer Test._http._tcp.local. SRV in the Additional section \
+         of 1 query; responders suppress only on the Answer section"
     );
 }

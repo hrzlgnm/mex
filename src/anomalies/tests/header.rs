@@ -41,6 +41,7 @@ fn packet(flags: u8, questions: Vec<RawRecord>) -> Event {
         questions,
         query_kas: Vec::new(),
         query_authority: Vec::new(),
+        query_additional: Vec::new(),
         rcode: (flags & QR != 0).then_some(0),
         received_at: Instant::now(),
         raw_bytes: vec![0, 0, flags, 0, 0, 1, 0, 0, 0, 0, 0, 0],

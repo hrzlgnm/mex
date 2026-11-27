@@ -1179,3 +1179,75 @@ fn a_query_s_aa_bit_is_exposed_on_the_event() {
     ));
     assert!(!parse(&r).is_authoritative_query());
 }
+
+/// The captured query of #424 (`fritz-box._igd2._tcp.local` SRV, the
+/// known SRV in Additional), with an OPT on each side of it and a
+/// malformed out-of-scope record after: header `flags`.
+fn query_with_additionals(flags: u16) -> Vec<u8> {
+    let mut raw = Vec::new();
+    for field in [0u16, flags, 1, 0, 0, 4] {
+        raw.extend_from_slice(&field.to_be_bytes());
+    }
+    raw.extend_from_slice(b"\x09fritz-box\x05_igd2\x04_tcp\x05local\x00");
+    raw.extend_from_slice(&[0, 33, 0, 1]);
+    let opt = [0, 0, 41, 0x05, 0xa0, 0, 0, 0, 0, 0, 0];
+    raw.extend_from_slice(&opt);
+    // SRV 0 0 49000 fritz-box.fritz.box, owner compressed to the question.
+    let target = b"\x09fritz-box\x05fritz\x03box\x00";
+    raw.extend_from_slice(&[0xc0, 12, 0, 33, 0, 1, 0, 0, 0, 120]);
+    raw.extend_from_slice(&(6 + target.len() as u16).to_be_bytes());
+    raw.extend_from_slice(&[0, 0, 0, 0, 0xbf, 0x68]);
+    raw.extend_from_slice(target);
+    raw.extend_from_slice(&opt);
+    // TYPE6 with 3 bytes of garbage: out of scope, never decoded.
+    raw.extend_from_slice(&[0xc0, 12, 0, 6, 0, 1, 0, 0, 0, 120, 0, 3, 0xff, 0xff, 0xff]);
+    raw
+}
+
+#[test]
+fn a_query_s_additional_records_are_kept_apart_not_filed() {
+    let parse = |flags| {
+        parse_packet(
+            &query_with_additionals(flags),
+            test_source(),
+            std::net::IpAddr::V4(MDNS_V4),
+            "enx",
+            2,
+        )
+        .expect("packet parses")
+    };
+    let rows = |records: &[RawRecord]| -> Vec<(u16, String, RecordSection)> {
+        records
+            .iter()
+            .map(|r| (r.rtype, r.rdata.clone(), r.section))
+            .collect()
+    };
+    let srv = "0 0 49000 fritz-box.fritz.box.";
+    let query = parse(0);
+    assert!(query.answers.is_empty(), "never filed as records");
+    assert!(query.query_kas.is_empty(), "never known answers");
+    assert_eq!(query.questions.len(), 1);
+    assert_eq!(
+        rows(&query.query_additional),
+        vec![
+            (33, srv.to_string(), RecordSection::Additional),
+            (6, "rdlength=3".to_string(), RecordSection::Additional),
+        ],
+        "both OPTs dropped, the out-of-scope record opaque"
+    );
+    assert_eq!(
+        query.query_additional[0].name,
+        "fritz-box._igd2._tcp.local."
+    );
+    assert_eq!(query.query_additional[0].iface, "enx");
+    // A response's additional section stays an answer section.
+    let response = parse(0x8400);
+    assert!(response.query_additional.is_empty());
+    assert_eq!(
+        rows(&response.answers),
+        vec![
+            (33, srv.to_string(), RecordSection::Additional),
+            (6, "rdlength=3".to_string(), RecordSection::Additional),
+        ]
+    );
+}
