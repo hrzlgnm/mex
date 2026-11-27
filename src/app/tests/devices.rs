@@ -309,10 +309,7 @@ fn soa_from(app: &mut App, source: &str) {
 fn finding_line(app: &App, source: &str) -> String {
     // Tall enough for every wrapped finding row (#410).
     let buf = render_to_buffer(app, 160, 80);
-    let lines: Vec<String> = rect_text(&buf, app.layout.answers_rect.get())
-        .lines()
-        .map(str::to_string)
-        .collect();
+    let lines = pane_lines(&buf, app.layout.answers_rect.get());
     lines
         .iter()
         .find(|l| l.contains(source) && l.contains("unicast-style-response"))

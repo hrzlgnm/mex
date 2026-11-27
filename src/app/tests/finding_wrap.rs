@@ -19,10 +19,6 @@ fn frame(app: &App, found: &[anomalies::Anomaly], w: u16, h: u16) -> ratatui::bu
     term.backend().buffer().clone()
 }
 
-fn pane_lines(buf: &ratatui::buffer::Buffer, area: ratatui::layout::Rect) -> Vec<String> {
-    rect_text(buf, area).lines().map(str::to_string).collect()
-}
-
 /// The live findings with the `kind` one's message replaced by `msg`.
 fn with_message(app: &App, kind: anomalies::AnomalyKind, msg: &str) -> Vec<anomalies::Anomaly> {
     let mut found = app.anomalies();
@@ -81,9 +77,61 @@ fn long_record_finding_wraps_under_its_row() {
         a.rfc, a.requirement
     );
     assert_eq!(block.join(" "), expected, "nothing clipped: {lines:#?}");
-    // The TXT record row sits right above; the row after the block is
-    // the next table row, not more of the finding.
+    // The TXT record row sits right above.
     assert!(lines[first - 1].contains("TXT"));
+}
+
+#[test]
+fn sourced_block_finding_keeps_its_source_on_the_first_line() {
+    // The router zone's SOA from the box: a host-block finding that
+    // names its responder.
+    let mut app = fritz_mesh();
+    ingest(
+        &mut app,
+        &from(
+            raw_record("fritz.box.", 6, "TYPE6", "rdlength=49", 4500),
+            BOX_V4,
+        ),
+    );
+    select_instance(&mut app, "Fritzel");
+    let found = with_message(&app, anomalies::AnomalyKind::UnicastStyleResponse, LONG);
+    let buf = frame(&app, &found, 160, 80);
+    let lines = pane_lines(&buf, app.layout.answers_rect.get());
+    let (first, block) = finding_block(&lines, "unicast-style-response");
+    assert!(block.len() > 1, "{lines:#?}");
+    assert!(
+        lines[first].contains(BOX_V4),
+        "source on line one: {lines:#?}"
+    );
+    // The text stays in RDATA; later lines leave SOURCE blank.
+    let rdata = col(&lines[1], "RDATA");
+    assert_eq!(
+        col(&lines[first], "unicast-style-response"),
+        rdata,
+        "{lines:#?}"
+    );
+    assert!(!lines[first + 1].contains(BOX_V4), "{lines:#?}");
+}
+
+#[test]
+fn cursor_follow_pulls_a_wrapped_finding_into_view() {
+    use crossterm::event::KeyCode;
+    let mut app = App::new().unwrap();
+    service_with_txt(&mut app, "a=1; b=2");
+    let found = with_message(&app, anomalies::AnomalyKind::NoFlush, LONG);
+    // The pane holds the records and some, not all, of the TXT
+    // finding while the cursor sits on PTR at the top.
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Home);
+    frame(&app, &found, 100, 26);
+    press(&mut app, KeyCode::End);
+    let buf = frame(&app, &found, 100, 26);
+    let lines = pane_lines(&buf, app.layout.answers_rect.get());
+    let (_, block) = finding_block(&lines, "no-flush");
+    assert!(
+        block.last().unwrap().ends_with(')'),
+        "the whole finding shows, RFC suffix last: {lines:#?}"
+    );
 }
 
 #[test]
@@ -129,7 +177,8 @@ fn finding_taller_than_the_pane_is_cut_with_an_ellipsis() {
     service_with_txt(&mut app, "a=1; b=2");
     let long = [LONG; 8].join(" ");
     let found = with_message(&app, anomalies::AnomalyKind::NoFlush, &long);
-    // Park the cursor on TXT so its finding is pulled into view.
+    // The cursor sits on TXT (`service_with_txt`), so its finding is
+    // pulled into view under the pinned TXT row.
     let buf = frame(&app, &found, 100, 24);
     let area = app.layout.answers_rect.get();
     let lines = pane_lines(&buf, area);

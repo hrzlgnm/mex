@@ -476,13 +476,15 @@ fn legacy_aaaa_denial() -> browse::RawRecord {
     raw_record(DACP, 47, "NSEC", "iTunes_Ctrl._dacp._tcp.local. AAAA", 120)
 }
 
-/// Answers pane text, one line per table row (borders included).
+/// Text of `area` in `buf`, one line per screen line (borders included).
+fn pane_lines(buf: &ratatui::buffer::Buffer, area: ratatui::layout::Rect) -> Vec<String> {
+    rect_text(buf, area).lines().map(str::to_string).collect()
+}
+
+/// Answers pane text, one line per screen line (borders included).
 fn answers_text(app: &App) -> Vec<String> {
     let buf = render_to_buffer(app, 160, 40);
-    rect_text(&buf, app.layout.answers_rect.get())
-        .lines()
-        .map(str::to_string)
-        .collect()
+    pane_lines(&buf, app.layout.answers_rect.get())
 }
 
 /// Whether a finding of `kind` sits in the block headed by line

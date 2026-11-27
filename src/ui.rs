@@ -343,6 +343,15 @@ fn wrap_spans(spans: &[Span<'_>], width: usize) -> Vec<Line<'static>> {
     /// A word's chars, each with its style.
     type Word = Vec<(char, Style)>;
     let width = width.max(1);
+    // Text that fits stays exactly as it is, spaces included.
+    if spans.iter().map(Span::width).sum::<usize>() <= width {
+        return vec![Line::from(
+            spans
+                .iter()
+                .map(|s| Span::styled(s.content.to_string(), s.style))
+                .collect::<Vec<_>>(),
+        )];
+    }
     // Words, each with the style of the space before it.
     let mut words: Vec<(Option<Style>, Word)> = Vec::new();
     let mut sep = None;
@@ -762,6 +771,7 @@ mod tests {
         assert_eq!(fit_row_extent(0, 8, 19, 5, &[1; 30]), 8);
     }
 
+    /// Plain text of each line.
     fn texts(lines: &[Line<'_>]) -> Vec<String> {
         lines.iter().map(|l| l.to_string()).collect()
     }
@@ -771,7 +781,9 @@ mod tests {
         let spans = [Span::raw("ab cd  ef")];
         assert_eq!(texts(&wrap_spans(&spans, 5)), ["ab cd", "ef"]);
         assert_eq!(texts(&wrap_spans(&spans, 4)), ["ab", "cd", "ef"]);
-        assert_eq!(texts(&wrap_spans(&spans, 20)), ["ab cd ef"]);
+        // Fitting text is left alone, double space included.
+        assert_eq!(texts(&wrap_spans(&spans, 20)), ["ab cd  ef"]);
+        assert_eq!(texts(&wrap_spans(&spans, 9)), ["ab cd  ef"]);
         assert_eq!(texts(&wrap_spans(&[], 5)), [""]);
     }
 

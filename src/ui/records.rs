@@ -245,7 +245,7 @@ fn first_row_showing(end: usize, viewport: usize, heights: &[u16]) -> usize {
 }
 
 /// Largest useful offset: past it the table's end leaves blank lines.
-pub(super) fn max_row_offset(viewport: usize, heights: &[u16]) -> usize {
+fn max_row_offset(viewport: usize, heights: &[u16]) -> usize {
     first_row_showing(heights.len(), viewport, heights).min(heights.len().saturating_sub(1))
 }
 
