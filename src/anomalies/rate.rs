@@ -102,15 +102,15 @@ impl<T: Default> QuestionTally<T> {
         }
     }
 
-    /// Apply `add` once per question of `ev`: a question asked twice in
-    /// one packet is one query.
-    pub(super) fn add_packet(&mut self, ev: &Event, add: impl Fn(&mut T)) {
+    /// Apply `add` once per question of `ev`, with that question: a
+    /// question asked twice in one packet is one query.
+    pub(super) fn add_packet(&mut self, ev: &Event, add: impl Fn(&mut T, &RawRecord)) {
         let mut in_packet = HashSet::new();
         for q in &ev.questions {
             let key = asking_key(&q.name, q.rtype, q.source);
             if in_packet.insert(key.clone()) {
-                add(self.all.entry(key.clone()).or_default());
-                add(self.per_link.entry((key, q.source_label())).or_default());
+                add(self.all.entry(key.clone()).or_default(), q);
+                add(self.per_link.entry((key, q.source_label())).or_default(), q);
             }
         }
     }

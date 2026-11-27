@@ -36,7 +36,7 @@ pub(super) fn check_query_aa_bit(
     let mut counts = QuestionTally::<AaCount>::new();
     for ev in events {
         let aa = usize::from(ev.is_authoritative_query());
-        counts.add_packet(ev, |count| {
+        counts.add_packet(ev, |count, _| {
             count.queries += 1;
             count.authoritative += aa;
         });

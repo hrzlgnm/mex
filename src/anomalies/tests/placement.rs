@@ -168,16 +168,65 @@ fn one_shot_queriers_are_flagged() {
 }
 
 #[test]
-fn every_question_of_the_query_is_marked() {
+fn every_question_a_misplaced_record_answers_is_marked() {
     let srv = question(NAME, 33, "SRV", querier());
     let txt = question(NAME, 16, "TXT", querier());
-    let ev = packet(vec![srv.clone(), txt.clone()], vec![misplaced_srv()]);
+    let ev = packet(
+        vec![srv.clone(), txt.clone()],
+        vec![
+            misplaced_srv(),
+            carried(NAME, 16, "TXT", RecordSection::Additional),
+        ],
+    );
     let found = findings(vec![row(SERVICE, &srv), row(SERVICE, &txt)], &[ev]);
     let mut types: Vec<_> = found.iter().map(|a| a.rtype).collect();
     types.sort();
     assert_eq!(types, vec![Some(16), Some(33)], "{found:#?}");
 }
 
+/// Only a record answering the question is a known answer for it: a
+/// query asking SRV and TXT with only the SRV misplaced marks the SRV row.
+#[test]
+fn a_question_nothing_answers_stays_quiet() {
+    let srv = question(NAME, 33, "SRV", querier());
+    let txt = question(NAME, 16, "TXT", querier());
+    let ev = packet(vec![srv.clone(), txt.clone()], vec![misplaced_srv()]);
+    let found = findings(vec![row(SERVICE, &srv), row(SERVICE, &txt)], &[ev]);
+    let types: Vec<_> = found.iter().map(|a| a.rtype).collect();
+    assert_eq!(types, vec![Some(33)], "{found:#?}");
+}
+
+#[test]
+fn records_answering_no_question_stay_quiet() {
+    let q = question(NAME, 33, "SRV", querier());
+    let host = carried("fritz-box.fritz.box.", 1, "A", RecordSection::Additional);
+    let found = findings(
+        vec![row(SERVICE, &q)],
+        &[packet(vec![q.clone()], vec![host])],
+    );
+    assert!(found.is_empty(), "{found:#?}");
+}
+
+#[test]
+fn an_any_question_is_answered_by_every_type_of_its_name() {
+    let q = question(NAME, 255, "ANY", querier());
+    let ev = packet(
+        vec![q.clone()],
+        vec![
+            misplaced_srv(),
+            carried(NAME, 16, "TXT", RecordSection::Additional),
+        ],
+    );
+    let found = findings(vec![row(SERVICE, &q)], &[ev]);
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert_eq!(
+        found[0].message,
+        format!("known answers {NAME} SRV and 1 more in the Additional section of 1 query{SUFFIX}")
+    );
+}
+
+/// Records differing in rdata are two (two addresses, two SRV targets);
+/// owner names differing only in ASCII case are one.
 #[test]
 fn several_records_are_summed_up_and_case_folded() {
     let q = question(NAME, 33, "SRV", querier());
@@ -187,10 +236,11 @@ fn several_records_are_summed_up_and_case_folded() {
         "SRV",
         RecordSection::Additional,
     );
-    let host = carried("fritz-box.fritz.box.", 1, "A", RecordSection::Additional);
+    let mut other_target = misplaced_srv();
+    other_target.rdata = "0 0 49000 fritz-box-2.fritz.box.".to_string();
     let events = vec![
         packet(vec![q.clone()], vec![misplaced_srv(), upper]),
-        packet(vec![q.clone()], vec![host]),
+        packet(vec![q.clone()], vec![other_target]),
     ];
     let found = findings(vec![row(SERVICE, &q)], &events);
     assert_eq!(found.len(), 1, "{found:#?}");

@@ -1475,13 +1475,13 @@ fn a_query_s_additional_records_are_never_filed_nor_known_answers() {
     );
 }
 
-/// A query from 192.168.1.70 for `Test._http._tcp.local.` SRV whose
-/// Additional section holds `additional` (each a whole record, the owner
-/// compressed to the question at offset 12).
-fn query_with_additional(additional: &[&[u8]]) -> browse::Event {
+/// A query from 192.168.1.70 for `Test._http._tcp.local.` of type
+/// `qtype` whose Additional section holds `additional` (each a whole
+/// record, the owner compressed to the question at offset 12).
+fn query_with_additional(qtype: u8, additional: &[&[u8]]) -> browse::Event {
     let mut raw = vec![0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, additional.len() as u8];
     raw.extend_from_slice(b"\x04Test\x05_http\x04_tcp\x05local\x00");
-    raw.extend_from_slice(&[0, 33, 0, 1]);
+    raw.extend_from_slice(&[0, qtype, 0, 1]);
     for record in additional {
         raw.extend_from_slice(record);
     }
@@ -1512,7 +1512,7 @@ fn a_query_with_only_opt_in_additional_raises_no_misplaced_known_answer() {
     // #424: EDNS0 OPT is no known answer, wherever it sits.
     let mut app = App::new().unwrap();
     service_with_txt(&mut app, "a=1");
-    ingest_packet(&mut app, query_with_additional(&[OPT, OPT]));
+    ingest_packet(&mut app, query_with_additional(33, &[OPT, OPT]));
     assert!(misplaced_findings(&app).is_empty());
 }
 
@@ -1520,11 +1520,11 @@ fn a_query_with_only_opt_in_additional_raises_no_misplaced_known_answer() {
 fn an_out_of_scope_record_in_a_query_s_additional_is_flagged_never_sighted() {
     // #424: an out-of-scope record in a response becomes a sighting; in a
     // query's Additional section it is a misplaced belief: flagged, opaque,
-    // never filed.
+    // never filed. The question is ANY, so the TYPE6 record answers it.
     let mut app = App::new().unwrap();
     service_with_txt(&mut app, "a=1");
     let sightings = app.sightings.len();
-    ingest_packet(&mut app, query_with_additional(&[OPT, OPAQUE]));
+    ingest_packet(&mut app, query_with_additional(255, &[OPT, OPAQUE]));
     assert_eq!(app.sightings.len(), sightings, "no sighting filed");
     assert_eq!(
         misplaced_findings(&app),
