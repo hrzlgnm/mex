@@ -378,9 +378,10 @@ fn response_at(at: Instant, ms: u64, records: Vec<RawRecord>) -> Event {
     }
 }
 
-/// `record` multicast at each offset (ms), one response each.
-fn sends(record: &RawRecord, offsets: &[u64]) -> Vec<Event> {
-    let at = base();
+/// `record` multicast at each offset (ms) from `at`, one response each.
+/// Callers pass one `at` to every `sends` they combine, so their gaps
+/// stay exact however long the test runs between calls.
+fn sends(at: Instant, record: &RawRecord, offsets: &[u64]) -> Vec<Event> {
     offsets
         .iter()
         .map(|ms| response_at(at, *ms, vec![record.clone()]))
@@ -424,7 +425,8 @@ fn cached(r: &RawRecord) -> RawRecord {
 #[test]
 fn record_multicast_twice_within_a_second_is_flagged() {
     let a = host_a(responder(), "");
-    let events = sends(&a, &[0, 250, 500, 750, 1000]);
+    let at = base();
+    let events = sends(at, &a, &[0, 250, 500, 750, 1000]);
     let found = analyze_answers(&[cached(&a)], &events);
     let flood = multicast_findings(&found);
     assert_eq!(flood.len(), 1, "{found:#?}");
@@ -459,7 +461,7 @@ fn copies_a_second_or_more_apart_stay_quiet() {
     let a = host_a(responder(), "");
     // Exactly the floor, then RFC 6762 §8.3 announcements (1 s, doubling).
     for offsets in [&[0, 1000, 2000][..], &[0, 1000, 3000][..]] {
-        let found = analyze_answers(&[cached(&a)], &sends(&a, offsets));
+        let found = analyze_answers(&[cached(&a)], &sends(base(), &a, offsets));
         assert!(
             multicast_findings(&found).is_empty(),
             "{offsets:?}: {found:#?}"
@@ -472,15 +474,17 @@ fn copies_from_two_sources_or_on_two_links_stay_quiet() {
     let other: SocketAddr = "192.168.1.110:5353".parse().unwrap();
     let mine = host_a(responder(), "");
     let theirs = host_a(other, "");
-    let mut events = sends(&mine, &[0]);
-    events.extend(sends(&theirs, &[250]));
+    let at = base();
+    let mut events = sends(at, &mine, &[0]);
+    events.extend(sends(at, &theirs, &[250]));
     let found = analyze_answers(&[cached(&mine), cached(&theirs)], &events);
     assert!(multicast_findings(&found).is_empty(), "{found:#?}");
 
     let on_eth = host_a(responder(), "eth0");
     let on_wlan = host_a(responder(), "wlan0");
-    let mut events = sends(&on_eth, &[0]);
-    events.extend(sends(&on_wlan, &[250]));
+    let at = base();
+    let mut events = sends(at, &on_eth, &[0]);
+    events.extend(sends(at, &on_wlan, &[250]));
     let found = analyze_answers(&[cached(&on_eth), cached(&on_wlan)], &events);
     assert!(multicast_findings(&found).is_empty(), "{found:#?}");
 }
@@ -501,15 +505,17 @@ fn unicast_copies_and_goodbyes_are_ignored() {
     let a = host_a(responder(), "");
     let mut unicast = a.clone();
     unicast.dst_is_multicast = false;
-    let mut events = sends(&a, &[0]);
-    events.extend(sends(&unicast, &[250]));
+    let at = base();
+    let mut events = sends(at, &a, &[0]);
+    events.extend(sends(at, &unicast, &[250]));
     let found = analyze_answers(&[cached(&a)], &events);
     assert!(multicast_findings(&found).is_empty(), "unicast: {found:#?}");
 
     let mut bye = a.clone();
     bye.ttl = 0;
-    let mut events = sends(&a, &[0]);
-    events.extend(sends(&bye, &[250]));
+    let at = base();
+    let mut events = sends(at, &a, &[0]);
+    events.extend(sends(at, &bye, &[250]));
     let found = analyze_answers(&[cached(&a)], &events);
     assert!(multicast_findings(&found).is_empty(), "goodbye: {found:#?}");
 }
@@ -588,8 +594,9 @@ fn record_names_fold_ascii_case_only() {
     let a = host_a(responder(), "");
     let mut upper = a.clone();
     upper.name = "REPEATER.local.".to_string();
-    let mut events = sends(&a, &[0]);
-    events.extend(sends(&upper, &[250]));
+    let at = base();
+    let mut events = sends(at, &a, &[0]);
+    events.extend(sends(at, &upper, &[250]));
     let found = analyze_answers(&[cached(&a)], &events);
     assert_eq!(multicast_findings(&found).len(), 1, "{found:#?}");
 
@@ -597,8 +604,9 @@ fn record_names_fold_ascii_case_only() {
     accented.name = "Répéteur.local.".to_string();
     let mut other = a.clone();
     other.name = "rÉpéteur.local.".to_string();
-    let mut events = sends(&accented, &[0]);
-    events.extend(sends(&other, &[250]));
+    let at = base();
+    let mut events = sends(at, &accented, &[0]);
+    events.extend(sends(at, &other, &[250]));
     let found = analyze_answers(&[cached(&accented)], &events);
     assert!(multicast_findings(&found).is_empty(), "{found:#?}");
 }
@@ -611,8 +619,9 @@ fn ptr_targets_fold_case_but_txt_data_does_not() {
     ptr.source = responder();
     let mut upper = ptr.clone();
     upper.rdata = "_IPP._tcp.local.".to_string();
-    let mut events = sends(&ptr, &[0]);
-    events.extend(sends(&upper, &[250]));
+    let at = base();
+    let mut events = sends(at, &ptr, &[0]);
+    events.extend(sends(at, &upper, &[250]));
     let row = cached(&upper);
     let snap = Snapshot {
         services: Vec::new(),
@@ -633,8 +642,9 @@ fn ptr_targets_fold_case_but_txt_data_does_not() {
     txt.source = responder();
     let mut other = txt.clone();
     other.rdata = "A=1".to_string();
-    let mut events = sends(&txt, &[0]);
-    events.extend(sends(&other, &[250]));
+    let at = base();
+    let mut events = sends(at, &txt, &[0]);
+    events.extend(sends(at, &other, &[250]));
     let found = analyze_answers(&[cached(&txt)], &events);
     assert!(multicast_findings(&found).is_empty(), "{found:#?}");
 }
@@ -647,8 +657,9 @@ fn name_valued_rdata_folds_case() {
     srv.source = responder();
     let mut upper = srv.clone();
     upper.rdata = "0 0 80 HOST.local.".to_string();
-    let mut events = sends(&srv, &[0]);
-    events.extend(sends(&upper, &[250]));
+    let at = base();
+    let mut events = sends(at, &srv, &[0]);
+    events.extend(sends(at, &upper, &[250]));
     let found = analyze_answers(&[cached(&srv)], &events);
     assert_eq!(multicast_findings(&found).len(), 1, "{found:#?}");
 }
@@ -688,13 +699,15 @@ fn opaque_records_compare_by_content_not_length() {
     soa.rdata_digest = Some(1);
     let mut bumped = soa.clone();
     bumped.rdata_digest = Some(2);
-    let mut events = sends(&soa, &[0]);
-    events.extend(sends(&bumped, &[250]));
+    let at = base();
+    let mut events = sends(at, &soa, &[0]);
+    events.extend(sends(at, &bumped, &[250]));
     let found = analyze_answers(&[cached(&bumped)], &events);
     assert!(multicast_findings(&found).is_empty(), "{found:#?}");
     // The same content again is a repeat.
-    let mut events = sends(&soa, &[0]);
-    events.extend(sends(&soa, &[250]));
+    let at = base();
+    let mut events = sends(at, &soa, &[0]);
+    events.extend(sends(at, &soa, &[250]));
     let found = analyze_answers(&[cached(&soa)], &events);
     assert_eq!(multicast_findings(&found).len(), 1, "{found:#?}");
 }
@@ -705,8 +718,9 @@ fn copies_on_two_unnamed_links_stay_quiet() {
     on_three.ifindex = 3;
     let mut on_four = on_three.clone();
     on_four.ifindex = 4;
-    let mut events = sends(&on_three, &[0]);
-    events.extend(sends(&on_four, &[250]));
+    let at = base();
+    let mut events = sends(at, &on_three, &[0]);
+    events.extend(sends(at, &on_four, &[250]));
     let found = analyze_answers(&[cached(&on_three), cached(&on_four)], &events);
     assert!(multicast_findings(&found).is_empty(), "{found:#?}");
 }
