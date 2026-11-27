@@ -5,6 +5,7 @@ use super::*;
 use std::net::SocketAddr;
 
 mod answer_sections;
+mod answers_scroll;
 mod conflicting_answers;
 mod denials;
 mod devices;
@@ -14,6 +15,11 @@ mod finding_targets;
 mod finding_wrap;
 mod hex;
 mod ingest;
+
+fn ingest(app: &mut App, rec: &browse::RawRecord) {
+    let ev = event_for(rec);
+    app.ingest_event(&ev);
+}
 mod input;
 mod manual_refresh;
 mod out_of_scope;
@@ -111,11 +117,6 @@ fn make_refresh_due(app: &mut App, name: &str, rtype: u16) {
             state.next_due = Instant::now() - Duration::from_millis(1);
         }
     }
-}
-
-fn ingest(app: &mut App, rec: &browse::RawRecord) {
-    let ev = event_for(rec);
-    app.ingest_event(&ev);
 }
 
 fn ingest_packet(app: &mut App, event: browse::Event) {

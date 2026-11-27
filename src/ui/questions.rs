@@ -259,7 +259,7 @@ pub(super) fn draw_questions_tab(
             .copied()
             .unwrap_or(heights.len());
         let viewport = area.height.saturating_sub(3) as usize;
-        offset = fit_row_extent(offset, selected, extent_end, viewport, &heights);
+        offset = fit_row_extent(offset, selected, selected, extent_end, viewport, &heights);
     }
     *tstate.offset_mut() = offset;
     frame.render_stateful_widget(table, area, &mut tstate);

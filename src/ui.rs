@@ -766,18 +766,18 @@ mod tests {
         let one = [1; 20];
         // Parent at 8 with 3 children (extent end 12), viewport 10: the
         // old offset 0 clips the children, so scroll to 2.
-        assert_eq!(fit_row_extent(0, 8, 12, 10, &one), 2);
+        assert_eq!(fit_row_extent(0, 8, 8, 12, 10, &one), 2);
         // Already visible: offset untouched.
-        assert_eq!(fit_row_extent(2, 8, 12, 10, &one), 2);
+        assert_eq!(fit_row_extent(2, 8, 8, 12, 10, &one), 2);
         // No children (extent is the row itself): no scroll.
-        assert_eq!(fit_row_extent(0, 3, 4, 10, &one), 0);
+        assert_eq!(fit_row_extent(0, 3, 3, 4, 10, &one), 0);
     }
 
     #[test]
     fn fit_row_extent_pins_oversized_expansion_to_parent() {
         // 10 children in a viewport of 5: cannot fit, so pin the parent
         // (row 8) to the top; the rest pages via Ctrl-j/k.
-        assert_eq!(fit_row_extent(0, 8, 19, 5, &[1; 30]), 8);
+        assert_eq!(fit_row_extent(0, 8, 8, 19, 5, &[1; 30]), 8);
     }
 
     /// Plain text of each line.
@@ -854,16 +854,34 @@ mod tests {
         // 0..=4 plus 5 lines of extent need 10, so scroll by 2 rows.
         let mut heights = [1; 10];
         heights[6] = 4;
-        assert_eq!(fit_row_extent(0, 5, 7, 8, &heights), 2);
+        assert_eq!(fit_row_extent(0, 5, 5, 7, 8, &heights), 2);
         // Exactly fits from row 3: lines 3..7 are 2 + 1 + 4 = 7 ≤ 8.
-        assert_eq!(fit_row_extent(3, 5, 7, 8, &heights), 3);
+        assert_eq!(fit_row_extent(3, 5, 5, 7, 8, &heights), 3);
         // Taller than the viewport: pin the parent.
         heights[6] = 9;
-        assert_eq!(fit_row_extent(0, 5, 7, 8, &heights), 5);
+        assert_eq!(fit_row_extent(0, 5, 5, 7, 8, &heights), 5);
         // The bottom never scrolls past the last row's end: rows 4..10
         // take 1+1+4+1+1+1 = 9 > 8, so the lowest offset is 5.
         heights[6] = 4;
-        assert_eq!(fit_row_extent(9, 9, 10, 8, &heights), 5);
+        assert_eq!(fit_row_extent(9, 9, 9, 10, 8, &heights), 5);
+    }
+
+    #[test]
+    fn fit_row_extent_reveals_leading_rows_of_the_first_record() {
+        // First record at row 4 under four header rows, scrolled to the
+        // bottom (offset 20): all of [0, 5) fits, so show from row 0.
+        assert_eq!(fit_row_extent(20, 0, 4, 5, 10, &[1; 30]), 0);
+        // Its two children (extent end 7) fit with the headers too.
+        assert_eq!(fit_row_extent(20, 0, 4, 7, 10, &[1; 30]), 0);
+    }
+
+    #[test]
+    fn fit_row_extent_keeps_the_first_record_when_headers_overflow() {
+        // Six header rows over a viewport of 3: scroll up only as far as
+        // keeps the record (row 6) on the last visible row.
+        assert_eq!(fit_row_extent(20, 0, 6, 7, 3, &[1; 30]), 4);
+        // Children that need the room still win over the headers.
+        assert_eq!(fit_row_extent(20, 0, 6, 9, 3, &[1; 30]), 6);
     }
 
     #[test]
