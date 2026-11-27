@@ -504,21 +504,25 @@ impl App {
         }
     }
 
-    /// Map an Answers table row (including info/child rows) to the detail
-    /// cursor index. Child rows select their parent record; info rows
-    /// select nothing. Mirrors `detail_table_rows` in `ui.rs`.
-    pub(super) fn answers_table_row_to_detail(&self, table_row: usize) -> Option<usize> {
+    /// Map an Answers viewport line to the detail cursor index of the
+    /// row drawn there (including info/child rows). Child rows select
+    /// their parent record; info rows select nothing. Mirrors
+    /// `detail_table_rows` in `ui.rs`.
+    pub(super) fn answers_line_to_detail(&self, line: usize) -> Option<usize> {
+        let offset = self.layout.detail_offset.get();
         // Finding and TXT child rows select their parent record, info and
         // block rows nothing. Hit-test the frame as drawn: findings can
-        // change between drawing and the click.
+        // change between drawing and the click, and wrapped findings
+        // (#410) take more than one line.
         if let Some(rows) = self.layout.answers_rows.borrow().as_ref() {
-            return rows.get(table_row).copied().flatten();
+            return rows.owner(rows.row_at_line(offset, line)?);
         }
-        // Nothing drawn for this target yet: the current layout.
+        // Nothing drawn for this target yet: the current layout, one
+        // line per row.
         let target = self.display_detail()?;
         let found = self.anomalies();
         self.answers_layout(&target, &found)
-            .get(table_row)?
+            .get(offset.saturating_add(line))?
             .owning_record()
     }
 
@@ -532,8 +536,7 @@ impl App {
             return;
         }
         let rel = row.saturating_sub(area.y.saturating_add(2)) as usize;
-        let table_row = self.layout.detail_offset.get().saturating_add(rel);
-        if let Some(idx) = self.answers_table_row_to_detail(table_row) {
+        if let Some(idx) = self.answers_line_to_detail(rel) {
             // Stay on the clicked target: the cursor follows the click
             // instead of the manual-scroll viewport. A new row also
             // restarts the hex dump at the top.
@@ -562,15 +565,15 @@ impl App {
             return;
         };
         let raws = target.ordered_answers().len();
-        let table_row = self.layout.questions_offset.get().saturating_add(rel);
-        // Each question row is followed by its finding rows (#248); hit
-        // the frame as drawn, else the current layout.
-        let drawn = self
-            .layout
-            .questions_rows
-            .borrow()
-            .as_ref()
-            .map(|rows| rows.get(table_row).copied().flatten());
+        let offset = self.layout.questions_offset.get();
+        // Each question row is followed by its finding rows (#248), which
+        // can wrap (#410); hit the frame as drawn, else the current
+        // layout at one line per row.
+        let drawn = self.layout.questions_rows.borrow().as_ref().map(|rows| {
+            rows.row_at_line(offset, rel)
+                .and_then(|table_row| rows.owner(table_row))
+        });
+        let table_row = offset.saturating_add(rel);
         let hit = drawn.unwrap_or_else(|| {
             let found = self.anomalies();
             let mut row = 0;
@@ -928,13 +931,32 @@ impl App {
     /// Page the record cursor by one Answers-table viewport. Falls back
     /// to 10 rows before the first draw answers the real height.
     pub(super) fn page_detail(&mut self, pages: isize) {
-        let per_page = self.layout.record_viewport.get().max(1) as isize;
-        let steps = pages * per_page;
-        let n = steps.unsigned_abs().min(1000);
-        for _ in 0..n {
+        let per_page = self.layout.record_viewport.get().max(1);
+        let budget = per_page.saturating_mul(pages.unsigned_abs());
+        // On drawn Answers rows a page is a viewport of lines, so tall
+        // rows (wrapped findings, #410) count as drawn. Questions and
+        // undrawn tables count one line per cursor step.
+        let drawn = self.layout.answers_rows.borrow().clone();
+        let start = self.view_state.detail_selected;
+        for _ in 0..budget.min(1000) {
             let before = self.view_state.detail_selected;
-            self.move_detail_cursor(steps.signum());
-            if self.view_state.detail_selected == before {
+            self.move_detail_cursor(pages.signum());
+            let now = self.view_state.detail_selected;
+            if now == before {
+                break;
+            }
+            let Some(lines) = drawn
+                .as_ref()
+                .and_then(|d| d.lines_between_owners(start, now))
+            else {
+                continue;
+            };
+            if lines > budget && before != start {
+                // One record too far: the page ends on the previous one.
+                self.move_detail_cursor(-pages.signum());
+                break;
+            }
+            if lines >= budget {
                 break;
             }
         }

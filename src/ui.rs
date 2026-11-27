@@ -300,8 +300,155 @@ fn finding_text(
     ])
 }
 
+/// Where finding rows of one table may draw: the table's columns as
+/// laid out (x and width inside the borders) and the most lines a
+/// single finding may take (the viewport height).
+pub(super) struct FindingFit {
+    cols: Vec<Rect>,
+    max_lines: usize,
+}
+
+impl FindingFit {
+    /// Columns of a bordered table drawn in `area` with `widths`, laid
+    /// out the way ratatui's `Table` does (start flex, one-cell
+    /// spacing, no highlight symbol).
+    pub(super) fn new(area: Rect, widths: &[Constraint], max_lines: usize) -> Self {
+        let inner = Rect::new(0, 0, area.width.saturating_sub(2), 1);
+        let cols = Layout::horizontal(widths.iter().copied())
+            .flex(ratatui::layout::Flex::Start)
+            .spacing(1)
+            .split(inner)
+            .to_vec();
+        Self { cols, max_lines }
+    }
+
+    /// Cells from the start of column `from` to the end of column `to`.
+    fn span(&self, from: usize, to: usize) -> usize {
+        match (self.cols.get(from), self.cols.get(to)) {
+            (Some(a), Some(b)) => b.right().saturating_sub(a.x) as usize,
+            _ => 0,
+        }
+    }
+}
+
+/// Display width of one char in terminal cells.
+fn char_width(c: char) -> usize {
+    Span::raw(&*c.encode_utf8(&mut [0; 4])).width()
+}
+
+/// Word-wrap styled spans to `width` cells (#410): breaks at spaces
+/// (runs of spaces collapse, none starts a line), breaks words wider
+/// than the line, and keeps every char's style. At least one line.
+fn wrap_spans(spans: &[Span<'_>], width: usize) -> Vec<Line<'static>> {
+    /// A word's chars, each with its style.
+    type Word = Vec<(char, Style)>;
+    let width = width.max(1);
+    // Words, each with the style of the space before it.
+    let mut words: Vec<(Option<Style>, Word)> = Vec::new();
+    let mut sep = None;
+    let mut word: Vec<(char, Style)> = Vec::new();
+    for span in spans {
+        for c in span.content.chars() {
+            if c == ' ' {
+                if !word.is_empty() {
+                    words.push((sep.take(), std::mem::take(&mut word)));
+                }
+                sep.get_or_insert(span.style);
+            } else {
+                word.push((c, span.style));
+            }
+        }
+    }
+    if !word.is_empty() {
+        words.push((sep.take(), word));
+    }
+
+    let mut lines: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut cur: Vec<(char, Style)> = Vec::new();
+    let mut used = 0;
+    for (sep, chars) in words {
+        let w: usize = chars.iter().map(|(c, _)| char_width(*c)).sum();
+        if !cur.is_empty() {
+            if used + 1 + w <= width {
+                cur.push((' ', sep.unwrap_or_default()));
+                cur.extend(chars);
+                used += 1 + w;
+                continue;
+            }
+            lines.push(std::mem::take(&mut cur));
+            used = 0;
+        }
+        for (c, style) in chars {
+            let cw = char_width(c);
+            if used > 0 && used + cw > width {
+                lines.push(std::mem::take(&mut cur));
+                used = 0;
+            }
+            cur.push((c, style));
+            used += cw;
+        }
+    }
+    if !cur.is_empty() || lines.is_empty() {
+        lines.push(cur);
+    }
+    lines.into_iter().map(styled_line).collect()
+}
+
+/// One line from styled chars, runs of one style merged into a span.
+fn styled_line(chars: Vec<(char, Style)>) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut run_style: Option<Style> = None;
+    for (c, style) in chars {
+        match run_style {
+            Some(s) if s != style => spans.push(Span::styled(std::mem::take(&mut run), s)),
+            _ => {}
+        }
+        run_style = Some(style);
+        run.push(c);
+    }
+    if let Some(style) = run_style {
+        spans.push(Span::styled(run, style));
+    }
+    Line::from(spans)
+}
+
+/// The finding text wrapped to `width`, at most `max_lines` lines; a cut
+/// finding ends in `…` so the clip shows.
+fn finding_lines(
+    a: &Anomaly,
+    identity_count: &std::collections::HashMap<(String, u16), usize>,
+    width: usize,
+    max_lines: usize,
+) -> Vec<Line<'static>> {
+    let text = finding_text(a, identity_count);
+    let mut lines = wrap_spans(&text.spans, width);
+    let max_lines = max_lines.max(1);
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+        let last = lines.pop().unwrap_or_default();
+        let mut chars: Vec<(char, Style)> = last
+            .spans
+            .iter()
+            .flat_map(|s| s.content.chars().map(move |c| (c, s.style)))
+            .collect();
+        let style = chars.last().map(|(_, s)| *s).unwrap_or_default();
+        let mut used: usize = chars.iter().map(|(c, _)| char_width(*c)).sum();
+        while used + 1 > width.max(1) {
+            match chars.pop() {
+                Some((c, _)) => used -= char_width(c),
+                None => break,
+            }
+        }
+        chars.push(('…', style));
+        lines.push(styled_line(chars));
+    }
+    lines
+}
+
 /// Child row for one finding: icon in the type column, the announcer or
-/// querier in the source column, the finding text in the data column.
+/// querier in the source column, the finding text in the data column,
+/// wrapped to the width it spans (#410). Returns the row and its height.
 fn finding_row(
     a: &Anomaly,
     identity_count: &std::collections::HashMap<(String, u16), usize>,
@@ -309,15 +456,23 @@ fn finding_row(
     source_col: usize,
     data_col: usize,
     under_parent: bool,
-) -> Row<'static> {
+    fit: &FindingFit,
+) -> (Row<'static>, u16) {
+    let text = |from: usize| {
+        let lines = finding_lines(a, identity_count, fit.span(from, data_col), fit.max_lines);
+        let height = lines.len() as u16;
+        (ratatui::text::Text::from(lines), height)
+    };
     if under_parent {
         // Under its record or question (#266): the parent row already
         // shows the source and carries the severity mark, so the text
         // alone runs from the second column to the end.
-        return Row::new(vec![
+        let (body, height) = text(1);
+        let row = Row::new(vec![
             Cell::from(""),
-            Cell::from(finding_text(a, identity_count)).column_span(data_col as u16),
+            Cell::from(body).column_span(data_col as u16),
         ]);
+        return (row.height(height), height);
     }
     let mut cells: Vec<Cell<'static>> = (0..=data_col).map(|_| Cell::from("")).collect();
     cells[0] = Cell::from(Line::from(vec![Span::raw("  "), level_icon(a.severity)]));
@@ -325,19 +480,18 @@ fn finding_row(
         // Unsourced findings (e.g. `conflicting-answers`, whose message
         // names every responder) take the empty source column too, so
         // their long text isn't clipped to the data column.
+        let (body, height) = text(source_col);
         cells.truncate(source_col);
-        cells.push(
-            Cell::from(finding_text(a, identity_count))
-                .column_span((data_col - source_col + 1) as u16),
-        );
-        return Row::new(cells);
+        cells.push(Cell::from(body).column_span((data_col - source_col + 1) as u16));
+        return (Row::new(cells).height(height), height);
     };
     // No parent row names the responder here (`service` / `host`
     // blocks, `(unattributed)`): name it, device included (#246).
     let source = named(src.to_string(), book.resolve_label(src));
+    let (body, height) = text(data_col);
     cells[source_col] = Cell::from(source).style(Style::default().fg(Color::Gray));
-    cells[data_col] = Cell::from(finding_text(a, identity_count));
-    Row::new(cells)
+    cells[data_col] = Cell::from(body);
+    (Row::new(cells).height(height), height)
 }
 
 /// `label (Name)`, or the label alone when no device is named (#246).
@@ -591,20 +745,91 @@ mod tests {
 
     #[test]
     fn fit_row_extent_pulls_children_into_view() {
+        let one = [1; 20];
         // Parent at 8 with 3 children (extent end 12), viewport 10: the
         // old offset 0 clips the children, so scroll to 2.
-        assert_eq!(fit_row_extent(0, 8, 12, 10, 20), 2);
+        assert_eq!(fit_row_extent(0, 8, 12, 10, &one), 2);
         // Already visible: offset untouched.
-        assert_eq!(fit_row_extent(2, 8, 12, 10, 20), 2);
+        assert_eq!(fit_row_extent(2, 8, 12, 10, &one), 2);
         // No children (extent is the row itself): no scroll.
-        assert_eq!(fit_row_extent(0, 3, 4, 10, 20), 0);
+        assert_eq!(fit_row_extent(0, 3, 4, 10, &one), 0);
     }
 
     #[test]
     fn fit_row_extent_pins_oversized_expansion_to_parent() {
         // 10 children in a viewport of 5: cannot fit, so pin the parent
         // (row 8) to the top; the rest pages via Ctrl-j/k.
-        assert_eq!(fit_row_extent(0, 8, 19, 5, 30), 8);
+        assert_eq!(fit_row_extent(0, 8, 19, 5, &[1; 30]), 8);
+    }
+
+    fn texts(lines: &[Line<'_>]) -> Vec<String> {
+        lines.iter().map(|l| l.to_string()).collect()
+    }
+
+    #[test]
+    fn wrap_spans_breaks_at_spaces_and_fits_exactly() {
+        let spans = [Span::raw("ab cd  ef")];
+        assert_eq!(texts(&wrap_spans(&spans, 5)), ["ab cd", "ef"]);
+        assert_eq!(texts(&wrap_spans(&spans, 4)), ["ab", "cd", "ef"]);
+        assert_eq!(texts(&wrap_spans(&spans, 20)), ["ab cd ef"]);
+        assert_eq!(texts(&wrap_spans(&[], 5)), [""]);
+    }
+
+    #[test]
+    fn wrap_spans_breaks_long_words_and_survives_tiny_widths() {
+        let spans = [Span::raw("abcdefg h")];
+        assert_eq!(texts(&wrap_spans(&spans, 3)), ["abc", "def", "g h"]);
+        assert_eq!(texts(&wrap_spans(&spans, 0)).len(), 8);
+        assert_eq!(texts(&wrap_spans(&spans, 1)).len(), 8);
+    }
+
+    #[test]
+    fn wrap_spans_measures_wide_chars_by_cells() {
+        // `日` takes two cells: three fit in six, not in five.
+        let spans = [Span::raw("日日日")];
+        assert_eq!(texts(&wrap_spans(&spans, 6)), ["日日日"]);
+        assert_eq!(texts(&wrap_spans(&spans, 5)), ["日日", "日"]);
+    }
+
+    #[test]
+    fn wrap_spans_keeps_styles_across_breaks() {
+        let white = Style::default().fg(Color::White);
+        let gray = Style::default().fg(Color::Gray);
+        let spans = [
+            Span::styled("kind: msg", white),
+            Span::styled(" (RFC 1)", gray),
+        ];
+        let lines = wrap_spans(&spans, 9);
+        assert_eq!(texts(&lines), ["kind: msg", "(RFC 1)"]);
+        assert_eq!(lines[0].spans, [Span::styled("kind: msg", white)]);
+        assert_eq!(lines[1].spans, [Span::styled("(RFC 1)", gray)]);
+        // On one line the separator keeps the suffix's style.
+        let one = wrap_spans(&spans, 40);
+        assert_eq!(
+            one[0].spans,
+            [
+                Span::styled("kind: msg", white),
+                Span::styled(" (RFC 1)", gray)
+            ]
+        );
+    }
+
+    #[test]
+    fn fit_row_extent_counts_wrapped_rows_in_lines() {
+        // Parent at 5 with one 4-line finding (#410), viewport 8: rows
+        // 0..=4 plus 5 lines of extent need 10, so scroll by 2 rows.
+        let mut heights = [1; 10];
+        heights[6] = 4;
+        assert_eq!(fit_row_extent(0, 5, 7, 8, &heights), 2);
+        // Exactly fits from row 3: lines 3..7 are 2 + 1 + 4 = 7 ≤ 8.
+        assert_eq!(fit_row_extent(3, 5, 7, 8, &heights), 3);
+        // Taller than the viewport: pin the parent.
+        heights[6] = 9;
+        assert_eq!(fit_row_extent(0, 5, 7, 8, &heights), 5);
+        // The bottom never scrolls past the last row's end: rows 4..10
+        // take 1+1+4+1+1+1 = 9 > 8, so the lowest offset is 5.
+        heights[6] = 4;
+        assert_eq!(fit_row_extent(9, 9, 10, 8, &heights), 5);
     }
 
     #[test]

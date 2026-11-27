@@ -11,6 +11,7 @@ mod devices;
 mod diagnostics;
 mod finding_owners;
 mod finding_targets;
+mod finding_wrap;
 mod hex;
 mod ingest;
 mod input;

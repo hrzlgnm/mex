@@ -42,10 +42,55 @@ pub struct Layout {
     /// Horizontal scroll offset inside the diagnostics popup, in chars: the
     /// key column stays frozen while long values pan left.
     pub diagnostics_hscroll: Cell<usize>,
-    /// Row -> record index of the Answers table as last drawn (`None` per
-    /// info, block or unowned row), so a click hits what was on screen
-    /// even if findings changed since. `None` before the first draw.
-    pub answers_rows: RefCell<Option<Vec<Option<usize>>>>,
-    /// Row -> question index of the Questions table as last drawn.
-    pub questions_rows: RefCell<Option<Vec<Option<usize>>>>,
+    /// Rows of the Answers table as last drawn (owner: record index),
+    /// so a click hits what was on screen even if findings changed
+    /// since. `None` before the first draw.
+    pub answers_rows: RefCell<Option<DrawnRows>>,
+    /// Rows of the Questions table as last drawn (owner: question index).
+    pub questions_rows: RefCell<Option<DrawnRows>>,
+}
+
+/// One table's rows as drawn: each row's owner (`None` per info, block
+/// or unowned row) and its height in lines. Wrapped findings (#410) are
+/// taller than one line, so screen lines and table rows differ.
+#[derive(Debug, Clone, Default)]
+pub struct DrawnRows {
+    owners: Vec<Option<usize>>,
+    heights: Vec<u16>,
+}
+
+impl DrawnRows {
+    /// Rows with their owners and heights; a missing height counts as 1.
+    pub fn new(owners: Vec<Option<usize>>, mut heights: Vec<u16>) -> Self {
+        heights.resize(owners.len(), 1);
+        Self { owners, heights }
+    }
+
+    /// Owner of table row `row`.
+    pub fn owner(&self, row: usize) -> Option<usize> {
+        self.owners.get(row).copied().flatten()
+    }
+
+    /// Table row drawn at viewport line `line` while the table shows
+    /// rows from `offset` on, or `None` past the last row.
+    pub fn row_at_line(&self, offset: usize, line: usize) -> Option<usize> {
+        let mut top = 0;
+        for (row, h) in self.heights.iter().enumerate().skip(offset) {
+            let h = usize::from((*h).max(1));
+            if line < top + h {
+                return Some(row);
+            }
+            top += h;
+        }
+        None
+    }
+
+    /// Lines between the rows of owners `a` and `b` (each owner's first
+    /// row, its own row), `None` when either has no row.
+    pub fn lines_between_owners(&self, a: usize, b: usize) -> Option<usize> {
+        let first = |o| self.owners.iter().position(|x| *x == Some(o));
+        let (ra, rb) = (first(a)?, first(b)?);
+        let (lo, hi) = (ra.min(rb), ra.max(rb));
+        Some(self.heights[lo..hi].iter().map(|h| usize::from(*h)).sum())
+    }
 }

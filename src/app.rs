@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 use denials::AddressDenials;
-pub use layout::Layout;
+pub use layout::{DrawnRows, Layout};
 use schedule::Scheduler;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
