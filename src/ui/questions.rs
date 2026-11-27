@@ -192,7 +192,7 @@ pub(super) fn draw_questions_tab(
     }
     app.layout()
         .questions_rows
-        .replace(Some(crate::app::DrawnRows::new(owners, heights)));
+        .replace(Some(crate::app::DrawnRows::new(owners, heights.clone())));
 
     // The Questions table is its own focus stop: light its border when
     // focused.
@@ -250,7 +250,18 @@ pub(super) fn draw_questions_tab(
     } else {
         None
     });
-    *tstate.offset_mut() = app.layout().questions_offset.get();
+    // Like Answers: pull the selected question's (wrapped, #410) findings
+    // into view, counting lines; a too-tall extent pins the question.
+    let mut offset = app.layout().questions_offset.get();
+    if let Some(selected) = selected_table_row {
+        let extent_end = question_positions
+            .get(app.view_state().detail_selected - raw_count + 1)
+            .copied()
+            .unwrap_or(heights.len());
+        let viewport = area.height.saturating_sub(3) as usize;
+        offset = fit_row_extent(offset, selected, extent_end, viewport, &heights);
+    }
+    *tstate.offset_mut() = offset;
     frame.render_stateful_widget(table, area, &mut tstate);
     app.layout().questions_offset.set(tstate.offset());
 }

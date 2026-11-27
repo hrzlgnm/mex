@@ -304,6 +304,76 @@ fn long_question_finding_wraps_and_clicks_select_its_question() {
 }
 
 #[test]
+fn selected_question_pulls_its_wrapped_finding_into_view() {
+    let (mut app, mut found) = questioned_app(LONG);
+    // Many more queriers; the injected finding moves to the last
+    // question, which End selects, so it sits at the bottom edge.
+    for i in 0..20 {
+        let querier: SocketAddr = format!("192.168.1.{}:5353", 100 + i).parse().unwrap();
+        app.ingest_event(&query_event(
+            "Test._http._tcp.local.",
+            16,
+            "TXT",
+            false,
+            Vec::new(),
+            querier,
+        ));
+    }
+    let (rtype, source) = {
+        let target = app.display_detail().unwrap();
+        let questions = target.ordered_questions();
+        let (_, rtype, source, _, _) = questions.last().expect("questions");
+        (rtype.clone(), *source)
+    };
+    let injected = found.last_mut().unwrap();
+    injected.rtype = crate::browse::rtype_from_str(&rtype);
+    injected.rtype_str = Some(rtype);
+    injected.source = Some(source.to_string());
+    let querier = source.to_string();
+    press(&mut app, crossterm::event::KeyCode::Tab);
+    press(&mut app, crossterm::event::KeyCode::Tab);
+    assert_eq!(app.view_state.focus, Focus::Questions);
+    press(&mut app, crossterm::event::KeyCode::End);
+    assert!(matches!(
+        app.selected_detail_entry(),
+        Some(DetailEntry::Question { .. })
+    ));
+    // Whatever the height, once the question shows, its finding never
+    // ends below the bottom edge (it may be cut with `…` when taller
+    // than the pane).
+    let mut checked = 0;
+    for h in 20..80 {
+        // Scrolled to the top, as when the cursor just jumped to End.
+        app.layout.questions_offset.set(0);
+        let buf = frame(&app, &found, 120, h);
+        let area = app.layout.questions_rect.get();
+        let lines = pane_lines(&buf, area);
+        let viewport = usize::from(area.height).saturating_sub(3);
+        // The selected question row names its querier; the cursor keeps
+        // it visible, so only a pane too small for two lines skips.
+        if viewport < 2 {
+            continue;
+        }
+        assert!(
+            lines.iter().any(|l| l.contains(&querier)),
+            "height {h}: the selected question shows: {lines:#?}"
+        );
+        checked += 1;
+        assert!(
+            lines.iter().any(|l| l.contains("unsupported-question")),
+            "height {h}: the finding shows under its question: {lines:#?}"
+        );
+        let (_, block) = finding_block(&lines, "unsupported-question");
+        let text = block.join(" ");
+        assert!(
+            text.ends_with("zulu-end (RFC 6762 §5)") || text.ends_with('…'),
+            "height {h}: the whole finding shows: {lines:#?}"
+        );
+    }
+    assert!(checked > 0, "some height leaves room for the question");
+}
+
+#[test]
 fn unsourced_block_finding_wraps_across_source_and_data() {
     let mut app = super::conflicting_answers::disagreeing_mesh();
     select_instance(&mut app, "Fritzel");
