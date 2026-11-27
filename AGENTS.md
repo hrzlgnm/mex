@@ -105,7 +105,8 @@ Headless run (no TTY) logs to stderr.
   pane splits through `App::view_state()` (`app::ViewState`, changed only
   by input). The only state draw writes is
   `app::Layout` (via `App::layout()`): pane geometry, viewport heights,
-  row maps (`app::DrawnRows`: owner and height of each drawn row, since
+  row maps (`app::DrawnRows`: each drawn row's owner, by identity so a
+  reorder before a click can't retarget it, and its height, since
   wrapped findings take several lines), hex hit boxes and the scroll
   offsets it clamps.
   Child modules per pane: `services`, `records`, `questions`, `hex`,

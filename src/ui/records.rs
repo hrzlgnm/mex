@@ -105,10 +105,20 @@ pub(super) fn draw_records_tab(
     let fit = FindingFit::new(area, &widths, viewport.saturating_sub(1));
     let (rows, raw_positions, heights) =
         detail_table_rows(app, &target, &layout, &book, &own, show_sect, &fit);
+    // Each row's owning record by identity, so a click resolves the
+    // record drawn there even if the list reorders first (#413).
+    // One identity per record, which its child rows share by index.
+    let keys = target
+        .ordered_answers()
+        .into_iter()
+        .map(crate::app::DetailCursorKey::record)
+        .collect();
+    let owners = layout.iter().map(|l| l.owning_record()).collect();
     app.layout()
         .answers_rows
         .replace(Some(crate::app::DrawnRows::new(
-            layout.iter().map(|l| l.owning_record()).collect(),
+            keys,
+            owners,
             heights.clone(),
         )));
     let total_rows = rows.len();
