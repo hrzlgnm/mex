@@ -314,6 +314,25 @@ pub struct QueryRequest {
     pub qu: bool,
 }
 
+/// One query copy mex sent (#431), reported by the listener when the
+/// copy left without error: the multicast-rate check needs to know when,
+/// and on which link, mex itself asked, since our looped-back copies are
+/// dropped on receive. Stamped on the listener thread, the clock of
+/// `Event::received_at`. Never a received packet: it travels on its own
+/// channel and reaches no view, counter or other check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnSend {
+    /// The questions the copy asked: the name as sent, and the type.
+    pub questions: Vec<(String, u16)>,
+    /// The egress link the copy was pinned to: interface name and kernel
+    /// index, as received records carry them.
+    pub iface: String,
+    pub ifindex: u32,
+    /// Sent over IPv6 (else IPv4).
+    pub v6: bool,
+    pub sent_at: Instant,
+}
+
 /// Query sender for the listener thread. Each request is queued once
 /// and the poll loop is woken, so it leaves immediately on every usable
 /// link of both families (solicited queries reach v6-only responders
@@ -508,10 +527,18 @@ impl DropStats {
     }
 }
 
-pub fn spawn(
-    selection: Option<HashSet<String>>,
-) -> Result<(QueryTx, mpsc::Receiver<Event>, Arc<DropStats>)> {
+/// What `spawn` hands the app: received packets and our own sent copies
+/// arrive on separate channels.
+pub type Spawned = (
+    QueryTx,
+    mpsc::Receiver<Event>,
+    mpsc::Receiver<OwnSend>,
+    Arc<DropStats>,
+);
+
+pub fn spawn(selection: Option<HashSet<String>>) -> Result<Spawned> {
     let (tx, rx) = mpsc::channel();
+    let (own_tx, own_rx) = mpsc::channel();
     let (query_tx, query_rx) = mpsc::channel();
     let drops = Arc::new(DropStats::default());
     let poll = mio::Poll::new()?;
@@ -526,6 +553,7 @@ pub fn spawn(
         drops: drops.clone(),
         transmit: transmit.clone(),
         waker: waker.clone(),
+        own_sends: own_tx,
     };
     let mut listener = Listener::new(poll, v4, v6, tx, query_rx, shared, selection);
     // First interface refresh before returning: the transmit flags then
@@ -541,6 +569,7 @@ pub fn spawn(
             transmit,
         },
         rx,
+        own_rx,
         drops,
     ))
 }

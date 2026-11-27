@@ -216,6 +216,15 @@ pub(super) fn drain_queries(
     (sent, QueueState::More)
 }
 
+/// The kernel index of the link named `name`, as received packets carry
+/// it (`ifnames` is the same map that names them), or 0 when unknown.
+pub(super) fn link_index(ifnames: &HashMap<u32, String>, name: &str) -> u32 {
+    ifnames
+        .iter()
+        .find_map(|(idx, n)| (n == name).then_some(*idx))
+        .unwrap_or(0)
+}
+
 /// State the listener updates and the app thread reads.
 pub(super) struct SharedWithApp {
     pub(super) drops: Arc<DropStats>,
@@ -223,6 +232,8 @@ pub(super) struct SharedWithApp {
     /// Kept open by the listener: a wake from the app's `QueryTx` drop
     /// would be lost if the drop closed the waker's last handle first.
     pub(super) waker: Arc<mio::Waker>,
+    /// Where each sent query copy is reported (#431).
+    pub(super) own_sends: mpsc::Sender<OwnSend>,
 }
 
 /// The single listener: one thread, one poll loop over both family
@@ -251,6 +262,7 @@ pub(super) struct Listener {
     /// Our own sent query copies, dropped when they loop back.
     pub(super) sent_copies: SentCopies,
     pub(super) transmit: Arc<TransmitState>,
+    pub(super) own_sends: mpsc::Sender<OwnSend>,
     pub(super) buf: Vec<u8>,
     /// See `SharedWithApp::waker`.
     _waker: Arc<mio::Waker>,
@@ -270,6 +282,7 @@ impl Listener {
             drops,
             transmit,
             waker,
+            own_sends,
         } = shared;
         Self {
             poll,
@@ -289,6 +302,7 @@ impl Listener {
             send_failures: SendFailures::default(),
             sent_copies: SentCopies::default(),
             transmit,
+            own_sends,
             buf: vec![0u8; 65535],
             _waker: waker,
         }
@@ -415,11 +429,13 @@ impl Listener {
             ifaces_v6,
             send_failures,
             sent_copies,
+            own_sends,
+            ifnames,
             ..
         } = self;
         let (_, queue) = drain_queries(query_rx, QUERY_BUDGET, |req| {
             for socket in [v4.as_ref(), v6.as_ref()].into_iter().flatten() {
-                send_on_all_interfaces(
+                for sent in send_on_all_interfaces(
                     &socket.pktinfo,
                     req,
                     socket.family,
@@ -427,7 +443,15 @@ impl Listener {
                     ifaces_v6,
                     send_failures,
                     sent_copies,
-                );
+                ) {
+                    let mut sent = sent;
+                    if sent.ifindex == 0 {
+                        sent.ifindex = link_index(ifnames, &sent.iface);
+                    }
+                    // A closed channel means the app is gone; the closed
+                    // query queue stops this loop right after.
+                    let _ = own_sends.send(sent);
+                }
             }
         });
         self.queries_pending = queue == QueueState::More;

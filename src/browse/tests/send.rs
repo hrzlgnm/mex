@@ -707,3 +707,89 @@ fn own_queries_keep_opcode_zero() {
     let inferred = inferred_question_packet("_http._tcp.local", 12, false).unwrap();
     assert_eq!(inferred[2] & 0x78, 0);
 }
+
+// --- #431: each copy that left is reported as our own send ---
+
+#[test]
+fn each_sent_copy_is_reported_with_its_link_family_and_question() {
+    let socket = FakeSocket::default();
+    let links = [("eth0".to_string(), 2u32), ("wlan0".to_string(), 3u32)];
+    let before = Instant::now();
+    let sent = send_on_all_interfaces(
+        &socket,
+        &ptr_query(),
+        Family::V6,
+        &[],
+        &links,
+        &mut SendFailures::default(),
+        &mut SentCopies::default(),
+    );
+    let reported: Vec<_> = sent
+        .iter()
+        .map(|s| (s.iface.as_str(), s.ifindex, s.v6, s.questions.clone()))
+        .collect();
+    let question = vec![("_http._tcp.local".to_string(), 12)];
+    assert_eq!(
+        reported,
+        [
+            ("eth0", 2, true, question.clone()),
+            ("wlan0", 3, true, question)
+        ]
+    );
+    assert!(sent
+        .iter()
+        .all(|s| s.sent_at >= before && s.sent_at <= Instant::now()));
+
+    let v4 = [("eth0".to_string(), Ipv4Addr::new(192, 168, 1, 2))];
+    let sent = send_on_all_interfaces(
+        &socket,
+        &ptr_query(),
+        Family::V4,
+        &v4,
+        &[],
+        &mut SendFailures::default(),
+        &mut SentCopies::default(),
+    );
+    assert_eq!(sent.len(), 1);
+    assert!(!sent[0].v6);
+    assert_eq!(
+        sent[0].ifindex, 0,
+        "pinned by address: the listener fills it in"
+    );
+}
+
+#[test]
+fn failed_or_unencodable_copies_are_not_reported() {
+    let eth0 = Ipv4Addr::new(192, 168, 1, 2);
+    let wlan0 = Ipv4Addr::new(10, 0, 0, 2);
+    let links = [("eth0".to_string(), eth0), ("wlan0".to_string(), wlan0)];
+    let send = |socket: &FakeSocket, req: &QueryRequest| {
+        send_on_all_interfaces(
+            socket,
+            req,
+            Family::V4,
+            &links,
+            &[],
+            &mut SendFailures::default(),
+            &mut SentCopies::default(),
+        )
+    };
+    // A failed pin skips that link's copy only.
+    let socket = FakeSocket {
+        failing_pin: Some(Egress::V4(eth0)),
+        ..FakeSocket::default()
+    };
+    let sent = send(&socket, &ptr_query());
+    let links_sent: Vec<_> = sent.iter().map(|s| s.iface.as_str()).collect();
+    assert_eq!(links_sent, ["wlan0"]);
+    // A failed send reports nothing.
+    let socket = FakeSocket::default();
+    socket.failing_send.set(true);
+    assert!(send(&socket, &ptr_query()).is_empty());
+    // Nor does a request that can't be encoded.
+    let req = QueryRequest {
+        name: "a..local".to_string(),
+        ..ptr_query()
+    };
+    assert!(send(&FakeSocket::default(), &req).is_empty());
+}

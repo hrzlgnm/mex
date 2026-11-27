@@ -9,10 +9,10 @@ use std::collections::BTreeSet;
 use std::net::IpAddr;
 
 use super::*;
-use crate::browse::Event;
+use crate::browse::{Event, OwnSend};
 
 /// The RFC floor between two sends of the same thing on one link.
-const MIN_GAP: Duration = Duration::from_secs(1);
+pub(crate) const MIN_GAP: Duration = Duration::from_secs(1);
 
 /// How one identity repeated within the retained packets.
 #[derive(Debug, PartialEq)]
@@ -260,6 +260,9 @@ pub(super) struct MulticastIndex<'a> {
     /// The retained packets, in arrival order (one listener thread
     /// stamps and queues them).
     events: &'a [Event],
+    /// Our own sent query copies (#431), in send order, on the clock of
+    /// `events`: a copy may answer one of them.
+    own_sends: &'a [OwnSend],
     /// Each identity's sends: receive time and packet index, one per
     /// packet (a record in two sections of one response is one send).
     sends: HashMap<SendKey, Vec<(Instant, usize)>>,
@@ -292,7 +295,11 @@ fn display_names(devices: &HashMap<IpAddr, DeviceLabel>) -> HashMap<&str, &str> 
 }
 
 impl<'a> MulticastIndex<'a> {
-    pub fn new(events: &'a [Event], device_names: &'a HashMap<IpAddr, DeviceLabel>) -> Self {
+    pub fn new(
+        events: &'a [Event],
+        own_sends: &'a [OwnSend],
+        device_names: &'a HashMap<IpAddr, DeviceLabel>,
+    ) -> Self {
         let mut sends: HashMap<SendKey, Vec<(Instant, usize)>> = HashMap::new();
         let mut probes = Vec::new();
         let mut device_askers: HashMap<DeviceAskingKey, BTreeSet<String>> = HashMap::new();
@@ -342,6 +349,7 @@ impl<'a> MulticastIndex<'a> {
         }
         Self {
             events,
+            own_sends,
             sends,
             probes,
             device_display: display_names(device_names),
@@ -380,27 +388,43 @@ impl<'a> MulticastIndex<'a> {
     /// it asked this question from on the link; otherwise the latest
     /// query of the copy's own address family wins, then the latest of
     /// any family.
+    ///
+    /// Our own query (#431) wins when it is the latest asking: it reads
+    /// `mex (this host) asking name TYPE`, never through the address
+    /// book, so this host's own announced name doesn't stand in for mex.
     fn trigger(&self, rec: &RawRecord, at: Instant, packet: usize) -> Option<String> {
-        let names: HashSet<String> = self.events[packet]
-            .answers
-            .iter()
-            .map(|r| r.name.to_ascii_lowercase())
-            .collect();
+        let names = self.packet_names(packet);
         // Packets arrive in order: walk back only through the second
         // before the copy, not the whole retained buffer. Latest first.
-        let askings: Vec<&RawRecord> = self.events[..packet]
+        let foreign: Vec<(Instant, &RawRecord)> = self.events[..packet]
             .iter()
             .rev()
             .take_while(|ev| at.saturating_duration_since(ev.received_at) <= MIN_GAP)
             .filter(|ev| ev.source != rec.source && !ev.is_probe())
             .filter_map(|ev| {
-                ev.questions.iter().find(|q| {
-                    q.iface == rec.iface
-                        && q.ifindex == rec.ifindex
-                        && names.contains(&q.name.to_ascii_lowercase())
-                })
+                ev.questions
+                    .iter()
+                    .find(|q| {
+                        q.iface == rec.iface
+                            && q.ifindex == rec.ifindex
+                            && names.contains(&name_key(&q.name))
+                    })
+                    .map(|q| (ev.received_at, q))
             })
             .collect();
+        if let Some((sent_at, (name, rtype))) = self.own_askings(rec, at, &names).next() {
+            if foreign
+                .first()
+                .is_none_or(|(asked_at, _)| sent_at > *asked_at)
+            {
+                return Some(format!(
+                    "mex (this host) asking {}. {}",
+                    name.trim_end_matches('.'),
+                    crate::browse::rtype_label(*rtype)
+                ));
+            }
+        }
+        let askings: Vec<&RawRecord> = foreign.into_iter().map(|(_, q)| q).collect();
         let device = askings.iter().find_map(|q| {
             let device = self.device_names.get(&q.source.ip())?;
             let key = (
@@ -432,6 +456,42 @@ impl<'a> MulticastIndex<'a> {
             q.name,
             q.rtype_str
         ))
+    }
+
+    /// The owner names of a response packet's records, as `name_key`
+    /// keys: the names a question must ask to have triggered it.
+    fn packet_names(&self, packet: usize) -> HashSet<String> {
+        self.events[packet]
+            .answers
+            .iter()
+            .map(|r| name_key(&r.name))
+            .collect()
+    }
+
+    /// Our own sends a copy at `at` may answer, latest first: sent on
+    /// the copy's link (interface name and index, as for other queriers;
+    /// both families count) in the second before it,
+    /// asking one of its packet's `names`. Each with the question asked.
+    fn own_askings<'s>(
+        &'s self,
+        rec: &'s RawRecord,
+        at: Instant,
+        names: &'s HashSet<String>,
+    ) -> impl Iterator<Item = (Instant, &'s (String, u16))> + 's {
+        // In send order: start at the last send at or before `at`, so the
+        // walk covers only the second before it.
+        let end = self.own_sends.partition_point(|s| s.sent_at <= at);
+        self.own_sends[..end]
+            .iter()
+            .rev()
+            .take_while(move |s| at - s.sent_at <= MIN_GAP)
+            .filter(move |s| s.iface == rec.iface && s.ifindex == rec.ifindex)
+            .filter_map(move |s| {
+                s.questions
+                    .iter()
+                    .find(|(name, _)| names.contains(&name_key(name)))
+                    .map(|q| (s.sent_at, q))
+            })
     }
 
     /// `multicast-rate-limit` (#407): a responder multicasting one record
@@ -469,6 +529,27 @@ impl<'a> MulticastIndex<'a> {
             .find_map(|((at, packet), _)| self.trigger(rec, *at, *packet))
             .map(|t| format!(", answering {t}"))
             .unwrap_or_default();
+        // How many judged copies (probe answers aside) followed one of
+        // our own queries (#431): did mex provoke the repeats?
+        let judged: Vec<&(Instant, usize)> = copies
+            .iter()
+            .zip(&probed)
+            .filter(|(_, p)| !**p)
+            .map(|(copy, _)| copy)
+            .collect();
+        let after_own = judged
+            .iter()
+            .filter(|(at, packet)| {
+                let names = self.packet_names(*packet);
+                let asked = self.own_askings(rec, *at, &names).next().is_some();
+                asked
+            })
+            .count();
+        let caused = if after_own > 0 {
+            format!(", {after_own} of {} after mex's own queries", judged.len())
+        } else {
+            String::new()
+        };
         out.push(Anomaly {
             kind: AnomalyKind::MulticastRateLimit,
             severity: Severity::Warning,
@@ -478,7 +559,7 @@ impl<'a> MulticastIndex<'a> {
             rtype_str: Some(rec.rtype_str.clone()),
             rdata: Some(rec.rdata.clone()),
             source: Some(rec.source_label()),
-            message: format!("{}{trigger}", rep.describe("multicast")),
+            message: format!("{}{caused}{trigger}", rep.describe("multicast")),
             rfc: "RFC 6762 §6",
             requirement: "MUST NOT",
             response: None,

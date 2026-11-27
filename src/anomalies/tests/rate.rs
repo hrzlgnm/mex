@@ -4,7 +4,7 @@
 // --- #408: questions repeated within one second (RFC 6762 §5.2) ---
 
 use super::*;
-use crate::browse::{Event, RecordSection};
+use crate::browse::{Event, OwnSend, RecordSection};
 
 const SERVICE: &str = "Inst._http._tcp.local";
 const NAME: &str = "Inst._http._tcp.local.";
@@ -94,7 +94,7 @@ fn analyze_questions(rows: Vec<QuestionView<'_>>, events: &[Event]) -> Vec<Anoma
         host_addresses: Vec::new(),
         device_names: HashMap::new(),
     };
-    analyze_observations(&snap, events, &[])
+    analyze_observations(&snap, events, &[], &[])
 }
 
 fn rate_findings(found: &[Anomaly]) -> Vec<&Anomaly> {
@@ -392,6 +392,11 @@ fn sends(at: Instant, record: &RawRecord, offsets: &[u64]) -> Vec<Event> {
 
 /// Analyze one service holding `answers` against `events`.
 fn analyze_answers(answers: &[RawRecord], events: &[Event]) -> Vec<Anomaly> {
+    analyze_answers_own(answers, events, &[])
+}
+
+/// `analyze_answers`, with our own sent query copies `own`.
+fn analyze_answers_own(answers: &[RawRecord], events: &[Event], own: &[OwnSend]) -> Vec<Anomaly> {
     let snap = Snapshot {
         services: vec![ServiceView {
             instance: "Inst",
@@ -407,7 +412,7 @@ fn analyze_answers(answers: &[RawRecord], events: &[Event]) -> Vec<Anomaly> {
         host_addresses: Vec::new(),
         device_names: HashMap::new(),
     };
-    analyze_observations(&snap, events, &[])
+    analyze_observations(&snap, events, own, &[])
 }
 
 fn multicast_findings(found: &[Anomaly]) -> Vec<&Anomaly> {
@@ -635,7 +640,7 @@ fn analyze_answers_named(
         host_addresses: Vec::new(),
         device_names,
     };
-    analyze_observations(&snap, events, &[])
+    analyze_observations(&snap, events, &[], &[])
 }
 
 /// The device `homeassistant.local`, matched exactly as `name`, or
@@ -790,7 +795,7 @@ fn ptr_targets_fold_case_but_txt_data_does_not() {
         host_addresses: Vec::new(),
         device_names: HashMap::new(),
     };
-    let found = analyze_observations(&snap, &events, &[]);
+    let found = analyze_observations(&snap, &events, &[], &[]);
     let flood = multicast_findings(&found);
     assert_eq!(flood.len(), 1, "{found:#?}");
     assert_eq!(flood[0].service, ENUMERATION_SERVICE);
@@ -938,4 +943,187 @@ fn nonzero_opcode_floods_are_ignored() {
     assert!(multicast_findings(&found).is_empty(), "{found:#?}");
     let found = analyze_answers(&[cached(&a)], &with_opcode(copies, 0));
     assert_eq!(multicast_findings(&found).len(), 1, "{found:#?}");
+}
+
+// --- #431: mex's own queries as the trigger ---
+
+/// Our own query copy asking `name` (as the app sends it: no trailing
+/// dot) for `rtype` on `iface` (index 2 for `eth0`, as `host_a` has it,
+/// else 3), sent `ms` after `at`.
+fn own_at(at: Instant, ms: u64, name: &str, rtype: u16, iface: &str) -> OwnSend {
+    OwnSend {
+        questions: vec![(name.to_string(), rtype)],
+        iface: iface.to_string(),
+        ifindex: if iface == "eth0" { 2 } else { 3 },
+        v6: false,
+        sent_at: at + Duration::from_millis(ms),
+    }
+}
+
+/// The repeater's A record on `eth0`, multicast at each offset (ms).
+fn eth0_copies(at: Instant, offsets: &[u64]) -> (RawRecord, Vec<Event>) {
+    let a = host_a(responder(), "eth0");
+    let events = sends(at, &a, offsets);
+    (a, events)
+}
+
+fn own_flood_message(a: &RawRecord, events: &[Event], own: &[OwnSend]) -> String {
+    let found = analyze_answers_own(&[cached(a)], events, own);
+    let flood = multicast_findings(&found);
+    assert_eq!(flood.len(), 1, "{found:#?}");
+    flood[0].message.clone()
+}
+
+#[test]
+fn our_query_right_before_the_repeats_names_mex() {
+    let at = base();
+    let (a, events) = eth0_copies(at, &[20, 270, 520]);
+    let own: Vec<_> = [0, 250, 500]
+        .map(|ms| own_at(at, ms, "Repeater.local", 1, "eth0"))
+        .into();
+    assert_eq!(
+        own_flood_message(&a, &events, &own),
+        "multicast 3 times in 0.5 s, as little as 0.25 s apart, \
+         3 of 3 after mex's own queries, answering mex (this host) asking Repeater.local. A"
+    );
+}
+
+#[test]
+fn a_foreign_query_after_ours_wins_the_trigger() {
+    let at = base();
+    let a = host_a(responder(), "eth0");
+    let ask = |ms| query_at(at, ms, vec![question(HOST, 1, "A", querier(), "eth0")]);
+    let events = vec![
+        ask(10),
+        response_at(at, 20, vec![a.clone()]),
+        ask(260),
+        response_at(at, 270, vec![a.clone()]),
+    ];
+    let own = [
+        own_at(at, 0, "Repeater.local", 1, "eth0"),
+        own_at(at, 250, "Repeater.local", 1, "eth0"),
+    ];
+    let message = own_flood_message(&a, &events, &own);
+    assert!(
+        message.ends_with(
+            ", 2 of 2 after mex's own queries, \
+             answering 192.168.1.70:5353@eth0 asking Repeater.local. A"
+        ),
+        "{message}"
+    );
+}
+
+#[test]
+fn our_query_on_another_link_or_for_another_name_is_ignored() {
+    let at = base();
+    let (a, events) = eth0_copies(at, &[20, 270]);
+    let own = [
+        own_at(at, 0, "Repeater.local", 1, "wlan0"),
+        own_at(at, 250, "other.local", 1, "eth0"),
+    ];
+    assert_eq!(
+        own_flood_message(&a, &events, &own),
+        "multicast 2 times in 0.25 s, as little as 0.25 s apart"
+    );
+}
+
+/// A link removed and re-created under the same name gets a new index:
+/// a send on the old one never answers a copy on the new one.
+#[test]
+fn our_query_on_a_same_named_link_with_another_index_is_ignored() {
+    let at = base();
+    let (a, events) = eth0_copies(at, &[20, 270]);
+    let mut old_eth0 = own_at(at, 0, "Repeater.local", 1, "eth0");
+    old_eth0.ifindex = 7;
+    assert_eq!(
+        own_flood_message(&a, &events, &[old_eth0]),
+        "multicast 2 times in 0.25 s, as little as 0.25 s apart"
+    );
+}
+
+#[test]
+fn our_query_more_than_a_second_before_is_ignored() {
+    let at = base();
+    let (a, events) = eth0_copies(at, &[1100, 1300]);
+    let own = [own_at(at, 0, "Repeater.local", 1, "eth0")];
+    assert_eq!(
+        own_flood_message(&a, &events, &own),
+        "multicast 2 times in 0.2 s, as little as 0.2 s apart"
+    );
+}
+
+#[test]
+fn our_queries_match_names_ignoring_ascii_case_and_both_families_count() {
+    let at = base();
+    let (a, events) = eth0_copies(at, &[20, 270]);
+    let mut v6 = own_at(at, 250, "REPEATER.local.", 1, "eth0");
+    v6.v6 = true;
+    let own = [own_at(at, 0, "repeater.local", 1, "eth0"), v6];
+    let message = own_flood_message(&a, &events, &own);
+    assert!(
+        message.ends_with(
+            ", 2 of 2 after mex's own queries, answering mex (this host) asking REPEATER.local. A"
+        ),
+        "{message}"
+    );
+}
+
+#[test]
+fn a_mixed_history_counts_only_the_copies_after_our_queries() {
+    let at = base();
+    let (a, events) = eth0_copies(at, &[1500, 1750, 2000, 2250]);
+    // Our queries before the first two copies only, each within a second.
+    let own = [
+        own_at(at, 1400, "Repeater.local", 1, "eth0"),
+        own_at(at, 1700, "Repeater.local", 1, "eth0"),
+    ];
+    let message = own_flood_message(&a, &events, &own);
+    assert!(
+        message.contains(", 4 of 4 after mex's own queries"),
+        "every copy within a second of one: {message}"
+    );
+    let (a, events) = eth0_copies(at, &[0, 250, 1500, 1750]);
+    let own = [own_at(at, 200, "Repeater.local", 1, "eth0")];
+    let message = own_flood_message(&a, &events, &own);
+    assert!(
+        message.contains(", 1 of 4 after mex's own queries"),
+        "{message}"
+    );
+    // The trigger comes from the latest copy that has one, as before:
+    // here the one at 250 ms, after our query.
+    assert!(
+        message.ends_with("answering mex (this host) asking Repeater.local. A"),
+        "{message}"
+    );
+}
+
+#[test]
+fn probe_answers_are_neither_judged_nor_attributed_to_us() {
+    let at = base();
+    let a = host_a(responder(), "eth0");
+    let prober: SocketAddr = "192.168.1.50:5353".parse().unwrap();
+    let mut probe = query_at(at, 1350, vec![question(HOST, 255, "ANY", prober, "eth0")]);
+    probe.query_authority = vec![host_a(prober, "eth0")];
+    let events = vec![
+        response_at(at, 0, vec![a.clone()]),
+        response_at(at, 300, vec![a.clone()]),
+        probe,
+        response_at(at, 1360, vec![a.clone()]),
+    ];
+    // Ours right before the probe answer only.
+    let own = [own_at(at, 1355, "Repeater.local", 1, "eth0")];
+    assert_eq!(
+        own_flood_message(&a, &events, &own),
+        "multicast 3 times in 1.36 s, as little as 0.3 s apart"
+    );
+}
+
+#[test]
+fn without_own_sends_the_text_is_unchanged() {
+    let at = base();
+    let (a, events) = eth0_copies(at, &[0, 250, 500, 750, 1000]);
+    assert_eq!(
+        own_flood_message(&a, &events, &[]),
+        "multicast 5 times in 1 s, as little as 0.25 s apart"
+    );
 }

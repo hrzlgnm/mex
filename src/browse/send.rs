@@ -183,7 +183,10 @@ pub(super) fn send_targets<'a>(
 /// One copy of the query per usable link, each forced out its own link:
 /// without the per-packet interface the kernel sends everything via the
 /// default multicast interface and other links (e.g. a bridge) never see
-/// our queries. No usable link means no copy (`send_targets`).
+/// our queries. No usable link means no copy (`send_targets`). Returns
+/// one `OwnSend` per copy that left without error (#431): a failed pin
+/// or send, or a request that can't be encoded, reports nothing. An IPv4
+/// copy's link index is left 0 for the caller, which knows the names.
 pub(super) fn send_on_all_interfaces(
     socket: &impl QuerySocket,
     req: &QueryRequest,
@@ -192,8 +195,9 @@ pub(super) fn send_on_all_interfaces(
     ifaces_v6: &[(String, u32)],
     failures: &mut SendFailures,
     sent_copies: &mut SentCopies,
-) {
+) -> Vec<OwnSend> {
     let family_label = family.label();
+    let mut sent_ok = Vec::new();
     for target in send_targets(family, ifaces_v4, ifaces_v6) {
         let SendTarget { link, dest, egress } = target;
         // The egress pin is socket-wide: set it right before this copy.
@@ -213,7 +217,20 @@ pub(super) fn send_on_all_interfaces(
         };
         match sent {
             Ok(()) => {
-                sent_copies.record(&bytes, Instant::now());
+                let now = Instant::now();
+                sent_copies.record(&bytes, now);
+                sent_ok.push(OwnSend {
+                    questions: vec![(req.name.clone(), u16::from(req.record_type))],
+                    iface: link.to_string(),
+                    // An IPv6 copy is pinned by index; an IPv4 one by
+                    // address, so the listener fills its index in.
+                    ifindex: match egress {
+                        Egress::V6(idx) => idx,
+                        Egress::V4(_) => 0,
+                    },
+                    v6: family == Family::V6,
+                    sent_at: now,
+                });
                 if failures.record_success(family, link).is_some() {
                     log::info!("mex: {family_label} send on {link} recovered");
                 }
@@ -228,6 +245,7 @@ pub(super) fn send_on_all_interfaces(
             }
         }
     }
+    sent_ok
 }
 
 /// Known answers relevant to one egress interface: suppression only

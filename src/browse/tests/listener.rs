@@ -133,6 +133,7 @@ fn dropping_the_query_sender_stops_the_listener() {
             drops: Arc::new(DropStats::default()),
             transmit: transmit.clone(),
             waker: waker.clone(),
+            own_sends: mpsc::channel().0,
         },
         Some(HashSet::new()),
     );
@@ -214,6 +215,7 @@ fn listener_runs_with_one_family_missing() {
             drops: Arc::new(DropStats::default()),
             transmit: Arc::new(TransmitState::new(true, false)),
             waker,
+            own_sends: mpsc::channel().0,
         },
         Some(HashSet::new()),
     );
@@ -277,6 +279,7 @@ fn bare_listener(
             drops: drops.clone(),
             transmit: Arc::new(TransmitState::new(true, true)),
             waker,
+            own_sends: mpsc::channel().0,
         },
         selection,
     );
@@ -549,4 +552,13 @@ fn drop_counts_survive_a_poisoned_last_source_lock() {
     assert_eq!((drops.total(), drops.malformed_total()), (1, 1));
     assert!(drops.last().is_none());
     assert!(drops.malformed_last().is_none());
+}
+
+#[test]
+fn an_ipv4_copy_s_link_index_comes_from_the_name_map() {
+    // #431: received records carry the index `ifnames` names; our IPv4
+    // copies are pinned by address, so their index is looked up by name.
+    let ifnames = HashMap::from([(2, "eth0".to_string()), (3, "wlan0".to_string())]);
+    assert_eq!(link_index(&ifnames, "wlan0"), 3);
+    assert_eq!(link_index(&ifnames, "gone0"), 0, "unknown: matches no copy");
 }

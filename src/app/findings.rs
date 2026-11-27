@@ -194,7 +194,7 @@ impl App {
             host_addresses,
             device_names,
         };
-        anomalies::analyze_observations(&snap, &self.raw_events, &address_queries)
+        anomalies::analyze_observations(&snap, &self.raw_events, &self.own_sends, &address_queries)
     }
 
     /// Per-service anomaly counts keyed by service id (`anomalies::service_id`).

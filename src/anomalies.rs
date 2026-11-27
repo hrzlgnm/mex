@@ -76,8 +76,18 @@ pub fn service_id(instance: &str, service_type: &str) -> String {
 /// many services, so host-owned evidence is recorded once, under the
 /// host, and every service on it shows it in a `host` block.
 pub fn host_id(hostname: &str) -> String {
-    hostname.trim_end_matches('.').to_ascii_lowercase()
+    name_key(hostname)
 }
+
+/// A name as a comparison key: ASCII case folded (RFC 6762 §16) and the
+/// root dot dropped, so `Host.local.` and `host.local` are one name.
+pub fn name_key(name: &str) -> String {
+    name.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// The one-second floor between two multicasts of one thing on one link
+/// (RFC 6762 §5.2, §6), also how far back a copy's trigger can lie.
+pub(crate) use rate::MIN_GAP;
 
 /// Severity of an anomaly: errors are clear RFC violations, warnings are
 /// likely misconfigurations, informational notes are observations.
@@ -464,7 +474,7 @@ fn check_conflicting_answers(
 /// Answers row shows its own finding.
 #[cfg(test)]
 pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
-    analyze_observations(snap, &[], &[])
+    analyze_observations(snap, &[], &[], &[])
 }
 
 /// Analyze browser state and retained response packets. Packet-scoped checks
@@ -472,6 +482,7 @@ pub fn analyze(snap: &Snapshot) -> Vec<Anomaly> {
 pub fn analyze_observations(
     snap: &Snapshot,
     events: &[crate::browse::Event],
+    own_sends: &[crate::browse::OwnSend],
     address_queries: &[AddressQueryView],
 ) -> Vec<Anomaly> {
     // RFC 6762 §18.3: a message with a non-zero OPCODE carries no mDNS
@@ -520,7 +531,7 @@ pub fn analyze_observations(
     };
 
     // Multicast sends per record identity, indexed once for every row.
-    let multicasts = rate::MulticastIndex::new(events, &snap.device_names);
+    let multicasts = rate::MulticastIndex::new(events, own_sends, &snap.device_names);
 
     for svc in &snap.services {
         let service_id = service_id(svc.instance, svc.service_type);
