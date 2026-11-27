@@ -589,6 +589,129 @@ fn the_triggering_question_is_named() {
     );
 }
 
+/// The IPv6 twin of `querier()`: one device, two address families.
+fn querier_v6() -> SocketAddr {
+    "[fe80::8534:69b3:f34a:ac9d]:5353".parse().unwrap()
+}
+
+/// `record` from `source`, answering a query that `queriers` each sent
+/// once per round (in that order, 0.1 ms apart), every 250 ms. Each
+/// round's response follows the queries.
+fn dual_stack_flood(record: &RawRecord, queriers: &[SocketAddr]) -> Vec<Event> {
+    let at = base();
+    let mut events = Vec::new();
+    for round in 0..4u64 {
+        let t = round * 250;
+        for (i, src) in queriers.iter().enumerate() {
+            let mut ev = query_at(at, t, vec![question(HOST, 1, "A", *src, "")]);
+            ev.received_at += Duration::from_micros(100 * i as u64);
+            events.push(ev);
+        }
+        events.push(response_at(at, t + 5, vec![record.clone()]));
+    }
+    events
+}
+
+/// Analyze one service holding `answers`, with `device_names` known.
+fn analyze_answers_named(
+    answers: &[RawRecord],
+    events: &[Event],
+    device_names: HashMap<std::net::IpAddr, String>,
+) -> Vec<Anomaly> {
+    let snap = Snapshot {
+        services: vec![ServiceView {
+            instance: "Inst",
+            service_type: "_http._tcp.local",
+            answers,
+            subtypes: &[],
+            denied_address_types: Vec::new(),
+        }],
+        enum_answers: Vec::new(),
+        pending_hosts: HashSet::new(),
+        questions: Vec::new(),
+        sightings: Vec::new(),
+        host_addresses: Vec::new(),
+        device_names,
+    };
+    analyze_observations(&snap, events, &[])
+}
+
+fn flood_message(found: &[Anomaly]) -> String {
+    let flood = multicast_findings(found);
+    assert_eq!(flood.len(), 1, "{found:#?}");
+    flood[0].message.clone()
+}
+
+#[test]
+fn a_dual_stack_querier_is_named_as_its_device() {
+    // One device asks over IPv4 and IPv6 within a millisecond, in
+    // either order: the trigger names the device and both addresses,
+    // the same text whichever copy arrived last.
+    let a = host_a(responder(), "");
+    let names: HashMap<_, _> = [
+        (querier().ip(), "homeassistant".to_string()),
+        (querier_v6().ip(), "homeassistant".to_string()),
+    ]
+    .into();
+    let want = "answering homeassistant (192.168.1.70:5353, [fe80::8534:69b3:f34a:ac9d]:5353) \
+                asking Repeater.local. A";
+    for order in [[querier(), querier_v6()], [querier_v6(), querier()]] {
+        let events = dual_stack_flood(&a, &order);
+        let msg = flood_message(&analyze_answers_named(
+            &[cached(&a)],
+            &events,
+            names.clone(),
+        ));
+        assert!(msg.contains(want), "{msg}");
+    }
+}
+
+#[test]
+fn a_device_known_by_one_address_still_names_the_device() {
+    // Only the IPv4 address resolves: the device wins even when the
+    // unresolved IPv6 query is the latest.
+    let a = host_a(responder(), "");
+    let names: HashMap<_, _> = [(querier().ip(), "homeassistant".to_string())].into();
+    let events = dual_stack_flood(&a, &[querier(), querier_v6()]);
+    let msg = flood_message(&analyze_answers_named(&[cached(&a)], &events, names));
+    assert!(
+        msg.contains("answering homeassistant (192.168.1.70:5353) asking Repeater.local. A"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn an_unknown_querier_is_named_by_the_copy_s_family() {
+    // No device known: an IPv4 copy names the IPv4 query and an IPv6
+    // copy the IPv6 one, whichever arrived last.
+    let v4 = host_a(responder(), "");
+    let mut v6 = v4.clone();
+    v6.source = "[fe80::ca0e:14ff:feff:416]:5353".parse().unwrap();
+    for order in [[querier(), querier_v6()], [querier_v6(), querier()]] {
+        let events = dual_stack_flood(&v4, &order);
+        let msg = flood_message(&analyze_answers(&[cached(&v4)], &events));
+        assert!(msg.contains("answering 192.168.1.70:5353 asking"), "{msg}");
+        let events = dual_stack_flood(&v6, &order);
+        let msg = flood_message(&analyze_answers(&[cached(&v6)], &events));
+        assert!(
+            msg.contains("answering [fe80::8534:69b3:f34a:ac9d]:5353 asking"),
+            "{msg}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_querier_of_the_other_family_is_still_named() {
+    // Only an IPv6 query precedes an IPv4 copy: it is still the trigger.
+    let a = host_a(responder(), "");
+    let events = dual_stack_flood(&a, &[querier_v6()]);
+    let msg = flood_message(&analyze_answers(&[cached(&a)], &events));
+    assert!(
+        msg.contains("answering [fe80::8534:69b3:f34a:ac9d]:5353 asking Repeater.local. A"),
+        "{msg}"
+    );
+}
+
 #[test]
 fn record_names_fold_ascii_case_only() {
     let a = host_a(responder(), "");

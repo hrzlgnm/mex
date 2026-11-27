@@ -5,6 +5,9 @@
 //! thing on one link again within a second (questions: RFC 6762 §5.2,
 //! #408; records: §6, #407).
 
+use std::collections::BTreeSet;
+use std::net::IpAddr;
+
 use super::*;
 use crate::browse::Event;
 
@@ -198,6 +201,10 @@ struct Probe {
     ifindex: u32,
 }
 
+/// One device asking one question on one link: the device name, the
+/// question name folded ASCII-only, its type, and the link.
+type DeviceAskingKey = (String, String, u16, Link);
+
 /// Multicast record sends in the retained packets, indexed once per
 /// analysis so every row is checked against them cheaply (#407).
 pub(super) struct MulticastIndex<'a> {
@@ -208,12 +215,18 @@ pub(super) struct MulticastIndex<'a> {
     /// packet (a record in two sections of one response is one send).
     sends: HashMap<SendKey, Vec<(Instant, usize)>>,
     probes: Vec<Probe>,
+    /// Device names behind source addresses, for naming a trigger.
+    device_names: &'a HashMap<IpAddr, String>,
+    /// Each known device's querier labels per question and link, sorted:
+    /// one device asking over IPv4 and IPv6 names both addresses.
+    device_askers: HashMap<DeviceAskingKey, BTreeSet<String>>,
 }
 
 impl<'a> MulticastIndex<'a> {
-    pub fn new(events: &'a [Event]) -> Self {
+    pub fn new(events: &'a [Event], device_names: &'a HashMap<IpAddr, String>) -> Self {
         let mut sends: HashMap<SendKey, Vec<(Instant, usize)>> = HashMap::new();
         let mut probes = Vec::new();
+        let mut device_askers: HashMap<DeviceAskingKey, BTreeSet<String>> = HashMap::new();
         for (i, ev) in events.iter().enumerate() {
             if ev.is_probe() {
                 // Every record of a packet shares its ingress link.
@@ -229,6 +242,20 @@ impl<'a> MulticastIndex<'a> {
                     iface: first.iface.clone(),
                     ifindex: first.ifindex,
                 });
+            } else {
+                for q in &ev.questions {
+                    if let Some(device) = device_names.get(&q.source.ip()) {
+                        device_askers
+                            .entry((
+                                device.clone(),
+                                q.name.to_ascii_lowercase(),
+                                q.rtype,
+                                (q.iface.clone(), q.ifindex),
+                            ))
+                            .or_default()
+                            .insert(q.source_label());
+                    }
+                }
             }
             let mut in_packet = HashSet::new();
             // Only multicast copies count, and a goodbye is a withdrawal,
@@ -248,6 +275,8 @@ impl<'a> MulticastIndex<'a> {
             events,
             sends,
             probes,
+            device_names,
+            device_askers,
         }
     }
 
@@ -269,10 +298,18 @@ impl<'a> MulticastIndex<'a> {
     }
 
     /// The question a copy most likely answered (mDNS responses carry no
-    /// question section, so timing is all there is): the latest query
-    /// from another source on the copy's link, up to a second before it,
+    /// question section, so timing is all there is): a query from
+    /// another source on the copy's link, up to a second before it,
     /// asking a name present in that response packet. `querier asking
     /// name TYPE`.
+    ///
+    /// A querier often sends one query over IPv4 and IPv6 within a
+    /// millisecond, in either order, so "the latest" alternates between
+    /// its two addresses. To keep the text stable: a querier that
+    /// resolves to a device is named as that device, with every address
+    /// it asked this question from on the link; otherwise the latest
+    /// query of the copy's own address family wins, then the latest of
+    /// any family.
     fn trigger(&self, rec: &RawRecord, at: Instant, packet: usize) -> Option<String> {
         let names: HashSet<String> = self.events[packet]
             .answers
@@ -280,22 +317,50 @@ impl<'a> MulticastIndex<'a> {
             .map(|r| r.name.to_ascii_lowercase())
             .collect();
         // Packets arrive in order: walk back only through the second
-        // before the copy, not the whole retained buffer.
-        self.events[..packet]
+        // before the copy, not the whole retained buffer. Latest first.
+        let askings: Vec<&RawRecord> = self.events[..packet]
             .iter()
             .rev()
             .take_while(|ev| at.saturating_duration_since(ev.received_at) <= MIN_GAP)
             .filter(|ev| ev.source != rec.source && !ev.is_probe())
-            .find_map(|ev| {
-                ev.questions
-                    .iter()
-                    .find(|q| {
-                        q.iface == rec.iface
-                            && q.ifindex == rec.ifindex
-                            && names.contains(&q.name.to_ascii_lowercase())
-                    })
-                    .map(|q| format!("{} asking {} {}", q.source_label(), q.name, q.rtype_str))
+            .filter_map(|ev| {
+                ev.questions.iter().find(|q| {
+                    q.iface == rec.iface
+                        && q.ifindex == rec.ifindex
+                        && names.contains(&q.name.to_ascii_lowercase())
+                })
             })
+            .collect();
+        let device = askings.iter().find_map(|q| {
+            let device = self.device_names.get(&q.source.ip())?;
+            let key = (
+                device.clone(),
+                q.name.to_ascii_lowercase(),
+                q.rtype,
+                (q.iface.clone(), q.ifindex),
+            );
+            let labels = self.device_askers.get(&key)?;
+            Some((q, device, labels))
+        });
+        if let Some((q, device, labels)) = device {
+            let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+            return Some(format!(
+                "{device} ({}) asking {} {}",
+                labels.join(", "),
+                q.name,
+                q.rtype_str
+            ));
+        }
+        let q = askings
+            .iter()
+            .find(|q| q.source.is_ipv4() == rec.source.is_ipv4())
+            .or(askings.first())?;
+        Some(format!(
+            "{} asking {} {}",
+            q.source_label(),
+            q.name,
+            q.rtype_str
+        ))
     }
 
     /// `multicast-rate-limit` (#407): a responder multicasting one record

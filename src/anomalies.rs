@@ -266,8 +266,8 @@ pub struct Snapshot<'a> {
     /// Live A/AAAA announcements per hostname that a live service points
     /// at (selected host or live SRV target), for `conflicting-answers`.
     pub host_addresses: Vec<HostAddressView<'a>>,
-    /// Device names behind responder IPs (#246), for finding messages
-    /// only: never part of a finding's identity.
+    /// Device names behind responder and querier IPs (#246), for finding
+    /// messages only: never part of a finding's identity.
     pub device_names: HashMap<std::net::IpAddr, String>,
 }
 
@@ -487,7 +487,7 @@ pub fn analyze_observations(
     };
 
     // Multicast sends per record identity, indexed once for every row.
-    let multicasts = rate::MulticastIndex::new(events);
+    let multicasts = rate::MulticastIndex::new(events, &snap.device_names);
 
     for svc in &snap.services {
         let service_id = service_id(svc.instance, svc.service_type);

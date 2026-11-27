@@ -316,3 +316,51 @@ fn finding_line(app: &App, source: &str) -> String {
         .unwrap_or_else(|| panic!("finding row from {source}: {lines:#?}"))
         .clone()
 }
+
+#[test]
+fn rate_finding_names_the_querier_device() {
+    // The repeater keeps asking for Fritzel's SRV and the main box keeps
+    // multicasting it: the finding names the querier as its device, from
+    // the retained query packets, not only from address-record sources.
+    let mut app = fritz_mesh();
+    let mut srv = from(
+        raw_record(
+            "Fritzel._fbox._tcp.local.",
+            33,
+            "SRV",
+            "0 0 49000 fritz.box.",
+            120,
+        ),
+        BOX_V4,
+    );
+    srv.flush_bit = true;
+    srv.dst_is_multicast = true;
+    for _ in 0..3 {
+        ingest_packet(
+            &mut app,
+            query_event(
+                "Fritzel._fbox._tcp.local.",
+                33,
+                "SRV",
+                false,
+                Vec::new(),
+                REPEATER.parse().unwrap(),
+            ),
+        );
+        let mut response = event_for(&srv);
+        response.source = srv.source;
+        ingest_packet(&mut app, response);
+    }
+    let flood = findings_of(&app, anomalies::AnomalyKind::MulticastRateLimit);
+    let srv_flood = flood
+        .iter()
+        .find(|f| f.rtype == Some(33))
+        .unwrap_or_else(|| panic!("{flood:#?}"));
+    assert!(
+        srv_flood.message.contains(&format!(
+            "answering FritzBoxRepeater ({REPEATER}) asking Fritzel._fbox._tcp.local. SRV"
+        )),
+        "{}",
+        srv_flood.message
+    );
+}
