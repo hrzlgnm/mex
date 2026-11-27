@@ -12,7 +12,7 @@ use super::*;
 use crate::browse::{Event, OwnSend};
 
 /// The RFC floor between two sends of the same thing on one link.
-const MIN_GAP: Duration = Duration::from_secs(1);
+pub(crate) const MIN_GAP: Duration = Duration::from_secs(1);
 
 /// How one identity repeated within the retained packets.
 #[derive(Debug, PartialEq)]
@@ -230,12 +230,6 @@ pub(super) fn record_content(r: &RawRecord) -> String {
     }
 }
 
-/// A name as a comparison key: ASCII case folded (RFC 6762 §16), the
-/// trailing dot dropped (our own queries name it without one).
-fn fold_name(name: &str) -> String {
-    name.trim_end_matches('.').to_ascii_lowercase()
-}
-
 fn send_key(r: &RawRecord) -> SendKey {
     (
         r.name.to_ascii_lowercase(),
@@ -413,7 +407,7 @@ impl<'a> MulticastIndex<'a> {
                     .find(|q| {
                         q.iface == rec.iface
                             && q.ifindex == rec.ifindex
-                            && names.contains(&fold_name(&q.name))
+                            && names.contains(&name_key(&q.name))
                     })
                     .map(|q| (ev.received_at, q))
             })
@@ -464,19 +458,19 @@ impl<'a> MulticastIndex<'a> {
         ))
     }
 
-    /// The owner names of a response packet's records, as `fold_name`
+    /// The owner names of a response packet's records, as `name_key`
     /// keys: the names a question must ask to have triggered it.
     fn packet_names(&self, packet: usize) -> HashSet<String> {
         self.events[packet]
             .answers
             .iter()
-            .map(|r| fold_name(&r.name))
+            .map(|r| name_key(&r.name))
             .collect()
     }
 
     /// Our own sends a copy at `at` may answer, latest first: sent on
-    /// the copy's link (by name: ours always carry one, and both
-    /// families count, as for other queriers) in the second before it,
+    /// the copy's link (interface name and index, as for other queriers;
+    /// both families count) in the second before it,
     /// asking one of its packet's `names`. Each with the question asked.
     fn own_askings<'s>(
         &'s self,
@@ -489,11 +483,11 @@ impl<'a> MulticastIndex<'a> {
             .rev()
             .skip_while(move |s| s.sent_at > at)
             .take_while(move |s| at - s.sent_at <= MIN_GAP)
-            .filter(move |s| s.iface == rec.iface)
+            .filter(move |s| s.iface == rec.iface && s.ifindex == rec.ifindex)
             .filter_map(move |s| {
                 s.questions
                     .iter()
-                    .find(|(name, _)| names.contains(&fold_name(name)))
+                    .find(|(name, _)| names.contains(&name_key(name)))
                     .map(|q| (s.sent_at, q))
             })
     }

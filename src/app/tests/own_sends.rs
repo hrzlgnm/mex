@@ -10,6 +10,7 @@ fn own(at: Instant, name: &str, iface: &str) -> browse::OwnSend {
     browse::OwnSend {
         questions: vec![(name.to_string(), 33)],
         iface: iface.to_string(),
+        ifindex: 2,
         v6: false,
         sent_at: at,
     }
@@ -62,13 +63,32 @@ fn a_repeat_after_our_query_names_mex_on_the_answers_row() {
         .filter(|a| a.kind == anomalies::AnomalyKind::MulticastRateLimit)
         .map(|a| a.message)
         .collect();
-    assert_eq!(
-        flood,
-        [
-            "multicast 2 times in 0.25 s, as little as 0.25 s apart, 2 of 2 after mex's own \
-          queries, answering mex (this host) asking Test._http._tcp.local. SRV"
-        ]
-    );
+    let expected = "multicast 2 times in 0.25 s, as little as 0.25 s apart, 2 of 2 after \
+                    mex's own queries, answering mex (this host) asking \
+                    Test._http._tcp.local. SRV";
+    assert_eq!(flood, [expected]);
+    // The state dump carries the same text.
+    let dumped: Vec<_> = app
+        .state_dump()
+        .anomalies
+        .into_iter()
+        .filter(|a| a.kind == "multicast-rate-limit")
+        .map(|a| a.message)
+        .collect();
+    assert_eq!(dumped, [expected]);
+}
+
+#[test]
+fn a_passive_browser_records_no_own_sends() {
+    // #431: passive mode sends nothing, so nothing names mex.
+    let mut app = App::new_with(true, None).unwrap();
+    ingest(&mut app, &ptr_record(4500));
+    app.send_queries();
+    app.poll_continuous();
+    // Give the listener time to report anything it might have sent.
+    std::thread::sleep(Duration::from_millis(100));
+    app.drain_events();
+    assert!(app.own_sends.is_empty());
 }
 
 #[test]

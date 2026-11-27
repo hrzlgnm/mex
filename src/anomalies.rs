@@ -76,8 +76,18 @@ pub fn service_id(instance: &str, service_type: &str) -> String {
 /// many services, so host-owned evidence is recorded once, under the
 /// host, and every service on it shows it in a `host` block.
 pub fn host_id(hostname: &str) -> String {
-    hostname.trim_end_matches('.').to_ascii_lowercase()
+    name_key(hostname)
 }
+
+/// A name as a comparison key: ASCII case folded (RFC 6762 §16) and the
+/// root dot dropped, so `Host.local.` and `host.local` are one name.
+pub fn name_key(name: &str) -> String {
+    name.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// The one-second floor between two multicasts of one thing on one link
+/// (RFC 6762 §5.2, §6), also how far back a copy's trigger can lie.
+pub(crate) use rate::MIN_GAP;
 
 /// Severity of an anomaly: errors are clear RFC violations, warnings are
 /// likely misconfigurations, informational notes are observations.

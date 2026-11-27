@@ -948,11 +948,13 @@ fn nonzero_opcode_floods_are_ignored() {
 // --- #431: mex's own queries as the trigger ---
 
 /// Our own query copy asking `name` (as the app sends it: no trailing
-/// dot) for `rtype` on `iface`, sent `ms` after `at`.
+/// dot) for `rtype` on `iface` (index 2 for `eth0`, as `host_a` has it,
+/// else 3), sent `ms` after `at`.
 fn own_at(at: Instant, ms: u64, name: &str, rtype: u16, iface: &str) -> OwnSend {
     OwnSend {
         questions: vec![(name.to_string(), rtype)],
         iface: iface.to_string(),
+        ifindex: if iface == "eth0" { 2 } else { 3 },
         v6: false,
         sent_at: at + Duration::from_millis(ms),
     }
@@ -1021,6 +1023,20 @@ fn our_query_on_another_link_or_for_another_name_is_ignored() {
     ];
     assert_eq!(
         own_flood_message(&a, &events, &own),
+        "multicast 2 times in 0.25 s, as little as 0.25 s apart"
+    );
+}
+
+/// A link removed and re-created under the same name gets a new index:
+/// a send on the old one never answers a copy on the new one.
+#[test]
+fn our_query_on_a_same_named_link_with_another_index_is_ignored() {
+    let at = base();
+    let (a, events) = eth0_copies(at, &[20, 270]);
+    let mut old_eth0 = own_at(at, 0, "Repeater.local", 1, "eth0");
+    old_eth0.ifindex = 7;
+    assert_eq!(
+        own_flood_message(&a, &events, &[old_eth0]),
         "multicast 2 times in 0.25 s, as little as 0.25 s apart"
     );
 }

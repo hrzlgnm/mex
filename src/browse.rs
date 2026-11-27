@@ -324,8 +324,10 @@ pub struct QueryRequest {
 pub struct OwnSend {
     /// The questions the copy asked: the name as sent, and the type.
     pub questions: Vec<(String, u16)>,
-    /// The egress interface the copy was pinned to.
+    /// The egress link the copy was pinned to: interface name and kernel
+    /// index, as received records carry them.
     pub iface: String,
+    pub ifindex: u32,
     /// Sent over IPv6 (else IPv4).
     pub v6: bool,
     pub sent_at: Instant,

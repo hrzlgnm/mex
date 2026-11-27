@@ -1447,7 +1447,7 @@ impl App {
             self.own_sends.push(sent);
         }
         if let Some(oldest) = self.raw_events.first() {
-            let horizon = oldest.received_at.checked_sub(Duration::from_secs(1));
+            let horizon = oldest.received_at.checked_sub(anomalies::MIN_GAP);
             let stale = self
                 .own_sends
                 .iter()

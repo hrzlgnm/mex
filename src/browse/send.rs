@@ -185,7 +185,8 @@ pub(super) fn send_targets<'a>(
 /// default multicast interface and other links (e.g. a bridge) never see
 /// our queries. No usable link means no copy (`send_targets`). Returns
 /// one `OwnSend` per copy that left without error (#431): a failed pin
-/// or send, or a request that can't be encoded, reports nothing.
+/// or send, or a request that can't be encoded, reports nothing. An IPv4
+/// copy's link index is left 0 for the caller, which knows the names.
 pub(super) fn send_on_all_interfaces(
     socket: &impl QuerySocket,
     req: &QueryRequest,
@@ -221,6 +222,12 @@ pub(super) fn send_on_all_interfaces(
                 sent_ok.push(OwnSend {
                     questions: vec![(req.name.clone(), u16::from(req.record_type))],
                     iface: link.to_string(),
+                    // An IPv6 copy is pinned by index; an IPv4 one by
+                    // address, so the listener fills its index in.
+                    ifindex: match egress {
+                        Egress::V6(idx) => idx,
+                        Egress::V4(_) => 0,
+                    },
                     v6: family == Family::V6,
                     sent_at: now,
                 });

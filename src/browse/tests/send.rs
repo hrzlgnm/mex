@@ -726,12 +726,15 @@ fn each_sent_copy_is_reported_with_its_link_family_and_question() {
     );
     let reported: Vec<_> = sent
         .iter()
-        .map(|s| (s.iface.as_str(), s.v6, s.questions.clone()))
+        .map(|s| (s.iface.as_str(), s.ifindex, s.v6, s.questions.clone()))
         .collect();
     let question = vec![("_http._tcp.local".to_string(), 12)];
     assert_eq!(
         reported,
-        [("eth0", true, question.clone()), ("wlan0", true, question)]
+        [
+            ("eth0", 2, true, question.clone()),
+            ("wlan0", 3, true, question)
+        ]
     );
     assert!(sent
         .iter()
@@ -749,6 +752,10 @@ fn each_sent_copy_is_reported_with_its_link_family_and_question() {
     );
     assert_eq!(sent.len(), 1);
     assert!(!sent[0].v6);
+    assert_eq!(
+        sent[0].ifindex, 0,
+        "pinned by address: the listener fills it in"
+    );
 }
 
 #[test]

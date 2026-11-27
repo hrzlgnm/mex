@@ -553,3 +553,12 @@ fn drop_counts_survive_a_poisoned_last_source_lock() {
     assert!(drops.last().is_none());
     assert!(drops.malformed_last().is_none());
 }
+
+#[test]
+fn an_ipv4_copy_s_link_index_comes_from_the_name_map() {
+    // #431: received records carry the index `ifnames` names; our IPv4
+    // copies are pinned by address, so their index is looked up by name.
+    let ifnames = HashMap::from([(2, "eth0".to_string()), (3, "wlan0".to_string())]);
+    assert_eq!(link_index(&ifnames, "wlan0"), 3);
+    assert_eq!(link_index(&ifnames, "gone0"), 0, "unknown: matches no copy");
+}

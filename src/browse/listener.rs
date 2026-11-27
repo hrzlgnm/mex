@@ -216,6 +216,15 @@ pub(super) fn drain_queries(
     (sent, QueueState::More)
 }
 
+/// The kernel index of the link named `name`, as received packets carry
+/// it (`ifnames` is the same map that names them), or 0 when unknown.
+pub(super) fn link_index(ifnames: &HashMap<u32, String>, name: &str) -> u32 {
+    ifnames
+        .iter()
+        .find_map(|(idx, n)| (n == name).then_some(*idx))
+        .unwrap_or(0)
+}
+
 /// State the listener updates and the app thread reads.
 pub(super) struct SharedWithApp {
     pub(super) drops: Arc<DropStats>,
@@ -421,6 +430,7 @@ impl Listener {
             send_failures,
             sent_copies,
             own_sends,
+            ifnames,
             ..
         } = self;
         let (_, queue) = drain_queries(query_rx, QUERY_BUDGET, |req| {
@@ -434,6 +444,10 @@ impl Listener {
                     send_failures,
                     sent_copies,
                 ) {
+                    let mut sent = sent;
+                    if sent.ifindex == 0 {
+                        sent.ifindex = link_index(ifnames, &sent.iface);
+                    }
                     // A closed channel means the app is gone; the closed
                     // query queue stops this loop right after.
                     let _ = own_sends.send(sent);
