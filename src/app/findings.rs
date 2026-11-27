@@ -161,12 +161,28 @@ impl App {
         }
         let host_addresses = self.host_address_views();
         let book = self.address_book();
+        // Responders behind the address records, and every querier in the
+        // retained packets (a rate finding names what its repeats answered).
+        let queriers = self
+            .raw_events
+            .iter()
+            .filter(|ev| !ev.questions.is_empty())
+            .map(|ev| ev.source.ip());
         let device_names = host_addresses
             .iter()
             .flat_map(|v| v.records.iter())
-            .filter_map(|r| {
-                let ip = r.source.ip();
-                book.resolve(ip).map(|d| (ip, d.display()))
+            .map(|r| r.source.ip())
+            .chain(queriers)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .filter_map(|ip| {
+                book.resolve(ip).map(|d| {
+                    let label = anomalies::DeviceLabel {
+                        id: d.host_id(),
+                        name: d.display(),
+                    };
+                    (ip, label)
+                })
             })
             .collect();
         let snap = anomalies::Snapshot {
