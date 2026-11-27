@@ -540,3 +540,32 @@ fn app_with_unattributed() -> (App, usize) {
         .expect("(unattributed) entry");
     (app, pos)
 }
+
+#[test]
+fn flooded_host_addresses_are_flagged_in_every_sibling_service() {
+    // #407: the host's responder multicasts its A/AAAA as additionals
+    // several times a second (RFC 6762 §6); both services on the host
+    // show the finding on those rows.
+    let mut app = knulp_app();
+    for _ in 0..3 {
+        ingest_packet(&mut app, packet(vec![a_knulp(), aaaa_knulp()]));
+    }
+    for instance in ["iTunes_Ctrl", "KNULP"] {
+        select_instance(&mut app, instance);
+        let target = app.display_detail().unwrap();
+        let rows = target.ordered_answers();
+        let flagged: Vec<u16> = shown(&app)
+            .into_iter()
+            .filter(|(a, _)| a.kind == anomalies::AnomalyKind::MulticastRateLimit)
+            .filter_map(|(_, row)| row.map(|r| rows[r].rtype))
+            .collect();
+        assert!(
+            flagged.contains(&1),
+            "{instance}: A row flagged: {flagged:?}"
+        );
+        assert!(
+            flagged.contains(&28),
+            "{instance}: AAAA row flagged: {flagged:?}"
+        );
+    }
+}

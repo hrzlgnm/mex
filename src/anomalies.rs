@@ -122,6 +122,7 @@ pub enum AnomalyKind {
     EnumSubtype,
     ConflictingAnswers,
     QueryRateLimit,
+    MulticastRateLimit,
 }
 
 impl AnomalyKind {
@@ -145,6 +146,7 @@ impl AnomalyKind {
             AnomalyKind::EnumSubtype => "enum-subtype",
             AnomalyKind::ConflictingAnswers => "conflicting-answers",
             AnomalyKind::QueryRateLimit => "query-rate-limit",
+            AnomalyKind::MulticastRateLimit => "multicast-rate-limit",
         }
     }
 
@@ -484,6 +486,9 @@ pub fn analyze_observations(
         now,
     };
 
+    // Multicast sends per record identity, indexed once for every row.
+    let multicasts = rate::MulticastIndex::new(events);
+
     for svc in &snap.services {
         let service_id = service_id(svc.instance, svc.service_type);
         check_unresolved_srv_target(svc, &service_id, &address_evidence, &mut out);
@@ -496,6 +501,7 @@ pub fn analyze_observations(
                 continue;
             }
             check_record(&service_id, rec, &mut out);
+            multicasts.check(&service_id, rec, &mut out);
         }
         check_ttl_stable(svc, &service_id, now, &mut out);
     }
@@ -503,6 +509,7 @@ pub fn analyze_observations(
     for (service, rec) in &snap.sightings {
         if is_live(rec, now) {
             check_record(service, rec, &mut out);
+            multicasts.check(service, rec, &mut out);
         }
     }
 
@@ -511,6 +518,7 @@ pub fn analyze_observations(
             continue;
         }
         check_record(ENUMERATION_SERVICE, rec, &mut out);
+        multicasts.check(ENUMERATION_SERVICE, rec, &mut out);
         // Enumeration PTR targets name service types (or subtypes): a
         // malformed target means the name itself violates DNS-SD naming,
         // so flag the PTR row itself (with full record identity, so the
