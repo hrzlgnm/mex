@@ -34,12 +34,12 @@ pub(super) fn check_misplaced_known_answers(
     events: &[Event],
     out: &mut Vec<Anomaly>,
 ) {
-    let flagged = |ev: &&Event| !ev.query_additional.is_empty() && !ev.is_probe();
-    if questions.is_empty() || !events.iter().any(|ev| flagged(&ev)) {
+    let carries_misplaced = |ev: &&Event| !ev.query_additional.is_empty() && !ev.is_probe();
+    if questions.is_empty() || !events.iter().any(|ev| carries_misplaced(&ev)) {
         return;
     }
     let mut tally = QuestionTally::<Misplaced>::new();
-    for ev in events.iter().filter(flagged) {
+    for ev in events.iter().filter(carries_misplaced) {
         tally.add_packet(ev, |m| {
             m.queries += 1;
             for r in &ev.query_additional {
