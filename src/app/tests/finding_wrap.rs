@@ -249,6 +249,63 @@ fn page_down_moves_one_viewport_of_drawn_lines() {
     }
 }
 
+#[test]
+fn page_up_stops_before_a_record_a_tall_finding_pushes_past_the_page() {
+    use crossterm::event::KeyCode;
+    let mut app = App::new().unwrap();
+    service_with_txt(&mut app, "a=1; b=2");
+    // PTR's finding is cut at the viewport: SRV is one line above TXT,
+    // PTR more than a page.
+    let long = [LONG; 8].join(" ");
+    let found = with_message(&app, anomalies::AnomalyKind::TtlMismatch, &long);
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::End);
+    frame(&app, &found, 100, 24);
+    press(&mut app, KeyCode::PageUp);
+    match app.selected_detail_entry() {
+        Some(DetailEntry::Record(r)) => assert_eq!(r.rtype, 33, "the page ends on SRV"),
+        _ => panic!("cursor on a record"),
+    }
+}
+
+#[test]
+fn click_below_the_last_row_selects_nothing_new() {
+    let mut app = App::new().unwrap();
+    service_with_txt(&mut app, "a=1; b=2");
+    let found = with_message(&app, anomalies::AnomalyKind::NoFlush, LONG);
+    let buf = frame(&app, &found, 120, 40);
+    let area = app.layout.answers_rect.get();
+    let lines = pane_lines(&buf, area);
+    let before = app.view_state.detail_selected;
+    // The last line inside the border is blank: below every row.
+    let blank = lines.len() - 2;
+    assert!(
+        lines[blank].trim_matches(['│', '┃', ' ']).is_empty(),
+        "{lines:#?}"
+    );
+    app.click_answers(area.y + blank as u16);
+    assert_eq!(app.view_state.detail_selected, before);
+}
+
+#[test]
+fn free_scroll_stops_once_the_last_wrapped_row_is_in_view() {
+    let mut app = App::new().unwrap();
+    service_with_txt(&mut app, "a=1; b=2");
+    let found = with_message(&app, anomalies::AnomalyKind::NoFlush, LONG);
+    // Scroll far past the end, as a spun mouse wheel does.
+    app.scroll_detail(100);
+    let buf = frame(&app, &found, 100, 24);
+    let lines = pane_lines(&buf, app.layout.answers_rect.get());
+    let (_, block) = finding_block(&lines, "no-flush");
+    assert!(
+        block.join(" ").ends_with(')'),
+        "the last row, the TXT finding, shows in full: {lines:#?}"
+    );
+    // Clamped by lines, not rows: the TXT record above its finding
+    // still shows, instead of the finding alone at the top.
+    assert!(lines.iter().any(|l| l.contains("▸ TXT")), "{lines:#?}");
+}
+
 /// The service app with a TXT question from a foreign querier and an
 /// injected finding of `msg` on it.
 fn questioned_app(msg: &str) -> (App, Vec<anomalies::Anomaly>) {

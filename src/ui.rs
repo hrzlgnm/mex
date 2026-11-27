@@ -324,10 +324,10 @@ impl FindingFit {
 
     /// Cells from the start of column `from` to the end of column `to`.
     fn span(&self, from: usize, to: usize) -> usize {
-        match (self.cols.get(from), self.cols.get(to)) {
-            (Some(a), Some(b)) => b.right().saturating_sub(a.x) as usize,
-            _ => 0,
-        }
+        self.cols
+            .get(from)
+            .zip(self.cols.get(to))
+            .map_or(0, |(a, b)| b.right().saturating_sub(a.x) as usize)
     }
 }
 
@@ -408,9 +408,8 @@ fn wrap_spans(spans: &[Span<'_>], width: usize) -> Vec<Line<'static>> {
             used += gw;
         }
     }
-    if !cur.is_empty() || lines.is_empty() {
-        lines.push(cur);
-    }
+    // The last line: never empty unless there were no words at all.
+    lines.push(cur);
     lines.into_iter().map(styled_line).collect()
 }
 
@@ -446,17 +445,20 @@ fn finding_lines(
     let max_lines = max_lines.max(1);
     if lines.len() > max_lines {
         lines.truncate(max_lines);
-        // Drop whole graphemes until `…` fits on the last line.
+        // Keep the whole graphemes that leave a cell for `…`.
         let last = lines.pop().unwrap_or_default();
-        let mut kept: Vec<Glyph<'_>> = glyphs(&last.spans).collect();
-        let style = kept.last().map(|(_, s)| *s).unwrap_or_default();
-        let mut used: usize = kept.iter().map(|(g, _)| glyph_width(g)).sum();
-        while used + 1 > width.max(1) {
-            match kept.pop() {
-                Some((g, _)) => used -= glyph_width(g),
-                None => break,
-            }
-        }
+        let style = glyphs(&last.spans)
+            .last()
+            .map(|(_, s)| s)
+            .unwrap_or_default();
+        let room = width.max(1) - 1;
+        let mut used = 0;
+        let mut kept: Vec<Glyph<'_>> = glyphs(&last.spans)
+            .take_while(|(g, _)| {
+                used += glyph_width(g);
+                used <= room
+            })
+            .collect();
         kept.push(("…", style));
         let cut = styled_line(kept);
         lines.push(cut);
@@ -794,6 +796,9 @@ mod tests {
         assert_eq!(texts(&wrap_spans(&spans, 20)), ["ab cd  ef"]);
         assert_eq!(texts(&wrap_spans(&spans, 9)), ["ab cd  ef"]);
         assert_eq!(texts(&wrap_spans(&[], 5)), [""]);
+        // Trailing spaces end no line; only spaces wrap to one empty line.
+        assert_eq!(texts(&wrap_spans(&[Span::raw("ab cd  ")], 3)), ["ab", "cd"]);
+        assert_eq!(texts(&wrap_spans(&[Span::raw("      ")], 3)), [""]);
     }
 
     #[test]
