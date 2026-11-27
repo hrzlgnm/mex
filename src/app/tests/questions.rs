@@ -410,3 +410,42 @@ fn querier_repeating_a_question_gets_a_rate_finding_on_its_row() {
         rate[0].message
     );
 }
+
+#[test]
+fn querier_setting_the_aa_bit_gets_a_finding_on_its_row() {
+    // #423: the query arrives on a named link, as live traffic does; the
+    // Questions row keeps no link and must still get the finding.
+    let mut app = App::new().unwrap();
+    service_with_txt(&mut app, "a=1; b=2");
+    let querier: SocketAddr = "192.168.1.70:5353".parse().unwrap();
+    let mut ev = query_event(
+        "Test._http._tcp.local.",
+        33,
+        "SRV",
+        false,
+        Vec::new(),
+        querier,
+    );
+    ev.questions[0].iface = "eth0".to_string();
+    ev.questions[0].ifindex = 2;
+    // Header: ID 0, flags 0x0400 (query, AA set), one question.
+    ev.raw_bytes = vec![0, 0, 0x04, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+    ingest_packet(&mut app, ev);
+    let found = app.anomalies();
+    let target = app.display_detail().unwrap();
+    let rows = app.question_findings(&target, &found);
+    let questions = target.ordered_questions();
+    let row = questions
+        .iter()
+        .position(|q| q.2 == querier && q.1 == "SRV")
+        .expect("the querier's SRV row");
+    let aa: Vec<_> = rows[row]
+        .iter()
+        .filter(|a| a.kind == anomalies::AnomalyKind::QueryAaBit)
+        .collect();
+    assert_eq!(aa.len(), 1, "{:#?}", rows[row]);
+    assert_eq!(
+        aa[0].message,
+        "AA bit set in 1 of 1 query (must be zero in queries)"
+    );
+}
