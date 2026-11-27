@@ -675,3 +675,19 @@ fn a_reused_in_memory_sink_starts_each_packet_fresh() {
     let second = build_query_into(&mut sink, &qname, TYPE::PTR, false, &[]).unwrap();
     assert_eq!(first, second);
 }
+
+#[test]
+fn own_queries_keep_the_aa_bit_clear() {
+    // RFC 6762 §18.4: mex must never raise `query-aa-bit` itself (#423).
+    let mut req = ptr_query();
+    assert!(!roundtrip_query(&req).is_authoritative_query());
+    req.qu = true;
+    req.known_answers = vec![KnownAnswer {
+        target: "Inst._http._tcp.local.".into(),
+        ttl: 4500,
+        iface: String::new(),
+    }];
+    assert!(!roundtrip_query(&req).is_authoritative_query());
+    let inferred = inferred_question_packet("_http._tcp.local", 12, false).unwrap();
+    assert_eq!(inferred[2] & 0x04, 0);
+}

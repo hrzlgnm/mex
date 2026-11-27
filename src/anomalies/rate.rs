@@ -73,13 +73,13 @@ pub(super) fn fmt_secs(d: Duration) -> String {
 /// Identity of one question as a Questions row knows it: the name folded
 /// ASCII-only (RFC 6762 §16), the type, and the querier address. Rows
 /// carry no ingress link, so links are told apart below it.
-type AskingKey = (String, u16, SocketAddr);
+pub(super) type AskingKey = (String, u16, SocketAddr);
 
 /// An ingress link: interface name and index, so two unnamed links stay
 /// two.
 type Link = (String, u32);
 
-fn asking_key(name: &str, rtype: u16, source: SocketAddr) -> AskingKey {
+pub(super) fn asking_key(name: &str, rtype: u16, source: SocketAddr) -> AskingKey {
     (name.to_ascii_lowercase(), rtype, source)
 }
 
