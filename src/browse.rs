@@ -261,6 +261,15 @@ impl Event {
             .iter()
             .any(|r| r.rtype != wire::OPT_TYPE)
     }
+
+    /// Whether this is a query with the Authoritative Answer bit set,
+    /// which RFC 6762 §18.4 forbids (MUST be zero in queries, ignored on
+    /// reception). Read from the header's flags byte: QR clear, AA set.
+    pub fn is_authoritative_query(&self) -> bool {
+        self.raw_bytes
+            .get(2)
+            .is_some_and(|flags| flags & 0x80 == 0 && flags & 0x04 != 0)
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -1141,3 +1141,41 @@ fn dotted_instance_label_parses_to_presentation_form() {
     assert_eq!(ev.answers[1].name, "a\\.b._x._tcp.local.");
     assert_eq!(ev.answers[1].owner_labels[0], b"a.b");
 }
+
+#[test]
+fn a_query_s_aa_bit_is_exposed_on_the_event() {
+    // RFC 6762 §18.4: AA must be zero in queries (#423).
+    let parse = |pkt: &Packet| {
+        parse_packet(
+            &pkt.build_bytes_vec().unwrap(),
+            test_source(),
+            std::net::IpAddr::V4(MDNS_V4),
+            "enx",
+            2,
+        )
+        .unwrap()
+    };
+    let question = simple_dns::Question::new(
+        simple_dns::Name::new_unchecked("svc._http._tcp.local."),
+        QTYPE::TYPE(TYPE::PTR),
+        QCLASS::CLASS(CLASS::IN),
+        false,
+    );
+    let mut q = Packet::new_query(0);
+    q.questions.push(question.clone());
+    assert!(!parse(&q).is_authoritative_query());
+    q.set_flags(simple_dns::PacketFlag::AUTHORITATIVE_ANSWER);
+    let ev = parse(&q);
+    assert!(ev.is_authoritative_query());
+    assert_eq!(ev.questions.len(), 1);
+
+    // A response sets AA as it must: never an authoritative query.
+    let mut r = Packet::new_reply(0);
+    r.set_flags(simple_dns::PacketFlag::AUTHORITATIVE_ANSWER);
+    r.answers.push(known_answer(
+        "svc._http._tcp.local.",
+        "Inst.svc._http._tcp.local.",
+        120,
+    ));
+    assert!(!parse(&r).is_authoritative_query());
+}

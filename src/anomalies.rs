@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::browse::{rtype_from_str, RawRecord, ENUM_SERVICE};
 
+mod header;
 mod naming;
 mod questions;
 mod rate;
@@ -123,6 +124,7 @@ pub enum AnomalyKind {
     ConflictingAnswers,
     QueryRateLimit,
     MulticastRateLimit,
+    QueryAaBit,
 }
 
 impl AnomalyKind {
@@ -147,6 +149,7 @@ impl AnomalyKind {
             AnomalyKind::ConflictingAnswers => "conflicting-answers",
             AnomalyKind::QueryRateLimit => "query-rate-limit",
             AnomalyKind::MulticastRateLimit => "multicast-rate-limit",
+            AnomalyKind::QueryAaBit => "query-aa-bit",
         }
     }
 
@@ -165,7 +168,9 @@ impl AnomalyKind {
     pub fn is_question(self) -> bool {
         matches!(
             self,
-            AnomalyKind::UnsupportedQuestion | AnomalyKind::QueryRateLimit
+            AnomalyKind::UnsupportedQuestion
+                | AnomalyKind::QueryRateLimit
+                | AnomalyKind::QueryAaBit
         )
     }
 }
@@ -591,6 +596,7 @@ pub fn analyze_observations(
         check_question(q, &mut out);
     }
     rate::check_query_rate(&snap.questions, events, &mut out);
+    header::check_query_aa_bit(&snap.questions, events, &mut out);
 
     for view in &snap.host_addresses {
         check_conflicting_answers(view, &snap.device_names, now, &mut out);

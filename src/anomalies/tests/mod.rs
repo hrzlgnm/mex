@@ -8,6 +8,7 @@ use std::time::Duration;
 mod analyze;
 mod conflicts;
 mod flush;
+mod header;
 mod naming;
 mod questions;
 mod rate;
