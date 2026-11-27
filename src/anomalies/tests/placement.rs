@@ -226,16 +226,17 @@ fn an_any_question_is_answered_by_every_type_of_its_name() {
 }
 
 /// Records differing in rdata are two (two addresses, two SRV targets);
-/// owner names differing only in ASCII case are one.
+/// owner names or SRV targets differing only in ASCII case are one.
 #[test]
 fn several_records_are_summed_up_and_case_folded() {
     let q = question(NAME, 33, "SRV", querier());
-    let upper = carried(
+    let mut upper = carried(
         "FRITZ-BOX._igd2._tcp.local.",
         33,
         "SRV",
         RecordSection::Additional,
     );
+    upper.rdata = "0 0 49000 FRITZ-BOX.fritz.box.".to_string();
     let mut other_target = misplaced_srv();
     other_target.rdata = "0 0 49000 fritz-box-2.fritz.box.".to_string();
     let events = vec![

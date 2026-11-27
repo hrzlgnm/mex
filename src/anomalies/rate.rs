@@ -213,8 +213,10 @@ pub(super) fn check_query_rate(
 /// link (interface name and index, so two unnamed links stay two).
 type SendKey = (String, u16, String, SocketAddr, Link);
 
-fn send_key(r: &RawRecord) -> SendKey {
-    let content = match r.rdata_digest {
+/// A record's content as an identity: one record sent twice, or listed
+/// twice, compares equal.
+pub(super) fn record_content(r: &RawRecord) -> String {
+    match r.rdata_digest {
         // Out-of-scope rdata shows only `rdlength=<n>`: its digest tells
         // a repeat from new content of one length (an SOA serial bump).
         Some(digest) => format!("#{digest:016x}"),
@@ -225,11 +227,14 @@ fn send_key(r: &RawRecord) -> SendKey {
         // exactly.
         None if matches!(r.rtype, 2 | 5 | 12 | 33 | 47) => r.rdata.to_ascii_lowercase(),
         None => r.rdata.clone(),
-    };
+    }
+}
+
+fn send_key(r: &RawRecord) -> SendKey {
     (
         r.name.to_ascii_lowercase(),
         r.rtype,
-        content,
+        record_content(r),
         r.source,
         (r.iface.clone(), r.ifindex),
     )

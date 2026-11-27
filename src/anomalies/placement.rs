@@ -4,7 +4,7 @@
 //! Query section checks over the retained packets: records a querier
 //! puts where responders never look (RFC 6762 §7.1, #424).
 
-use super::rate::QuestionTally;
+use super::rate::{record_content, QuestionTally};
 use super::*;
 use crate::browse::Event;
 
@@ -17,9 +17,9 @@ struct Misplaced {
     /// The distinct misplaced records, `name TYPE`, in arrival order.
     records: Vec<String>,
     /// Their identities: the name folded ASCII-only (RFC 6762 §16), the
-    /// type and the rdata (the digest for an opaque record, whose rdata
-    /// shows only its length), so two addresses of one name stay two.
-    seen: HashSet<(String, u16, String, Option<u64>)>,
+    /// type and the content as `record_content` compares it, so two
+    /// addresses of one name stay two and a target's case doesn't split one.
+    seen: HashSet<(String, u16, String)>,
 }
 
 /// Whether `r` answers the question `q`: the same name (ASCII case
@@ -56,12 +56,7 @@ pub(super) fn check_misplaced_known_answers(
             let mut carried = false;
             for r in ev.query_additional.iter().filter(|r| answers(r, q)) {
                 carried = true;
-                let identity = (
-                    r.name.to_ascii_lowercase(),
-                    r.rtype,
-                    r.rdata.clone(),
-                    r.rdata_digest,
-                );
+                let identity = (r.name.to_ascii_lowercase(), r.rtype, record_content(r));
                 if m.seen.insert(identity) {
                     m.records.push(format!("{} {}", r.name, r.rtype_str));
                 }
