@@ -307,7 +307,9 @@ fn soa_from(app: &mut App, source: &str) {
 /// The finding row in the Answers pane whose source column starts
 /// with `source`.
 fn finding_line(app: &App, source: &str) -> String {
-    let lines = answers_text(app);
+    // Tall enough for every wrapped finding row (#410).
+    let buf = render_to_buffer(app, 160, 80);
+    let lines = pane_lines(&buf, app.layout.answers_rect.get());
     lines
         .iter()
         .find(|l| l.contains(source) && l.contains("unicast-style-response"))

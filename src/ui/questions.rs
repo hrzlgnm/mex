@@ -147,27 +147,6 @@ pub(super) fn draw_questions_tab(
         .max()
         .unwrap_or(3)
         .clamp(8, 15) as u16;
-    let mut rows: Vec<Row> = Vec::new();
-    let mut question_positions = Vec::with_capacity(body.len());
-    // Row -> question index as drawn: finding rows belong to their question.
-    let mut row_map = Vec::new();
-    for (q, (cells, style)) in body.into_iter().enumerate() {
-        question_positions.push(rows.len());
-        row_map.extend(std::iter::repeat_n(Some(q), 1 + per_question[q].len()));
-        let mut cells = cells.into_iter();
-        let mut row_cells = vec![marked_cell(
-            cells.next().unwrap_or_default(),
-            marks[q],
-            Style::default(),
-        )];
-        row_cells.extend(cells.map(Cell::from));
-        rows.push(Row::new(row_cells).style(style));
-        for a in &per_question[q] {
-            rows.push(finding_row(a, &identity_count, &book, 3, 4, true));
-        }
-    }
-    app.layout().questions_rows.replace(Some(row_map));
-
     let widths = [
         Constraint::Length(8),
         Constraint::Length(last_w),
@@ -183,6 +162,37 @@ pub(super) fn draw_questions_tab(
         ),
         Constraint::Min(20),
     ];
+
+    // Findings wrap to their span (#410), leaving a line for the question.
+    let fit = FindingFit::new(area, &widths, area.height.saturating_sub(4) as usize);
+    let mut rows: Vec<Row> = Vec::new();
+    let mut question_positions = Vec::with_capacity(body.len());
+    // Row -> question index and height as drawn: finding rows belong to
+    // their question.
+    let mut owners = Vec::new();
+    let mut heights = Vec::new();
+    for (q, (cells, style)) in body.into_iter().enumerate() {
+        question_positions.push(rows.len());
+        let mut cells = cells.into_iter();
+        let mut row_cells = vec![marked_cell(
+            cells.next().unwrap_or_default(),
+            marks[q],
+            Style::default(),
+        )];
+        row_cells.extend(cells.map(Cell::from));
+        rows.push(Row::new(row_cells).style(style));
+        owners.push(Some(q));
+        heights.push(1);
+        for a in &per_question[q] {
+            let (row, height) = finding_row(a, &identity_count, &book, 3, 4, true, &fit);
+            rows.push(row);
+            owners.push(Some(q));
+            heights.push(height);
+        }
+    }
+    app.layout()
+        .questions_rows
+        .replace(Some(crate::app::DrawnRows::new(owners, heights.clone())));
 
     // The Questions table is its own focus stop: light its border when
     // focused.
@@ -240,7 +250,18 @@ pub(super) fn draw_questions_tab(
     } else {
         None
     });
-    *tstate.offset_mut() = app.layout().questions_offset.get();
+    // Like Answers: pull the selected question's (wrapped, #410) findings
+    // into view, counting lines; a too-tall extent pins the question.
+    let mut offset = app.layout().questions_offset.get();
+    if let Some(selected) = selected_table_row {
+        let extent_end = question_positions
+            .get(app.view_state().detail_selected - raw_count + 1)
+            .copied()
+            .unwrap_or(heights.len());
+        let viewport = area.height.saturating_sub(3) as usize;
+        offset = fit_row_extent(offset, selected, selected, extent_end, viewport, &heights);
+    }
+    *tstate.offset_mut() = offset;
     frame.render_stateful_widget(table, area, &mut tstate);
     app.layout().questions_offset.set(tstate.offset());
 }

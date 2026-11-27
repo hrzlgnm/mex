@@ -56,10 +56,14 @@ fn enum_question_finding_keeps_qry_scope() {
     app.view_state.selected_display = pos;
     app.clamp_selection();
     let lines = answers_text(&app);
+    // The finding may wrap (#410): read the pane as one text.
+    let text = lines
+        .iter()
+        .map(|l| l.trim_matches(['│', '┃', ' ']))
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(
-        lines
-            .iter()
-            .any(|l| l.contains("QRY TYPE6 _services._dns-sd")),
+        text.contains("QRY TYPE6 _services._dns-sd"),
         "enum question keeps its QRY scope, got: {lines:#?}"
     );
 }

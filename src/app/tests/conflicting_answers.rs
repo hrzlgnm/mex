@@ -407,7 +407,7 @@ const REP_GUA: &str = "2003:a:b:c:ca0e:14ff:feff:416";
 /// The observed mesh: the box announces its AAAA pair and its A from
 /// both of its sources, the repeater its own AAAA pair for the same
 /// name (and no A).
-fn disagreeing_mesh() -> App {
+pub(super) fn disagreeing_mesh() -> App {
     let mut app = fritz_mesh();
     for source in [BOX_V4, BOX_LL] {
         for addr in [BOX_ULA, BOX_GUA] {

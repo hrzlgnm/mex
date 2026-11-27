@@ -12,8 +12,14 @@ mod devices;
 mod diagnostics;
 mod finding_owners;
 mod finding_targets;
+mod finding_wrap;
 mod hex;
 mod ingest;
+
+fn ingest(app: &mut App, rec: &browse::RawRecord) {
+    let ev = event_for(rec);
+    app.ingest_event(&ev);
+}
 mod input;
 mod manual_refresh;
 mod out_of_scope;
@@ -111,11 +117,6 @@ fn make_refresh_due(app: &mut App, name: &str, rtype: u16) {
             state.next_due = Instant::now() - Duration::from_millis(1);
         }
     }
-}
-
-fn ingest(app: &mut App, rec: &browse::RawRecord) {
-    let ev = event_for(rec);
-    app.ingest_event(&ev);
 }
 
 fn ingest_packet(app: &mut App, event: browse::Event) {
@@ -476,13 +477,15 @@ fn legacy_aaaa_denial() -> browse::RawRecord {
     raw_record(DACP, 47, "NSEC", "iTunes_Ctrl._dacp._tcp.local. AAAA", 120)
 }
 
-/// Answers pane text, one line per table row (borders included).
+/// Text of `area` in `buf`, one line per screen line (borders included).
+fn pane_lines(buf: &ratatui::buffer::Buffer, area: ratatui::layout::Rect) -> Vec<String> {
+    rect_text(buf, area).lines().map(str::to_string).collect()
+}
+
+/// Answers pane text, one line per screen line (borders included).
 fn answers_text(app: &App) -> Vec<String> {
     let buf = render_to_buffer(app, 160, 40);
-    rect_text(&buf, app.layout.answers_rect.get())
-        .lines()
-        .map(str::to_string)
-        .collect()
+    pane_lines(&buf, app.layout.answers_rect.get())
 }
 
 /// Whether a finding of `kind` sits in the block headed by line

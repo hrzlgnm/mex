@@ -189,11 +189,11 @@ fn home_brings_back_every_leading_block() {
         response: None,
         responders: Vec::new(),
     });
-    // Tall enough for every leading row plus the first record, still far
-    // shorter than the table.
+    // Tall enough for every leading row (the host findings wrap, #410)
+    // plus the first record, still far shorter than the table.
     let pane_with = |app: &App| -> Vec<String> {
         let mut term =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(WIDTH, 32)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(WIDTH, 40)).unwrap();
         term.draw(|f| crate::ui::draw_with_findings(f, app, &found))
             .unwrap();
         rect_text(term.backend().buffer(), app.layout.answers_rect.get())

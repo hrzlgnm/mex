@@ -98,10 +98,19 @@ pub(super) fn draw_records_tab(
     if show_sect {
         widths.insert(3, Constraint::Length(SECT_WIDTH));
     }
-    let (rows, raw_positions) = detail_table_rows(app, &target, &layout, &book, &own, show_sect);
+    // Visible data rows: borders plus the header row are chrome.
+    let viewport = area.height.saturating_sub(3) as usize;
+    // A finding leaves a line for its parent row (#410): pinned to the
+    // top, the parent and the whole cut finding stay in view.
+    let fit = FindingFit::new(area, &widths, viewport.saturating_sub(1));
+    let (rows, raw_positions, heights) =
+        detail_table_rows(app, &target, &layout, &book, &own, show_sect, &fit);
     app.layout()
         .answers_rows
-        .replace(Some(layout.iter().map(|l| l.owning_record()).collect()));
+        .replace(Some(crate::app::DrawnRows::new(
+            layout.iter().map(|l| l.owning_record()).collect(),
+            heights.clone(),
+        )));
     let total_rows = rows.len();
     let mut header = vec!["TYPE", "TTL", "FLUSH", "SOURCE", "RDATA"];
     if show_sect {
@@ -115,10 +124,7 @@ pub(super) fn draw_records_tab(
     };
     let mut title_spans = vec![Span::raw(format!(" {block_title} "))];
     title_spans.extend(title_count_spans(shown));
-    // Visible data rows: borders plus the header row are chrome.
-    app.layout()
-        .record_viewport
-        .set(area.height.saturating_sub(3) as usize);
+    app.layout().record_viewport.set(viewport);
 
     let table = Table::new(rows, widths)
         .header(
@@ -168,6 +174,7 @@ pub(super) fn draw_records_tab(
     // keep the parent visible: oversized expansions pin the parent to
     // the top and show the first viewport-full of children (page the
     // rest with Ctrl-j/k).
+    // Both count lines, so wrapped findings (#410) fit as drawn.
     let mut offset = app.layout().detail_offset.get();
     if !app.view_state().detail_free_scroll {
         if let Some(selected) = selected_table_row {
@@ -177,20 +184,17 @@ pub(super) fn draw_records_tab(
             // host blocks) belong to its extent, so moving back to it
             // brings them into view again (#406).
             let extent_start = if record == 0 { 0 } else { selected };
-            let viewport = area.height.saturating_sub(3) as usize;
             offset = fit_row_extent(
                 offset,
                 extent_start,
                 selected,
                 extent_end,
                 viewport,
-                total_rows,
+                &heights,
             );
         }
     } else {
-        let viewport = area.height.saturating_sub(3) as usize;
-        offset = offset.min(total_rows.saturating_sub(viewport));
-        offset = offset.min(total_rows.saturating_sub(1));
+        offset = offset.min(max_row_offset(viewport, &heights));
     }
     let mut tstate = TableState::default();
     // In free-scroll mode the selection is withheld so ratatui (which
@@ -207,34 +211,61 @@ pub(super) fn draw_records_tab(
     app.layout().detail_offset.set(tstate.offset());
 }
 
-/// Viewport offset that keeps `selected` visible and pulls its extent
-/// `[start, extent_end)` into view: the child rows below it first
+/// Viewport offset (a row) that keeps `selected` visible and pulls its
+/// extent `[start, extent_end)` into view: the child rows below it first
 /// (oversized child extents pin the parent to the top), then the
 /// leading rows from `start` (`start < selected` only for the first
-/// record) as far as they fit. Pure helper, unit-tested in `ui.rs`.
+/// record) as far as they fit. The viewport counts lines and `heights`
+/// holds each row's (wrapped findings span several, #410). Pure helper,
+/// unit-tested in `ui.rs`.
 pub(super) fn fit_row_extent(
     offset: usize,
     start: usize,
     selected: usize,
     extent_end: usize,
     viewport: usize,
-    total: usize,
+    heights: &[u16],
 ) -> usize {
-    if viewport == 0 || total == 0 {
+    if viewport == 0 || heights.is_empty() {
         return 0;
     }
-    let max_offset = total.saturating_sub(viewport);
+    let max_offset = max_row_offset(viewport, heights);
     let mut fitted = offset.min(max_offset).min(selected);
-    if extent_end > fitted + viewport {
-        fitted = extent_end.saturating_sub(viewport).min(selected);
+    let showing_extent = first_row_showing(extent_end, viewport, heights);
+    if lines_between(heights, fitted, extent_end) > viewport {
+        fitted = showing_extent.min(selected);
     }
     if start < selected {
         // Topmost row the viewport can start at while the children
         // and the selected row still fit below it.
-        let lowest = start.max(extent_end.saturating_sub(viewport)).min(selected);
+        let lowest = start.max(showing_extent).min(selected);
         fitted = fitted.min(lowest);
     }
     fitted.min(max_offset)
+}
+
+/// Lines rows `[from, to)` take.
+fn lines_between(heights: &[u16], from: usize, to: usize) -> usize {
+    let to = to.min(heights.len());
+    heights[from.min(to)..to]
+        .iter()
+        .map(|h| usize::from(*h))
+        .sum()
+}
+
+/// Lowest offset whose viewport still shows every row before `end` in
+/// full (`end` itself when even that row alone is too tall).
+fn first_row_showing(end: usize, viewport: usize, heights: &[u16]) -> usize {
+    let mut start = end.min(heights.len());
+    while start > 0 && lines_between(heights, start - 1, end) <= viewport {
+        start -= 1;
+    }
+    start
+}
+
+/// Largest useful offset: past it the table's end leaves blank lines.
+fn max_row_offset(viewport: usize, heights: &[u16]) -> usize {
+    first_row_showing(heights.len(), viewport, heights).min(heights.len().saturating_sub(1))
 }
 
 /// Heat color for the TTL cell, aligned to the RFC 6762 §5.2 requery
@@ -263,9 +294,12 @@ pub(super) fn detail_table_rows<'a>(
     book: &AddressBook,
     own: &HashSet<String>,
     show_sect: bool,
-) -> (Vec<Row<'a>>, Vec<usize>) {
+    fit: &FindingFit,
+) -> (Vec<Row<'a>>, Vec<usize>, Vec<u16>) {
     use crate::app::AnswerLine;
     let mut rows = Vec::new();
+    // Drawn height of each row: findings wrap (#410), the rest is 1.
+    let mut heights = Vec::new();
     // Columns: TYPE, TTL, FLUSH, [SECT,] SOURCE, RDATA.
     let columns: u16 = if show_sect { 6 } else { 5 };
     let source_col = usize::from(columns) - 2;
@@ -333,14 +367,19 @@ pub(super) fn detail_table_rows<'a>(
                 Row::new(vec![Cell::from(label.clone()).column_span(columns)]).style(block_style),
             ),
             AnswerLine::Finding { anomaly, record } => {
-                rows.push(finding_row(
+                let (row, height) = finding_row(
                     anomaly,
                     &identity_count,
                     book,
                     source_col,
                     source_col + 1,
                     record.is_some(),
-                ));
+                    fit,
+                );
+                // Every other row is one line tall.
+                heights.resize(rows.len(), 1);
+                heights.push(height);
+                rows.push(row);
             }
             AnswerLine::TxtPair { pair, last, .. } => {
                 // Children span the full row width so the pair text sits
@@ -413,5 +452,6 @@ pub(super) fn detail_table_rows<'a>(
         }
     }
 
-    (rows, raw_positions)
+    heights.resize(rows.len(), 1);
+    (rows, raw_positions, heights)
 }
