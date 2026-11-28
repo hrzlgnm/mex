@@ -63,7 +63,8 @@ impl App {
         owners
     }
 
-    /// File an out-of-scope record or question as a sighting. A TTL-0
+    /// File an out-of-scope record or question, or an in-scope question
+    /// no row owns (#429), as a sighting. A TTL-0
     /// response record withdraws its sighting instead (it never reaches
     /// the goodbye paths, so no real answer row is marked gone); a
     /// known answer is never a goodbye. Re-filing moves the sighting to

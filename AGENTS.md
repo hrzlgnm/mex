@@ -75,7 +75,8 @@ Headless run (no TTY) logs to stderr.
   and responses with a non-zero RCODE (§18.11) stop at ingest but stay in
   the packet log; non-zero-OPCODE ones are also dropped before the
   analyzer and counted in diagnostics.
-  Out-of-scope records, known answers and questions go to `sightings`
+  Out-of-scope records, known answers and questions, and in-scope
+  questions no row owns (#429), go to `sightings`
   (never rows, never query drivers; capped, expired by TTL/time), with
   owners resolved at analysis time: instance names to their service,
   hostnames once to the host (`anomalies::host_id`), shown in every
