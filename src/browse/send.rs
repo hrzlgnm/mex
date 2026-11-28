@@ -250,6 +250,15 @@ pub(super) fn send_on_all_interfaces(
                         },
                         v6: family == Family::V6,
                         sent_at: now,
+                        known_answers: asked
+                            .iter()
+                            .flat_map(|&i| {
+                                let q = &on_link[i];
+                                known_answers_for_iface(&q.known_answers, link)
+                                    .into_iter()
+                                    .map(|(target, ttl)| (q.name.clone(), target.to_string(), ttl))
+                            })
+                            .collect(),
                     });
                     if failures.record_success(family, link).is_some() {
                         log::info!("mex: {family_label} send on {link} recovered");

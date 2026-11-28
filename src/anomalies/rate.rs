@@ -808,6 +808,114 @@ impl<'a> MulticastIndex<'a> {
     /// its TTL never counts down and its refresh never fires. The finding
     /// takes `rec`'s full identity, so it sits on that Answers row of
     /// `service`, and names what the repeats most likely answered.
+    /// `known-answer-ignored` (#443): RFC 6762 §7.1 says a responder MUST
+    /// NOT answer a query whose Answer section already lists that answer
+    /// with at least half its TTL. A multicast copy of `rec` is such an
+    /// answer when queries asked its name and type (or ANY) on its link in
+    /// the second before, and every one of them listed it: other
+    /// queriers' known answers and our own (`OwnSend::known_answers`)
+    /// alike. A query that didn't list it excuses the copy. Probe answers
+    /// are left out; unicast replies and goodbyes never count as copies.
+    /// The finding takes `rec`'s identity, on its Answers row.
+    pub fn check_known_answers(&self, service: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
+        let Some(copies) = self.sends.get(&send_key(rec)) else {
+            return;
+        };
+        let probed = self.probed_copies(rec, copies);
+        let ignored = copies
+            .iter()
+            .zip(&probed)
+            .filter(|(_, probe)| !**probe)
+            .filter(|((at, packet), _)| self.ignores_known_answers(rec, *at, *packet))
+            .count();
+        if ignored == 0 {
+            return;
+        }
+        let times = if ignored == 1 { "once" } else { "times" };
+        let count = if ignored == 1 {
+            String::new()
+        } else {
+            format!("{ignored} ")
+        };
+        out.push(Anomaly {
+            kind: AnomalyKind::KnownAnswerIgnored,
+            severity: Severity::Warning,
+            service: service.to_string(),
+            record_name: Some(rec.name.clone()),
+            rtype: Some(rec.rtype),
+            rtype_str: Some(rec.rtype_str.clone()),
+            rdata: Some(rec.rdata.clone()),
+            source: Some(rec.source_label()),
+            message: format!(
+                "answered {} {} {count}{times} although the query listed it as a known answer",
+                rec.name, rec.rtype_str
+            ),
+            rfc: "RFC 6762 §7.1",
+            requirement: "MUST NOT",
+            response: None,
+            responders: Vec::new(),
+        });
+    }
+
+    /// Whether the copy of `rec` at `at` (in `packet`) answered only
+    /// queries that already listed it as a known answer (#443).
+    fn ignores_known_answers(&self, rec: &RawRecord, at: Instant, packet: usize) -> bool {
+        let name = name_key(&rec.name);
+        let content = record_content(rec);
+        let asks = |q_name: &str, q_type: u16| {
+            name_key(q_name) == name && (q_type == rec.rtype || q_type == 255)
+        };
+        // Listed with at least half the copy's TTL (u64: twice a TTL
+        // overflows u32).
+        let enough = |ttl: u32| u64::from(ttl) * 2 >= u64::from(rec.ttl);
+        let mut asked = false;
+        // Other queriers, in the second before the copy, on its link.
+        for ev in self.events[..packet]
+            .iter()
+            .rev()
+            .take_while(|ev| at.saturating_duration_since(ev.received_at) <= MIN_GAP)
+            .filter(|ev| ev.source != rec.source && !ev.is_probe())
+        {
+            let on_link = ev.questions.iter().any(|q| {
+                q.iface == rec.iface && q.ifindex == rec.ifindex && asks(&q.name, q.rtype)
+            });
+            if !on_link {
+                continue;
+            }
+            asked = true;
+            let listed = ev.query_kas.iter().any(|ka| {
+                name_key(&ka.name) == name
+                    && ka.rtype == rec.rtype
+                    && record_content(ka) == content
+                    && enough(ka.ttl)
+            });
+            if !listed {
+                return false;
+            }
+        }
+        // Our own sends, which list only PTR known answers.
+        let end = self.own_sends.partition_point(|s| s.sent_at <= at);
+        for sent in self.own_sends[..end]
+            .iter()
+            .rev()
+            .take_while(|s| at - s.sent_at <= MIN_GAP)
+            .filter(|s| s.iface == rec.iface && s.ifindex == rec.ifindex)
+            .filter(|s| s.questions.iter().any(|(n, t)| asks(n, *t)))
+        {
+            asked = true;
+            let listed = rec.rtype == 12
+                && sent.known_answers.iter().any(|(owner, target, ttl)| {
+                    name_key(owner) == name
+                        && name_key(target) == name_key(&rec.rdata)
+                        && enough(*ttl)
+                });
+            if !listed {
+                return false;
+            }
+        }
+        asked
+    }
+
     pub fn check(&self, service: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
         // Sent once (or never): nothing repeats.
         let key = send_key(rec);
