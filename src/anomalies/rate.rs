@@ -340,6 +340,9 @@ pub(super) struct MulticastIndex<'a> {
     /// (#442): its record, which copies answer a probe, and its bursts.
     /// A single copy can't repeat, so it's left out.
     grouped: HashMap<SendKey, Grouped<'a>>,
+    /// Each record with copies that answered only queries already
+    /// listing it (#443), and how many.
+    ignored: Vec<(&'a RawRecord, usize)>,
     /// Device names behind source addresses, for naming a trigger.
     device_names: &'a HashMap<IpAddr, DeviceLabel>,
     /// Each device's display name, by identity: an exact match's name
@@ -439,10 +442,18 @@ impl<'a> MulticastIndex<'a> {
             probes,
             asked,
             grouped: HashMap::new(),
+            ignored: Vec::new(),
             device_display: display_names(device_names),
             device_names,
             device_askers,
         };
+        index.ignored = records
+            .iter()
+            .filter_map(|(key, &rec)| {
+                let n = index.ignored_copies(rec, index.sends.get(key)?);
+                (n > 0).then_some((rec, n))
+            })
+            .collect();
         // Each copy's trigger is found once here, not again for every row
         // that shows the record and for the responder findings.
         let grouped = records
@@ -668,21 +679,7 @@ impl<'a> MulticastIndex<'a> {
             if b.per_query < 2 || b.unexplained.is_some() {
                 continue;
             }
-            let device = self.device_names.get(&rec.source.ip());
-            let owner = match device {
-                Some(d) if hosts.contains(d.id.as_str()) => d.id.clone(),
-                _ => UNATTRIBUTED_SERVICE.to_string(),
-            };
-            let who = device
-                .and_then(|d| {
-                    self.device_display
-                        .get(d.id.as_str())
-                        .map(|n| n.to_string())
-                })
-                .unwrap_or_else(|| rec.source.ip().to_string());
-            // One device by its identity (host id), not its display name:
-            // two devices can share a short name. Unknown ones by address.
-            let identity = device.map_or_else(|| rec.source.ip().to_string(), |d| d.id.clone());
+            let (owner, identity, who) = self.responder(rec, hosts);
             let r = responders.entry((owner, identity)).or_default();
             r.name = who;
             r.sources.insert(rec.source_label());
@@ -724,6 +721,28 @@ impl<'a> MulticastIndex<'a> {
                 responders: Vec::new(),
             });
         }
+    }
+
+    /// The responder behind `rec` for a per-responder finding: the host
+    /// header it goes on (`(unattributed)` when the device heads none of
+    /// `hosts`), its identity, and its display name. One device by its
+    /// identity (host id), not its display name: two devices can share a
+    /// short name. Unknown ones by address.
+    fn responder(&self, rec: &RawRecord, hosts: &HashSet<&str>) -> (String, String, String) {
+        let device = self.device_names.get(&rec.source.ip());
+        let owner = match device {
+            Some(d) if hosts.contains(d.id.as_str()) => d.id.clone(),
+            _ => UNATTRIBUTED_SERVICE.to_string(),
+        };
+        let name = device
+            .and_then(|d| {
+                self.device_display
+                    .get(d.id.as_str())
+                    .map(|n| n.to_string())
+            })
+            .unwrap_or_else(|| rec.source.ip().to_string());
+        let identity = device.map_or_else(|| rec.source.ip().to_string(), |d| d.id.clone());
+        (owner, identity, name)
     }
 
     /// Whether each copy answers a probe (`probed`): copies are in arrival
@@ -810,51 +829,71 @@ impl<'a> MulticastIndex<'a> {
     /// `service`, and names what the repeats most likely answered.
     /// `known-answer-ignored` (#443): RFC 6762 §7.1 says a responder MUST
     /// NOT answer a query whose Answer section already lists that answer
-    /// with at least half its TTL. A multicast copy of `rec` is such an
-    /// answer when queries asked its name and type (or ANY) on its link in
-    /// the second before, and every one of them listed it: other
-    /// queriers' known answers and our own (`OwnSend::known_answers`)
-    /// alike. A query that didn't list it excuses the copy. Probe answers
-    /// are left out; unicast replies and goodbyes never count as copies.
-    /// The finding takes `rec`'s identity, on its Answers row.
-    pub fn check_known_answers(&self, service: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
-        let Some(copies) = self.sends.get(&send_key(rec)) else {
-            return;
-        };
+    /// with at least half its TTL. A multicast copy is such an answer when
+    /// queries asked its name and type (or ANY) on its link in the second
+    /// before, and every one of them listed it: other queriers' known
+    /// answers and our own (`OwnSend::known_answers`) alike. A query that
+    /// didn't list it excuses the copy. Probe answers are left out;
+    /// unicast replies and goodbyes never count as copies. Like the burst
+    /// findings (#442), each responder gets one finding, on its host header
+    /// (or `(unattributed)` when it heads no host in `hosts`), not one per
+    /// record row: a responder that ignores known answers does so for all.
+    pub fn check_known_answers(&self, hosts: &HashSet<&str>, out: &mut Vec<Anomaly>) {
+        #[derive(Default)]
+        struct Responder {
+            name: String,
+            sources: BTreeSet<String>,
+            copies: usize,
+            rows: usize,
+        }
+        let mut responders: BTreeMap<(String, String), Responder> = BTreeMap::new();
+        for &(rec, copies) in &self.ignored {
+            let (owner, identity, name) = self.responder(rec, hosts);
+            let r = responders.entry((owner, identity)).or_default();
+            r.name = name;
+            r.sources.insert(rec.source_label());
+            r.copies += copies;
+            r.rows += 1;
+        }
+        for ((owner, _), r) in responders {
+            let sources: Vec<&str> = r.sources.iter().map(String::as_str).collect();
+            let times = if r.copies == 1 { "answer" } else { "answers" };
+            let rows = if r.rows == 1 { "record" } else { "records" };
+            out.push(Anomaly {
+                kind: AnomalyKind::KnownAnswerIgnored,
+                severity: Severity::Warning,
+                service: owner,
+                record_name: None,
+                rtype: None,
+                rtype_str: None,
+                rdata: None,
+                source: Some(sources.join(", ")),
+                message: format!(
+                    "{} ({}) answers queries that already list the answer as known \
+                     ({} {times}, {} {rows})",
+                    r.name,
+                    sources.join(", "),
+                    r.copies,
+                    r.rows
+                ),
+                rfc: "RFC 6762 §7.1",
+                requirement: "MUST NOT",
+                response: None,
+                responders: Vec::new(),
+            });
+        }
+    }
+
+    /// How many of `rec`'s multicast copies answered only queries that
+    /// already listed it (#443); probe answers aside.
+    fn ignored_copies(&self, rec: &RawRecord, copies: &[(Instant, usize)]) -> usize {
         let probed = self.probed_copies(rec, copies);
-        let ignored = copies
+        copies
             .iter()
             .zip(&probed)
             .filter(|(_, probe)| !**probe)
             .filter(|((at, packet), _)| self.ignores_known_answers(rec, *at, *packet))
-            .count();
-        if ignored == 0 {
-            return;
-        }
-        let times = if ignored == 1 { "once" } else { "times" };
-        let count = if ignored == 1 {
-            String::new()
-        } else {
-            format!("{ignored} ")
-        };
-        out.push(Anomaly {
-            kind: AnomalyKind::KnownAnswerIgnored,
-            severity: Severity::Warning,
-            service: service.to_string(),
-            record_name: Some(rec.name.clone()),
-            rtype: Some(rec.rtype),
-            rtype_str: Some(rec.rtype_str.clone()),
-            rdata: Some(rec.rdata.clone()),
-            source: Some(rec.source_label()),
-            message: format!(
-                "answered {} {} {count}{times} although the query listed it as a known answer",
-                rec.name, rec.rtype_str
-            ),
-            rfc: "RFC 6762 §7.1",
-            requirement: "MUST NOT",
-            response: None,
-            responders: Vec::new(),
-        });
+            .count()
     }
 
     /// Whether the copy of `rec` at `at` (in `packet`) answered only

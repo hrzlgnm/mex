@@ -543,6 +543,8 @@ pub fn analyze_observations(
         .map(|v| v.host.as_str())
         .collect();
     multicasts.check_bursts(&hosts, &mut out);
+    // Likewise responders that answer what the query already listed (#443).
+    multicasts.check_known_answers(&hosts, &mut out);
 
     for svc in &snap.services {
         let service_id = service_id(svc.instance, svc.service_type);
@@ -557,7 +559,6 @@ pub fn analyze_observations(
             }
             check_record(&service_id, rec, &mut out);
             multicasts.check(&service_id, rec, &mut out);
-            multicasts.check_known_answers(&service_id, rec, &mut out);
         }
         check_ttl_stable(svc, &service_id, now, &mut out);
     }
@@ -566,7 +567,6 @@ pub fn analyze_observations(
         if is_live(rec, now) {
             check_record(service, rec, &mut out);
             multicasts.check(service, rec, &mut out);
-            multicasts.check_known_answers(service, rec, &mut out);
         }
     }
 
@@ -576,7 +576,6 @@ pub fn analyze_observations(
         }
         check_record(ENUMERATION_SERVICE, rec, &mut out);
         multicasts.check(ENUMERATION_SERVICE, rec, &mut out);
-        multicasts.check_known_answers(ENUMERATION_SERVICE, rec, &mut out);
         // Enumeration PTR targets name service types (or subtypes): a
         // malformed target means the name itself violates DNS-SD naming,
         // so flag the PTR row itself (with full record identity, so the

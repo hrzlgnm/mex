@@ -1753,7 +1753,7 @@ fn known(a: &RawRecord, ttl: u32) -> RawRecord {
 }
 
 #[test]
-fn an_answer_the_query_listed_is_flagged() {
+fn an_answer_the_query_listed_is_flagged_once_on_the_responder_s_host() {
     let at = base();
     let a = host_a(responder(), "eth0");
     let events = vec![
@@ -1762,21 +1762,77 @@ fn an_answer_the_query_listed_is_flagged() {
         asking_with(at, 2000, vec![known(&a, 100)]),
         response_at(at, 2020, vec![a.clone()]),
     ];
-    let found = analyze_answers(&[cached(&a)], &events);
+    let found = analyze_full(
+        &[cached(&a)],
+        &events,
+        &[],
+        repeater_device(),
+        &["repeater"],
+    );
     let flagged = known_answer_findings(&found);
     assert_eq!(flagged.len(), 1, "{found:#?}");
     let f = flagged[0];
     assert_eq!(f.severity, Severity::Warning);
     assert_eq!((f.rfc, f.requirement), ("RFC 6762 §7.1", "MUST NOT"));
-    assert_eq!(f.record_name.as_deref(), Some(HOST));
+    assert_eq!(f.service, "repeater", "on the host header");
+    assert_eq!(f.record_name, None, "no record row");
     assert_eq!(f.source.as_deref(), Some("192.168.1.109:5353@eth0"));
     assert_eq!(
         f.message,
-        format!("answered {HOST} A 2 times although the query listed it as a known answer")
+        "Repeater.local (192.168.1.109:5353@eth0) answers queries that already list the \
+         answer as known (2 answers, 1 record)"
     );
     assert_eq!(
         AnomalyKind::KnownAnswerIgnored.as_str(),
         "known-answer-ignored"
+    );
+}
+
+#[test]
+fn a_responder_ignoring_known_answers_for_several_records_gets_one_finding() {
+    // #443 like #442: one finding per responder, however many rows.
+    let at = base();
+    let a = host_a(responder(), "eth0");
+    let mut aaaa = a.clone();
+    aaaa.rtype = 28;
+    aaaa.rtype_str = "AAAA".to_string();
+    aaaa.rdata = "fe80::1".to_string();
+    let mut ev = asking_with(at, 0, vec![known(&a, 120), known(&aaaa, 120)]);
+    ev.questions
+        .push(question(HOST, 28, "AAAA", querier(), "eth0"));
+    let events = vec![ev, response_at(at, 20, vec![a.clone(), aaaa.clone()])];
+    let found = analyze_full(
+        &[cached(&a), cached(&aaaa)],
+        &events,
+        &[],
+        repeater_device(),
+        &["repeater"],
+    );
+    let flagged = known_answer_findings(&found);
+    assert_eq!(flagged.len(), 1, "{found:#?}");
+    assert!(
+        flagged[0].message.ends_with("(2 answers, 2 records)"),
+        "{}",
+        flagged[0].message
+    );
+}
+
+#[test]
+fn a_responder_heading_no_host_is_flagged_unattributed() {
+    let at = base();
+    let a = host_a(responder(), "eth0");
+    let events = vec![
+        asking_with(at, 0, vec![known(&a, 120)]),
+        response_at(at, 20, vec![a.clone()]),
+    ];
+    let found = analyze_answers(&[cached(&a)], &events);
+    let flagged = known_answer_findings(&found);
+    assert_eq!(flagged.len(), 1, "{found:#?}");
+    assert_eq!(flagged[0].service, UNATTRIBUTED_SERVICE);
+    assert_eq!(
+        flagged[0].message,
+        "192.168.1.109 (192.168.1.109:5353@eth0) answers queries that already list the \
+         answer as known (1 answer, 1 record)"
     );
 }
 

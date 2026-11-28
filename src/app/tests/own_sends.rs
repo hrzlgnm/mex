@@ -158,7 +158,7 @@ fn own_sends_are_capped() {
 }
 
 #[test]
-fn a_responder_answering_our_known_answer_is_flagged_on_its_row() {
+fn a_responder_answering_our_known_answer_is_flagged() {
     // #443 end to end: our PTR query listed the instance; the responder
     // multicasts that PTR anyway.
     let mut app = App::new().unwrap();
@@ -183,7 +183,7 @@ fn a_responder_answering_our_known_answer_is_flagged_on_its_row() {
         .filter(|a| a.kind == anomalies::AnomalyKind::KnownAnswerIgnored)
         .collect();
     assert_eq!(found.len(), 1, "{found:#?}");
-    assert_eq!(found[0].record_name.as_deref(), Some("_http._tcp.local."));
+    assert_eq!(found[0].record_name, None, "per responder, not per row");
     assert!(app
         .state_dump()
         .anomalies
