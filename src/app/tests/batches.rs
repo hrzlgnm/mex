@@ -108,6 +108,7 @@ fn a_question_queued_twice_in_one_tick_goes_in_once() {
         record_type: TYPE::PTR,
         known_answers: kas,
         qu,
+        links: Vec::new(),
     };
     app.queue_question(ptr(
         "_http._tcp.local",

@@ -5,7 +5,7 @@ use denials::AddressDenials;
 pub use layout::{DrawnRows, Layout};
 use schedule::Scheduler;
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;

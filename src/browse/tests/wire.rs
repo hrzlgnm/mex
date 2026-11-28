@@ -731,6 +731,7 @@ fn response_code_is_kept_for_responses_not_queries() {
             record_type: TYPE::A,
             known_answers: Vec::new(),
             qu: false,
+            links: Vec::new(),
         },
         "br0",
     )

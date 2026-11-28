@@ -642,7 +642,17 @@ impl App {
         let fresh = rec.ttl > 0 && elapsed < rec.ttl && !in_refresh_window(elapsed, rec.ttl);
         if fresh && is_unique_answer(rec) {
             let ckey = Scheduler::continuous_key(rec.name.trim_end_matches('.'), rec.rtype);
-            self.scheduler.dampen(&ckey);
+            // Per link (#441): the answer covers the link it came in on;
+            // the stream is dampened once every usable link is covered,
+            // or at once when the answer's link is unknown.
+            let Some(link) = self.answer_link(rec) else {
+                self.scheduler.dampen(&ckey);
+                return;
+            };
+            let usable = self.query_links();
+            if self.scheduler.cover(&ckey, link, &usable) {
+                self.scheduler.dampen(&ckey);
+            }
         }
     }
 

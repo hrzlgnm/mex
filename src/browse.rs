@@ -312,6 +312,10 @@ pub struct QueryRequest {
     /// startup batch (RFC 6762 §5.4); retransmissions and later questions
     /// are QM.
     pub qu: bool,
+    /// The links (interface names) the question goes out on, empty for
+    /// every usable link (#441): a question already answered with a unique
+    /// record on one link is asked only where it still isn't.
+    pub links: Vec<String>,
 }
 
 /// One query copy mex sent (#431), reported by the listener when the
