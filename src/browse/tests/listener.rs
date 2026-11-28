@@ -584,3 +584,14 @@ fn the_send_budget_counts_packets_not_batches() {
     assert_eq!(drain_queries(&rx, 3, |n| *n), (4, QueueState::More));
     assert_eq!(drain_queries(&rx, 3, |n| *n), (2, QueueState::Empty));
 }
+
+#[test]
+fn a_batch_that_sends_nothing_still_counts_against_the_budget() {
+    // Every pin or send failing reports no packets: the pass must still
+    // stop at the budget instead of draining the whole queue.
+    let (tx, rx) = mpsc::channel();
+    for _ in 0..5 {
+        tx.send(()).unwrap();
+    }
+    assert_eq!(drain_queries(&rx, 3, |_| 0), (3, QueueState::More));
+}
