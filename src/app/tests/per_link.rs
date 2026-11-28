@@ -250,3 +250,85 @@ fn an_interface_selection_limits_the_links_to_cover() {
     ingest(&mut app, &srv_on("eth0", 2));
     assert_eq!(interval(&app, 33), MAX_CONTINUOUS_INTERVAL);
 }
+
+/// A remote query for the instance's SRV, overheard on `iface`.
+fn overhear_srv(app: &mut App, iface: &str, ifindex: u32) {
+    let mut ev = query_event(
+        "Test._http._tcp.local.",
+        33,
+        "SRV",
+        false,
+        Vec::new(),
+        remote_source(),
+    );
+    ev.questions[0].iface = iface.to_string();
+    ev.questions[0].ifindex = ifindex;
+    app.ingest_event(&ev);
+}
+
+#[test]
+fn a_query_overheard_on_a_covered_link_leaves_ours_in_place() {
+    // eth0 answered, so we ask wlan0 alone; a query overheard on eth0
+    // can't stand in for ours on wlan0, and isn't used up.
+    let (mut app, rx) = two_link_app();
+    ingest(&mut app, &srv_on("eth0", 2));
+    overhear_srv(&mut app, "eth0", 2);
+    rx.try_iter().count();
+    let suppressed = app.diagnostics.suppressed_continuous;
+    all_due(&mut app);
+    app.send_queries();
+    assert_eq!(links_of(&rx, 33), Some(vec!["wlan0".to_string()]));
+    assert_eq!(app.diagnostics.suppressed_continuous, suppressed);
+    assert!(app
+        .scheduler
+        .overheard()
+        .contains_key(&(INSTANCE.to_string(), 33)));
+}
+
+#[test]
+fn an_answer_on_an_unknown_link_still_lets_a_new_link_restart_the_stream() {
+    // Its link unknown, the answer dampens at once and covers the links
+    // usable then; a link appearing later is uncovered and asked.
+    let mut app = App::new().unwrap();
+    pin_links(&mut app, &["eth0"]);
+    let rx = capture(&mut app);
+    ingest(&mut app, &ptr_record(4500));
+    app.send_queries();
+    ingest(&mut app, &srv_on("", 0));
+    assert_eq!(interval(&app, 33), MAX_CONTINUOUS_INTERVAL);
+    pin_links(&mut app, &["eth0", "wlan0"]);
+    app.send_queries();
+    assert_eq!(interval(&app, 33), Duration::from_secs(1));
+    rx.try_iter().count();
+    all_due(&mut app);
+    app.send_queries();
+    assert_eq!(links_of(&rx, 33), Some(vec!["wlan0".to_string()]));
+}
+
+#[test]
+fn a_refresh_overheard_on_one_link_still_goes_out_on_the_others() {
+    // §7.3 per link for the cache refresh too: the query overheard on
+    // eth0 stands in there; wlan0 gets its refresh, which counts as sent.
+    let mut app = App::new().unwrap();
+    pin_links(&mut app, &["eth0", "wlan0"]);
+    let rx = capture(&mut app);
+    ingest(&mut app, &ptr_record(4500));
+    ingest(&mut app, &srv_record(120));
+    for svc in &mut app.services {
+        for rec in &mut svc.answers {
+            if rec.rtype == 33 {
+                rec.received_at = Instant::now() - Duration::from_secs(100);
+            }
+        }
+    }
+    overhear_srv(&mut app, "eth0", 2);
+    let (sent, suppressed) = (
+        app.diagnostics.q_sent_refresh,
+        app.diagnostics.suppressed_refresh,
+    );
+    app.requery_expiring();
+    app.flush_outbox();
+    assert_eq!(links_of(&rx, 33), Some(vec!["wlan0".to_string()]));
+    assert_eq!(app.diagnostics.q_sent_refresh, sent + 1);
+    assert_eq!(app.diagnostics.suppressed_refresh, suppressed);
+}

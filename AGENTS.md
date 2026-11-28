@@ -164,9 +164,11 @@ Headless run (no TTY) logs to stderr.
   (`Scheduler::covered`, by interface name, or the IPv6 index when the name
   is unresolved), the stream then asks only the other usable links
   (`QueryRequest::links`), and drops to hourly once every usable link is
-  covered (or at once for an answer whose link is unknown). A link that
-  appears later restarts a dampened stream with the startup schedule, and a
-  §7.3 overheard query stands in for ours only on its own link. One usable
+  covered (or at once for an answer whose link is unknown, which covers
+  every link usable then). A link that appears later restarts a dampened
+  stream with the startup schedule. A §7.3 overheard query stands in for
+  ours, continuous or refresh, only on its own link, and for nothing when
+  that's a link we don't ask (`App::overheard_scope`). One usable
   link behaves as before: the stream dampens to hourly,
   also when cached before the interest appeared (e.g. A/AAAA additionals);
   the 80%-TTL refresh takes over.

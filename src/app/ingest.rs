@@ -645,11 +645,17 @@ impl App {
             // Per link (#441): the answer covers the link it came in on;
             // the stream is dampened once every usable link is covered,
             // or at once when the answer's link is unknown.
+            let usable = self.query_links();
             let Some(link) = self.answer_link(rec) else {
+                // An unknown link covers every link usable now (dampening
+                // at once, as before), so a link appearing later is still
+                // noticed and asked.
+                for link in &usable {
+                    self.scheduler.cover(&ckey, link.clone(), &usable);
+                }
                 self.scheduler.dampen(&ckey);
                 return;
             };
-            let usable = self.query_links();
             if self.scheduler.cover(&ckey, link, &usable) {
                 self.scheduler.dampen(&ckey);
             }

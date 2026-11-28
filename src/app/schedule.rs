@@ -669,12 +669,9 @@ impl App {
         } else {
             Vec::new()
         };
-        if self.scheduler.suppressed_by_overheard(key, &ka) {
-            log::debug!("mex: suppressed refresh query for {} (overheard)", key.0);
-            self.diagnostics.suppressed_refresh += 1;
-            self.diagnostics.suppressed_times.push_back(now);
-            self.note_query(&key.0, key.1, OwnQuery::Suppressed, now);
-        } else {
+        // §7.3 per link (#441): overheard on one of several links, the
+        // refresh still goes out on the others.
+        if let Some(links) = self.overheard_scope(key, &ka, &[]) {
             self.diagnostics.q_sent_refresh += 1;
             self.diagnostics.ka_sent += ka.len() as u64;
             self.queue_question(browse::QueryRequest {
@@ -682,8 +679,13 @@ impl App {
                 record_type: rt,
                 known_answers: ka,
                 qu: false,
-                links: Vec::new(),
+                links,
             });
+        } else {
+            log::debug!("mex: suppressed refresh query for {} (overheard)", key.0);
+            self.diagnostics.suppressed_refresh += 1;
+            self.diagnostics.suppressed_times.push_back(now);
+            self.note_query(&key.0, key.1, OwnQuery::Suppressed, now);
         }
         self.route_own_question(&key.0, key.1, false);
         // A refresh query also elicits new answers, so postpone the
@@ -1127,7 +1129,12 @@ impl App {
                     // demand: file its self row now so the Questions pane
                     // shows it pending (LAST "—", DUE the refresh) instead
                     // of hiding it until the first refresh fires.
-                    let (unknown_link, cover) = self.fresh_unique_cover(&key);
+                    let (unknown_link, mut cover) = self.fresh_unique_cover(&key);
+                    // An answer on an unknown link covers every link usable
+                    // now, so a link appearing later is still noticed.
+                    if unknown_link {
+                        cover.extend(usable.iter().cloned());
+                    }
                     let all_covered = unknown_link
                         || (!cover.is_empty() && (usable.is_empty() || usable.is_subset(&cover)));
                     if !cover.is_empty() {
@@ -1187,36 +1194,22 @@ impl App {
             // question with no KA we wouldn't send — treat ours as sent.
             // QU elicits unicast and is never suppressed. Overheard on one
             // of several links we'd ask, it stands in for ours there only.
-            let overheard_on = self.scheduler.overheard_link(&key);
-            if !qu && self.scheduler.suppressed_by_overheard(&key, &ka) {
-                let asked: Vec<String> = if links.is_empty() {
-                    usable.iter().cloned().collect()
-                } else {
-                    links.clone()
-                };
-                let rest: Vec<String> = match &overheard_on {
-                    Some(on) if asked.len() > 1 && asked.contains(on) => {
-                        asked.into_iter().filter(|l| l != on).collect()
-                    }
-                    _ => Vec::new(),
-                };
-                if rest.is_empty() {
-                    log::debug!("mex: suppressed continuous query for {} (overheard)", key.0);
-                    let now = Instant::now();
-                    self.diagnostics.suppressed_continuous += 1;
-                    self.diagnostics.suppressed_times.push_back(now);
-                    self.note_query(&key.0, key.1, OwnQuery::Suppressed, now);
-                    self.route_own_question(&key.0, key.1, false);
-                    self.scheduler.advance_continuous(&key, now);
-                    continue;
-                }
-                log::debug!(
-                    "mex: continuous query for {} overheard on {}; asking the other links",
-                    key.0,
-                    overheard_on.as_deref().unwrap_or_default()
-                );
-                links = rest;
-            }
+            let scope = if qu {
+                Some(links.clone())
+            } else {
+                self.overheard_scope(&key, &ka, &links)
+            };
+            let Some(scope) = scope else {
+                log::debug!("mex: suppressed continuous query for {} (overheard)", key.0);
+                let now = Instant::now();
+                self.diagnostics.suppressed_continuous += 1;
+                self.diagnostics.suppressed_times.push_back(now);
+                self.note_query(&key.0, key.1, OwnQuery::Suppressed, now);
+                self.route_own_question(&key.0, key.1, false);
+                self.scheduler.advance_continuous(&key, now);
+                continue;
+            };
+            links = scope;
             if qu {
                 self.scheduler.startup_qu_sent = true;
                 // Keep the flag for the passive-mode test; per-name QU above
@@ -1325,6 +1318,43 @@ impl App {
             return;
         }
         self.scheduler.note_overheard(q, &ev.query_kas);
+    }
+
+    /// Where our query for `key` still goes after RFC 6762 §7.3 (#441):
+    /// `links` are the links we'd ask (empty for every usable link). An
+    /// overheard copy stands in for ours only on the link it came in on.
+    /// On a link we don't ask it stands in for nothing: `links` unchanged,
+    /// and the overheard entry is kept. On one of several links we ask,
+    /// the others remain. On the only link we ask, or on an unknown link,
+    /// it stands in everywhere: `None`, as before per-link suppression.
+    pub(super) fn overheard_scope(
+        &mut self,
+        key: &(String, u16),
+        ka: &[browse::KnownAnswer],
+        links: &[String],
+    ) -> Option<Vec<String>> {
+        let asked: Vec<String> = if links.is_empty() {
+            self.query_links().into_iter().collect()
+        } else {
+            links.to_vec()
+        };
+        let on = self.scheduler.overheard_link(key);
+        if on.as_ref().is_some_and(|on| !asked.contains(on)) {
+            return Some(links.to_vec());
+        }
+        if !self.scheduler.suppressed_by_overheard(key, ka) {
+            return Some(links.to_vec());
+        }
+        match on {
+            Some(on) if asked.len() > 1 => {
+                log::debug!(
+                    "mex: query for {} overheard on {on}; asking the other links",
+                    key.0
+                );
+                Some(asked.into_iter().filter(|l| *l != on).collect())
+            }
+            _ => None,
+        }
     }
 
     /// The usable links queries go out on: interface names of both
