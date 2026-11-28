@@ -447,17 +447,11 @@ impl<'a> MulticastIndex<'a> {
             device_names,
             device_askers,
         };
-        index.ignored = records
-            .iter()
-            .filter_map(|(key, &rec)| {
-                let n = index.ignored_copies(rec, index.sends.get(key)?);
-                (n > 0).then_some((rec, n))
-            })
-            .collect();
         // Each copy's trigger is found once here, not again for every row
         // that shows the record and for the responder findings.
         let grouped = records
-            .into_iter()
+            .iter()
+            .map(|(key, &rec)| (key.clone(), rec))
             .filter_map(|(key, rec)| {
                 let copies = index.sends.get(&key)?;
                 if copies.len() < 2 {
@@ -476,6 +470,20 @@ impl<'a> MulticastIndex<'a> {
             })
             .collect();
         index.grouped = grouped;
+        // Records answering queries that already listed them (#443): a
+        // grouped record's probe marks are reused, a single copy's found.
+        index.ignored = records
+            .iter()
+            .filter_map(|(key, &rec)| {
+                let copies = index.sends.get(key)?;
+                let probed = match index.grouped.get(key) {
+                    Some(g) => std::borrow::Cow::Borrowed(&g.probed[..]),
+                    None => std::borrow::Cow::Owned(index.probed_copies(rec, copies)),
+                };
+                let n = index.ignored_copies(rec, copies, &probed);
+                (n > 0).then_some((rec, n))
+            })
+            .collect();
         index
     }
 
@@ -886,11 +894,15 @@ impl<'a> MulticastIndex<'a> {
 
     /// How many of `rec`'s multicast copies answered only queries that
     /// already listed it (#443); probe answers aside.
-    fn ignored_copies(&self, rec: &RawRecord, copies: &[(Instant, usize)]) -> usize {
-        let probed = self.probed_copies(rec, copies);
+    fn ignored_copies(
+        &self,
+        rec: &RawRecord,
+        copies: &[(Instant, usize)],
+        probed: &[bool],
+    ) -> usize {
         copies
             .iter()
-            .zip(&probed)
+            .zip(probed)
             .filter(|(_, probe)| !**probe)
             .filter(|((at, packet), _)| self.ignores_known_answers(rec, *at, *packet))
             .count()
@@ -910,28 +922,40 @@ impl<'a> MulticastIndex<'a> {
         let mut asked = false;
         // Queries in the second before the copy, on its link, the
         // responder's own included: its stack asks from the same address,
-        // and those queries are answered too.
-        for ev in self.events[..packet]
-            .iter()
-            .rev()
-            .take_while(|ev| at.saturating_duration_since(ev.received_at) <= MIN_GAP)
-            .filter(|ev| !ev.is_probe())
+        // and those queries are answered too. Found through the `asked`
+        // index, as the trigger lookup does, not by walking the retained
+        // packets; one packet asking the name twice is judged once.
+        if let Some(list) = self
+            .asked
+            .get(&(name.clone(), rec.iface.clone(), rec.ifindex))
         {
-            let on_link = ev.questions.iter().any(|q| {
-                q.iface == rec.iface && q.ifindex == rec.ifindex && asks(&q.name, q.rtype)
-            });
-            if !on_link {
-                continue;
-            }
-            asked = true;
-            let listed = ev.query_kas.iter().any(|ka| {
-                name_key(&ka.name) == name
-                    && ka.rtype == rec.rtype
-                    && record_content(ka) == content
-                    && enough(ka.ttl)
-            });
-            if !listed {
-                return false;
+            let end = list.partition_point(|q| q.packet < packet);
+            let mut last = None;
+            for q in list[..end]
+                .iter()
+                .rev()
+                .take_while(|q| at.saturating_duration_since(q.at) <= MIN_GAP)
+            {
+                if last.replace(q.packet) == Some(q.packet) {
+                    continue;
+                }
+                let ev = &self.events[q.packet];
+                let on_link = ev.questions.iter().any(|q| {
+                    q.iface == rec.iface && q.ifindex == rec.ifindex && asks(&q.name, q.rtype)
+                });
+                if !on_link {
+                    continue;
+                }
+                asked = true;
+                let listed = ev.query_kas.iter().any(|ka| {
+                    name_key(&ka.name) == name
+                        && ka.rtype == rec.rtype
+                        && record_content(ka) == content
+                        && enough(ka.ttl)
+                });
+                if !listed {
+                    return false;
+                }
             }
         }
         // Our own sends, which list only PTR known answers.
