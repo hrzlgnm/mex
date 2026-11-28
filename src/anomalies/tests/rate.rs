@@ -1948,3 +1948,39 @@ fn probe_answers_unicast_replies_and_goodbyes_stay_quiet() {
     ];
     assert!(known_answer_findings(&analyze_answers(&[cached(&a)], &events)).is_empty());
 }
+
+/// A query for HOST A on eth0 at `ms` from `from`, listing `kas`.
+fn asking_from(at: Instant, ms: u64, from: SocketAddr, kas: Vec<RawRecord>) -> Event {
+    let mut ev = query_at(at, ms, vec![question(HOST, 1, "A", from, "eth0")]);
+    ev.query_kas = kas;
+    ev
+}
+
+#[test]
+fn the_responder_s_own_query_without_the_known_answer_excuses_the_copy() {
+    // Its stack asks from the same address; that query didn't know it.
+    let at = base();
+    let a = host_a(responder(), "eth0");
+    let events = vec![
+        asking_with(at, 0, vec![known(&a, 120)]),
+        asking_from(at, 5, responder(), Vec::new()),
+        response_at(at, 20, vec![a.clone()]),
+    ];
+    assert!(known_answer_findings(&analyze_answers(&[cached(&a)], &events)).is_empty());
+}
+
+#[test]
+fn the_responder_s_own_query_listing_the_answer_counts() {
+    let at = base();
+    let a = host_a(responder(), "eth0");
+    let mut ka = known(&a, 120);
+    ka.source = responder();
+    let events = vec![
+        asking_from(at, 0, responder(), vec![ka]),
+        response_at(at, 20, vec![a.clone()]),
+    ];
+    assert_eq!(
+        known_answer_findings(&analyze_answers(&[cached(&a)], &events)).len(),
+        1
+    );
+}

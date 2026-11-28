@@ -908,12 +908,14 @@ impl<'a> MulticastIndex<'a> {
         // overflows u32).
         let enough = |ttl: u32| u64::from(ttl) * 2 >= u64::from(rec.ttl);
         let mut asked = false;
-        // Other queriers, in the second before the copy, on its link.
+        // Queries in the second before the copy, on its link, the
+        // responder's own included: its stack asks from the same address,
+        // and those queries are answered too.
         for ev in self.events[..packet]
             .iter()
             .rev()
             .take_while(|ev| at.saturating_duration_since(ev.received_at) <= MIN_GAP)
-            .filter(|ev| ev.source != rec.source && !ev.is_probe())
+            .filter(|ev| !ev.is_probe())
         {
             let on_link = ev.questions.iter().any(|q| {
                 q.iface == rec.iface && q.ifindex == rec.ifindex && asks(&q.name, q.rtype)
