@@ -38,6 +38,7 @@ mod service_identity;
 mod srv_target;
 mod state_dump;
 mod transmit_state;
+mod unique_types;
 mod view;
 
 fn test_source() -> SocketAddr {
@@ -123,6 +124,13 @@ fn make_refresh_due(app: &mut App, name: &str, rtype: u16) {
             state.next_due = Instant::now() - Duration::from_millis(1);
         }
     }
+}
+
+/// Route the app's queries to a channel the test reads (#430).
+fn capture(app: &mut App) -> mpsc::Receiver<browse::QueryBatch> {
+    let (query_tx, rx) = browse::QueryTx::capturing();
+    app.query_tx = query_tx;
+    rx
 }
 
 fn ingest_packet(app: &mut App, event: browse::Event) {
