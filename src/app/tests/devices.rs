@@ -335,20 +335,25 @@ fn rate_finding_names_the_querier_device() {
     );
     srv.flush_bit = true;
     srv.dst_is_multicast = true;
-    for _ in 0..3 {
-        ingest_packet(
-            &mut app,
-            query_event(
-                "Fritzel._fbox._tcp.local.",
-                33,
-                "SRV",
-                false,
-                Vec::new(),
-                REPEATER.parse().unwrap(),
-            ),
+    // Three rounds 300 ms apart: each query answered once, the answers
+    // closer than a second (a burst of one round would go to the
+    // responder's host finding instead, #442).
+    let base = Instant::now() - Duration::from_secs(2);
+    for round in 0..3u32 {
+        let asked = base + Duration::from_millis(300) * round;
+        let mut query = query_event(
+            "Fritzel._fbox._tcp.local.",
+            33,
+            "SRV",
+            false,
+            Vec::new(),
+            REPEATER.parse().unwrap(),
         );
+        query.received_at = asked;
+        ingest_packet(&mut app, query);
         let mut response = event_for(&srv);
         response.source = srv.source;
+        response.received_at = asked + Duration::from_millis(5);
         ingest_packet(&mut app, response);
     }
     let flood = findings_of(&app, anomalies::AnomalyKind::MulticastRateLimit);
