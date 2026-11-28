@@ -879,6 +879,13 @@ pub struct App {
     /// The questions this tick asks (#430), sent as one batch when the
     /// tick's schedules have run (`flush_outbox`).
     outbox: browse::QueryBatch,
+    /// Whether the last analysis filed a finding under
+    /// `anomalies::UNATTRIBUTED_SERVICE`, so `has_unattributed` (cheap,
+    /// no analyzer run) shows the `(unattributed)` entry for findings
+    /// with no sighting behind them too, such as a bursting responder
+    /// that heads no host (#442). Set by `anomalies()`, which every draw
+    /// runs.
+    unattributed_findings: Cell<bool>,
     /// Query scheduling state (RFC 6762 §5.2/§5.4/§7.1/§7.3); see
     /// [`Scheduler`].
     scheduler: Scheduler,
@@ -1248,6 +1255,7 @@ impl App {
             own_sends: Vec::new(),
             query_tx,
             outbox: Vec::new(),
+            unattributed_findings: Cell::new(false),
             last_ip_refresh: Instant::now(),
             collapsed_hosts: HashSet::new(),
             expanded_txt: HashSet::new(),
