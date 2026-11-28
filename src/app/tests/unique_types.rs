@@ -117,3 +117,22 @@ fn a_dampened_question_comes_back_only_through_the_refresh() {
     app.send_queries();
     assert!(asked(&rx).contains(&srv_key));
 }
+
+#[test]
+fn a_txt_that_expired_while_pending_does_not_dampen_on_promotion() {
+    // A TTL-1 TXT that waited past its TTL for the SRV is no answer any
+    // more: dampening on promotion would leave the question unasked for
+    // an hour, since the refresh skips an expired row.
+    let mut app = pending_app();
+    let mut txt = txt_record("a=1");
+    txt.flush_bit = false;
+    txt.ttl = 1;
+    txt.received_at = Instant::now() - Duration::from_secs(5);
+    ingest(&mut app, &txt);
+    let mut srv = srv_record(120);
+    srv.flush_bit = false;
+    ingest(&mut app, &srv); // promotes the pending instance
+    assert!(!app.services.is_empty(), "promoted");
+    assert!(stream_interval(&app, INSTANCE, 16) < MAX_CONTINUOUS_INTERVAL);
+    assert_eq!(stream_interval(&app, INSTANCE, 33), MAX_CONTINUOUS_INTERVAL);
+}

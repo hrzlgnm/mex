@@ -626,18 +626,21 @@ impl App {
         self.pending_instances[pi].answers.push(rec.clone());
         // The pending instance already drives the TXT stream: a TXT
         // arriving before its SRV answers it too (#438).
-        if rec.ttl > 0 {
-            self.dampen_if_unique(rec);
-        }
+        self.dampen_if_unique(rec);
     }
 
     /// RFC 6762 §5.2: a unique answer (`is_unique_answer`: cache-flush
     /// bit, or a type unique by definition) means no other answers are
     /// forthcoming, so dampen its question's exponential discovery stream
-    /// and let the 80%-TTL refresh take over. Callers pass live answers
-    /// only: a goodbye never dampens.
+    /// and let the 80%-TTL refresh take over. Only a fresh answer does,
+    /// as at stream creation (`has_fresh_unique_answer`): a goodbye, or a
+    /// row that expired or reached its refresh window while it waited on a
+    /// pending instance, leaves the stream asking, since the refresh won't
+    /// maintain it.
     fn dampen_if_unique(&mut self, rec: &browse::RawRecord) {
-        if is_unique_answer(rec) {
+        let elapsed = rec.received_at.elapsed().as_secs() as u32;
+        let fresh = rec.ttl > 0 && elapsed < rec.ttl && !in_refresh_window(elapsed, rec.ttl);
+        if fresh && is_unique_answer(rec) {
             let ckey = Scheduler::continuous_key(rec.name.trim_end_matches('.'), rec.rtype);
             self.scheduler.dampen(&ckey);
         }
