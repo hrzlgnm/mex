@@ -420,3 +420,31 @@ fn a_scoped_query_records_only_its_links() {
         .expect("sent");
     assert_eq!(state.transmitted_interfaces, "wlan0");
 }
+
+#[test]
+fn a_question_never_sent_restarts_at_once_when_a_link_appears() {
+    // Only suppressed so far (overheard on its single link), it has no
+    // send to keep a second from: a new link restarts it at the startup
+    // delay.
+    let mut app = App::new().unwrap();
+    pin_links(&mut app, &["eth0"]);
+    let _rx = capture(&mut app);
+    ingest(&mut app, &ptr_record(4500));
+    app.send_queries();
+    overhear_srv(&mut app, "eth0", 2);
+    all_due(&mut app);
+    app.send_queries();
+    let history = app
+        .scheduler
+        .history(&Scheduler::provenance_key(INSTANCE, 33))
+        .expect("suppression recorded");
+    assert!(history.transmitted.is_none() && history.suppressed.is_some());
+    pin_links(&mut app, &["eth0", "wlan0"]);
+    let before = Instant::now();
+    app.send_queries();
+    let next = app.scheduler.continuous()[&(INSTANCE.to_string(), 33)].next_due;
+    assert!(
+        next <= before + Duration::from_millis(200),
+        "startup delay only"
+    );
+}
