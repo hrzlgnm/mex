@@ -138,13 +138,16 @@ impl App {
         book
     }
 
-    /// Whether any live sighting has no owner (it would be filed under
-    /// `anomalies::UNATTRIBUTED_SERVICE`). Cheap: no analyzer run.
+    /// Whether anything is filed under `anomalies::UNATTRIBUTED_SERVICE`:
+    /// a live sighting with no owner, or a finding the last analysis put
+    /// there (`unattributed_findings`). Cheap: no analyzer run.
     pub(super) fn has_unattributed(&self) -> bool {
         let now = Instant::now();
-        self.sightings
-            .iter()
-            .any(|s| s.is_live(now) && self.sighting_owners(s).is_empty())
+        self.unattributed_findings.get()
+            || self
+                .sightings
+                .iter()
+                .any(|s| s.is_live(now) && self.sighting_owners(s).is_empty())
     }
 
     /// Normalized group key for host grouping: lowercased hostname without

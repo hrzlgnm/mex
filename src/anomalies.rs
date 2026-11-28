@@ -532,6 +532,14 @@ pub fn analyze_observations(
 
     // Multicast sends per record identity, indexed once for every row.
     let multicasts = rate::MulticastIndex::new(events, own_sends, &snap.device_names);
+    // Responders that send each answer several times per query: one
+    // finding each, on their host header (#442).
+    let hosts: HashSet<&str> = snap
+        .host_addresses
+        .iter()
+        .map(|v| v.host.as_str())
+        .collect();
+    multicasts.check_bursts(&hosts, &mut out);
 
     for svc in &snap.services {
         let service_id = service_id(svc.instance, svc.service_type);

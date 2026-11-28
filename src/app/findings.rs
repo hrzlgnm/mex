@@ -194,7 +194,18 @@ impl App {
             host_addresses,
             device_names,
         };
-        anomalies::analyze_observations(&snap, &self.raw_events, &self.own_sends, &address_queries)
+        let found = anomalies::analyze_observations(
+            &snap,
+            &self.raw_events,
+            &self.own_sends,
+            &address_queries,
+        );
+        self.unattributed_findings.set(
+            found
+                .iter()
+                .any(|a| a.service == anomalies::UNATTRIBUTED_SERVICE),
+        );
+        found
     }
 
     /// Per-service anomaly counts keyed by service id (`anomalies::service_id`).

@@ -405,7 +405,8 @@ fn unattributed_entry_lists_ownerless_findings_until_an_owner_appears() {
         block_has(&lines, block, "unicast-style-response"),
         "{lines:#?}"
     );
-    // Once the service appears, the finding moves and the entry goes.
+    // Once the service appears, the finding moves and, from the next
+    // frame on, the entry goes (each draw analyzes before it lists).
     ingest(
         &mut app,
         &raw_record(
@@ -416,6 +417,7 @@ fn unattributed_entry_lists_ownerless_findings_until_an_owner_appears() {
             4500,
         ),
     );
+    render_to_buffer(&app, 160, 40);
     assert!(!app
         .display_items()
         .iter()
@@ -568,4 +570,35 @@ fn flooded_host_addresses_are_flagged_in_every_sibling_service() {
             "{instance}: AAAA row flagged: {flagged:?}"
         );
     }
+}
+
+#[test]
+fn unattributed_entry_shows_a_bursting_responder_with_no_host() {
+    // #442: a responder that heads no host and sends each answer twice
+    // per query is filed under `(unattributed)` without any sighting
+    // there; the entry still appears once a frame has analyzed it.
+    let mut app = App::new().unwrap();
+    let responder: std::net::SocketAddr = "192.168.1.200:5353".parse().unwrap();
+    let base = Instant::now() - Duration::from_secs(2);
+    let mut query = query_event("ghost.local.", 1, "A", false, Vec::new(), remote_source());
+    query.received_at = base;
+    ingest_packet(&mut app, query);
+    for ms in [5, 12] {
+        let mut a = raw_record("ghost.local.", 1, "A", "192.168.1.200", 120);
+        a.source = responder;
+        a.dst_is_multicast = true;
+        let mut ev = event_for(&a);
+        ev.source = responder;
+        ev.received_at = base + Duration::from_millis(ms);
+        ingest_packet(&mut app, ev);
+    }
+    render_to_buffer(&app, 160, 40);
+    assert!(app
+        .anomalies()
+        .iter()
+        .any(|a| a.service == anomalies::UNATTRIBUTED_SERVICE && a.record_name.is_none()));
+    assert!(app
+        .display_items()
+        .iter()
+        .any(|it| matches!(it, DisplayItem::Unattributed)));
 }
