@@ -5,7 +5,7 @@ use denials::AddressDenials;
 pub use layout::{DrawnRows, Layout};
 use schedule::Scheduler;
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -441,6 +441,13 @@ struct ContinuousQuery {
     /// normalized to lowercase for host names so lookups dedup
     /// case-insensitively, but the query itself keeps wire case.
     qname: String,
+}
+
+/// A question's startup stream on one newly usable link (#441): asked
+/// there alone, doubling until it catches up with the question's stream.
+pub(super) struct LinkStream {
+    pub(super) next_due: Instant,
+    pub(super) interval: Duration,
 }
 
 /// Small xorshift-style helper so query jitter does not need a new

@@ -81,6 +81,7 @@ fn query_send_wakes_the_poll_and_is_drained() {
         record_type: TYPE::PTR,
         known_answers: Vec::new(),
         qu: false,
+        links: Vec::new(),
     };
     assert!(query_tx.send(vec![req.clone()]));
     assert!(query_tx.send(vec![req]));
@@ -172,6 +173,7 @@ fn query_drain_is_budgeted_per_pass() {
             record_type: TYPE::A,
             known_answers: Vec::new(),
             qu: false,
+            links: Vec::new(),
         }])
         .unwrap();
     }
@@ -540,6 +542,7 @@ fn query_send_fails_once_the_listener_is_gone() {
         record_type: TYPE::PTR,
         known_answers: Vec::new(),
         qu: false,
+        links: Vec::new(),
     }]));
 }
 

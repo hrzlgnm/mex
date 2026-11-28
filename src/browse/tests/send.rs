@@ -38,6 +38,7 @@ fn instance_names_with_spaces_and_punctuation_reach_the_wire() {
         record_type: TYPE::SRV,
         known_answers: Vec::new(),
         qu: false,
+        links: Vec::new(),
     });
     assert_eq!(ev.questions.len(), 1);
     assert_eq!(ev.questions[0].name, format!("{name}."));
@@ -54,6 +55,7 @@ fn utf8_instance_names_survive_the_wire_round_trip() {
         record_type: TYPE::SRV,
         known_answers: Vec::new(),
         qu: false,
+        links: Vec::new(),
     });
     assert_eq!(ev.questions[0].name, format!("{name}."));
 }
@@ -106,6 +108,7 @@ fn dotted_instance_query_round_trips_in_presentation_form() {
         record_type: TYPE::SRV,
         known_answers: Vec::new(),
         qu: false,
+        links: Vec::new(),
     });
     assert_eq!(ev.questions[0].name, format!("{name}."));
     assert_eq!(
@@ -125,6 +128,7 @@ fn known_answers_with_spaces_are_sent() {
             iface: String::new(),
         }],
         qu: false,
+        links: Vec::new(),
     });
     assert_eq!(ev.query_kas.len(), 1);
     assert_eq!(ev.query_kas[0].rdata, "Denon AVR-X1400H._http._tcp.local.");
@@ -147,6 +151,7 @@ fn oversized_ka_list_truncates_but_keeps_question() {
             record_type: TYPE::PTR,
             known_answers: kas,
             qu: false,
+            links: Vec::new(),
         },
         "",
     )
@@ -483,6 +488,7 @@ fn ptr_query() -> QueryRequest {
         record_type: TYPE::PTR,
         known_answers: Vec::new(),
         qu: false,
+        links: Vec::new(),
     }
 }
 
@@ -803,6 +809,7 @@ fn ask(name: &str, rtype: TYPE) -> QueryRequest {
         record_type: rtype,
         known_answers: Vec::new(),
         qu: false,
+        links: Vec::new(),
     }
 }
 
@@ -1017,4 +1024,55 @@ fn every_packet_of_a_batch_leaves_on_every_link() {
         .map(|s| s.questions.len())
         .sum();
     assert_eq!(eth0_questions, 6, "every question reported once per link");
+}
+
+// --- #441: a question limited to some links goes out only there ---
+
+#[test]
+fn a_question_for_one_link_leaves_only_on_that_link() {
+    let socket = FakeSocket::default();
+    let links = [("eth0".to_string(), 2u32), ("wlan0".to_string(), 3u32)];
+    let only_wlan0 = QueryRequest {
+        links: vec!["wlan0".to_string()],
+        ..ptr_query()
+    };
+    let everywhere = ask("Host.local", TYPE::A);
+    let sent = send_on_all_interfaces(
+        &socket,
+        &[only_wlan0, everywhere],
+        Family::V6,
+        &[],
+        &links,
+        &mut SendFailures::default(),
+        &mut SentCopies::default(),
+    );
+    let asked: Vec<_> = sent
+        .iter()
+        .map(|s| (s.iface.as_str(), s.questions.len()))
+        .collect();
+    assert_eq!(asked, [("eth0", 1), ("wlan0", 2)]);
+}
+
+#[test]
+fn a_link_with_nothing_to_ask_gets_no_copy() {
+    let socket = FakeSocket::default();
+    let links = [("eth0".to_string(), 2u32), ("wlan0".to_string(), 3u32)];
+    let only_wlan0 = QueryRequest {
+        links: vec!["wlan0".to_string()],
+        ..ptr_query()
+    };
+    send_on_all_interfaces(
+        &socket,
+        &[only_wlan0],
+        Family::V6,
+        &[],
+        &links,
+        &mut SendFailures::default(),
+        &mut SentCopies::default(),
+    );
+    assert_eq!(
+        *socket.calls.borrow(),
+        ["pin V6(3)", "send [ff02::fb%3]:5353"],
+        "eth0 is never pinned"
+    );
 }

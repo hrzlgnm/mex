@@ -16,6 +16,21 @@ pub(super) struct Scheduler {
     /// exponential backoff (1s, 2s, 4s, … capped at 1h). Replaces the old
     /// fixed 60s re-poll. TTL-driven cache refresh lives in `requeries`.
     continuous: HashMap<(String, u16), ContinuousQuery>,
+    /// Per continuous stream, the links (interface names) a fresh unique
+    /// answer arrived on (#441): the stream asks only the other links,
+    /// and is dampened once every usable link is covered. Pruned with
+    /// `continuous`.
+    covered: HashMap<(String, u16), BTreeSet<String>>,
+    /// The usable links at the last `poll_continuous`: a link not among
+    /// them is new (just up, newly selected, or back after going away),
+    /// and restarts discovery there (#441).
+    last_usable: BTreeSet<String>,
+    /// A link that became usable runs its own startup stream for each
+    /// question (#441), by (question, link): it asks that link alone, so
+    /// a reconnecting Wi-Fi never restarts discovery on the other links.
+    /// It ends when the link is covered, or joins the question's stream
+    /// once its interval has caught up.
+    link_streams: HashMap<((String, u16), String), LinkStream>,
     /// Every service type ever learned (enumeration answers, PTR owners,
     /// confirmed services). Persistent: used for instance/type splitting
     /// and as the desired continuous-query set. Never cleared on a timer.
@@ -84,6 +99,21 @@ impl Scheduler {
 
     /// RFC 6762 §5.2: a unique answer ends discovery for this interest;
     /// the 80%-TTL refresh takes over.
+    /// Note that a fresh unique answer for `key` arrived on `link`
+    /// (#441). Returns whether every usable link is covered now (or none
+    /// is known), so the stream can be dampened everywhere.
+    pub(super) fn cover(
+        &mut self,
+        key: &(String, u16),
+        link: String,
+        usable: &BTreeSet<String>,
+    ) -> bool {
+        self.link_streams.remove(&(key.clone(), link.clone()));
+        let cover = self.covered.entry(key.clone()).or_default();
+        cover.insert(link);
+        usable.is_empty() || usable.is_subset(cover)
+    }
+
     pub(super) fn dampen(&mut self, key: &(String, u16)) {
         if let Some(entry) = self.continuous.get_mut(key) {
             entry.interval = MAX_CONTINUOUS_INTERVAL;
@@ -179,6 +209,17 @@ impl Scheduler {
                 ),
                 own,
             })
+    }
+
+    /// The link an overheard copy of `key` arrived on, while it can still
+    /// stand in for ours (`suppressed_by_overheard`); `None` when there is
+    /// none or its link is unknown.
+    pub(super) fn overheard_link(&self, key: &(String, u16)) -> Option<String> {
+        let lookup = (key.0.trim_end_matches('.').to_ascii_lowercase(), key.1);
+        self.overheard
+            .get(&lookup)
+            .filter(|(seen, _, iface)| seen.elapsed() < OVERHEARD_WINDOW && !iface.is_empty())
+            .map(|(_, _, iface)| iface.clone())
     }
 
     /// RFC 6762 §7.3: if we overheard the same QM question recently and its
@@ -313,6 +354,7 @@ impl Scheduler {
         self.requeries
             .retain(|k, _| live.contains(&(k.0.to_ascii_lowercase(), k.1)));
         self.continuous.retain(|k, _| live.contains(k));
+        self.covered.retain(|k, _| live.contains(k));
         // Provenance outlives short schedule gaps but not dead
         // interests: keep entries with a live schedule key or a recent
         // event, so a recently expired interest still reports its
@@ -365,6 +407,11 @@ impl Scheduler {
         &mut self,
     ) -> &mut HashMap<(String, u16), (Instant, HashSet<String>, String)> {
         &mut self.overheard
+    }
+
+    #[cfg(test)]
+    pub(super) fn link_streams_mut(&mut self) -> &mut HashMap<((String, u16), String), LinkStream> {
+        &mut self.link_streams
     }
 
     pub(super) fn continuous_mut(&mut self) -> &mut HashMap<(String, u16), ContinuousQuery> {
@@ -638,12 +685,9 @@ impl App {
         } else {
             Vec::new()
         };
-        if self.scheduler.suppressed_by_overheard(key, &ka) {
-            log::debug!("mex: suppressed refresh query for {} (overheard)", key.0);
-            self.diagnostics.suppressed_refresh += 1;
-            self.diagnostics.suppressed_times.push_back(now);
-            self.note_query(&key.0, key.1, OwnQuery::Suppressed, now);
-        } else {
+        // §7.3 per link (#441): overheard on one of several links, the
+        // refresh still goes out on the others.
+        if let Some(links) = self.overheard_scope(key, &ka, &[]) {
             self.diagnostics.q_sent_refresh += 1;
             self.diagnostics.ka_sent += ka.len() as u64;
             self.queue_question(browse::QueryRequest {
@@ -651,7 +695,13 @@ impl App {
                 record_type: rt,
                 known_answers: ka,
                 qu: false,
+                links,
             });
+        } else {
+            log::debug!("mex: suppressed refresh query for {} (overheard)", key.0);
+            self.diagnostics.suppressed_refresh += 1;
+            self.diagnostics.suppressed_times.push_back(now);
+            self.note_query(&key.0, key.1, OwnQuery::Suppressed, now);
         }
         self.route_own_question(&key.0, key.1, false);
         // A refresh query also elicits new answers, so postpone the
@@ -739,6 +789,7 @@ impl App {
             record_type: rt,
             known_answers: ka,
             qu: false,
+            links: Vec::new(),
         }]) {
             log::warn!("mex: dropped manual query for {name} (listener channels closed)");
             return Ok(());
@@ -772,6 +823,16 @@ impl App {
             return;
         };
         queued.qu |= req.qu;
+        // Every link (empty) wins; otherwise ask the union of both.
+        if queued.links.is_empty() || req.links.is_empty() {
+            queued.links.clear();
+        } else {
+            for link in req.links {
+                if !queued.links.contains(&link) {
+                    queued.links.push(link);
+                }
+            }
+        }
         for ka in req.known_answers {
             if !queued
                 .known_answers
@@ -792,9 +853,9 @@ impl App {
             return;
         }
         let batch = std::mem::take(&mut self.outbox);
-        let asked: Vec<(String, u16)> = batch
+        let asked: Vec<(String, u16, Vec<String>)> = batch
             .iter()
-            .map(|q| (q.name.clone(), u16::from(q.record_type)))
+            .map(|q| (q.name.clone(), u16::from(q.record_type), q.links.clone()))
             .collect();
         if !self.query_tx.send(batch) {
             log::warn!(
@@ -804,14 +865,27 @@ impl App {
             return;
         }
         let now = Instant::now();
-        for (name, rtype) in asked {
-            self.note_query(&name, rtype, OwnQuery::Transmitted, now);
+        for (name, rtype, links) in asked {
+            self.note_query_on(&name, rtype, OwnQuery::Transmitted, now, &links);
         }
     }
 
     /// Record a query event for an interest: we transmitted it or §7.3
     /// suppression stood in for it, stamped at action time.
     pub(super) fn note_query(&mut self, name: &str, rtype: u16, origin: OwnQuery, at: Instant) {
+        self.note_query_on(name, rtype, origin, at, &[]);
+    }
+
+    /// `note_query` for a query sent only on `links` (#441), recorded as
+    /// its interfaces; empty for every usable link.
+    pub(super) fn note_query_on(
+        &mut self,
+        name: &str,
+        rtype: u16,
+        origin: OwnQuery,
+        at: Instant,
+        links: &[String],
+    ) {
         let mut query_interfaces: Vec<String> = self
             .link_stats
             .v4
@@ -824,6 +898,9 @@ impl App {
                     .is_none_or(|selected| selected.contains(name))
             })
             .collect();
+        if !links.is_empty() {
+            query_interfaces = links.to_vec();
+        }
         query_interfaces.sort();
         query_interfaces.dedup();
         let query_interfaces = query_interfaces.join(", ");
@@ -1047,10 +1124,16 @@ impl App {
         self.scheduler
             .continuous
             .retain(|k, _| desired.contains_key(k));
+        let continuous = &self.scheduler.continuous;
+        self.scheduler
+            .covered
+            .retain(|k, _| continuous.contains_key(k));
+        let usable = self.query_links();
         // Streams first seen in this pass share one first-query delay, so
         // questions learned together (a host's addresses with its SRV/TXT)
         // stay due on one tick and keep sharing packets as they double.
         let mut first_delay: Option<Duration> = None;
+        self.follow_link_changes(&usable, now, &mut first_delay);
         for (key, qname) in desired {
             let (due, send_name) = match self.scheduler.continuous.get(&key) {
                 Some(entry) => (now >= entry.next_due, entry.qname.clone()),
@@ -1064,7 +1147,18 @@ impl App {
                     // demand: file its self row now so the Questions pane
                     // shows it pending (LAST "—", DUE the refresh) instead
                     // of hiding it until the first refresh fires.
-                    let (next_due, interval) = if self.has_fresh_unique_answer(&key) {
+                    let (unknown_link, mut cover) = self.fresh_unique_cover(&key);
+                    // An answer on an unknown link covers every link usable
+                    // now, so a link appearing later is still noticed.
+                    if unknown_link {
+                        cover.extend(usable.iter().cloned());
+                    }
+                    let all_covered = unknown_link
+                        || (!cover.is_empty() && (usable.is_empty() || usable.is_subset(&cover)));
+                    if !cover.is_empty() {
+                        self.scheduler.covered.insert(key.clone(), cover);
+                    }
+                    let (next_due, interval) = if all_covered {
                         self.route_own_question(&qname, key.1, false);
                         (now + MAX_CONTINUOUS_INTERVAL, MAX_CONTINUOUS_INTERVAL)
                     } else {
@@ -1088,15 +1182,7 @@ impl App {
             let Some(rt) = browse::record_type_from_u16(key.1) else {
                 continue;
             };
-            let ka = if rt == TYPE::PTR {
-                if is_enum_name(&key.0) {
-                    self.known_enum_answers()
-                } else {
-                    self.known_ptrs(&key.0)
-                }
-            } else {
-                Vec::new()
-            };
+            let ka = self.scheduled_known_answers(&key.0, rt);
             // QU on the first transmission of the enumeration query
             // (RFC 6762 §5.4 startup batch); everything afterwards is QM.
             // First-transmission (interval still 1s) rather than a single
@@ -1108,10 +1194,47 @@ impl App {
                     .continuous
                     .get(&key)
                     .is_some_and(|e| e.interval == Duration::from_secs(1));
+            // Only the links no fresh unique answer covers yet (#441); none
+            // recorded, every link.
+            // Links covered, or still on their own link stream, are out.
+            let excluded: BTreeSet<&String> = self
+                .scheduler
+                .covered
+                .get(&key)
+                .into_iter()
+                .flatten()
+                .chain(
+                    self.scheduler
+                        .link_streams
+                        .keys()
+                        .filter(|(k, _)| *k == key)
+                        .map(|(_, link)| link),
+                )
+                .collect();
+            let mut links: Vec<String> = if excluded.is_empty() {
+                Vec::new()
+            } else {
+                usable
+                    .iter()
+                    .filter(|l| !excluded.contains(l))
+                    .cloned()
+                    .collect()
+            };
+            if !excluded.is_empty() && links.is_empty() {
+                // Nothing left to ask on this stream's links this round.
+                self.scheduler.advance_continuous(&key, now);
+                continue;
+            }
             // RFC 6762 §7.3: another querier just asked the same QM
             // question with no KA we wouldn't send — treat ours as sent.
-            // QU elicits unicast and is never suppressed.
-            if !qu && self.scheduler.suppressed_by_overheard(&key, &ka) {
+            // QU elicits unicast and is never suppressed. Overheard on one
+            // of several links we'd ask, it stands in for ours there only.
+            let scope = if qu {
+                Some(links.clone())
+            } else {
+                self.overheard_scope(&key, &ka, &links)
+            };
+            let Some(scope) = scope else {
                 log::debug!("mex: suppressed continuous query for {} (overheard)", key.0);
                 let now = Instant::now();
                 self.diagnostics.suppressed_continuous += 1;
@@ -1120,7 +1243,8 @@ impl App {
                 self.route_own_question(&key.0, key.1, false);
                 self.scheduler.advance_continuous(&key, now);
                 continue;
-            }
+            };
+            links = scope;
             if qu {
                 self.scheduler.startup_qu_sent = true;
                 // Keep the flag for the passive-mode test; per-name QU above
@@ -1141,6 +1265,7 @@ impl App {
                 record_type: rt,
                 known_answers: ka,
                 qu,
+                links,
             });
             self.route_own_question(&send_name, key.1, qu);
             // RFC 6762 §5.2: at least 1s between the first two, then at
@@ -1150,6 +1275,7 @@ impl App {
             // the 1s gap and start at 2s).
             self.scheduler.advance_continuous(&key, now);
         }
+        self.poll_link_streams(now);
     }
 
     pub(super) fn send_queries(&mut self) {
@@ -1196,6 +1322,7 @@ impl App {
                 if self.scheduler.transmit_held {
                     log::info!("mex: transmission resumed; restarting discovery");
                     self.scheduler.continuous.clear();
+                    self.scheduler.covered.clear();
                     self.scheduler.transmit_held = false;
                     // Links just came back: take a fresh interface
                     // snapshot first, so resumed queries record the
@@ -1229,26 +1356,252 @@ impl App {
         self.scheduler.note_overheard(q, &ev.query_kas);
     }
 
+    /// The known answers a scheduled query for `name` carries: PTR only
+    /// (shared records, RFC 6762 §7.1), from the enumeration or the type.
+    fn scheduled_known_answers(&self, name: &str, rt: TYPE) -> Vec<browse::KnownAnswer> {
+        if rt != TYPE::PTR {
+            Vec::new()
+        } else if is_enum_name(name) {
+            self.known_enum_answers()
+        } else {
+            self.known_ptrs(name)
+        }
+    }
+
+    /// Where our query for `key` still goes after RFC 6762 §7.3 (#441):
+    /// `links` are the links we'd ask (empty for every usable link). An
+    /// overheard copy stands in for ours only on the link it came in on.
+    /// On a link we don't ask it stands in for nothing: `links` unchanged,
+    /// and the overheard entry is kept. On one of several links we ask,
+    /// the others remain. On the only link we ask, or on an unknown link,
+    /// it stands in everywhere: `None`, as before per-link suppression.
+    pub(super) fn overheard_scope(
+        &mut self,
+        key: &(String, u16),
+        ka: &[browse::KnownAnswer],
+        links: &[String],
+    ) -> Option<Vec<String>> {
+        let asked: Vec<String> = if links.is_empty() {
+            self.query_links().into_iter().collect()
+        } else {
+            links.to_vec()
+        };
+        let on = self.scheduler.overheard_link(key);
+        if on.as_ref().is_some_and(|on| !asked.contains(on)) {
+            return Some(links.to_vec());
+        }
+        if !self.scheduler.suppressed_by_overheard(key, ka) {
+            return Some(links.to_vec());
+        }
+        match on {
+            Some(on) if asked.len() > 1 => {
+                log::debug!(
+                    "mex: query for {} overheard on {on}; asking the other links",
+                    key.0
+                );
+                Some(asked.into_iter().filter(|l| *l != on).collect())
+            }
+            _ => None,
+        }
+    }
+
+    /// Follow the usable links since the last poll (#441). A link that
+    /// went away is dropped from every stream's covered links, so it counts
+    /// as new when it comes back. A new link (just up, newly selected, or
+    /// back) starts a link stream for every question: the startup
+    /// schedule on that link alone, so the other links keep theirs. The
+    /// first poll only learns the links.
+    fn follow_link_changes(
+        &mut self,
+        usable: &BTreeSet<String>,
+        now: Instant,
+        first_delay: &mut Option<Duration>,
+    ) {
+        for cover in self.scheduler.covered.values_mut() {
+            cover.retain(|link| usable.contains(link));
+        }
+        let previous = std::mem::replace(&mut self.scheduler.last_usable, usable.clone());
+        // Link streams end with their question, link or coverage.
+        let (continuous, covered) = (&self.scheduler.continuous, &self.scheduler.covered);
+        self.scheduler.link_streams.retain(|(key, link), _| {
+            continuous.contains_key(key)
+                && usable.contains(link)
+                && !covered.get(key).is_some_and(|c| c.contains(link))
+        });
+        let new_links: Vec<String> = if previous.is_empty() {
+            Vec::new()
+        } else {
+            usable.difference(&previous).cloned().collect()
+        };
+        if new_links.is_empty() {
+            return;
+        }
+        log::info!(
+            "mex: {} became usable; starting discovery there",
+            new_links.join(", ")
+        );
+        let delay = *first_delay.get_or_insert_with(|| rand_range(20, 120));
+        let keys: Vec<(String, u16)> = self.scheduler.continuous.keys().cloned().collect();
+        for key in keys {
+            for link in &new_links {
+                self.scheduler.link_streams.insert(
+                    (key.clone(), link.clone()),
+                    LinkStream {
+                        next_due: now + delay,
+                        interval: Duration::from_secs(1),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Ask the questions whose link streams are due (#441): each on its
+    /// own link alone, §7.3-suppressed only by a query overheard there,
+    /// then doubling; once its interval has caught up with the question's
+    /// stream, the link joins that stream.
+    fn poll_link_streams(&mut self, now: Instant) {
+        type Due = ((String, u16), String, String, Duration, Duration);
+        let due: Vec<Due> = self
+            .scheduler
+            .link_streams
+            .iter()
+            .filter(|(_, stream)| now >= stream.next_due)
+            .filter_map(|((key, link), stream)| {
+                let entry = self.scheduler.continuous.get(key)?;
+                Some((
+                    key.clone(),
+                    link.clone(),
+                    entry.qname.clone(),
+                    stream.interval,
+                    entry.interval,
+                ))
+            })
+            .collect();
+        for (key, link, qname, step, joins_at) in due {
+            let Some(rt) = browse::record_type_from_u16(key.1) else {
+                continue;
+            };
+            let ka = self.scheduled_known_answers(&key.0, rt);
+            match self.overheard_scope(&key, &ka, std::slice::from_ref(&link)) {
+                None => {
+                    self.diagnostics.suppressed_continuous += 1;
+                    self.diagnostics.suppressed_times.push_back(now);
+                    self.note_query_on(
+                        &key.0,
+                        key.1,
+                        OwnQuery::Suppressed,
+                        now,
+                        std::slice::from_ref(&link),
+                    );
+                }
+                Some(links) => {
+                    self.diagnostics.q_sent_continuous += 1;
+                    self.diagnostics.ka_sent += ka.len() as u64;
+                    self.queue_question(browse::QueryRequest {
+                        name: qname.clone(),
+                        record_type: rt,
+                        known_answers: ka,
+                        qu: false,
+                        links,
+                    });
+                }
+            }
+            self.route_own_question(&qname, key.1, false);
+            // Send using the current interval, then double (RFC 6762 §5.2);
+            // caught up with the question's stream, the link joins it.
+            let next = (step * 2).min(MAX_CONTINUOUS_INTERVAL);
+            if next >= joins_at {
+                self.scheduler.link_streams.remove(&(key, link));
+            } else {
+                self.scheduler.link_streams.insert(
+                    (key, link),
+                    LinkStream {
+                        next_due: now + step,
+                        interval: next,
+                    },
+                );
+            }
+        }
+    }
+
+    /// The usable links queries go out on: interface names of both
+    /// families, within the `-i` selection.
+    pub(super) fn query_links(&self) -> BTreeSet<String> {
+        self.link_stats
+            .v4
+            .iter()
+            .map(|(name, _)| name.clone())
+            .chain(self.link_stats.v6.iter().map(|(name, _)| name.clone()))
+            .filter(|name| {
+                self.interfaces
+                    .as_ref()
+                    .is_none_or(|selected| selected.contains(name))
+            })
+            .collect()
+    }
+
+    /// The link (interface name) `rec` arrived on, as `query_links` names
+    /// it: its resolved name, else the IPv6 link with its index. `None`
+    /// when neither is known.
+    pub(super) fn answer_link(&self, rec: &browse::RawRecord) -> Option<String> {
+        if !rec.iface.is_empty() {
+            return Some(rec.iface.clone());
+        }
+        self.link_stats
+            .v6
+            .iter()
+            .find(|(_, idx)| *idx == rec.ifindex && rec.ifindex != 0)
+            .map(|(name, _)| name.clone())
+    }
+
+    /// The links fresh unique answers for `key` arrived on (#441), and
+    /// whether one came on an unknown link (which then covers them all,
+    /// as before per-link dampening).
+    pub(super) fn fresh_unique_cover(&self, key: &(String, u16)) -> (bool, BTreeSet<String>) {
+        let mut unknown = false;
+        let mut cover = BTreeSet::new();
+        for r in self.fresh_unique_answers(key) {
+            match self.answer_link(r) {
+                Some(link) => {
+                    cover.insert(link);
+                }
+                None => unknown = true,
+            }
+        }
+        (unknown, cover)
+    }
+
     /// Whether a live unique answer (`is_unique_answer`) for `key` is
-    /// cached and still before its 80%-TTL refresh window.
+    /// cached and still before its 80%-TTL refresh window. Scheduling reads
+    /// the links of those answers (`fresh_unique_cover`); this is the
+    /// tests' yes/no view.
+    #[cfg(test)]
     pub(super) fn has_fresh_unique_answer(&self, key: &(String, u16)) -> bool {
+        self.fresh_unique_answers(key).next().is_some()
+    }
+
+    /// The live unique answers for `key` still before their 80%-TTL
+    /// refresh window.
+    fn fresh_unique_answers<'s>(
+        &'s self,
+        key: &'s (String, u16),
+    ) -> impl Iterator<Item = &'s browse::RawRecord> + 's {
         // Pending instances count too: they already drive SRV/TXT
         // interest (`desired_continuous`) before their SRV arrives.
-        let mut rows = self
-            .services
+        self.services
             .iter()
             .flat_map(|s| &s.answers)
-            .chain(self.pending_instances.iter().flat_map(|p| &p.answers));
-        rows.any(|r| {
-            if !is_unique_answer(r)
-                || r.ttl == 0
-                || r.rtype != key.1
-                || r.name.trim_end_matches('.').to_ascii_lowercase() != key.0
-            {
-                return false;
-            }
-            let elapsed = r.received_at.elapsed().as_secs() as u32;
-            !in_refresh_window(elapsed, r.ttl)
-        })
+            .chain(self.pending_instances.iter().flat_map(|p| &p.answers))
+            .filter(move |r| {
+                if !is_unique_answer(r)
+                    || r.ttl == 0
+                    || r.rtype != key.1
+                    || r.name.trim_end_matches('.').to_ascii_lowercase() != key.0
+                {
+                    return false;
+                }
+                let elapsed = r.received_at.elapsed().as_secs() as u32;
+                !in_refresh_window(elapsed, r.ttl)
+            })
     }
 }

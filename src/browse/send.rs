@@ -202,6 +202,23 @@ pub(super) fn send_on_all_interfaces(
     let mut sent_ok = Vec::new();
     for target in send_targets(family, ifaces_v4, ifaces_v6) {
         let SendTarget { link, dest, egress } = target;
+        // Only the questions still asked on this link (#441); none, and
+        // the link gets no copy at all.
+        let on_link: std::borrow::Cow<'_, [QueryRequest]> =
+            if batch.iter().all(|q| q.links.is_empty()) {
+                std::borrow::Cow::Borrowed(batch)
+            } else {
+                std::borrow::Cow::Owned(
+                    batch
+                        .iter()
+                        .filter(|q| q.links.is_empty() || q.links.iter().any(|l| l == link))
+                        .cloned()
+                        .collect(),
+                )
+            };
+        if on_link.is_empty() {
+            continue;
+        }
         // The egress pin is socket-wide: set it right before this copy.
         // A failed pin would send the copy out of the default multicast
         // interface instead: skip it.
@@ -214,7 +231,7 @@ pub(super) fn send_on_all_interfaces(
             }
             continue;
         }
-        for (bytes, asked) in encode_batch(batch, link) {
+        for (bytes, asked) in encode_batch(&on_link, link) {
             match socket.send_to(&bytes, dest) {
                 Ok(()) => {
                     let now = Instant::now();
@@ -222,7 +239,7 @@ pub(super) fn send_on_all_interfaces(
                     sent_ok.push(OwnSend {
                         questions: asked
                             .iter()
-                            .map(|&i| (batch[i].name.clone(), u16::from(batch[i].record_type)))
+                            .map(|&i| (on_link[i].name.clone(), u16::from(on_link[i].record_type)))
                             .collect(),
                         iface: link.to_string(),
                         // An IPv6 copy is pinned by index; an IPv4 one by

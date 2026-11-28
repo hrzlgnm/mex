@@ -29,8 +29,9 @@ Headless run (no TTY) logs to stderr.
   `take_log_error` for the TUI status line.
 * `src/browse.rs` — raw mDNS transport: v4/v6 sockets on `224.0.0.251:5353` /
   `[FF02::FB]:5353` via `socket-pktinfo`, query batches (`QueryBatch`:
-  one tick's questions, each QM/QU with its known answers, packed into as
-  few packets as fit per egress interface, one copy per interface),
+  one tick's questions, each QM/QU with its known answers and the links it
+  goes out on, packed into as few packets as fit per egress interface, one
+  copy per interface that has a question for it),
   packet parse with ingress interface.
   One listener thread drives both sockets from a `mio` poll loop
   (readiness via a duplicate handle, reads via pktinfo, drained with a
@@ -159,7 +160,22 @@ Headless run (no TTY) logs to stderr.
   `@iface` otherwise) from IP_PKTINFO.
 * Unique answers (flush bit, or SRV/TXT/A/AAAA, unique by type even when a
   responder leaves the bit off; RFC 6762 §7.1, #438) dampen the exponential
-  stream to hourly,
+  stream per link (#441): an answer covers the link it came in on
+  (`Scheduler::covered`, by interface name, or the IPv6 index when the name
+  is unresolved), the stream then asks only the other usable links
+  (`QueryRequest::links`), and drops to hourly once every usable link is
+  covered (or at once for an answer whose link is unknown, which covers
+  every link usable then). A link that becomes usable (new, newly
+  selected, or back after going away) gets a link stream per question
+  (`Scheduler::link_streams`): the startup schedule on that link alone,
+  so a reconnecting Wi-Fi never restarts discovery on the other links; it
+  ends when the link is covered, or joins the question's stream once its
+  interval catches up. A link that goes away is dropped from the covered
+  links. Reaching the hourly cap by backoff restarts nothing. A §7.3
+  overheard query stands in for
+  ours, continuous or refresh, only on its own link, and for nothing when
+  that's a link we don't ask (`App::overheard_scope`). One usable
+  link behaves as before: the stream dampens to hourly,
   also when cached before the interest appeared (e.g. A/AAAA additionals);
   the 80%-TTL refresh takes over.
 * While no family can transmit (`browse::TransmitState`, set by the
