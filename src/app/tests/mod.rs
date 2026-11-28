@@ -40,6 +40,7 @@ mod srv_target;
 mod state_dump;
 mod transmit_state;
 mod unique_types;
+mod unowned_questions;
 mod view;
 
 fn test_source() -> SocketAddr {

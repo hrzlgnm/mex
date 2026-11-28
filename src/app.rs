@@ -672,7 +672,8 @@ enum SightingKind {
     Question,
 }
 
-/// One out-of-scope record or question. Records carry only
+/// One out-of-scope record or question, or an unowned in-scope
+/// question (#429). Records carry only
 /// `rdlength=<n>` as rdata and no wire bytes (see `browse::record_row`).
 /// No owner is stored: attribution runs at analysis time
 /// (`App::sighting_owners`), so a host that appears later still claims
@@ -923,8 +924,9 @@ pub struct App {
     next_pending_addr_prune: Instant,
     raw_events: Vec<browse::Event>,
     /// Out-of-scope records and questions (`anomalies::is_mdns_answer_type`
-    /// / `is_mdns_question_type` false), kept only as evidence for
-    /// findings: never Answers or Questions rows, never query drivers.
+    /// / `is_mdns_question_type` false), and in-scope questions no row
+    /// owns (#429), kept only as evidence for findings: never Answers or
+    /// Questions rows, never query drivers.
     /// Oldest first, capped at `SIGHTINGS_CAP`.
     sightings: Vec<Sighting>,
     /// NSEC address denials (#245) and the addresses they withhold.

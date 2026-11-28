@@ -7,12 +7,15 @@ impl App {
     /// File a question asking for a service, so the Records view can show
     /// who is asking (and the hex pane can show the query packet).
     /// Enumeration questions file on their selectable enumeration row.
+    /// A question no row owns becomes a sighting (#429).
     pub(super) fn route_question(&mut self, q: &browse::RawRecord, ev: &browse::Event) {
         self.scheduler.note_observed(q, ev.source);
         let name = q.name.trim_end_matches('.').to_ascii_lowercase();
+        let mut owned = false;
         if is_enum_name(&name) {
             for entry in &mut self.enum_entries {
                 if entry.name.to_ascii_lowercase() == name {
+                    owned = true;
                     Self::file_question_counted(
                         &mut entry.questions,
                         &mut entry.questions_dropped,
@@ -26,33 +29,41 @@ impl App {
                     entry.last_event = Some(ev.clone());
                 }
             }
-            return;
-        }
-        for i in 0..self.services.len() {
-            let full = crate::browse::instance_name(
-                &self.services[i].instance,
-                &self.services[i].service_type,
-            )
-            .to_ascii_lowercase();
-            let host = self.services[i]
-                .hostname
-                .trim_end_matches('.')
+        } else {
+            for i in 0..self.services.len() {
+                let full = crate::browse::instance_name(
+                    &self.services[i].instance,
+                    &self.services[i].service_type,
+                )
                 .to_ascii_lowercase();
-            if full == name
-                || host == name
-                || self.services[i].service_type.to_ascii_lowercase() == name
-            {
-                let svc = &mut self.services[i];
-                Self::file_question_counted(
-                    &mut svc.questions,
-                    &mut svc.questions_dropped,
-                    q.name.clone(),
-                    q.rtype_str.clone(),
-                    ev.source,
-                    q.received_at,
-                    ev.raw_bytes.clone(),
-                );
+                let host = self.services[i]
+                    .hostname
+                    .trim_end_matches('.')
+                    .to_ascii_lowercase();
+                if full == name
+                    || host == name
+                    || self.services[i].service_type.to_ascii_lowercase() == name
+                {
+                    owned = true;
+                    let svc = &mut self.services[i];
+                    Self::file_question_counted(
+                        &mut svc.questions,
+                        &mut svc.questions_dropped,
+                        q.name.clone(),
+                        q.rtype_str.clone(),
+                        ev.source,
+                        q.received_at,
+                        ev.raw_bytes.clone(),
+                    );
+                }
             }
+        }
+        // #429: a question nothing here owns yet (e.g. a storm for a host no
+        // service names) is sighted instead, like out-of-scope questions,
+        // so the analyzer still judges its rate; ownership resolves when it
+        // runs, so a service that appears later claims it.
+        if !owned {
+            self.ingest_sighting(SightingKind::Question, q.clone());
         }
     }
 
