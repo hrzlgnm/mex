@@ -287,6 +287,15 @@ type DeviceAskingKey = (String, String, u16, Link);
 
 /// Multicast record sends in the retained packets, indexed once per
 /// analysis so every row is checked against them cheaply (#407).
+/// One identity's copies, grouped once per analysis (#442).
+struct Grouped<'a> {
+    /// The record the copies carry.
+    rec: &'a RawRecord,
+    /// Which copies answer a probe.
+    probed: Vec<bool>,
+    bursts: Bursts,
+}
+
 /// A record's copies grouped by the query they answered (#442).
 #[derive(Default)]
 struct Bursts {
@@ -313,6 +322,10 @@ pub(super) struct MulticastIndex<'a> {
     /// packet (a record in two sections of one response is one send).
     sends: HashMap<SendKey, Vec<(Instant, usize)>>,
     probes: Vec<Probe>,
+    /// Each identity sent more than once, grouped once per analysis
+    /// (#442): its record, which copies answer a probe, and its bursts.
+    /// A single copy can't repeat, so it's left out.
+    grouped: HashMap<SendKey, Grouped<'a>>,
     /// Device names behind source addresses, for naming a trigger.
     device_names: &'a HashMap<IpAddr, DeviceLabel>,
     /// Each device's display name, by identity: an exact match's name
@@ -347,6 +360,8 @@ impl<'a> MulticastIndex<'a> {
         device_names: &'a HashMap<IpAddr, DeviceLabel>,
     ) -> Self {
         let mut sends: HashMap<SendKey, Vec<(Instant, usize)>> = HashMap::new();
+        // One record per identity, for grouping its copies below.
+        let mut records: HashMap<SendKey, &'a RawRecord> = HashMap::new();
         let mut probes = Vec::new();
         let mut device_askers: HashMap<DeviceAskingKey, BTreeSet<String>> = HashMap::new();
         for (i, ev) in events.iter().enumerate() {
@@ -389,19 +404,44 @@ impl<'a> MulticastIndex<'a> {
             {
                 let key = send_key(r);
                 if in_packet.insert(key.clone()) {
+                    records.entry(key.clone()).or_insert(r);
                     sends.entry(key).or_default().push((ev.received_at, i));
                 }
             }
         }
-        Self {
+        let mut index = Self {
             events,
             own_sends,
             sends,
             probes,
+            grouped: HashMap::new(),
             device_display: display_names(device_names),
             device_names,
             device_askers,
-        }
+        };
+        // Each copy's trigger is found once here, not again for every row
+        // that shows the record and for the responder findings.
+        let grouped = records
+            .into_iter()
+            .filter_map(|(key, rec)| {
+                let copies = index.sends.get(&key)?;
+                if copies.len() < 2 {
+                    return None;
+                }
+                let probed = index.probed_copies(rec, copies);
+                let bursts = index.bursts(rec, copies, &probed);
+                Some((
+                    key,
+                    Grouped {
+                        rec,
+                        probed,
+                        bursts,
+                    },
+                ))
+            })
+            .collect();
+        index.grouped = grouped;
+        index
     }
 
     /// Whether the copy at `at` answers a probe: one for `rec`'s owner
@@ -573,19 +613,7 @@ impl<'a> MulticastIndex<'a> {
         }
         // By owner (host header) and responder name, sorted for a stable list.
         let mut responders: BTreeMap<(String, String), Responder> = BTreeMap::new();
-        for (key, copies) in &self.sends {
-            // `sends` is built from these very records, with this filter,
-            // so the first copy's packet always holds one: a guard, not a
-            // path real input reaches.
-            let Some(rec) = self.events[copies[0].1]
-                .answers
-                .iter()
-                .find(|r| r.dst_is_multicast && r.ttl > 0 && send_key(r) == *key)
-            else {
-                continue;
-            };
-            let probed = self.probed_copies(rec, copies);
-            let b = self.bursts(rec, copies, &probed);
+        for Grouped { rec, bursts: b, .. } in self.grouped.values() {
             if b.per_query < 2 || b.unexplained.is_some() {
                 continue;
             }
@@ -606,7 +634,7 @@ impl<'a> MulticastIndex<'a> {
             r.sources.insert(rec.source_label());
             r.per_query = r.per_query.max(b.per_query);
             r.span = r.span.max(b.span);
-            r.queries.extend(b.queries);
+            r.queries.extend(b.queries.iter().copied());
             r.rows += 1;
         }
         for ((owner, _), r) in responders {
@@ -727,20 +755,22 @@ impl<'a> MulticastIndex<'a> {
     /// takes `rec`'s full identity, so it sits on that Answers row of
     /// `service`, and names what the repeats most likely answered.
     pub fn check(&self, service: &str, rec: &RawRecord, out: &mut Vec<Anomaly>) {
-        let Some(copies) = self.sends.get(&send_key(rec)) else {
+        // Sent once (or never): nothing repeats.
+        let key = send_key(rec);
+        let (Some(copies), Some(Grouped { probed, bursts, .. })) =
+            (self.sends.get(&key), self.grouped.get(&key))
+        else {
             return;
         };
         // A probe answer may come early, but it is still a multicast:
         // the next copy must wait a second after it (RFC 6762 §6).
-        let probed = self.probed_copies(rec, copies);
-        let sends = copies.iter().zip(&probed).map(|((at, _), p)| (*at, *p));
+        let sends = copies.iter().zip(probed).map(|((at, _), p)| (*at, *p));
         let Some(rep) = repeats_except(sends.collect()) else {
             return;
         };
         // Repeats only because the responder answers each query several
         // times: one finding for the responder (`check_bursts`), none
         // per row (#442).
-        let bursts = self.bursts(rec, copies, &probed);
         let Some(min_gap) = bursts.unexplained else {
             return;
         };
@@ -755,7 +785,7 @@ impl<'a> MulticastIndex<'a> {
         // What drove the repeats: probe answers answered the probe.
         let trigger = copies
             .iter()
-            .zip(&probed)
+            .zip(probed)
             .rev()
             .filter(|(_, p)| !**p)
             .find_map(|((at, packet), _)| self.trigger(rec, *at, *packet))
@@ -765,7 +795,7 @@ impl<'a> MulticastIndex<'a> {
         // our own queries (#431): did mex provoke the repeats?
         let judged: Vec<&(Instant, usize)> = copies
             .iter()
-            .zip(&probed)
+            .zip(probed)
             .filter(|(_, p)| !**p)
             .map(|(copy, _)| copy)
             .collect();

@@ -1384,9 +1384,10 @@ fn unsolicited_copies_are_never_a_burst() {
 }
 
 #[test]
-fn a_responder_finding_sums_queries_and_records_across_families() {
+fn a_responder_finding_sums_records_across_families() {
     // The same device answers over IPv4 and IPv6, each burst on its own
-    // family: one finding naming both addresses.
+    // family: one finding naming both addresses. The querier asked over
+    // both families 1 ms apart, which is one round.
     let at = base();
     let v6: SocketAddr = "[fe80::1:2:3:4]:5353".parse().unwrap();
     let a4 = host_a(responder(), "eth0");
@@ -1400,6 +1401,8 @@ fn a_responder_finding_sums_queries_and_records_across_families() {
     events.push(query_at(at, 1, vec![q6]));
     events.push(response_at(at, 6, vec![a6.clone()]));
     events.push(response_at(at, 9, vec![a6.clone()]));
+    // The analyzer reads events in arrival order, as the listener queues them.
+    events.sort_by_key(|ev| ev.received_at);
     let mut names = repeater_device();
     names.insert(v6.ip(), names[&responder().ip()].clone());
     let found = analyze_full(
@@ -1417,7 +1420,7 @@ fn a_responder_finding_sums_queries_and_records_across_families() {
         "both addresses, sorted"
     );
     assert!(
-        flood[0].message.ends_with("(2 queries, 2 records)"),
+        flood[0].message.ends_with("(1 query, 2 records)"),
         "{}",
         flood[0].message
     );
@@ -1464,18 +1467,20 @@ fn bursts_a_second_apart_leave_only_the_responder_finding() {
 
 #[test]
 fn queries_a_few_ms_apart_are_one_round() {
-    // A querier sending its questions in packets a few ms apart, each
-    // answered with the same record: one round answered three times.
+    // A querier sending its questions in packets 10 ms apart, each
+    // answered with the same record before the next arrives: three copies
+    // with three distinct triggers, all inside one reply delay, so one
+    // round answered three times.
     let at = base();
     let a = host_a(responder(), "eth0");
     let mut events = Vec::new();
-    for ms in [0, 3, 6] {
+    for ms in [0, 10, 20] {
         events.push(query_at(
             at,
             ms,
             vec![question(HOST, 1, "A", querier(), "eth0")],
         ));
-        events.push(response_at(at, ms + 10, vec![a.clone()]));
+        events.push(response_at(at, ms + 5, vec![a.clone()]));
     }
     let found = analyze_full(
         &[cached(&a)],
