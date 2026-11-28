@@ -332,3 +332,91 @@ fn a_refresh_overheard_on_one_link_still_goes_out_on_the_others() {
     assert_eq!(app.diagnostics.q_sent_refresh, sent + 1);
     assert_eq!(app.diagnostics.suppressed_refresh, suppressed);
 }
+
+#[test]
+fn capped_backoff_on_an_unanswered_link_is_kept() {
+    // eth0 answered, wlan0 not: the stream backs off to the hourly cap
+    // normally, and nothing restarts it while the links stay the same.
+    let (mut app, _rx) = two_link_app();
+    ingest(&mut app, &srv_on("eth0", 2));
+    let later = Instant::now() + MAX_CONTINUOUS_INTERVAL;
+    let entry = app
+        .scheduler
+        .continuous_mut()
+        .get_mut(&(INSTANCE.to_string(), 33))
+        .unwrap();
+    entry.interval = MAX_CONTINUOUS_INTERVAL;
+    entry.next_due = later;
+    app.send_queries();
+    assert_eq!(interval(&app, 33), MAX_CONTINUOUS_INTERVAL);
+}
+
+#[test]
+fn a_new_link_restarts_streams_without_answer_coverage_too() {
+    // A PTR browse has no unique answers to cover anything; when a link
+    // comes up it still starts over with the startup schedule.
+    let mut app = App::new().unwrap();
+    pin_links(&mut app, &["eth0"]);
+    ingest(&mut app, &ptr_record(4500));
+    app.send_queries();
+    let browse = ("_http._tcp.local".to_string(), 12);
+    let entry = app.scheduler.continuous_mut().get_mut(&browse).unwrap();
+    entry.interval = MAX_CONTINUOUS_INTERVAL;
+    entry.next_due = Instant::now() + MAX_CONTINUOUS_INTERVAL;
+    pin_links(&mut app, &["eth0", "wlan0"]);
+    app.send_queries();
+    assert_eq!(
+        app.scheduler.continuous()[&browse].interval,
+        Duration::from_secs(1)
+    );
+}
+
+#[test]
+fn a_link_that_comes_back_is_asked_again() {
+    // Both links answered (dampened); wlan0 goes away and returns: its old
+    // answer no longer counts, so the stream restarts and asks wlan0.
+    let (mut app, rx) = two_link_app();
+    ingest(&mut app, &srv_on("eth0", 2));
+    ingest(&mut app, &srv_on("wlan0", 3));
+    assert_eq!(interval(&app, 33), MAX_CONTINUOUS_INTERVAL);
+    pin_links(&mut app, &["eth0"]);
+    app.send_queries();
+    pin_links(&mut app, &["eth0", "wlan0"]);
+    app.send_queries();
+    assert_eq!(interval(&app, 33), Duration::from_secs(1));
+    rx.try_iter().count();
+    all_due(&mut app);
+    app.send_queries();
+    assert_eq!(links_of(&rx, 33), Some(vec!["wlan0".to_string()]));
+}
+
+#[test]
+fn a_restart_keeps_a_second_after_the_last_send() {
+    // RFC 6762 §5.2: a link appearing right after a send doesn't make the
+    // question go out again within a second.
+    let (mut app, _rx) = two_link_app();
+    all_due(&mut app);
+    app.send_queries();
+    let sent = app
+        .scheduler
+        .history(&Scheduler::provenance_key(INSTANCE, 33))
+        .and_then(|h| h.transmitted)
+        .expect("sent");
+    pin_links(&mut app, &["eth0", "usb0", "wlan0"]);
+    app.send_queries();
+    let next = app.scheduler.continuous()[&(INSTANCE.to_string(), 33)].next_due;
+    assert!(next >= sent + Duration::from_secs(1));
+}
+
+#[test]
+fn a_scoped_query_records_only_its_links() {
+    let (mut app, _rx) = two_link_app();
+    ingest(&mut app, &srv_on("eth0", 2));
+    all_due(&mut app);
+    app.send_queries();
+    let state = app
+        .scheduler
+        .history(&Scheduler::provenance_key(INSTANCE, 33))
+        .expect("sent");
+    assert_eq!(state.transmitted_interfaces, "wlan0");
+}

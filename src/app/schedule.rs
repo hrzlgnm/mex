@@ -21,6 +21,10 @@ pub(super) struct Scheduler {
     /// and is dampened once every usable link is covered. Pruned with
     /// `continuous`.
     covered: HashMap<(String, u16), BTreeSet<String>>,
+    /// The usable links at the last `poll_continuous`: a link not among
+    /// them is new (just up, newly selected, or back after going away),
+    /// and restarts discovery there (#441).
+    last_usable: BTreeSet<String>,
     /// Every service type ever learned (enumeration answers, PTR owners,
     /// confirmed services). Persistent: used for instance/type splitting
     /// and as the desired continuous-query set. Never cleared on a timer.
@@ -837,9 +841,9 @@ impl App {
             return;
         }
         let batch = std::mem::take(&mut self.outbox);
-        let asked: Vec<(String, u16)> = batch
+        let asked: Vec<(String, u16, Vec<String>)> = batch
             .iter()
-            .map(|q| (q.name.clone(), u16::from(q.record_type)))
+            .map(|q| (q.name.clone(), u16::from(q.record_type), q.links.clone()))
             .collect();
         if !self.query_tx.send(batch) {
             log::warn!(
@@ -849,14 +853,27 @@ impl App {
             return;
         }
         let now = Instant::now();
-        for (name, rtype) in asked {
-            self.note_query(&name, rtype, OwnQuery::Transmitted, now);
+        for (name, rtype, links) in asked {
+            self.note_query_on(&name, rtype, OwnQuery::Transmitted, now, &links);
         }
     }
 
     /// Record a query event for an interest: we transmitted it or §7.3
     /// suppression stood in for it, stamped at action time.
     pub(super) fn note_query(&mut self, name: &str, rtype: u16, origin: OwnQuery, at: Instant) {
+        self.note_query_on(name, rtype, origin, at, &[]);
+    }
+
+    /// `note_query` for a query sent only on `links` (#441), recorded as
+    /// its interfaces; empty for every usable link.
+    pub(super) fn note_query_on(
+        &mut self,
+        name: &str,
+        rtype: u16,
+        origin: OwnQuery,
+        at: Instant,
+        links: &[String],
+    ) {
         let mut query_interfaces: Vec<String> = self
             .link_stats
             .v4
@@ -869,6 +886,9 @@ impl App {
                     .is_none_or(|selected| selected.contains(name))
             })
             .collect();
+        if !links.is_empty() {
+            query_interfaces = links.to_vec();
+        }
         query_interfaces.sort();
         query_interfaces.dedup();
         let query_interfaces = query_interfaces.join(", ");
@@ -1101,22 +1121,8 @@ impl App {
         // questions learned together (a host's addresses with its SRV/TXT)
         // stay due on one tick and keep sharing packets as they double.
         let mut first_delay: Option<Duration> = None;
+        self.follow_link_changes(&usable, now, &mut first_delay);
         for (key, qname) in desired {
-            // A link that appeared after the stream was dampened isn't
-            // covered by the answers that dampened it: restart there with
-            // the startup schedule (#441).
-            let uncovered_link = self
-                .scheduler
-                .covered
-                .get(&key)
-                .is_some_and(|cover| !usable.is_empty() && !usable.is_subset(cover));
-            if let Some(entry) = self.scheduler.continuous.get_mut(&key) {
-                if uncovered_link && entry.interval == MAX_CONTINUOUS_INTERVAL {
-                    let delay = *first_delay.get_or_insert_with(|| rand_range(20, 120));
-                    entry.next_due = now + delay;
-                    entry.interval = Duration::from_secs(1);
-                }
-            }
             let (due, send_name) = match self.scheduler.continuous.get(&key) {
                 Some(entry) => (now >= entry.next_due, entry.qname.clone()),
                 None => {
@@ -1354,6 +1360,51 @@ impl App {
                 Some(asked.into_iter().filter(|l| *l != on).collect())
             }
             _ => None,
+        }
+    }
+
+    /// Follow the usable links since the last poll (#441). A link that
+    /// went away is dropped from every stream's covered links, so it counts
+    /// as new when it comes back. A new link restarts every stream with
+    /// the startup schedule, as resuming after a transmit hold does:
+    /// covered links stay covered, so a dampened stream asks only the new
+    /// link, and no question goes out again within a second of its last
+    /// transmission (RFC 6762 §5.2). The first poll only learns the links.
+    fn follow_link_changes(
+        &mut self,
+        usable: &BTreeSet<String>,
+        now: Instant,
+        first_delay: &mut Option<Duration>,
+    ) {
+        for cover in self.scheduler.covered.values_mut() {
+            cover.retain(|link| usable.contains(link));
+        }
+        let appeared = !self.scheduler.last_usable.is_empty()
+            && !usable.is_subset(&self.scheduler.last_usable);
+        self.scheduler.last_usable = usable.clone();
+        if !appeared {
+            return;
+        }
+        log::info!("mex: a link became usable; restarting discovery there");
+        let delay = *first_delay.get_or_insert_with(|| rand_range(20, 120));
+        // Each question's earliest next send: a second after its last.
+        let floors: HashMap<(String, u16), Instant> = self
+            .scheduler
+            .continuous
+            .keys()
+            .filter_map(|key| {
+                let sent = self
+                    .scheduler
+                    .history(&Scheduler::provenance_key(&key.0, key.1))?
+                    .transmitted?;
+                Some((key.clone(), sent + Duration::from_secs(1)))
+            })
+            .collect();
+        for (key, entry) in self.scheduler.continuous.iter_mut() {
+            entry.next_due = floors
+                .get(key)
+                .map_or(now + delay, |floor| (*floor).max(now + delay));
+            entry.interval = Duration::from_secs(1);
         }
     }
 
