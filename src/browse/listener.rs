@@ -195,8 +195,10 @@ pub(super) enum QueueState {
 }
 
 /// Send queued batches until `budget` packets went out. `send` returns
-/// how many packets a batch took; a batch is never split across passes,
-/// so one large batch may overrun the budget once. Returns the packets
+/// how many packets a batch took; a batch counts at least one, so batches
+/// that send nothing (every pin or send failed) can't drain the whole
+/// queue in one pass. A batch is never split across passes, so one large
+/// batch may overrun the budget once. Returns the packets
 /// sent and what is left in the queue. Wakes may coalesce, so the queue
 /// is drained on every pass.
 pub(super) fn drain_queries<T>(
@@ -208,7 +210,7 @@ pub(super) fn drain_queries<T>(
     while sent < budget {
         match rx.try_recv() {
             Ok(batch) => {
-                sent += send(&batch);
+                sent += send(&batch).max(1);
             }
             Err(mpsc::TryRecvError::Empty) => return (sent, QueueState::Empty),
             Err(mpsc::TryRecvError::Disconnected) => return (sent, QueueState::Closed),

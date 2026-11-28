@@ -1127,3 +1127,47 @@ fn without_own_sends_the_text_is_unchanged() {
         "multicast 5 times in 1 s, as little as 0.25 s apart"
     );
 }
+
+/// A packed query (#430) asks A and AAAA of one name together: the
+/// trigger names the question the copy answers, not the first one.
+#[test]
+fn a_packed_query_names_the_question_the_copy_answers() {
+    let at = base();
+    let (a, events) = eth0_copies(at, &[20, 270]);
+    let packed = |ms| OwnSend {
+        questions: vec![
+            ("Repeater.local".to_string(), 28),
+            ("Repeater.local".to_string(), 1),
+        ],
+        ..own_at(at, ms, "unused", 0, "eth0")
+    };
+    let message = own_flood_message(&a, &events, &[packed(0), packed(250)]);
+    assert!(
+        message.ends_with("answering mex (this host) asking Repeater.local. A"),
+        "{message}"
+    );
+
+    // The same for another querier's packed query.
+    let a = host_a(responder(), "eth0");
+    let ask = |ms| {
+        query_at(
+            at,
+            ms,
+            vec![
+                question(HOST, 28, "AAAA", querier(), "eth0"),
+                question(HOST, 1, "A", querier(), "eth0"),
+            ],
+        )
+    };
+    let events = vec![
+        ask(0),
+        response_at(at, 20, vec![a.clone()]),
+        ask(250),
+        response_at(at, 270, vec![a.clone()]),
+    ];
+    let message = own_flood_message(&a, &events, &[]);
+    assert!(
+        message.ends_with("answering 192.168.1.70:5353@eth0 asking Repeater.local. A"),
+        "{message}"
+    );
+}
