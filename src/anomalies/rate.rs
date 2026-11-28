@@ -287,6 +287,16 @@ type DeviceAskingKey = (String, String, u16, Link);
 
 /// Multicast record sends in the retained packets, indexed once per
 /// analysis so every row is checked against them cheaply (#407).
+/// A question's name (`name_key`) and the link it was asked on.
+type AskedKey = (String, String, u32);
+
+/// One question asked by another querier: when, in which packet, by whom.
+struct Asked {
+    at: Instant,
+    packet: usize,
+    source: SocketAddr,
+}
+
 /// One identity's copies, grouped once per analysis (#442).
 struct Grouped<'a> {
     /// The record the copies carry.
@@ -322,6 +332,10 @@ pub(super) struct MulticastIndex<'a> {
     /// packet (a record in two sections of one response is one send).
     sends: HashMap<SendKey, Vec<(Instant, usize)>>,
     probes: Vec<Probe>,
+    /// Every non-probe question by name (`name_key`) and link, in arrival
+    /// order: finds a copy's trigger with a binary search, not a walk
+    /// back through the retained packets for every copy.
+    asked: HashMap<AskedKey, Vec<Asked>>,
     /// Each identity sent more than once, grouped once per analysis
     /// (#442): its record, which copies answer a probe, and its bursts.
     /// A single copy can't repeat, so it's left out.
@@ -362,6 +376,7 @@ impl<'a> MulticastIndex<'a> {
         let mut sends: HashMap<SendKey, Vec<(Instant, usize)>> = HashMap::new();
         // One record per identity, for grouping its copies below.
         let mut records: HashMap<SendKey, &'a RawRecord> = HashMap::new();
+        let mut asked: HashMap<AskedKey, Vec<Asked>> = HashMap::new();
         let mut probes = Vec::new();
         let mut device_askers: HashMap<DeviceAskingKey, BTreeSet<String>> = HashMap::new();
         for (i, ev) in events.iter().enumerate() {
@@ -381,6 +396,14 @@ impl<'a> MulticastIndex<'a> {
                 });
             } else {
                 for q in &ev.questions {
+                    asked
+                        .entry((name_key(&q.name), q.iface.clone(), q.ifindex))
+                        .or_default()
+                        .push(Asked {
+                            at: ev.received_at,
+                            packet: i,
+                            source: q.source,
+                        });
                     if let Some(device) = device_names.get(&q.source.ip()) {
                         device_askers
                             .entry((
@@ -414,6 +437,7 @@ impl<'a> MulticastIndex<'a> {
             own_sends,
             sends,
             probes,
+            asked,
             grouped: HashMap::new(),
             device_display: display_names(device_names),
             device_names,
@@ -532,10 +556,23 @@ impl<'a> MulticastIndex<'a> {
     /// as the trigger picks them. `None` for an unsolicited copy.
     fn trigger_at(&self, rec: &RawRecord, at: Instant, packet: usize) -> Option<Instant> {
         let names = self.packet_names(packet);
-        let foreign = self
-            .foreign_askings(rec, at, packet, &names)
-            .first()
-            .map(|(t, _)| *t);
+        // The latest question for any of the packet's names, asked on the
+        // copy's link by another source in the second before it.
+        let foreign = names
+            .iter()
+            .filter_map(|name| {
+                let list = self
+                    .asked
+                    .get(&(name.clone(), rec.iface.clone(), rec.ifindex))?;
+                let end = list.partition_point(|q| q.packet < packet);
+                list[..end]
+                    .iter()
+                    .rev()
+                    .take_while(|q| at.saturating_duration_since(q.at) <= MIN_GAP)
+                    .find(|q| q.source != rec.source)
+                    .map(|q| q.at)
+            })
+            .max();
         let own = self.own_askings(rec, at, &names).next().map(|(t, _)| t);
         foreign.max(own)
     }
@@ -551,46 +588,60 @@ impl<'a> MulticastIndex<'a> {
             .iter()
             .map(|(at, packet)| self.trigger_at(rec, *at, *packet))
             .collect();
-        // Two neighbouring copies answer one query round: both judged, and
-        // their triggers no further apart than a reply delay (a querier
-        // sending several questions in packets a few ms apart is one round).
-        let same_query = |k: usize| {
-            !probed[k]
-                && !probed[k - 1]
-                && match (triggers[k], triggers[k - 1]) {
+        // Rounds, each `(first, end)`: a copy joins the open round when it
+        // and the round's first copy are judged (a probe answer stands
+        // alone), its trigger is within a reply delay of the round's first
+        // trigger (a querier sending several questions in packets a few ms
+        // apart is one round; measured from the first, so rounds can't
+        // chain), and it was sent within a second of the round's first
+        // copy (only then is it a repeat at all).
+        let mut rounds: Vec<(usize, usize)> = Vec::new();
+        let mut first = 0;
+        for k in 1..copies.len() {
+            let joins = !probed[k]
+                && !probed[first]
+                && copies[k].0 - copies[first].0 < MIN_GAP
+                && match (triggers[k], triggers[first]) {
                     (Some(a), Some(b)) => a.max(b) - a.min(b) <= REPLY_DELAY,
                     _ => false,
-                }
-        };
-        let mut b = Bursts::default();
-        let mut start = 0;
-        for k in 1..=copies.len() {
-            if k < copies.len() && same_query(k) {
-                continue;
+                };
+            if !joins {
+                rounds.push((first, k));
+                first = k;
             }
-            let n = k - start;
+        }
+        rounds.push((first, copies.len()));
+        let mut b = Bursts::default();
+        for &(first, end) in &rounds {
+            let n = end - first;
             if n > 1 {
                 b.per_query = b.per_query.max(n);
-                b.span = b.span.max(copies[k - 1].0 - copies[start].0);
-                b.queries.extend(triggers[start]);
+                b.span = b.span.max(copies[end - 1].0 - copies[first].0);
+                b.queries.extend(triggers[first]);
             }
-            start = k;
         }
         // A burst is one answer sent several times: the next send is
         // judged from the burst's first copy, so a responder answering two
         // queries a second apart isn't flagged again for its own
         // duplicates, which the copies-per-query count already reports.
-        // Where each round's copies start (a round of one copy included).
-        let starts: Vec<usize> = (0..copies.len())
-            .filter(|&k| k == 0 || !same_query(k))
-            .collect();
-        // Answers to queries a second apart may land a reply delay closer;
-        // a probe answer may come early (§6).
-        b.unexplained = starts
+        // A probe answer may come early (§6). Between two answers to
+        // queries, the reply delay may bring them closer than a second;
+        // an unsolicited copy, or one after a probe answer, gets no such
+        // tolerance.
+        b.unexplained = rounds
             .windows(2)
-            .filter(|w| !probed[w[1]])
-            .map(|w| copies[w[1]].0 - copies[w[0]].0)
-            .filter(|gap| *gap < MIN_GAP - REPLY_DELAY)
+            .filter(|w| !probed[w[1].0])
+            .filter_map(|w| {
+                let (prev, cur) = (w[0].0, w[1].0);
+                let answers = triggers[prev].is_some() && triggers[cur].is_some() && !probed[prev];
+                let floor = if answers {
+                    MIN_GAP - REPLY_DELAY
+                } else {
+                    MIN_GAP
+                };
+                let gap = copies[cur].0 - copies[prev].0;
+                (gap < floor).then_some(gap)
+            })
             .min();
         b
     }
@@ -611,7 +662,7 @@ impl<'a> MulticastIndex<'a> {
             queries: HashSet<Instant>,
             rows: usize,
         }
-        // By owner (host header) and responder name, sorted for a stable list.
+        // By owner (host header) and device identity, sorted for a stable list.
         let mut responders: BTreeMap<(String, String), Responder> = BTreeMap::new();
         for Grouped { rec, bursts: b, .. } in self.grouped.values() {
             if b.per_query < 2 || b.unexplained.is_some() {
@@ -629,7 +680,10 @@ impl<'a> MulticastIndex<'a> {
                         .map(|n| n.to_string())
                 })
                 .unwrap_or_else(|| rec.source.ip().to_string());
-            let r = responders.entry((owner, who.clone())).or_default();
+            // One device by its identity (host id), not its display name:
+            // two devices can share a short name. Unknown ones by address.
+            let identity = device.map_or_else(|| rec.source.ip().to_string(), |d| d.id.clone());
+            let r = responders.entry((owner, identity)).or_default();
             r.name = who;
             r.sources.insert(rec.source_label());
             r.per_query = r.per_query.max(b.per_query);

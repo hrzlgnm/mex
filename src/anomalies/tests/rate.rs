@@ -1559,3 +1559,135 @@ fn a_probe_answer_after_a_burst_is_no_re_send() {
     assert_eq!(flood.len(), 1, "{found:#?}");
     assert_eq!(flood[0].record_name, None, "{}", flood[0].message);
 }
+
+#[test]
+fn query_rounds_do_not_chain() {
+    // Queries 100 ms apart, each answered once: the first two are one
+    // round, but the third is 200 ms after the round's first query and
+    // starts its own, so the record is multicast again within a second.
+    let at = base();
+    let a = host_a(responder(), "eth0");
+    let mut events = Vec::new();
+    for ms in [0, 100, 200] {
+        events.push(query_at(
+            at,
+            ms,
+            vec![question(HOST, 1, "A", querier(), "eth0")],
+        ));
+        events.push(response_at(at, ms + 5, vec![a.clone()]));
+    }
+    let found = analyze_full(
+        &[cached(&a)],
+        &events,
+        &[],
+        repeater_device(),
+        &["repeater"],
+    );
+    let flood = multicast_findings(&found);
+    assert_eq!(flood.len(), 1, "{found:#?}");
+    assert_eq!(
+        flood[0].record_name.as_deref(),
+        Some(HOST),
+        "{}",
+        flood[0].message
+    );
+}
+
+#[test]
+fn unsolicited_copies_get_no_reply_delay_tolerance() {
+    // 0.9 s between two unsolicited copies: no query to answer late, so
+    // the full second applies.
+    let at = base();
+    let a = host_a(responder(), "eth0");
+    let events = sends(at, &a, &[0, 900]);
+    let found = analyze_full(
+        &[cached(&a)],
+        &events,
+        &[],
+        repeater_device(),
+        &["repeater"],
+    );
+    assert_eq!(multicast_findings(&found).len(), 1, "{found:#?}");
+}
+
+#[test]
+fn a_copy_after_a_probe_answer_waits_a_full_second() {
+    // §6: a probe answer may come early, but the next copy must wait a
+    // second after it, however soon a query asks again.
+    let at = base();
+    let a = host_a(responder(), "eth0");
+    let prober: SocketAddr = "192.168.1.50:5353".parse().unwrap();
+    let mut probe = query_at(at, 0, vec![question(HOST, 255, "ANY", prober, "eth0")]);
+    probe.query_authority = vec![host_a(prober, "eth0")];
+    let events = vec![
+        probe,
+        response_at(at, 10, vec![a.clone()]),
+        query_at(at, 800, vec![question(HOST, 1, "A", querier(), "eth0")]),
+        response_at(at, 910, vec![a.clone()]),
+    ];
+    let found = analyze_full(
+        &[cached(&a)],
+        &events,
+        &[],
+        repeater_device(),
+        &["repeater"],
+    );
+    let flood = multicast_findings(&found);
+    assert_eq!(flood.len(), 1, "{found:#?}");
+    assert_eq!(flood[0].record_name.as_deref(), Some(HOST));
+}
+
+#[test]
+fn copies_a_second_apart_are_no_burst_however_close_their_queries() {
+    // Queries 100 ms apart (one round), but the second answer comes 1.045 s
+    // after the first, still answering the second query: no repeat, so
+    // neither a row nor a host finding.
+    let at = base();
+    let a = host_a(responder(), "eth0");
+    let events = vec![
+        query_at(at, 0, vec![question(HOST, 1, "A", querier(), "eth0")]),
+        response_at(at, 5, vec![a.clone()]),
+        query_at(at, 100, vec![question(HOST, 1, "A", querier(), "eth0")]),
+        response_at(at, 1050, vec![a.clone()]),
+    ];
+    let found = analyze_full(
+        &[cached(&a)],
+        &events,
+        &[],
+        repeater_device(),
+        &["repeater"],
+    );
+    assert!(multicast_findings(&found).is_empty(), "{found:#?}");
+}
+
+#[test]
+fn devices_sharing_a_short_name_stay_two_findings() {
+    // Two unattributed devices both shown as `cam`: one finding each,
+    // keyed by device identity, not by the name they display.
+    let at = base();
+    let other: SocketAddr = "192.168.1.110:5353".parse().unwrap();
+    let a = host_a(responder(), "eth0");
+    let mut b = host_a(other, "eth0");
+    b.name = "Other.local.".to_string();
+    b.rdata = "192.168.1.110".to_string();
+    let mut events = answered_in_burst(at, 0, &a, 2);
+    events.push(query_at(
+        at,
+        300,
+        vec![question("Other.local.", 1, "A", querier(), "eth0")],
+    ));
+    events.push(response_at(at, 305, vec![b.clone()]));
+    events.push(response_at(at, 310, vec![b.clone()]));
+    let cam = |id: &str| DeviceLabel {
+        id: id.to_string(),
+        name: "cam".to_string(),
+    };
+    let names: HashMap<_, _> =
+        [(responder().ip(), cam("cam-a")), (other.ip(), cam("cam-b"))].into();
+    let found = analyze_full(&[cached(&a), cached(&b)], &events, &[], names, &[]);
+    let flood = multicast_findings(&found);
+    assert_eq!(flood.len(), 2, "{found:#?}");
+    assert!(flood
+        .iter()
+        .all(|f| f.service == UNATTRIBUTED_SERVICE && f.record_name.is_none()));
+}
