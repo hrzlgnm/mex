@@ -1277,3 +1277,42 @@ fn a_message_s_opcode_is_exposed_on_the_event() {
     // AA and RD next to it don't leak into the OPCODE.
     assert_eq!(parse(0x8500).opcode(), 0);
 }
+
+/// A response holding an A record and an OPT in Additional whose TTL
+/// carries `extended` as its extended-RCODE byte; header RCODE 0.
+fn response_with_extended_rcode(extended: u8) -> Vec<u8> {
+    let mut wire = Vec::new();
+    for field in [0u16, 0x8400, 0, 1, 0, 1] {
+        wire.extend_from_slice(&field.to_be_bytes());
+    }
+    wire.extend_from_slice(b"\x04host\x05local\x00");
+    wire.extend_from_slice(&1u16.to_be_bytes());
+    wire.extend_from_slice(&1u16.to_be_bytes());
+    wire.extend_from_slice(&120u32.to_be_bytes());
+    wire.extend_from_slice(&4u16.to_be_bytes());
+    wire.extend_from_slice(&[192, 168, 1, 10]);
+    // OPT: root owner, type 41, UDP size 1232, TTL = extended RCODE,
+    // version 0, flags 0; no options.
+    wire.push(0);
+    wire.extend_from_slice(&OPT_TYPE.to_be_bytes());
+    wire.extend_from_slice(&1232u16.to_be_bytes());
+    wire.extend_from_slice(&[extended, 0, 0, 0]);
+    wire.extend_from_slice(&0u16.to_be_bytes());
+    wire
+}
+
+#[test]
+fn an_extended_rcode_in_the_opt_record_counts() {
+    // RFC 6891 §6.1.3: the RCODE is 12 bits, the upper 8 in the OPT TTL.
+    // A zero header nibble with extended RCODE 1 is BADVERS (16), non-zero.
+    let parse = |raw: &[u8]| {
+        parse_packet(raw, test_source(), std::net::IpAddr::V4(MDNS_V4), "br0", 3).unwrap()
+    };
+    let ev = parse(&response_with_extended_rcode(1));
+    assert_eq!(ev.rcode, Some(16));
+    assert!(ev.has_nonzero_rcode() && ev.is_ignored());
+    let ev = parse(&response_with_extended_rcode(0));
+    assert_eq!(ev.rcode, Some(0));
+    assert!(!ev.is_ignored());
+    assert_eq!(ev.answers.len(), 1, "the A record still parses");
+}

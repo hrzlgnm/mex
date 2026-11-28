@@ -71,10 +71,10 @@ Headless run (no TTY) logs to stderr.
   packets, no older than a second before the oldest retained one and
   capped; only the multicast-rate check reads them (mex as the trigger,
   copies after our queries), never a view, counter or other check.
-  Messages with a non-zero OPCODE (RFC 6762 §18.3, `Event::is_ignored`)
-  and responses with a non-zero RCODE (§18.11) stop at ingest but stay in
-  the packet log; non-zero-OPCODE ones are also dropped before the
-  analyzer and counted in diagnostics.
+  Messages with a non-zero OPCODE (RFC 6762 §18.3) and responses with a
+  non-zero RCODE (§18.11), both `Event::is_ignored`, stop at ingest but
+  stay in the packet log, and are dropped before the analyzer (#435);
+  non-zero-OPCODE ones are also counted in diagnostics.
   Out-of-scope records, known answers and questions go to `sightings`
   (never rows, never query drivers; capped, expired by TTL/time), with
   owners resolved at analysis time: instance names to their service,

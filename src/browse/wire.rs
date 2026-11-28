@@ -241,7 +241,12 @@ pub(crate) fn parse_packet(
         query_kas,
         query_authority,
         query_additional,
-        rcode: is_response.then(|| raw.get(3).copied().unwrap_or_default() & 0x0f),
+        // RFC 6891 §6.1.3: the header holds the low 4 bits of the RCODE,
+        // an OPT record the upper 8.
+        rcode: is_response.then(|| {
+            u16::from(wire.extended_rcode) << 4
+                | u16::from(raw.get(3).copied().unwrap_or_default() & 0x0f)
+        }),
         received_at: Instant::now(),
         raw_bytes: raw.to_vec(),
         source,
@@ -437,6 +442,10 @@ pub(super) struct WalkedSections {
     pub(super) answer: Vec<WireRecord>,
     pub(super) authority: Vec<WireRecord>,
     pub(super) additional: Vec<WireRecord>,
+    /// The upper 8 bits of the 12-bit RCODE (RFC 6891 §6.1.3): the first
+    /// TTL byte of the first OPT in Additional, the one `Packet::parse`
+    /// lifts into the header. Zero without one.
+    pub(super) extended_rcode: u8,
 }
 
 /// Walk every resource record header in a packet (answer, authority,
@@ -482,6 +491,9 @@ pub(super) fn walk_records(raw: &[u8]) -> Option<(Vec<u8>, WalkedSections)> {
         } else if index < answers + authority {
             &mut out.authority
         } else {
+            if rtype == OPT_TYPE && !out.additional.iter().any(|w| w.rtype == OPT_TYPE) {
+                out.extended_rcode = raw[type_at + 4];
+            }
             &mut out.additional
         };
         section.push(WireRecord { rtype, rdlength });

@@ -249,7 +249,7 @@ pub struct Event {
     /// only flagged (`misplaced-known-answer`, #424).
     pub query_additional: Vec<RawRecord>,
     /// DNS header response code for a response packet; queries are `None`.
-    pub rcode: Option<u8>,
+    pub rcode: Option<u16>,
     pub received_at: Instant,
     pub raw_bytes: Vec<u8>,
     pub source: SocketAddr,
@@ -282,12 +282,24 @@ impl Event {
         self.raw_bytes.get(2).map_or(0, |flags| (flags >> 3) & 0x0f)
     }
 
-    /// Whether mDNS gives this message no meaning: RFC 6762 §18.3 says a
-    /// message with a non-zero OPCODE MUST be silently ignored, query and
-    /// response alike. It stays in the packet log, but never reaches
-    /// state, scheduling or the analyzer (#427).
+    /// Whether mDNS gives this message no meaning, so it MUST be silently
+    /// ignored: a non-zero OPCODE, query or response (RFC 6762 §18.3,
+    /// #427), or a response with a non-zero RCODE (§18.11, #435). It stays
+    /// in the packet log, but never reaches state, scheduling or the
+    /// analyzer.
     pub fn is_ignored(&self) -> bool {
+        self.has_nonzero_opcode() || self.has_nonzero_rcode()
+    }
+
+    /// Whether the header's OPCODE is non-zero (RFC 6762 §18.3).
+    pub fn has_nonzero_opcode(&self) -> bool {
         self.opcode() != 0
+    }
+
+    /// Whether this is a response with a non-zero RCODE (RFC 6762
+    /// §18.11); queries carry none.
+    pub fn has_nonzero_rcode(&self) -> bool {
+        self.rcode.is_some_and(|rcode| rcode != 0)
     }
 }
 
