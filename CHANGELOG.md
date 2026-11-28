@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.26.0](https://github.com/hrzlgnm/mex/compare/v0.25.0...v0.26.0) (2026-11-28)
+
+
+### Features
+
+* dampen discovery per ingress link on multi-homed hosts ([#446](https://github.com/hrzlgnm/mex/issues/446)) ([4ff3596](https://github.com/hrzlgnm/mex/commit/4ff35966fd563b86589bb23f0d0321722520813e))
+* flag known answers in a query's Additional section (RFC 6762 §7.1) ([#428](https://github.com/hrzlgnm/mex/issues/428)) ([84f8f29](https://github.com/hrzlgnm/mex/commit/84f8f2903928bccca9521f4aede95a5978f3efd9))
+* flag queries with the AA bit set (RFC 6762 §18.4) ([#426](https://github.com/hrzlgnm/mex/issues/426)) ([7723f2e](https://github.com/hrzlgnm/mex/commit/7723f2e611d0fd47cf4b42a6f4b92387b4b84dc5))
+* flag questions repeated within one second (RFC 6762 §5.2) ([#417](https://github.com/hrzlgnm/mex/issues/417)) ([dbce802](https://github.com/hrzlgnm/mex/commit/dbce802f6c4a17a88542b129e36baf3cc59a946b))
+* flag records multicast again within one second (RFC 6762 §6) ([#418](https://github.com/hrzlgnm/mex/issues/418)) ([308f21a](https://github.com/hrzlgnm/mex/commit/308f21ac7be99f8287b6c73eea8735e1c538c6fd))
+* pack the questions of one tick into one query packet ([#437](https://github.com/hrzlgnm/mex/issues/437)) ([389b685](https://github.com/hrzlgnm/mex/commit/389b685e103abff8287318c985273023ecef45dc))
+* report responders that answer each query several times once, on their host ([#445](https://github.com/hrzlgnm/mex/issues/445)) ([c7b30d2](https://github.com/hrzlgnm/mex/commit/c7b30d28d2b225760d141252ebdb62d16a300c1b))
+
+
+### Bug Fixes
+
+* fold the NSEC next name's case when matching repeated multicasts ([#421](https://github.com/hrzlgnm/mex/issues/421)) ([447221e](https://github.com/hrzlgnm/mex/commit/447221ef5c9d75a115c29d532f7bd79411ac8a02))
+* name a dual-stack querier stably in multicast-rate-limit findings ([#425](https://github.com/hrzlgnm/mex/issues/425)) ([d571864](https://github.com/hrzlgnm/mex/commit/d571864ce46556eeb009761122c7b2ee3e837e32))
+* name mex's own queries as the trigger in multicast-rate-limit findings ([#436](https://github.com/hrzlgnm/mex/issues/436)) ([c10170b](https://github.com/hrzlgnm/mex/commit/c10170ba3371cb16c3f2105e5faac3c837e5c578))
+* silently ignore messages with a non-zero OPCODE (RFC 6762 §18.3) ([#434](https://github.com/hrzlgnm/mex/issues/434)) ([8c9d441](https://github.com/hrzlgnm/mex/commit/8c9d44119c5c6eb46ea5c3cea7a50e5bc47ea1ff))
+* treat SRV/TXT/A/AAAA answers as unique without the cache-flush bit ([#439](https://github.com/hrzlgnm/mex/issues/439)) ([3da6ffa](https://github.com/hrzlgnm/mex/commit/3da6ffa5ab8f3dc8240ca062a739899b7a10bbe3))
+
+
+### Tests
+
+* time combined multicast sends from one base ([#422](https://github.com/hrzlgnm/mex/issues/422)) ([a752f7e](https://github.com/hrzlgnm/mex/commit/a752f7ef63c6e86434c05df93f5a1c2f3a3c3389))
+
+
+### Continuous Integration
+
+* run the clippy passes in parallel per platform ([#433](https://github.com/hrzlgnm/mex/issues/433)) ([af7303c](https://github.com/hrzlgnm/mex/commit/af7303c5348357253b05ef3434902ab7264ac66d))
+
 ## [0.25.0](https://github.com/hrzlgnm/mex/compare/v0.24.0...v0.25.0) (2026-11-27)
 
 
