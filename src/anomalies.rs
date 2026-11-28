@@ -485,9 +485,10 @@ pub fn analyze_observations(
     own_sends: &[crate::browse::OwnSend],
     address_queries: &[AddressQueryView],
 ) -> Vec<Anomaly> {
-    // RFC 6762 §18.3: a message with a non-zero OPCODE carries no mDNS
-    // meaning, so no check counts it (#427). Copied only when one is
-    // retained, which is rare.
+    // RFC 6762 §18.3, §18.11: a message with a non-zero OPCODE, or a
+    // response with a non-zero RCODE, carries no mDNS meaning, so no check
+    // counts it (#427, #435). Copied only when one is retained, which is
+    // rare.
     let kept: Vec<crate::browse::Event>;
     let events = if events.iter().any(crate::browse::Event::is_ignored) {
         kept = events

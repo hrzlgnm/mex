@@ -286,7 +286,7 @@ stays in the packet log for the hex pane, but files no rows, sightings or
 questions, moves no query scheduling and counts in no finding. The
 diagnostics overlay and state dumps count such messages (`ignored opcode`,
 `opcode_ignored_packets`). A response with a non-zero RCODE is likewise
-kept off the panes ([§18.11](https://www.rfc-editor.org/rfc/rfc6762#section-18.11)).
+kept off the panes and out of every finding ([§18.11](https://www.rfc-editor.org/rfc/rfc6762#section-18.11)).
 
 Reverse-mapping PTRs (`*.in-addr.arpa`, `*.ip6.arpa`) are exempt from
 the shared-record rules: they are unique records. Omitting the flush

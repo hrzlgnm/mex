@@ -1691,3 +1691,37 @@ fn devices_sharing_a_short_name_stay_two_findings() {
         .iter()
         .all(|f| f.service == UNATTRIBUTED_SERVICE && f.record_name.is_none()));
 }
+
+/// `events` with every response's RCODE set to `rcode`.
+fn with_rcode(events: Vec<Event>, rcode: u8) -> Vec<Event> {
+    events
+        .into_iter()
+        .map(|mut ev| {
+            if ev.rcode.is_some() {
+                ev.rcode = Some(rcode);
+            }
+            ev
+        })
+        .collect()
+}
+
+/// RFC 6762 §18.11 (#435): a response with a non-zero RCODE is ignored,
+/// so its copies never count as multicasts.
+#[test]
+fn nonzero_rcode_floods_are_ignored() {
+    let a = host_a(responder(), "");
+    let copies = sends(base(), &a, &[0, 250, 500, 750, 1000]);
+    let found = analyze_answers(&[cached(&a)], &with_rcode(copies.clone(), 3));
+    assert!(multicast_findings(&found).is_empty(), "{found:#?}");
+    let found = analyze_answers(&[cached(&a)], &with_rcode(copies, 0));
+    assert_eq!(multicast_findings(&found).len(), 1, "{found:#?}");
+}
+
+#[test]
+fn a_normal_copy_next_to_a_nonzero_rcode_copy_is_no_repeat() {
+    let a = host_a(responder(), "");
+    let mut copies = sends(base(), &a, &[0, 300]);
+    copies[1].rcode = Some(3);
+    let found = analyze_answers(&[cached(&a)], &copies);
+    assert!(multicast_findings(&found).is_empty(), "{found:#?}");
+}

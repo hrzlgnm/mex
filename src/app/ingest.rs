@@ -11,7 +11,7 @@ impl App {
         // packet log for inspection, but none of its records or questions
         // reach state. Checked first, so one with a non-zero RCODE as well
         // is still counted, and the overlay shows something sends them.
-        if ev.is_ignored() {
+        if ev.has_nonzero_opcode() {
             log::debug!(
                 "mex: ignoring message from {} with OPCODE {}",
                 ev.source,
@@ -22,7 +22,7 @@ impl App {
             return;
         }
         // RFC 6762 §18.11: likewise for a response with a non-zero RCODE.
-        if has_nonzero_rcode(ev) {
+        if ev.has_nonzero_rcode() {
             log::debug!(
                 "mex: ignoring response from {} with RCODE {:?}",
                 ev.source,

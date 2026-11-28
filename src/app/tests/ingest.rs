@@ -1659,3 +1659,62 @@ fn a_message_with_nonzero_opcode_and_rcode_is_still_counted() {
     );
     assert_eq!(app.diagnostics.opcode_ignored, 1);
 }
+
+#[test]
+fn a_nonzero_rcode_response_never_decides_the_evidence_link() {
+    // #435: with the address query's links unknown, the unresolved-target
+    // evidence takes its link from the retained responses for the host. An
+    // RCODE 3 reply is ignored, so its link (eth9) never stands in.
+    let mut app = App::new().unwrap();
+    ingest(&mut app, &ptr_record(4500));
+    ingest(&mut app, &srv_record(120));
+    mark_address_queries(&mut app, "test.local", Duration::from_secs(2));
+    let mut a = raw_record("test.local.", 1, "A", "192.168.1.10", 120);
+    a.iface = "eth9".to_string();
+    a.ifindex = 9;
+    ingest_packet(
+        &mut app,
+        browse::Event {
+            answers: vec![a],
+            questions: Vec::new(),
+            query_kas: Vec::new(),
+            query_authority: Vec::new(),
+            query_additional: Vec::new(),
+            rcode: Some(3),
+            received_at: Instant::now(),
+            raw_bytes: vec![0x01],
+            source: test_source(),
+        },
+    );
+    let found = app
+        .anomalies()
+        .into_iter()
+        .filter(|a| a.kind.as_str() == "unresolved-srv-target")
+        .collect::<Vec<_>>();
+    assert!(!found.is_empty());
+    assert!(
+        found.iter().all(|f| !f.message.contains("eth9")),
+        "{found:#?}"
+    );
+}
+
+#[test]
+fn a_nonzero_rcode_alone_is_not_counted_as_ignored_opcode() {
+    let mut app = App::new().unwrap();
+    ingest_packet(
+        &mut app,
+        browse::Event {
+            answers: vec![raw_record("test.local.", 1, "A", "192.168.1.10", 120)],
+            questions: Vec::new(),
+            query_kas: Vec::new(),
+            query_authority: Vec::new(),
+            query_additional: Vec::new(),
+            rcode: Some(3),
+            received_at: Instant::now(),
+            raw_bytes: header(0x84),
+            source: test_source(),
+        },
+    );
+    assert_eq!(app.diagnostics.opcode_ignored, 0);
+    assert_eq!(app.raw_events.len(), 1, "still in the packet log");
+}

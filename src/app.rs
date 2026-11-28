@@ -494,12 +494,6 @@ fn is_unique_answer(rec: &browse::RawRecord) -> bool {
     rec.flush_bit || matches!(rec.rtype, 1 | 16 | 28 | 33)
 }
 
-/// Whether a response carries a non-zero RCODE, which RFC 6762 §18.11
-/// says MUST be silently ignored on receipt.
-fn has_nonzero_rcode(ev: &browse::Event) -> bool {
-    ev.rcode.is_some_and(|rcode| rcode != 0)
-}
-
 /// The enumeration name (case-insensitive, trailing dot ignored).
 fn is_enum_name(name: &str) -> bool {
     name.trim_end_matches('.')
@@ -1500,7 +1494,7 @@ impl App {
         }
         let target_changed = batch
             .iter()
-            .filter(|ev| !has_nonzero_rcode(ev) && !ev.is_ignored())
+            .filter(|ev| !ev.is_ignored())
             .any(|ev| ev.answers.iter().any(|rec| rec.rtype == 33 && rec.ttl > 0));
         for ev in &batch {
             self.note_packet_diagnostics(ev);
