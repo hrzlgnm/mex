@@ -540,22 +540,16 @@ impl<'a> MulticastIndex<'a> {
         // judged from the burst's first copy, so a responder answering two
         // queries a second apart isn't flagged again for its own
         // duplicates, which the copies-per-query count already reports.
-        let mut burst_start = copies.first().map(|c| c.0);
-        let mut gaps = Vec::new();
-        for k in 1..copies.len() {
-            if same_query(k) {
-                continue;
-            }
-            if let Some(start) = burst_start {
-                if !probed[k] {
-                    gaps.push(copies[k].0 - start);
-                }
-            }
-            burst_start = Some(copies[k].0);
-        }
-        // Answers to queries a second apart may land a reply delay closer.
-        b.unexplained = gaps
-            .into_iter()
+        // Where each round's copies start (a round of one copy included).
+        let starts: Vec<usize> = (0..copies.len())
+            .filter(|&k| k == 0 || !same_query(k))
+            .collect();
+        // Answers to queries a second apart may land a reply delay closer;
+        // a probe answer may come early (§6).
+        b.unexplained = starts
+            .windows(2)
+            .filter(|w| !probed[w[1]])
+            .map(|w| copies[w[1]].0 - copies[w[0]].0)
             .filter(|gap| *gap < MIN_GAP - REPLY_DELAY)
             .min();
         b
@@ -580,6 +574,9 @@ impl<'a> MulticastIndex<'a> {
         // By owner (host header) and responder name, sorted for a stable list.
         let mut responders: BTreeMap<(String, String), Responder> = BTreeMap::new();
         for (key, copies) in &self.sends {
+            // `sends` is built from these very records, with this filter,
+            // so the first copy's packet always holds one: a guard, not a
+            // path real input reaches.
             let Some(rec) = self.events[copies[0].1]
                 .answers
                 .iter()

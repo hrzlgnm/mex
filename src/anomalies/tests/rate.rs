@@ -1529,3 +1529,28 @@ fn answers_a_reply_delay_short_of_a_second_stay_quiet() {
     assert_eq!(flood.len(), 1, "{found:#?}");
     assert_eq!(flood[0].record_name.as_deref(), Some(HOST));
 }
+
+#[test]
+fn a_probe_answer_after_a_burst_is_no_re_send() {
+    // RFC 6762 §6: answering a probe may come early. After a burst for a
+    // query, a probe answer 200 ms later doesn't count as multicasting the
+    // record again, so only the responder finding remains.
+    let at = base();
+    let a = host_a(responder(), "eth0");
+    let mut events = answered_in_burst(at, 0, &a, 2);
+    let prober: SocketAddr = "192.168.1.50:5353".parse().unwrap();
+    let mut probe = query_at(at, 200, vec![question(HOST, 255, "ANY", prober, "eth0")]);
+    probe.query_authority = vec![host_a(prober, "eth0")];
+    events.push(probe);
+    events.push(response_at(at, 210, vec![a.clone()]));
+    let found = analyze_full(
+        &[cached(&a)],
+        &events,
+        &[],
+        repeater_device(),
+        &["repeater"],
+    );
+    let flood = multicast_findings(&found);
+    assert_eq!(flood.len(), 1, "{found:#?}");
+    assert_eq!(flood[0].record_name, None, "{}", flood[0].message);
+}
