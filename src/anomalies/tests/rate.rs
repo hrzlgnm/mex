@@ -1693,7 +1693,7 @@ fn devices_sharing_a_short_name_stay_two_findings() {
 }
 
 /// `events` with every response's RCODE set to `rcode`.
-fn with_rcode(events: Vec<Event>, rcode: u8) -> Vec<Event> {
+fn with_rcode(events: Vec<Event>, rcode: u16) -> Vec<Event> {
     events
         .into_iter()
         .map(|mut ev| {

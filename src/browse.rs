@@ -249,7 +249,7 @@ pub struct Event {
     /// only flagged (`misplaced-known-answer`, #424).
     pub query_additional: Vec<RawRecord>,
     /// DNS header response code for a response packet; queries are `None`.
-    pub rcode: Option<u8>,
+    pub rcode: Option<u16>,
     pub received_at: Instant,
     pub raw_bytes: Vec<u8>,
     pub source: SocketAddr,
