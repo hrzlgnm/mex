@@ -112,7 +112,8 @@ Headless run (no TTY) logs to stderr.
   modules: `records` (record claims, SRV targets, TTLs), `resolve`
   (unresolved targets, address-query evidence), `naming` (service type,
   label and subtype checks), `questions` (question verdicts), `rate`
-  (sends repeated within a second, over the retained packets, and
+  (sends repeated within a second and answers to queries that already
+  listed them, `known-answer-ignored`, over the retained packets, and
   `QuestionTally`, the per-question, per-link query count `header` and
   `placement` share), `header`
   (query header bits, over the retained packets), `placement` (records in

@@ -8,6 +8,7 @@ use super::*;
 /// Our query copy for `name` SRV on `iface`, sent at `at`.
 fn own(at: Instant, name: &str, iface: &str) -> browse::OwnSend {
     browse::OwnSend {
+        known_answers: Vec::new(),
         questions: vec![(name.to_string(), 33)],
         iface: iface.to_string(),
         ifindex: 2,
@@ -154,4 +155,38 @@ fn own_sends_are_capped() {
         app.own_sends[0].questions[0].0, "n5.local",
         "oldest dropped"
     );
+}
+
+#[test]
+fn a_responder_answering_our_known_answer_is_flagged() {
+    // #443 end to end: our PTR query listed the instance; the responder
+    // multicasts that PTR anyway.
+    let mut app = App::new().unwrap();
+    let base = Instant::now() - Duration::from_secs(2);
+    let mut ptr = ptr_record(4500);
+    ptr.iface = "eth0".to_string();
+    ptr.ifindex = 2;
+    ptr.received_at = base + Duration::from_millis(20);
+    let mut ev = event_for(&ptr);
+    ev.received_at = ptr.received_at;
+    let mut sent = own(base, "_http._tcp.local", "eth0");
+    sent.questions = vec![("_http._tcp.local".to_string(), 12)];
+    sent.known_answers = vec![(
+        "_http._tcp.local".to_string(),
+        "Test._http._tcp.local".to_string(),
+        4500,
+    )];
+    deliver(&mut app, vec![ev], vec![sent]);
+    let found: Vec<_> = app
+        .anomalies()
+        .into_iter()
+        .filter(|a| a.kind == anomalies::AnomalyKind::KnownAnswerIgnored)
+        .collect();
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert_eq!(found[0].record_name, None, "per responder, not per row");
+    assert!(app
+        .state_dump()
+        .anomalies
+        .iter()
+        .any(|a| a.kind == "known-answer-ignored"));
 }

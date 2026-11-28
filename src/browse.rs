@@ -347,6 +347,11 @@ pub struct OwnSend {
     /// Sent over IPv6 (else IPv4).
     pub v6: bool,
     pub sent_at: Instant,
+    /// The known answers the copy listed (#443): owner name, PTR target
+    /// and TTL, as scoped to its link. A packet over 9000 bytes sheds some
+    /// on the wire, which this list doesn't follow; that's rare enough
+    /// not to matter for the `known-answer-ignored` finding.
+    pub known_answers: Vec<(String, String, u32)>,
 }
 
 /// The questions one scheduler tick asks (#430): they leave together, as

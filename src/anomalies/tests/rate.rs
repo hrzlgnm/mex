@@ -952,6 +952,7 @@ fn nonzero_opcode_floods_are_ignored() {
 /// else 3), sent `ms` after `at`.
 fn own_at(at: Instant, ms: u64, name: &str, rtype: u16, iface: &str) -> OwnSend {
     OwnSend {
+        known_answers: Vec::new(),
         questions: vec![(name.to_string(), rtype)],
         iface: iface.to_string(),
         ifindex: if iface == "eth0" { 2 } else { 3 },
@@ -1724,4 +1725,262 @@ fn a_normal_copy_next_to_a_nonzero_rcode_copy_is_no_repeat() {
     copies[1].rcode = Some(3);
     let found = analyze_answers(&[cached(&a)], &copies);
     assert!(multicast_findings(&found).is_empty(), "{found:#?}");
+}
+
+// --- #443: responders answering what the query already listed ---
+
+fn known_answer_findings(found: &[Anomaly]) -> Vec<&Anomaly> {
+    found
+        .iter()
+        .filter(|a| a.kind == AnomalyKind::KnownAnswerIgnored)
+        .collect()
+}
+
+/// A query for HOST A on eth0 at `ms`, listing `kas` as known answers.
+fn asking_with(at: Instant, ms: u64, kas: Vec<RawRecord>) -> Event {
+    let mut ev = query_at(at, ms, vec![question(HOST, 1, "A", querier(), "eth0")]);
+    ev.query_kas = kas;
+    ev
+}
+
+/// `a` as a querier lists it: in its Answer section with `ttl` left.
+fn known(a: &RawRecord, ttl: u32) -> RawRecord {
+    let mut ka = a.clone();
+    ka.section = RecordSection::KnownAnswer;
+    ka.ttl = ttl;
+    ka.source = querier();
+    ka
+}
+
+#[test]
+fn an_answer_the_query_listed_is_flagged_once_on_the_responder_s_host() {
+    let at = base();
+    let a = host_a(responder(), "eth0");
+    let events = vec![
+        asking_with(at, 0, vec![known(&a, 120)]),
+        response_at(at, 20, vec![a.clone()]),
+        asking_with(at, 2000, vec![known(&a, 100)]),
+        response_at(at, 2020, vec![a.clone()]),
+    ];
+    let found = analyze_full(
+        &[cached(&a)],
+        &events,
+        &[],
+        repeater_device(),
+        &["repeater"],
+    );
+    let flagged = known_answer_findings(&found);
+    assert_eq!(flagged.len(), 1, "{found:#?}");
+    let f = flagged[0];
+    assert_eq!(f.severity, Severity::Warning);
+    assert_eq!((f.rfc, f.requirement), ("RFC 6762 §7.1", "MUST NOT"));
+    assert_eq!(f.service, "repeater", "on the host header");
+    assert_eq!(f.record_name, None, "no record row");
+    assert_eq!(f.source.as_deref(), Some("192.168.1.109:5353@eth0"));
+    assert_eq!(
+        f.message,
+        "Repeater.local (192.168.1.109:5353@eth0) answers queries that already list the \
+         answer as known (2 answers, 1 record)"
+    );
+    assert_eq!(
+        AnomalyKind::KnownAnswerIgnored.as_str(),
+        "known-answer-ignored"
+    );
+}
+
+#[test]
+fn a_responder_ignoring_known_answers_for_several_records_gets_one_finding() {
+    // #443 like #442: one finding per responder, however many rows.
+    let at = base();
+    let a = host_a(responder(), "eth0");
+    let mut aaaa = a.clone();
+    aaaa.rtype = 28;
+    aaaa.rtype_str = "AAAA".to_string();
+    aaaa.rdata = "fe80::1".to_string();
+    let mut ev = asking_with(at, 0, vec![known(&a, 120), known(&aaaa, 120)]);
+    ev.questions
+        .push(question(HOST, 28, "AAAA", querier(), "eth0"));
+    let events = vec![ev, response_at(at, 20, vec![a.clone(), aaaa.clone()])];
+    let found = analyze_full(
+        &[cached(&a), cached(&aaaa)],
+        &events,
+        &[],
+        repeater_device(),
+        &["repeater"],
+    );
+    let flagged = known_answer_findings(&found);
+    assert_eq!(flagged.len(), 1, "{found:#?}");
+    assert!(
+        flagged[0].message.ends_with("(2 answers, 2 records)"),
+        "{}",
+        flagged[0].message
+    );
+}
+
+#[test]
+fn a_responder_heading_no_host_is_flagged_unattributed() {
+    let at = base();
+    let a = host_a(responder(), "eth0");
+    let events = vec![
+        asking_with(at, 0, vec![known(&a, 120)]),
+        response_at(at, 20, vec![a.clone()]),
+    ];
+    let found = analyze_answers(&[cached(&a)], &events);
+    let flagged = known_answer_findings(&found);
+    assert_eq!(flagged.len(), 1, "{found:#?}");
+    assert_eq!(flagged[0].service, UNATTRIBUTED_SERVICE);
+    assert_eq!(
+        flagged[0].message,
+        "192.168.1.109 (192.168.1.109:5353@eth0) answers queries that already list the \
+         answer as known (1 answer, 1 record)"
+    );
+}
+
+#[test]
+fn an_answer_the_query_did_not_list_is_fine() {
+    let at = base();
+    let a = host_a(responder(), "eth0");
+    let events = vec![
+        asking_with(at, 0, Vec::new()),
+        response_at(at, 20, vec![a.clone()]),
+    ];
+    assert!(known_answer_findings(&analyze_answers(&[cached(&a)], &events)).is_empty());
+}
+
+#[test]
+fn a_known_answer_under_half_its_ttl_does_not_count() {
+    // §7.1: below half the TTL the responder must answer, to refresh it.
+    let at = base();
+    let a = host_a(responder(), "eth0");
+    let events = vec![
+        asking_with(at, 0, vec![known(&a, 59)]),
+        response_at(at, 20, vec![a.clone()]),
+    ];
+    assert!(known_answer_findings(&analyze_answers(&[cached(&a)], &events)).is_empty());
+}
+
+#[test]
+fn another_query_without_the_known_answer_excuses_the_copy() {
+    let at = base();
+    let a = host_a(responder(), "eth0");
+    let other: SocketAddr = "192.168.1.71:5353".parse().unwrap();
+    let events = vec![
+        asking_with(at, 0, vec![known(&a, 120)]),
+        query_at(at, 5, vec![question(HOST, 1, "A", other, "eth0")]),
+        response_at(at, 20, vec![a.clone()]),
+    ];
+    assert!(known_answer_findings(&analyze_answers(&[cached(&a)], &events)).is_empty());
+}
+
+#[test]
+fn our_own_known_answers_count() {
+    // mex lists PTR known answers; the responder answers the PTR anyway.
+    let at = base();
+    let mut ptr = rec_with(
+        "_http._tcp.local.",
+        12,
+        "PTR",
+        "Inst._http._tcp.local.",
+        4500,
+        false,
+        true,
+        RecordSection::Answer,
+    );
+    ptr.source = responder();
+    ptr.iface = "eth0".to_string();
+    ptr.ifindex = 2;
+    let events = vec![response_at(at, 20, vec![ptr.clone()])];
+    let mut own = own_at(at, 0, "_http._tcp.local", 12, "eth0");
+    own.known_answers = vec![(
+        "_http._tcp.local".to_string(),
+        "Inst._http._tcp.local".to_string(),
+        4500,
+    )];
+    let found = analyze_answers_own(&[cached(&ptr)], &events, &[own.clone()]);
+    assert_eq!(known_answer_findings(&found).len(), 1, "{found:#?}");
+    // Without the known answer, answering is right.
+    own.known_answers.clear();
+    let found = analyze_answers_own(&[cached(&ptr)], &events, &[own]);
+    assert!(known_answer_findings(&found).is_empty(), "{found:#?}");
+}
+
+#[test]
+fn a_query_on_another_link_does_not_count() {
+    let at = base();
+    let a = host_a(responder(), "eth0");
+    let mut ev = query_at(at, 0, vec![question(HOST, 1, "A", querier(), "wlan0")]);
+    ev.questions[0].ifindex = 3;
+    ev.query_kas = vec![known(&a, 120)];
+    let events = vec![ev, response_at(at, 20, vec![a.clone()])];
+    assert!(known_answer_findings(&analyze_answers(&[cached(&a)], &events)).is_empty());
+}
+
+#[test]
+fn probe_answers_unicast_replies_and_goodbyes_stay_quiet() {
+    let at = base();
+    let a = host_a(responder(), "eth0");
+    let prober: SocketAddr = "192.168.1.50:5353".parse().unwrap();
+    let mut probe = query_at(at, 0, vec![question(HOST, 255, "ANY", prober, "eth0")]);
+    probe.query_authority = vec![host_a(prober, "eth0")];
+    probe.query_kas = vec![known(&a, 120)];
+    let found = analyze_answers(
+        &[cached(&a)],
+        &[probe, response_at(at, 10, vec![a.clone()])],
+    );
+    assert!(
+        known_answer_findings(&found).is_empty(),
+        "probe: {found:#?}"
+    );
+
+    let mut unicast = a.clone();
+    unicast.dst_is_multicast = false;
+    let events = vec![
+        asking_with(at, 0, vec![known(&a, 120)]),
+        response_at(at, 20, vec![unicast]),
+    ];
+    assert!(known_answer_findings(&analyze_answers(&[cached(&a)], &events)).is_empty());
+
+    let mut bye = a.clone();
+    bye.ttl = 0;
+    let events = vec![
+        asking_with(at, 0, vec![known(&a, 120)]),
+        response_at(at, 20, vec![bye]),
+    ];
+    assert!(known_answer_findings(&analyze_answers(&[cached(&a)], &events)).is_empty());
+}
+
+/// A query for HOST A on eth0 at `ms` from `from`, listing `kas`.
+fn asking_from(at: Instant, ms: u64, from: SocketAddr, kas: Vec<RawRecord>) -> Event {
+    let mut ev = query_at(at, ms, vec![question(HOST, 1, "A", from, "eth0")]);
+    ev.query_kas = kas;
+    ev
+}
+
+#[test]
+fn the_responder_s_own_query_without_the_known_answer_excuses_the_copy() {
+    // Its stack asks from the same address; that query didn't know it.
+    let at = base();
+    let a = host_a(responder(), "eth0");
+    let events = vec![
+        asking_with(at, 0, vec![known(&a, 120)]),
+        asking_from(at, 5, responder(), Vec::new()),
+        response_at(at, 20, vec![a.clone()]),
+    ];
+    assert!(known_answer_findings(&analyze_answers(&[cached(&a)], &events)).is_empty());
+}
+
+#[test]
+fn the_responder_s_own_query_listing_the_answer_counts() {
+    let at = base();
+    let a = host_a(responder(), "eth0");
+    let mut ka = known(&a, 120);
+    ka.source = responder();
+    let events = vec![
+        asking_from(at, 0, responder(), vec![ka]),
+        response_at(at, 20, vec![a.clone()]),
+    ];
+    assert_eq!(
+        known_answer_findings(&analyze_answers(&[cached(&a)], &events)).len(),
+        1
+    );
 }

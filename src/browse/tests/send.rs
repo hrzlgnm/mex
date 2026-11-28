@@ -1076,3 +1076,38 @@ fn a_link_with_nothing_to_ask_gets_no_copy() {
         "eth0 is never pinned"
     );
 }
+
+// --- #443: our sends report the known answers they listed ---
+
+#[test]
+fn each_sent_copy_reports_the_known_answers_it_listed_on_its_link() {
+    let socket = FakeSocket::default();
+    let links = [("eth0".to_string(), 2u32), ("wlan0".to_string(), 3u32)];
+    let mut req = ptr_with_kas("_http._tcp.local", 1, "eth0");
+    req.known_answers.push(KnownAnswer {
+        target: "Elsewhere._http._tcp.local".to_string(),
+        ttl: 4500,
+        iface: "wlan0".to_string(),
+    });
+    let sent = send_on_all_interfaces(
+        &socket,
+        &[req],
+        Family::V6,
+        &[],
+        &links,
+        &mut SendFailures::default(),
+        &mut SentCopies::default(),
+    );
+    let listed: Vec<_> = sent
+        .iter()
+        .map(|s| (s.iface.as_str(), s.known_answers.clone()))
+        .collect();
+    let ka = |target: &str| ("_http._tcp.local".to_string(), target.to_string(), 4500);
+    assert_eq!(
+        listed,
+        [
+            ("eth0", vec![ka("instance-00000._http._tcp.local")]),
+            ("wlan0", vec![ka("Elsewhere._http._tcp.local")]),
+        ]
+    );
+}

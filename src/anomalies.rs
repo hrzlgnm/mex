@@ -137,6 +137,7 @@ pub enum AnomalyKind {
     MulticastRateLimit,
     QueryAaBit,
     MisplacedKnownAnswer,
+    KnownAnswerIgnored,
 }
 
 impl AnomalyKind {
@@ -163,6 +164,7 @@ impl AnomalyKind {
             AnomalyKind::MulticastRateLimit => "multicast-rate-limit",
             AnomalyKind::QueryAaBit => "query-aa-bit",
             AnomalyKind::MisplacedKnownAnswer => "misplaced-known-answer",
+            AnomalyKind::KnownAnswerIgnored => "known-answer-ignored",
         }
     }
 
@@ -541,6 +543,8 @@ pub fn analyze_observations(
         .map(|v| v.host.as_str())
         .collect();
     multicasts.check_bursts(&hosts, &mut out);
+    // Likewise responders that answer what the query already listed (#443).
+    multicasts.check_known_answers(&hosts, &mut out);
 
     for svc in &snap.services {
         let service_id = service_id(svc.instance, svc.service_type);
