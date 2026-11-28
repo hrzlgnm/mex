@@ -1229,8 +1229,6 @@ impl App {
         self.scheduler.note_overheard(q, &ev.query_kas);
     }
 
-    /// Advance the exponential stream as if a query had been sent (shared
-    /// by real sends and §7.3 suppression).
     /// Whether a live unique answer (`is_unique_answer`) for `key` is
     /// cached and still before its 80%-TTL refresh window.
     pub(super) fn has_fresh_unique_answer(&self, key: &(String, u16)) -> bool {

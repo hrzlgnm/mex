@@ -5,13 +5,6 @@
 
 use super::*;
 
-/// Route the app's queries to a channel the test reads.
-fn capture(app: &mut App) -> mpsc::Receiver<browse::QueryBatch> {
-    let (query_tx, rx) = browse::QueryTx::capturing();
-    app.query_tx = query_tx;
-    rx
-}
-
 /// Every batch handed over so far, as `(name, type)` lists.
 fn batches(rx: &mpsc::Receiver<browse::QueryBatch>) -> Vec<Vec<(String, u16)>> {
     rx.try_iter()

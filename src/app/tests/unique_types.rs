@@ -5,13 +5,6 @@
 
 use super::*;
 
-/// Route the app's queries to a channel the test reads.
-fn capture(app: &mut App) -> mpsc::Receiver<browse::QueryBatch> {
-    let (query_tx, rx) = browse::QueryTx::capturing();
-    app.query_tx = query_tx;
-    rx
-}
-
 /// The `(name, type)` of every question handed over so far.
 fn asked(rx: &mpsc::Receiver<browse::QueryBatch>) -> Vec<(String, u16)> {
     rx.try_iter()
@@ -20,7 +13,7 @@ fn asked(rx: &mpsc::Receiver<browse::QueryBatch>) -> Vec<(String, u16)> {
         .collect()
 }
 
-fn interval(app: &App, name: &str, rtype: u16) -> Duration {
+fn stream_interval(app: &App, name: &str, rtype: u16) -> Duration {
     app.scheduler
         .continuous()
         .get(&(name.to_string(), rtype))
@@ -47,8 +40,8 @@ fn srv_and_txt_without_the_flush_bit_dampen_their_streams() {
     let mut txt = txt_record("a=1");
     txt.flush_bit = false;
     ingest(&mut app, &txt);
-    assert_eq!(interval(&app, INSTANCE, 33), MAX_CONTINUOUS_INTERVAL);
-    assert_eq!(interval(&app, INSTANCE, 16), MAX_CONTINUOUS_INTERVAL);
+    assert_eq!(stream_interval(&app, INSTANCE, 33), MAX_CONTINUOUS_INTERVAL);
+    assert_eq!(stream_interval(&app, INSTANCE, 16), MAX_CONTINUOUS_INTERVAL);
 }
 
 #[test]
@@ -56,7 +49,7 @@ fn a_ptr_answer_keeps_its_discovery_stream() {
     // PTR is shared (RFC 6762 §7.1): more instances may answer, so its
     // stream keeps doubling and lists known answers instead.
     let app = pending_app();
-    assert!(interval(&app, "_http._tcp.local", 12) < MAX_CONTINUOUS_INTERVAL);
+    assert!(stream_interval(&app, "_http._tcp.local", 12) < MAX_CONTINUOUS_INTERVAL);
 }
 
 #[test]
@@ -65,10 +58,35 @@ fn a_goodbye_never_dampens() {
     let mut bye = srv_record(0);
     bye.flush_bit = false;
     ingest(&mut app, &bye);
-    let streams = app.scheduler.continuous();
-    if let Some(entry) = streams.get(&(INSTANCE.to_string(), 33)) {
-        assert!(entry.interval < MAX_CONTINUOUS_INTERVAL);
-    }
+    assert!(stream_interval(&app, INSTANCE, 33) < MAX_CONTINUOUS_INTERVAL);
+}
+
+#[test]
+fn a_txt_arriving_before_its_srv_dampens_its_stream() {
+    // The TXT waits on the pending instance for the SRV, but it already
+    // answers the TXT question that instance drives.
+    let mut app = pending_app();
+    let mut txt = txt_record("a=1");
+    txt.flush_bit = false;
+    ingest(&mut app, &txt);
+    assert!(app.services.is_empty(), "still pending");
+    assert_eq!(stream_interval(&app, INSTANCE, 16), MAX_CONTINUOUS_INTERVAL);
+    assert!(stream_interval(&app, INSTANCE, 33) < MAX_CONTINUOUS_INTERVAL);
+}
+
+#[test]
+fn srv_and_txt_cached_before_their_streams_start_dampened() {
+    let mut app = App::new().unwrap();
+    ingest(&mut app, &ptr_record(4500));
+    let mut srv = srv_record(120);
+    srv.flush_bit = false;
+    ingest(&mut app, &srv);
+    let mut txt = txt_record("a=1");
+    txt.flush_bit = false;
+    ingest(&mut app, &txt);
+    app.send_queries(); // the streams are created now
+    assert_eq!(stream_interval(&app, INSTANCE, 33), MAX_CONTINUOUS_INTERVAL);
+    assert_eq!(stream_interval(&app, INSTANCE, 16), MAX_CONTINUOUS_INTERVAL);
 }
 
 #[test]
