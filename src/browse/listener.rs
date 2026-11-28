@@ -194,20 +194,23 @@ pub(super) enum QueueState {
     Closed,
 }
 
-/// Send up to `budget` queued queries. Returns how many were sent and
-/// what is left in the queue. Wakes may coalesce, so the queue is
-/// drained on every pass.
-pub(super) fn drain_queries(
-    rx: &mpsc::Receiver<QueryRequest>,
+/// Send queued batches until `budget` packets went out. `send` returns
+/// how many packets a batch took; a batch counts at least one, so batches
+/// that send nothing (every pin or send failed) can't drain the whole
+/// queue in one pass. A batch is never split across passes, so one large
+/// batch may overrun the budget once. Returns the packets
+/// sent and what is left in the queue. Wakes may coalesce, so the queue
+/// is drained on every pass.
+pub(super) fn drain_queries<T>(
+    rx: &mpsc::Receiver<T>,
     budget: usize,
-    mut send: impl FnMut(&QueryRequest),
+    mut send: impl FnMut(&T) -> usize,
 ) -> (usize, QueueState) {
     let mut sent = 0;
     while sent < budget {
         match rx.try_recv() {
-            Ok(req) => {
-                send(&req);
-                sent += 1;
+            Ok(batch) => {
+                sent += send(&batch).max(1);
             }
             Err(mpsc::TryRecvError::Empty) => return (sent, QueueState::Empty),
             Err(mpsc::TryRecvError::Disconnected) => return (sent, QueueState::Closed),
@@ -246,7 +249,7 @@ pub(super) struct Listener {
     pub(super) v4: Option<FamilySocket>,
     pub(super) v6: Option<FamilySocket>,
     pub(super) tx: mpsc::Sender<Event>,
-    pub(super) query_rx: mpsc::Receiver<QueryRequest>,
+    pub(super) query_rx: mpsc::Receiver<QueryBatch>,
     pub(super) drops: Arc<DropStats>,
     pub(super) selection: Option<HashSet<String>>,
     pub(super) ifaces_v4: Vec<(String, Ipv4Addr)>,
@@ -274,7 +277,7 @@ impl Listener {
         v4: Option<FamilySocket>,
         v6: Option<FamilySocket>,
         tx: mpsc::Sender<Event>,
-        query_rx: mpsc::Receiver<QueryRequest>,
+        query_rx: mpsc::Receiver<QueryBatch>,
         shared: SharedWithApp,
         selection: Option<HashSet<String>>,
     ) -> Self {
@@ -433,11 +436,12 @@ impl Listener {
             ifnames,
             ..
         } = self;
-        let (_, queue) = drain_queries(query_rx, QUERY_BUDGET, |req| {
+        let (_, queue) = drain_queries(query_rx, QUERY_BUDGET, |batch| {
+            let mut packets = 0;
             for socket in [v4.as_ref(), v6.as_ref()].into_iter().flatten() {
                 for sent in send_on_all_interfaces(
                     &socket.pktinfo,
-                    req,
+                    batch,
                     socket.family,
                     ifaces_v4,
                     ifaces_v6,
@@ -448,11 +452,13 @@ impl Listener {
                     if sent.ifindex == 0 {
                         sent.ifindex = link_index(ifnames, &sent.iface);
                     }
+                    packets += 1;
                     // A closed channel means the app is gone; the closed
                     // query queue stops this loop right after.
                     let _ = own_sends.send(sent);
                 }
             }
+            packets
         });
         self.queries_pending = queue == QueueState::More;
         queue != QueueState::Closed

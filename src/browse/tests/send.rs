@@ -206,7 +206,7 @@ fn only_successfully_sent_copies_are_remembered() {
     socket.failing_send.set(true);
     send_on_all_interfaces(
         &socket,
-        &ptr_query(),
+        &[ptr_query()],
         Family::V6,
         &[],
         &links,
@@ -217,7 +217,7 @@ fn only_successfully_sent_copies_are_remembered() {
     socket.failing_send.set(false);
     send_on_all_interfaces(
         &socket,
-        &ptr_query(),
+        &[ptr_query()],
         Family::V6,
         &[],
         &links,
@@ -236,7 +236,7 @@ fn each_copy_is_pinned_right_before_it_is_sent() {
     let mut failures = SendFailures::default();
     send_on_all_interfaces(
         &socket,
-        &ptr_query(),
+        &[ptr_query()],
         Family::V6,
         &[],
         &links,
@@ -266,7 +266,7 @@ fn failed_pin_skips_only_that_links_copy() {
     let mut failures = SendFailures::default();
     send_on_all_interfaces(
         &socket,
-        &ptr_query(),
+        &[ptr_query()],
         Family::V4,
         &links,
         &[],
@@ -302,7 +302,7 @@ fn send_failure_is_recorded_until_the_link_recovers() {
     let mut failures = SendFailures::default();
     send_on_all_interfaces(
         &socket,
-        &ptr_query(),
+        &[ptr_query()],
         Family::V6,
         &[],
         &links,
@@ -322,7 +322,7 @@ fn send_failure_is_recorded_until_the_link_recovers() {
     socket.failing_send.set(false);
     send_on_all_interfaces(
         &socket,
-        &ptr_query(),
+        &[ptr_query()],
         Family::V6,
         &[],
         &links,
@@ -347,7 +347,7 @@ fn no_usable_link_means_no_send_target() {
     for family in [Family::V4, Family::V6] {
         send_on_all_interfaces(
             &socket,
-            &ptr_query(),
+            &[ptr_query()],
             family,
             &[],
             &[],
@@ -500,7 +500,7 @@ fn repeat_pin_failure_still_skips_the_copy() {
     for _ in 0..2 {
         send_on_all_interfaces(
             &socket,
-            &ptr_query(),
+            &[ptr_query()],
             Family::V4,
             &links,
             &[],
@@ -526,7 +526,7 @@ fn repeat_send_failure_is_not_remembered_as_sent() {
     for _ in 0..2 {
         send_on_all_interfaces(
             &socket,
-            &ptr_query(),
+            &[ptr_query()],
             Family::V6,
             &[],
             &links,
@@ -557,7 +557,7 @@ fn unencodable_request_sends_nothing_after_the_pin() {
     let mut sent = SentCopies::default();
     send_on_all_interfaces(
         &socket,
-        &req,
+        std::slice::from_ref(&req),
         Family::V6,
         &[],
         &[("eth0".to_string(), 2u32)],
@@ -717,7 +717,7 @@ fn each_sent_copy_is_reported_with_its_link_family_and_question() {
     let before = Instant::now();
     let sent = send_on_all_interfaces(
         &socket,
-        &ptr_query(),
+        &[ptr_query()],
         Family::V6,
         &[],
         &links,
@@ -743,7 +743,7 @@ fn each_sent_copy_is_reported_with_its_link_family_and_question() {
     let v4 = [("eth0".to_string(), Ipv4Addr::new(192, 168, 1, 2))];
     let sent = send_on_all_interfaces(
         &socket,
-        &ptr_query(),
+        &[ptr_query()],
         Family::V4,
         &v4,
         &[],
@@ -766,7 +766,7 @@ fn failed_or_unencodable_copies_are_not_reported() {
     let send = |socket: &FakeSocket, req: &QueryRequest| {
         send_on_all_interfaces(
             socket,
-            req,
+            std::slice::from_ref(req),
             Family::V4,
             &links,
             &[],
@@ -792,4 +792,229 @@ fn failed_or_unencodable_copies_are_not_reported() {
         ..ptr_query()
     };
     assert!(send(&FakeSocket::default(), &req).is_empty());
+}
+
+// --- #430: questions due together share a packet ---
+
+/// One question of `rtype` for `name`, QM, without known answers.
+fn ask(name: &str, rtype: TYPE) -> QueryRequest {
+    QueryRequest {
+        name: name.to_string(),
+        record_type: rtype,
+        known_answers: Vec::new(),
+        qu: false,
+    }
+}
+
+/// `name` PTR with `n` known answers, all learned on `iface`.
+fn ptr_with_kas(name: &str, n: usize, iface: &str) -> QueryRequest {
+    QueryRequest {
+        known_answers: (0..n)
+            .map(|i| KnownAnswer {
+                target: format!("instance-{i:05}.{name}"),
+                ttl: 4500,
+                iface: iface.to_string(),
+            })
+            .collect(),
+        ..ask(name, TYPE::PTR)
+    }
+}
+
+fn parse(bytes: &[u8]) -> Event {
+    parse_packet(bytes, test_source(), std::net::IpAddr::V4(MDNS_V4), "", 0).unwrap()
+}
+
+#[test]
+fn questions_due_together_leave_in_one_packet() {
+    let batch = [
+        ask("Inst._http._tcp.local", TYPE::SRV),
+        ask("Inst._http._tcp.local", TYPE::TXT),
+        ask("Host.local", TYPE::A),
+        ask("Host.local", TYPE::AAAA),
+    ];
+    let packets = encode_batch(&batch, "eth0");
+    assert_eq!(packets.len(), 1);
+    let (bytes, asked) = &packets[0];
+    assert_eq!(asked, &[0, 1, 2, 3]);
+    let questions: Vec<_> = parse(bytes)
+        .questions
+        .iter()
+        .map(|q| (q.name.clone(), q.rtype))
+        .collect();
+    assert_eq!(
+        questions,
+        [
+            ("Inst._http._tcp.local.".to_string(), 33),
+            ("Inst._http._tcp.local.".to_string(), 16),
+            ("Host.local.".to_string(), 1),
+            ("Host.local.".to_string(), 28),
+        ],
+        "wire case kept"
+    );
+}
+
+#[test]
+fn only_the_startup_question_carries_the_qu_bit() {
+    let mut enumeration = ask("_services._dns-sd._udp.local", TYPE::PTR);
+    enumeration.qu = true;
+    let batch = [enumeration, ask("_http._tcp.local", TYPE::PTR)];
+    let (bytes, _) = &encode_batch(&batch, "")[0];
+    let qu: Vec<_> = parse(bytes).questions.iter().map(|q| q.qu).collect();
+    assert_eq!(qu, [true, false]);
+}
+
+#[test]
+fn each_ptr_question_carries_its_own_interface_scoped_known_answers() {
+    let mut http = ptr_with_kas("_http._tcp.local", 2, "eth0");
+    http.known_answers.push(KnownAnswer {
+        target: "Elsewhere._http._tcp.local".to_string(),
+        ttl: 4500,
+        iface: "wlan0".to_string(),
+    });
+    let batch = [
+        http,
+        ask("Inst._http._tcp.local", TYPE::SRV),
+        ptr_with_kas("_ipp._tcp.local", 1, ""),
+    ];
+    let (bytes, _) = &encode_batch(&batch, "eth0")[0];
+    let kas: Vec<_> = parse(bytes)
+        .query_kas
+        .iter()
+        .map(|k| (k.name.clone(), k.rdata.clone()))
+        .collect();
+    assert_eq!(
+        kas,
+        [
+            (
+                "_http._tcp.local.".to_string(),
+                "instance-00000._http._tcp.local.".to_string()
+            ),
+            (
+                "_http._tcp.local.".to_string(),
+                "instance-00001._http._tcp.local.".to_string()
+            ),
+            (
+                "_ipp._tcp.local.".to_string(),
+                "instance-00000._ipp._tcp.local.".to_string()
+            ),
+        ],
+        "the wlan0 answer stays off eth0"
+    );
+}
+
+#[test]
+fn a_batch_over_the_size_limit_splits_at_question_boundaries() {
+    // Each question fits alone, but not all together.
+    let batch: Vec<_> = (0..6)
+        .map(|i| ptr_with_kas(&format!("_svc{i}._tcp.local"), 120, ""))
+        .collect();
+    let packets = encode_batch(&batch, "");
+    assert!(packets.len() > 1, "{} packet(s)", packets.len());
+    let mut asked: Vec<usize> = Vec::new();
+    for (bytes, idx) in &packets {
+        assert!(bytes.len() <= MAX_QUERY_BYTES, "{} bytes", bytes.len());
+        let ev = parse(bytes);
+        assert_eq!(ev.questions.len(), idx.len());
+        // Whole questions: every one keeps all 120 known answers.
+        assert_eq!(ev.query_kas.len(), 120 * idx.len());
+        asked.extend(idx.iter().copied());
+    }
+    assert_eq!(asked, [0, 1, 2, 3, 4, 5], "no question lost or repeated");
+}
+
+#[test]
+fn a_question_too_large_alone_sheds_known_answers_in_its_own_packet() {
+    let batch = [
+        ask("Inst._http._tcp.local", TYPE::SRV),
+        dense_ptr_query(),
+        ask("Inst._http._tcp.local", TYPE::TXT),
+    ];
+    let packets = encode_batch(&batch, "");
+    let asked: Vec<_> = packets.iter().map(|(_, idx)| idx.clone()).collect();
+    assert_eq!(asked, [vec![0], vec![1], vec![2]]);
+    let (bytes, _) = &packets[1];
+    assert!(bytes.len() <= MAX_QUERY_BYTES);
+    let ev = parse(bytes);
+    assert_eq!(ev.questions.len(), 1, "the question is kept");
+    assert!(!ev.query_kas.is_empty() && ev.query_kas.len() < 2000);
+}
+
+#[test]
+fn an_unencodable_question_is_skipped_and_the_rest_sent() {
+    let batch = [
+        ask("Inst._http._tcp.local", TYPE::SRV),
+        ask("a..local", TYPE::A),
+        ask("Host.local", TYPE::A),
+    ];
+    let packets = encode_batch(&batch, "");
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0].1, [0, 2]);
+    assert_eq!(parse(&packets[0].0).questions.len(), 2);
+}
+
+#[test]
+fn a_codec_failure_ends_the_batch_without_a_panic() {
+    let batch = [
+        ask("Inst._http._tcp.local", TYPE::SRV),
+        ask("Host.local", TYPE::A),
+    ];
+    assert!(encode_batch_into(&mut LimitedSink::new(0), &batch, "").is_empty());
+    // A budget for the first packet only: the second build fails, and the
+    // packet encoded before it is kept.
+    let mut probe = LimitedSink::new(usize::MAX);
+    encode_batch_into(&mut probe, &batch[..1], "");
+    let first_writes = usize::MAX - probe.budget;
+    let packets = encode_batch_into(&mut LimitedSink::new(first_writes), &batch, "");
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0].1, [0]);
+    // An oversized question whose shedding retry fails is dropped too.
+    let big = [dense_ptr_query()];
+    let mut probe = LimitedSink::new(usize::MAX);
+    let req = &big[0];
+    let qname = wire_name(&req.name).unwrap();
+    let kas: Vec<_> = req
+        .known_answers
+        .iter()
+        .map(|ka| (wire_name(&ka.target).unwrap(), ka.ttl))
+        .collect();
+    build_query_into(&mut probe, &qname, req.record_type, req.qu, &kas).unwrap();
+    let alone_writes = usize::MAX - probe.budget;
+    // Room for the first full build twice (the trial and the alone
+    // build), then the shedding retry runs out.
+    assert!(encode_batch_into(&mut LimitedSink::new(2 * alone_writes), &big, "").is_empty());
+}
+
+#[test]
+fn every_packet_of_a_batch_leaves_on_every_link() {
+    // Two packets (the batch splits) on two links: each pinned once,
+    // every copy remembered and reported with its own questions.
+    let socket = FakeSocket::default();
+    let links = [("eth0".to_string(), 2u32), ("wlan0".to_string(), 3u32)];
+    let batch: Vec<_> = (0..6)
+        .map(|i| ptr_with_kas(&format!("_svc{i}._tcp.local"), 120, ""))
+        .collect();
+    let per_link = encode_batch(&batch, "eth0").len();
+    assert!(per_link > 1);
+    let mut copies = SentCopies::default();
+    let sent = send_on_all_interfaces(
+        &socket,
+        &batch,
+        Family::V6,
+        &[],
+        &links,
+        &mut SendFailures::default(),
+        &mut copies,
+    );
+    let calls = socket.calls.borrow();
+    let pins: Vec<_> = calls.iter().filter(|c| c.starts_with("pin")).collect();
+    assert_eq!(pins, ["pin V6(2)", "pin V6(3)"]);
+    assert_eq!(calls.len(), 2 + 2 * per_link);
+    assert_eq!(sent.len(), 2 * per_link);
+    assert_eq!(copies.recent.len(), 2 * per_link);
+    let eth0_questions: usize = sent
+        .iter()
+        .filter(|s| s.iface == "eth0")
+        .map(|s| s.questions.len())
+        .sum();
+    assert_eq!(eth0_questions, 6, "every question reported once per link");
 }

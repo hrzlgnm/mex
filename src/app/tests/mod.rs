@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 
 mod answer_sections;
 mod answers_scroll;
+mod batches;
 mod conflicting_answers;
 mod denials;
 mod devices;

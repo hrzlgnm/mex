@@ -230,6 +230,31 @@ pub(super) fn record_content(r: &RawRecord) -> String {
     }
 }
 
+/// The question of a packet a copy of `rec` most likely answered: one
+/// asking `rec`'s own name and type (or ANY), else the first asking any
+/// name of the copy's packet (`names`, as `name_key`s). A packed query
+/// (#430) asks SRV and TXT, or A and AAAA, of one name together, so the
+/// name alone can pick the wrong type.
+fn pick_question<'q, Q>(
+    questions: &'q [Q],
+    rec: &RawRecord,
+    names: &HashSet<String>,
+    ask: impl Fn(&Q) -> (&str, u16),
+) -> Option<&'q Q> {
+    let own = name_key(&rec.name);
+    questions
+        .iter()
+        .find(|q| {
+            let (name, rtype) = ask(q);
+            (rtype == rec.rtype || rtype == 255) && name_key(name) == own
+        })
+        .or_else(|| {
+            questions
+                .iter()
+                .find(|q| names.contains(&name_key(ask(q).0)))
+        })
+}
+
 fn send_key(r: &RawRecord) -> SendKey {
     (
         r.name.to_ascii_lowercase(),
@@ -402,14 +427,13 @@ impl<'a> MulticastIndex<'a> {
             .take_while(|ev| at.saturating_duration_since(ev.received_at) <= MIN_GAP)
             .filter(|ev| ev.source != rec.source && !ev.is_probe())
             .filter_map(|ev| {
-                ev.questions
+                let on_link: Vec<&RawRecord> = ev
+                    .questions
                     .iter()
-                    .find(|q| {
-                        q.iface == rec.iface
-                            && q.ifindex == rec.ifindex
-                            && names.contains(&name_key(&q.name))
-                    })
-                    .map(|q| (ev.received_at, q))
+                    .filter(|q| q.iface == rec.iface && q.ifindex == rec.ifindex)
+                    .collect();
+                pick_question(&on_link, rec, &names, |q| (q.name.as_str(), q.rtype))
+                    .map(|q| (ev.received_at, *q))
             })
             .collect();
         if let Some((sent_at, (name, rtype))) = self.own_askings(rec, at, &names).next() {
@@ -487,9 +511,7 @@ impl<'a> MulticastIndex<'a> {
             .take_while(move |s| at - s.sent_at <= MIN_GAP)
             .filter(move |s| s.iface == rec.iface && s.ifindex == rec.ifindex)
             .filter_map(move |s| {
-                s.questions
-                    .iter()
-                    .find(|(name, _)| names.contains(&name_key(name)))
+                pick_question(&s.questions, rec, names, |(name, rtype)| (name, *rtype))
                     .map(|q| (s.sent_at, q))
             })
     }

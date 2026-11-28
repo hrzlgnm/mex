@@ -588,3 +588,18 @@ fn a_self_row_for_a_type_mex_never_queries_is_never_sent() {
         assert_no_popup(&app);
     }
 }
+
+#[test]
+fn r_sends_its_question_alone_and_at_once() {
+    // #430: the nudge doesn't wait for, or join, the tick's batch.
+    let mut app = app_with_self_ptr_row();
+    let (query_tx, rx) = browse::QueryTx::capturing();
+    app.query_tx = query_tx;
+    cursor_to_self_ptr(&mut app);
+    press(&mut app, KeyCode::Char('r'));
+    let handed: Vec<_> = rx.try_iter().collect();
+    assert_eq!(handed.len(), 1);
+    assert_eq!(handed[0].len(), 1);
+    assert_eq!(handed[0][0].name, "_http._tcp.local");
+    assert!(app.outbox.is_empty());
+}

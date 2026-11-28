@@ -28,8 +28,10 @@ Headless run (no TTY) logs to stderr.
 * `src/logging.rs` — the logger: stderr/file sink, size-rotated log file,
   `take_log_error` for the TUI status line.
 * `src/browse.rs` — raw mDNS transport: v4/v6 sockets on `224.0.0.251:5353` /
-  `[FF02::FB]:5353` via `socket-pktinfo`, `send_query` (QM/QU + known
-  answers, one copy per interface), packet parse with ingress interface.
+  `[FF02::FB]:5353` via `socket-pktinfo`, query batches (`QueryBatch`:
+  one tick's questions, each QM/QU with its known answers, packed into as
+  few packets as fit per egress interface, one copy per interface),
+  packet parse with ingress interface.
   One listener thread drives both sockets from a `mio` poll loop
   (readiness via a duplicate handle, reads via pktinfo, drained with a
   per-pass budget, then re-armed); `QueryTx::send` wakes it, queued queries
@@ -132,6 +134,16 @@ Headless run (no TTY) logs to stderr.
 
 * Continuous browsing (`App::continuous`): first query after 20–120ms random,
   then ≥1s, doubling each time, capped at 1/hour. No fixed 60s re-poll.
+  Streams first created in one pass share one 20–120ms delay, so questions
+  learned together stay due on the same tick.
+* Packing (#430): every question due in one tick (continuous and refresh,
+  §7.3-suppressed ones left out, a question due twice in once with the
+  union of its known answers) goes into `App::outbox` and leaves as one
+  `QueryBatch` at the end of `send_queries`. The listener encodes it per
+  egress interface into as few packets as fit 9000 bytes (§17), splitting
+  at question boundaries; only a question too large alone sheds known
+  answers. The send budget counts packets. The manual refresh sends its
+  own one-question batch at once.
 * Cache refresh (`App::requeries`): re-ask at ~80/85/90/95% of TTL with 0–2%
   random variation; after four misses the record expires at 100% TTL.
   The refresh itself never goes hourly; hourly is only the

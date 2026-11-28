@@ -646,19 +646,12 @@ impl App {
         } else {
             self.diagnostics.q_sent_refresh += 1;
             self.diagnostics.ka_sent += ka.len() as u64;
-            if self.query_tx.send(browse::QueryRequest {
+            self.queue_question(browse::QueryRequest {
                 name: key.0.clone(),
                 record_type: rt,
                 known_answers: ka,
                 qu: false,
-            }) {
-                self.note_query(&key.0, key.1, OwnQuery::Transmitted, now);
-            } else {
-                log::warn!(
-                    "mex: dropped refresh query for {} (listener channels closed)",
-                    key.0
-                );
-            }
+            });
         }
         self.route_own_question(&key.0, key.1, false);
         // A refresh query also elicits new answers, so postpone the
@@ -740,12 +733,13 @@ impl App {
             Vec::new()
         };
         let ka_count = ka.len() as u64;
-        if !self.query_tx.send(browse::QueryRequest {
+        // Immediate, alone: a nudge doesn't wait for the tick's batch.
+        if !self.query_tx.send(vec![browse::QueryRequest {
             name: name.clone(),
             record_type: rt,
             known_answers: ka,
             qu: false,
-        }) {
+        }]) {
             log::warn!("mex: dropped manual query for {name} (listener channels closed)");
             return Ok(());
         }
@@ -760,6 +754,59 @@ impl App {
         self.scheduler
             .postpone_continuous_for_manual(&(name.clone(), rtype), now);
         Ok(())
+    }
+
+    /// Add a due question to this tick's batch (#430). One asked twice in
+    /// a tick (stream and refresh) goes in once: names fold ASCII-only
+    /// (RFC 6762 §16), the known answers are the union and the QU bit
+    /// sticks.
+    pub(super) fn queue_question(&mut self, req: browse::QueryRequest) {
+        let same = |q: &browse::QueryRequest| {
+            q.record_type == req.record_type
+                && q.name
+                    .trim_end_matches('.')
+                    .eq_ignore_ascii_case(req.name.trim_end_matches('.'))
+        };
+        let Some(queued) = self.outbox.iter_mut().find(|q| same(q)) else {
+            self.outbox.push(req);
+            return;
+        };
+        queued.qu |= req.qu;
+        for ka in req.known_answers {
+            if !queued
+                .known_answers
+                .iter()
+                .any(|k| k.iface == ka.iface && k.target.eq_ignore_ascii_case(&ka.target))
+            {
+                queued.known_answers.push(ka);
+            }
+        }
+    }
+
+    /// Send this tick's questions as one batch: the listener packs them
+    /// into as few packets as fit per egress interface and family. Each
+    /// question is noted as transmitted once the listener takes the
+    /// batch; a closed channel drops them all, logged.
+    pub(super) fn flush_outbox(&mut self) {
+        if self.outbox.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(&mut self.outbox);
+        let asked: Vec<(String, u16)> = batch
+            .iter()
+            .map(|q| (q.name.clone(), u16::from(q.record_type)))
+            .collect();
+        if !self.query_tx.send(batch) {
+            log::warn!(
+                "mex: dropped {} queued question(s) (listener channels closed)",
+                asked.len()
+            );
+            return;
+        }
+        let now = Instant::now();
+        for (name, rtype) in asked {
+            self.note_query(&name, rtype, OwnQuery::Transmitted, now);
+        }
     }
 
     /// Record a query event for an interest: we transmitted it or §7.3
@@ -1000,6 +1047,10 @@ impl App {
         self.scheduler
             .continuous
             .retain(|k, _| desired.contains_key(k));
+        // Streams first seen in this pass share one first-query delay, so
+        // questions learned together (a host's addresses with its SRV/TXT)
+        // stay due on one tick and keep sharing packets as they double.
+        let mut first_delay: Option<Duration> = None;
         for (key, qname) in desired {
             let (due, send_name) = match self.scheduler.continuous.get(&key) {
                 Some(entry) => (now >= entry.next_due, entry.qname.clone()),
@@ -1017,7 +1068,8 @@ impl App {
                         self.route_own_question(&qname, key.1, false);
                         (now + MAX_CONTINUOUS_INTERVAL, MAX_CONTINUOUS_INTERVAL)
                     } else {
-                        (now + rand_range(20, 120), Duration::from_secs(1))
+                        let delay = *first_delay.get_or_insert_with(|| rand_range(20, 120));
+                        (now + delay, Duration::from_secs(1))
                     };
                     self.scheduler.continuous.insert(
                         key.clone(),
@@ -1084,19 +1136,12 @@ impl App {
                 self.diagnostics.qu_sent += 1;
             }
             self.diagnostics.ka_sent += ka.len() as u64;
-            if self.query_tx.send(browse::QueryRequest {
+            self.queue_question(browse::QueryRequest {
                 name: send_name.clone(),
                 record_type: rt,
                 known_answers: ka,
                 qu,
-            }) {
-                self.note_query(&send_name, key.1, OwnQuery::Transmitted, now);
-            } else {
-                log::warn!(
-                    "mex: dropped continuous query for {} (listener channels closed)",
-                    send_name
-                );
-            }
+            });
             self.route_own_question(&send_name, key.1, qu);
             // RFC 6762 §5.2: at least 1s between the first two, then at
             // least doubling, capped at one query per hour. Send using the
@@ -1159,6 +1204,7 @@ impl App {
                 }
                 self.requery_expiring();
                 self.poll_continuous();
+                self.flush_outbox();
             }
         }
 
