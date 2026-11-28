@@ -25,6 +25,12 @@ pub(super) struct Scheduler {
     /// them is new (just up, newly selected, or back after going away),
     /// and restarts discovery there (#441).
     last_usable: BTreeSet<String>,
+    /// A link that became usable runs its own startup stream for each
+    /// question (#441), by (question, link): it asks that link alone, so
+    /// a reconnecting Wi-Fi never restarts discovery on the other links.
+    /// It ends when the link is covered, or joins the question's stream
+    /// once its interval has caught up.
+    link_streams: HashMap<((String, u16), String), LinkStream>,
     /// Every service type ever learned (enumeration answers, PTR owners,
     /// confirmed services). Persistent: used for instance/type splitting
     /// and as the desired continuous-query set. Never cleared on a timer.
@@ -102,6 +108,7 @@ impl Scheduler {
         link: String,
         usable: &BTreeSet<String>,
     ) -> bool {
+        self.link_streams.remove(&(key.clone(), link.clone()));
         let cover = self.covered.entry(key.clone()).or_default();
         cover.insert(link);
         usable.is_empty() || usable.is_subset(cover)
@@ -400,6 +407,11 @@ impl Scheduler {
         &mut self,
     ) -> &mut HashMap<(String, u16), (Instant, HashSet<String>, String)> {
         &mut self.overheard
+    }
+
+    #[cfg(test)]
+    pub(super) fn link_streams_mut(&mut self) -> &mut HashMap<((String, u16), String), LinkStream> {
+        &mut self.link_streams
     }
 
     pub(super) fn continuous_mut(&mut self) -> &mut HashMap<(String, u16), ContinuousQuery> {
@@ -1170,15 +1182,7 @@ impl App {
             let Some(rt) = browse::record_type_from_u16(key.1) else {
                 continue;
             };
-            let ka = if rt == TYPE::PTR {
-                if is_enum_name(&key.0) {
-                    self.known_enum_answers()
-                } else {
-                    self.known_ptrs(&key.0)
-                }
-            } else {
-                Vec::new()
-            };
+            let ka = self.scheduled_known_answers(&key.0, rt);
             // QU on the first transmission of the enumeration query
             // (RFC 6762 §5.4 startup batch); everything afterwards is QM.
             // First-transmission (interval still 1s) rather than a single
@@ -1192,10 +1196,35 @@ impl App {
                     .is_some_and(|e| e.interval == Duration::from_secs(1));
             // Only the links no fresh unique answer covers yet (#441); none
             // recorded, every link.
-            let mut links: Vec<String> = match self.scheduler.covered.get(&key) {
-                Some(cover) if !cover.is_empty() => usable.difference(cover).cloned().collect(),
-                _ => Vec::new(),
+            // Links covered, or still on their own link stream, are out.
+            let excluded: BTreeSet<&String> = self
+                .scheduler
+                .covered
+                .get(&key)
+                .into_iter()
+                .flatten()
+                .chain(
+                    self.scheduler
+                        .link_streams
+                        .keys()
+                        .filter(|(k, _)| *k == key)
+                        .map(|(_, link)| link),
+                )
+                .collect();
+            let mut links: Vec<String> = if excluded.is_empty() {
+                Vec::new()
+            } else {
+                usable
+                    .iter()
+                    .filter(|l| !excluded.contains(l))
+                    .cloned()
+                    .collect()
             };
+            if !excluded.is_empty() && links.is_empty() {
+                // Nothing left to ask on this stream's links this round.
+                self.scheduler.advance_continuous(&key, now);
+                continue;
+            }
             // RFC 6762 §7.3: another querier just asked the same QM
             // question with no KA we wouldn't send — treat ours as sent.
             // QU elicits unicast and is never suppressed. Overheard on one
@@ -1246,6 +1275,7 @@ impl App {
             // the 1s gap and start at 2s).
             self.scheduler.advance_continuous(&key, now);
         }
+        self.poll_link_streams(now);
     }
 
     pub(super) fn send_queries(&mut self) {
@@ -1326,6 +1356,18 @@ impl App {
         self.scheduler.note_overheard(q, &ev.query_kas);
     }
 
+    /// The known answers a scheduled query for `name` carries: PTR only
+    /// (shared records, RFC 6762 §7.1), from the enumeration or the type.
+    fn scheduled_known_answers(&self, name: &str, rt: TYPE) -> Vec<browse::KnownAnswer> {
+        if rt != TYPE::PTR {
+            Vec::new()
+        } else if is_enum_name(name) {
+            self.known_enum_answers()
+        } else {
+            self.known_ptrs(name)
+        }
+    }
+
     /// Where our query for `key` still goes after RFC 6762 §7.3 (#441):
     /// `links` are the links we'd ask (empty for every usable link). An
     /// overheard copy stands in for ours only on the link it came in on.
@@ -1365,11 +1407,10 @@ impl App {
 
     /// Follow the usable links since the last poll (#441). A link that
     /// went away is dropped from every stream's covered links, so it counts
-    /// as new when it comes back. A new link restarts every stream with
-    /// the startup schedule, as resuming after a transmit hold does:
-    /// covered links stay covered, so a dampened stream asks only the new
-    /// link, and no question goes out again within a second of its last
-    /// transmission (RFC 6762 §5.2). The first poll only learns the links.
+    /// as new when it comes back. A new link (just up, newly selected, or
+    /// back) starts a link stream for every question: the startup
+    /// schedule on that link alone, so the other links keep theirs. The
+    /// first poll only learns the links.
     fn follow_link_changes(
         &mut self,
         usable: &BTreeSet<String>,
@@ -1379,32 +1420,107 @@ impl App {
         for cover in self.scheduler.covered.values_mut() {
             cover.retain(|link| usable.contains(link));
         }
-        let appeared = !self.scheduler.last_usable.is_empty()
-            && !usable.is_subset(&self.scheduler.last_usable);
-        self.scheduler.last_usable = usable.clone();
-        if !appeared {
+        let previous = std::mem::replace(&mut self.scheduler.last_usable, usable.clone());
+        // Link streams end with their question, link or coverage.
+        let (continuous, covered) = (&self.scheduler.continuous, &self.scheduler.covered);
+        self.scheduler.link_streams.retain(|(key, link), _| {
+            continuous.contains_key(key)
+                && usable.contains(link)
+                && !covered.get(key).is_some_and(|c| c.contains(link))
+        });
+        let new_links: Vec<String> = if previous.is_empty() {
+            Vec::new()
+        } else {
+            usable.difference(&previous).cloned().collect()
+        };
+        if new_links.is_empty() {
             return;
         }
-        log::info!("mex: a link became usable; restarting discovery there");
+        log::info!(
+            "mex: {} became usable; starting discovery there",
+            new_links.join(", ")
+        );
         let delay = *first_delay.get_or_insert_with(|| rand_range(20, 120));
-        // Each question's earliest next send: a second after its last.
-        let floors: HashMap<(String, u16), Instant> = self
+        let keys: Vec<(String, u16)> = self.scheduler.continuous.keys().cloned().collect();
+        for key in keys {
+            for link in &new_links {
+                self.scheduler.link_streams.insert(
+                    (key.clone(), link.clone()),
+                    LinkStream {
+                        next_due: now + delay,
+                        interval: Duration::from_secs(1),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Ask the questions whose link streams are due (#441): each on its
+    /// own link alone, §7.3-suppressed only by a query overheard there,
+    /// then doubling; once its interval has caught up with the question's
+    /// stream, the link joins that stream.
+    fn poll_link_streams(&mut self, now: Instant) {
+        type Due = ((String, u16), String, String, Duration, Duration);
+        let due: Vec<Due> = self
             .scheduler
-            .continuous
-            .keys()
-            .filter_map(|key| {
-                let sent = self
-                    .scheduler
-                    .history(&Scheduler::provenance_key(&key.0, key.1))?
-                    .transmitted?;
-                Some((key.clone(), sent + Duration::from_secs(1)))
+            .link_streams
+            .iter()
+            .filter(|(_, stream)| now >= stream.next_due)
+            .filter_map(|((key, link), stream)| {
+                let entry = self.scheduler.continuous.get(key)?;
+                Some((
+                    key.clone(),
+                    link.clone(),
+                    entry.qname.clone(),
+                    stream.interval,
+                    entry.interval,
+                ))
             })
             .collect();
-        for (key, entry) in self.scheduler.continuous.iter_mut() {
-            entry.next_due = floors
-                .get(key)
-                .map_or(now + delay, |floor| (*floor).max(now + delay));
-            entry.interval = Duration::from_secs(1);
+        for (key, link, qname, step, joins_at) in due {
+            let Some(rt) = browse::record_type_from_u16(key.1) else {
+                continue;
+            };
+            let ka = self.scheduled_known_answers(&key.0, rt);
+            match self.overheard_scope(&key, &ka, std::slice::from_ref(&link)) {
+                None => {
+                    self.diagnostics.suppressed_continuous += 1;
+                    self.diagnostics.suppressed_times.push_back(now);
+                    self.note_query_on(
+                        &key.0,
+                        key.1,
+                        OwnQuery::Suppressed,
+                        now,
+                        std::slice::from_ref(&link),
+                    );
+                }
+                Some(links) => {
+                    self.diagnostics.q_sent_continuous += 1;
+                    self.diagnostics.ka_sent += ka.len() as u64;
+                    self.queue_question(browse::QueryRequest {
+                        name: qname.clone(),
+                        record_type: rt,
+                        known_answers: ka,
+                        qu: false,
+                        links,
+                    });
+                }
+            }
+            self.route_own_question(&qname, key.1, false);
+            // Send using the current interval, then double (RFC 6762 §5.2);
+            // caught up with the question's stream, the link joins it.
+            let next = (step * 2).min(MAX_CONTINUOUS_INTERVAL);
+            if next >= joins_at {
+                self.scheduler.link_streams.remove(&(key, link));
+            } else {
+                self.scheduler.link_streams.insert(
+                    (key, link),
+                    LinkStream {
+                        next_due: now + step,
+                        interval: next,
+                    },
+                );
+            }
         }
     }
 

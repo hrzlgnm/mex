@@ -443,6 +443,13 @@ struct ContinuousQuery {
     qname: String,
 }
 
+/// A question's startup stream on one newly usable link (#441): asked
+/// there alone, doubling until it catches up with the question's stream.
+pub(super) struct LinkStream {
+    pub(super) next_due: Instant,
+    pub(super) interval: Duration,
+}
+
 /// Small xorshift-style helper so query jitter does not need a new
 /// dependency. Seeded from wall-clock time plus an atomic counter.
 fn rand_u32() -> u32 {

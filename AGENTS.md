@@ -166,10 +166,13 @@ Headless run (no TTY) logs to stderr.
   (`QueryRequest::links`), and drops to hourly once every usable link is
   covered (or at once for an answer whose link is unknown, which covers
   every link usable then). A link that becomes usable (new, newly
-  selected, or back after going away) restarts every stream with the
-  startup schedule, never within a second of a question's last send; a
-  link that goes away is dropped from the covered links. Reaching the
-  hourly cap by backoff restarts nothing. A §7.3 overheard query stands in for
+  selected, or back after going away) gets a link stream per question
+  (`Scheduler::link_streams`): the startup schedule on that link alone,
+  so a reconnecting Wi-Fi never restarts discovery on the other links; it
+  ends when the link is covered, or joins the question's stream once its
+  interval catches up. A link that goes away is dropped from the covered
+  links. Reaching the hourly cap by backoff restarts nothing. A §7.3
+  overheard query stands in for
   ours, continuous or refresh, only on its own link, and for nothing when
   that's a link we don't ask (`App::overheard_scope`). One usable
   link behaves as before: the stream dampens to hourly,

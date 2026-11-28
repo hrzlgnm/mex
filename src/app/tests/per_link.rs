@@ -126,28 +126,6 @@ fn an_answer_cached_on_one_link_starts_the_stream_on_the_others() {
 }
 
 #[test]
-fn a_link_appearing_later_restarts_a_dampened_stream_there() {
-    let mut app = App::new().unwrap();
-    pin_links(&mut app, &["eth0"]);
-    let rx = capture(&mut app);
-    ingest(&mut app, &ptr_record(4500));
-    app.send_queries();
-    ingest(&mut app, &srv_on("eth0", 2));
-    assert_eq!(interval(&app, 33), MAX_CONTINUOUS_INTERVAL);
-    pin_links(&mut app, &["eth0", "wlan0"]);
-    app.send_queries();
-    assert_eq!(
-        interval(&app, 33),
-        Duration::from_secs(1),
-        "startup schedule"
-    );
-    rx.try_iter().count();
-    all_due(&mut app);
-    app.send_queries();
-    assert_eq!(links_of(&rx, 33), Some(vec!["wlan0".to_string()]));
-}
-
-#[test]
 fn a_query_overheard_on_one_link_stands_in_for_ours_there_only() {
     // RFC 6762 §7.3 per link: another querier asked on eth0, so ours goes
     // out on wlan0 alone and still counts as sent.
@@ -286,26 +264,6 @@ fn a_query_overheard_on_a_covered_link_leaves_ours_in_place() {
 }
 
 #[test]
-fn an_answer_on_an_unknown_link_still_lets_a_new_link_restart_the_stream() {
-    // Its link unknown, the answer dampens at once and covers the links
-    // usable then; a link appearing later is uncovered and asked.
-    let mut app = App::new().unwrap();
-    pin_links(&mut app, &["eth0"]);
-    let rx = capture(&mut app);
-    ingest(&mut app, &ptr_record(4500));
-    app.send_queries();
-    ingest(&mut app, &srv_on("", 0));
-    assert_eq!(interval(&app, 33), MAX_CONTINUOUS_INTERVAL);
-    pin_links(&mut app, &["eth0", "wlan0"]);
-    app.send_queries();
-    assert_eq!(interval(&app, 33), Duration::from_secs(1));
-    rx.try_iter().count();
-    all_due(&mut app);
-    app.send_queries();
-    assert_eq!(links_of(&rx, 33), Some(vec!["wlan0".to_string()]));
-}
-
-#[test]
 fn a_refresh_overheard_on_one_link_still_goes_out_on_the_others() {
     // §7.3 per link for the cache refresh too: the query overheard on
     // eth0 stands in there; wlan0 gets its refresh, which counts as sent.
@@ -352,63 +310,6 @@ fn capped_backoff_on_an_unanswered_link_is_kept() {
 }
 
 #[test]
-fn a_new_link_restarts_streams_without_answer_coverage_too() {
-    // A PTR browse has no unique answers to cover anything; when a link
-    // comes up it still starts over with the startup schedule.
-    let mut app = App::new().unwrap();
-    pin_links(&mut app, &["eth0"]);
-    ingest(&mut app, &ptr_record(4500));
-    app.send_queries();
-    let browse = ("_http._tcp.local".to_string(), 12);
-    let entry = app.scheduler.continuous_mut().get_mut(&browse).unwrap();
-    entry.interval = MAX_CONTINUOUS_INTERVAL;
-    entry.next_due = Instant::now() + MAX_CONTINUOUS_INTERVAL;
-    pin_links(&mut app, &["eth0", "wlan0"]);
-    app.send_queries();
-    assert_eq!(
-        app.scheduler.continuous()[&browse].interval,
-        Duration::from_secs(1)
-    );
-}
-
-#[test]
-fn a_link_that_comes_back_is_asked_again() {
-    // Both links answered (dampened); wlan0 goes away and returns: its old
-    // answer no longer counts, so the stream restarts and asks wlan0.
-    let (mut app, rx) = two_link_app();
-    ingest(&mut app, &srv_on("eth0", 2));
-    ingest(&mut app, &srv_on("wlan0", 3));
-    assert_eq!(interval(&app, 33), MAX_CONTINUOUS_INTERVAL);
-    pin_links(&mut app, &["eth0"]);
-    app.send_queries();
-    pin_links(&mut app, &["eth0", "wlan0"]);
-    app.send_queries();
-    assert_eq!(interval(&app, 33), Duration::from_secs(1));
-    rx.try_iter().count();
-    all_due(&mut app);
-    app.send_queries();
-    assert_eq!(links_of(&rx, 33), Some(vec!["wlan0".to_string()]));
-}
-
-#[test]
-fn a_restart_keeps_a_second_after_the_last_send() {
-    // RFC 6762 §5.2: a link appearing right after a send doesn't make the
-    // question go out again within a second.
-    let (mut app, _rx) = two_link_app();
-    all_due(&mut app);
-    app.send_queries();
-    let sent = app
-        .scheduler
-        .history(&Scheduler::provenance_key(INSTANCE, 33))
-        .and_then(|h| h.transmitted)
-        .expect("sent");
-    pin_links(&mut app, &["eth0", "usb0", "wlan0"]);
-    app.send_queries();
-    let next = app.scheduler.continuous()[&(INSTANCE.to_string(), 33)].next_due;
-    assert!(next >= sent + Duration::from_secs(1));
-}
-
-#[test]
 fn a_scoped_query_records_only_its_links() {
     let (mut app, _rx) = two_link_app();
     ingest(&mut app, &srv_on("eth0", 2));
@@ -421,30 +322,274 @@ fn a_scoped_query_records_only_its_links() {
     assert_eq!(state.transmitted_interfaces, "wlan0");
 }
 
+/// Make every link stream due now.
+fn link_streams_due(app: &mut App) {
+    let now = Instant::now() - Duration::from_millis(1);
+    for stream in app.scheduler.link_streams_mut().values_mut() {
+        stream.next_due = now;
+    }
+}
+
+/// The interval of `rtype`'s link stream on `link`, if one runs.
+fn link_stream(app: &mut App, name: &str, rtype: u16, link: &str) -> Option<Duration> {
+    app.scheduler
+        .link_streams_mut()
+        .get(&((name.to_string(), rtype), link.to_string()))
+        .map(|s| s.interval)
+}
+
+/// Park `name`/`rtype`'s stream at the hourly cap, as backoff or
+/// dampening leaves it.
+fn park(app: &mut App, name: &str, rtype: u16) {
+    let entry = app
+        .scheduler
+        .continuous_mut()
+        .get_mut(&(name.to_string(), rtype))
+        .unwrap();
+    entry.interval = MAX_CONTINUOUS_INTERVAL;
+    entry.next_due = Instant::now() + MAX_CONTINUOUS_INTERVAL;
+}
+
 #[test]
-fn a_question_never_sent_restarts_at_once_when_a_link_appears() {
-    // Only suppressed so far (overheard on its single link), it has no
-    // send to keep a second from: a new link restarts it at the startup
-    // delay.
+fn a_link_appearing_later_is_asked_alone_on_a_dampened_stream() {
+    let mut app = App::new().unwrap();
+    pin_links(&mut app, &["eth0"]);
+    let rx = capture(&mut app);
+    ingest(&mut app, &ptr_record(4500));
+    app.send_queries();
+    ingest(&mut app, &srv_on("eth0", 2));
+    assert_eq!(interval(&app, 33), MAX_CONTINUOUS_INTERVAL);
+    pin_links(&mut app, &["eth0", "wlan0"]);
+    app.send_queries();
+    assert_eq!(
+        interval(&app, 33),
+        MAX_CONTINUOUS_INTERVAL,
+        "eth0 keeps its schedule"
+    );
+    assert_eq!(
+        link_stream(&mut app, INSTANCE, 33, "wlan0"),
+        Some(Duration::from_secs(1))
+    );
+    rx.try_iter().count();
+    link_streams_due(&mut app);
+    app.send_queries();
+    assert_eq!(links_of(&rx, 33), Some(vec!["wlan0".to_string()]));
+}
+
+#[test]
+fn a_reconnecting_link_never_restarts_browsing_on_the_others() {
+    // A PTR browse covers no link: when wlan0 (re)connects, it starts over
+    // on wlan0 alone, and eth0 keeps its backed-off schedule.
+    let mut app = App::new().unwrap();
+    pin_links(&mut app, &["eth0"]);
+    let rx = capture(&mut app);
+    ingest(&mut app, &ptr_record(4500));
+    app.send_queries();
+    let browse = "_http._tcp.local";
+    park(&mut app, browse, 12);
+    pin_links(&mut app, &["eth0", "wlan0"]);
+    app.send_queries();
+    assert_eq!(
+        app.scheduler.continuous()[&(browse.to_string(), 12)].interval,
+        MAX_CONTINUOUS_INTERVAL
+    );
+    rx.try_iter().count();
+    link_streams_due(&mut app);
+    app.send_queries();
+    let asked: Vec<_> = rx
+        .try_iter()
+        .flatten()
+        .filter(|q| q.name == browse)
+        .map(|q| q.links)
+        .collect();
+    assert_eq!(asked, [vec!["wlan0".to_string()]], "eth0 not asked");
+}
+
+#[test]
+fn a_link_that_comes_back_is_asked_again_alone() {
+    // Both links answered (dampened); wlan0 goes away and returns: its old
+    // answer no longer counts, so wlan0 alone is asked again.
+    let (mut app, rx) = two_link_app();
+    ingest(&mut app, &srv_on("eth0", 2));
+    ingest(&mut app, &srv_on("wlan0", 3));
+    assert_eq!(interval(&app, 33), MAX_CONTINUOUS_INTERVAL);
+    pin_links(&mut app, &["eth0"]);
+    app.send_queries();
+    pin_links(&mut app, &["eth0", "wlan0"]);
+    app.send_queries();
+    assert_eq!(interval(&app, 33), MAX_CONTINUOUS_INTERVAL);
+    rx.try_iter().count();
+    link_streams_due(&mut app);
+    app.send_queries();
+    assert_eq!(links_of(&rx, 33), Some(vec!["wlan0".to_string()]));
+}
+
+#[test]
+fn a_link_stream_starts_at_the_startup_delay() {
     let mut app = App::new().unwrap();
     pin_links(&mut app, &["eth0"]);
     let _rx = capture(&mut app);
     ingest(&mut app, &ptr_record(4500));
     app.send_queries();
-    overhear_srv(&mut app, "eth0", 2);
-    all_due(&mut app);
-    app.send_queries();
-    let history = app
-        .scheduler
-        .history(&Scheduler::provenance_key(INSTANCE, 33))
-        .expect("suppression recorded");
-    assert!(history.transmitted.is_none() && history.suppressed.is_some());
     pin_links(&mut app, &["eth0", "wlan0"]);
     let before = Instant::now();
     app.send_queries();
-    let next = app.scheduler.continuous()[&(INSTANCE.to_string(), 33)].next_due;
-    assert!(
-        next <= before + Duration::from_millis(200),
-        "startup delay only"
+    let next = app.scheduler.link_streams_mut()[&((INSTANCE.to_string(), 33), "wlan0".to_string())]
+        .next_due;
+    assert!(next <= before + Duration::from_millis(200), "startup delay");
+}
+
+#[test]
+fn a_new_link_leaves_the_other_links_schedule_alone() {
+    let (mut app, _rx) = two_link_app();
+    all_due(&mut app);
+    app.send_queries();
+    let key = (INSTANCE.to_string(), 33);
+    let (due, step) = {
+        let e = &app.scheduler.continuous()[&key];
+        (e.next_due, e.interval)
+    };
+    pin_links(&mut app, &["eth0", "usb0", "wlan0"]);
+    app.send_queries();
+    let e = &app.scheduler.continuous()[&key];
+    assert_eq!((e.next_due, e.interval), (due, step));
+}
+
+#[test]
+fn an_answer_on_an_unknown_link_still_lets_a_new_link_be_asked() {
+    // Its link unknown, the answer dampens at once and covers the links
+    // usable then; a link appearing later is uncovered and asked alone.
+    let mut app = App::new().unwrap();
+    pin_links(&mut app, &["eth0"]);
+    let rx = capture(&mut app);
+    ingest(&mut app, &ptr_record(4500));
+    app.send_queries();
+    ingest(&mut app, &srv_on("", 0));
+    assert_eq!(interval(&app, 33), MAX_CONTINUOUS_INTERVAL);
+    pin_links(&mut app, &["eth0", "wlan0"]);
+    app.send_queries();
+    rx.try_iter().count();
+    link_streams_due(&mut app);
+    app.send_queries();
+    assert_eq!(links_of(&rx, 33), Some(vec!["wlan0".to_string()]));
+}
+
+#[test]
+fn a_link_stream_joins_the_stream_once_caught_up() {
+    // The question's stream is at 4 s: the new link's stream asks at 1 s
+    // and 2 s, then joins, and the question goes out on every link again.
+    let mut app = App::new().unwrap();
+    pin_links(&mut app, &["eth0"]);
+    let rx = capture(&mut app);
+    ingest(&mut app, &ptr_record(4500));
+    app.send_queries();
+    let browse = "_http._tcp.local";
+    let entry = app
+        .scheduler
+        .continuous_mut()
+        .get_mut(&(browse.to_string(), 12))
+        .unwrap();
+    entry.interval = Duration::from_secs(4);
+    entry.next_due = Instant::now() + MAX_CONTINUOUS_INTERVAL;
+    pin_links(&mut app, &["eth0", "wlan0"]);
+    app.send_queries();
+    for _ in 0..2 {
+        link_streams_due(&mut app);
+        app.send_queries();
+    }
+    assert_eq!(link_stream(&mut app, browse, 12, "wlan0"), None, "joined");
+    rx.try_iter().count();
+    let entry = app
+        .scheduler
+        .continuous_mut()
+        .get_mut(&(browse.to_string(), 12))
+        .unwrap();
+    entry.next_due = Instant::now() - Duration::from_millis(1);
+    app.send_queries();
+    let asked: Vec<_> = rx
+        .try_iter()
+        .flatten()
+        .filter(|q| q.name == browse)
+        .map(|q| q.links)
+        .collect();
+    assert_eq!(asked, [Vec::<String>::new()], "every link");
+}
+
+#[test]
+fn an_answer_on_the_new_link_ends_its_stream() {
+    let mut app = App::new().unwrap();
+    pin_links(&mut app, &["eth0"]);
+    let _rx = capture(&mut app);
+    ingest(&mut app, &ptr_record(4500));
+    app.send_queries();
+    pin_links(&mut app, &["eth0", "wlan0"]);
+    app.send_queries();
+    assert!(link_stream(&mut app, INSTANCE, 33, "wlan0").is_some());
+    ingest(&mut app, &srv_on("wlan0", 3));
+    assert_eq!(link_stream(&mut app, INSTANCE, 33, "wlan0"), None);
+}
+
+#[test]
+fn a_query_overheard_on_the_new_link_stands_in_for_its_stream_send() {
+    let mut app = App::new().unwrap();
+    pin_links(&mut app, &["eth0"]);
+    let rx = capture(&mut app);
+    ingest(&mut app, &ptr_record(4500));
+    app.send_queries();
+    park(&mut app, INSTANCE, 33);
+    pin_links(&mut app, &["eth0", "wlan0"]);
+    app.send_queries();
+    overhear_srv(&mut app, "wlan0", 3);
+    rx.try_iter().count();
+    let suppressed = app.diagnostics.suppressed_continuous;
+    link_streams_due(&mut app);
+    app.send_queries();
+    assert_eq!(links_of(&rx, 33), None, "no SRV sent");
+    assert_eq!(app.diagnostics.suppressed_continuous, suppressed + 1);
+    assert_eq!(
+        link_stream(&mut app, INSTANCE, 33, "wlan0"),
+        Some(Duration::from_secs(2)),
+        "the stream still doubles"
     );
+}
+
+#[test]
+fn the_question_s_stream_skips_a_link_on_its_own_stream() {
+    // wlan0 just came up and runs its own startup stream: when the
+    // question's stream comes due meanwhile, it asks eth0 only.
+    let mut app = App::new().unwrap();
+    pin_links(&mut app, &["eth0"]);
+    let rx = capture(&mut app);
+    ingest(&mut app, &ptr_record(4500));
+    app.send_queries();
+    pin_links(&mut app, &["eth0", "wlan0"]);
+    app.send_queries();
+    for stream in app.scheduler.link_streams_mut().values_mut() {
+        stream.next_due = Instant::now() + MAX_CONTINUOUS_INTERVAL;
+    }
+    rx.try_iter().count();
+    all_due(&mut app);
+    app.send_queries();
+    assert_eq!(links_of(&rx, 33), Some(vec!["eth0".to_string()]));
+}
+
+#[test]
+fn with_every_link_covered_or_streaming_the_question_s_stream_only_advances() {
+    // eth0 answered, wlan0 on its own stream: the question's stream has
+    // no link left this round, so it sends nothing and moves on.
+    let (mut app, rx) = two_link_app();
+    ingest(&mut app, &srv_on("eth0", 2));
+    pin_links(&mut app, &["eth0"]);
+    app.send_queries();
+    pin_links(&mut app, &["eth0", "wlan0"]);
+    app.send_queries();
+    for stream in app.scheduler.link_streams_mut().values_mut() {
+        stream.next_due = Instant::now() + MAX_CONTINUOUS_INTERVAL;
+    }
+    rx.try_iter().count();
+    all_due(&mut app);
+    let before = app.scheduler.continuous()[&(INSTANCE.to_string(), 33)].interval;
+    app.send_queries();
+    assert_eq!(links_of(&rx, 33), None, "no SRV this round");
+    assert!(app.scheduler.continuous()[&(INSTANCE.to_string(), 33)].interval > before);
 }
